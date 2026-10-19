@@ -1,8 +1,8 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
-  "description": "A DSH plugin that lets an AI agent \"watch\" Bilibili videos: AI subtitles, local ASR, frame OCR, danmaku heatmap, comments, and nine-grid frame sheets.",
+  "description": "Bilibili video reader for DSH: subtitles, ASR, frame OCR, comments, danmaku.",
   "type": "module",
   "main": "index.js",
   "bin": {
