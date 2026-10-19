@@ -32,7 +32,7 @@ bili-watch view BV1EPnG6DEJC
 | 能力 | 需要 | 没有时 |
 |---|---|---|
 | 元数据 / 评论 / 弹幕 / 搜索 / 热榜 | 无（匿名 HTTP） | — |
-| 抽帧 / 九宫格 / 字幕带 | `ffmpeg` | 报错并提示装法（`text` 会降级到读图） |
+| 抽帧 / 九宫格 / 字幕带 | `ffmpeg` | 报错并提示装法（`text` 的兜底档就是抽帧，所以同样要 ffmpeg） |
 | AI 字幕 | 一次扫码登录（SESSDATA） | 返回「无字幕轨」，自动降级 |
 | 本地转写 | Python 3.10+ 与 faster-whisper（`deps/.venv-asr`） | 跳过，自动降级 |
 | 画面 OCR | Python 3.10+ 与 rapidocr_onnxruntime（`deps/.venv-ocr`） | 跳过，只剩基础抽帧 |
@@ -64,7 +64,7 @@ bash scripts/fetch-deps.sh all
 BILI_LOOK_MIRROR=cn bash scripts/fetch-deps.sh all
 ```
 
-脚本可以重复跑：目标已存在就跳过，`-Force` 重下（Windows），`-DryRun` 只打印命令。装 venv 时会验证包能不能 import，上次装到一半的会被重建。`-Target model` 需要 ASR 环境先装好，脚本会提示。
+脚本可以重复跑：目标已存在就跳过；Windows 用 `-Force` 重下、`-DryRun` 只打印命令（sh 版没有这两个参数，要重装就删掉目标目录）。装 venv 时会验证包能不能 import，上次装到一半的会被重建。`-Target model` 需要 ASR 环境先装好，脚本会提示。
 
 **从 GitHub 下载很慢或断**：ffmpeg 要从 GitHub 拉约 80 MB 的压缩包，国内直连经常断。三条替代路径：
 
