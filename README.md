@@ -72,7 +72,7 @@ macOS/Linux 的 ffmpeg 由系统包管理器安装（脚本只给提示），其
 1. `login`：插件出二维码，手机 B 站扫码。凭证存插件 `deps/credential.json`，不出本机。
 2. `--cred <文件路径>`：读一份现成的 `{sessdata, bili_jct, buvid3, buvid4}` JSON。
 
-凭证取值顺序：`--cred` → `deps/credential.json` → 匿名。
+凭证取值：给了 `--cred` 就只用它（读不到就按匿名跑，不会偷偷换回 `deps/credential.json`）；没给才用 `deps/credential.json`；都没有就匿名。
 
 > 这份文件等于你的账号登录态。别分享、别提交、别上传。
 

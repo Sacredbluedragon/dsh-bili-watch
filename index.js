@@ -7,7 +7,7 @@
  *
  * 两侧执行同一份 lookup：spawn 插件自带的只读工具
  *   <插件目录>\tools\look.mjs
- * 不碰值班账本、不占抽帧配额、默认匿名。
+ * 只读、默认匿名：不修改任何业务状态文件，可反复调用。
  */
 import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
@@ -144,7 +144,7 @@ function apply(ctx) {
   ctx.tools.register(defineTool({
     name: 'bili_watch',
     description:
-      '用户给出 B 站视频链接 / BV 号，要我看、总结、判断这条视频讲了什么、有没有坑、值不值得看时使用。读取一个 B 站视频的内容材料（只读、匿名、不碰账本）。优先级：字幕 → 本地 ASR 转写 → 抽帧 OCR。command=peek 最便宜：只拿标题/简介/热评 + 均匀 5 帧，用来先判断是口播还是画面，再决定走 text 还是 ocr；command=text 会按优先级自动降级并返回最可信的一份文本（推荐）；view=元数据与热评；comments=评论区；asr=强制本地转写；frames=抽帧（可加 ocr=true 顺带识别画面文字）；ocr=抽帧并识别画面文字；sub=只要字幕；search=按关键词搜视频（配 days 可只留最近 N 天发布的，结果按播放量降序，用来看「这几天有什么值得看」）；hot=综合热门榜（B 站按热度排的前 N 条）；danmaku=弹幕热区（观众在哪一段反应最集中，判断名场面在哪）；sheet=把 N 帧拼成九宫格一张图（看图省 token）；substrip=把底部字幕逐段竖拼成一张图（硬字幕视频最省）。多 P 视频用 p 指定第几个分P（默认 P1）。拿到文本后由你负责理解与总结。',
+      '用户给出 B 站视频链接 / BV 号，要我看、总结、判断这条视频讲了什么、有没有坑、值不值得看时使用。读取一个 B 站视频的内容材料（只读、匿名）。优先级：字幕 → 本地 ASR 转写 → 抽帧 OCR。command=peek 最便宜：只拿标题/简介/热评 + 均匀 5 帧，用来先判断是口播还是画面，再决定走 text 还是 ocr；command=text 会按优先级自动降级并返回最可信的一份文本（推荐）；view=元数据与热评；comments=评论区；asr=强制本地转写；frames=抽帧（可加 ocr=true 顺带识别画面文字）；ocr=抽帧并识别画面文字；sub=只要字幕；search=按关键词搜视频（配 days 可只留最近 N 天发布的，结果按播放量降序，用来看「这几天有什么值得看」）；hot=综合热门榜（B 站按热度排的前 N 条）；danmaku=弹幕热区（观众在哪一段反应最集中，判断名场面在哪）；sheet=把 N 帧拼成九宫格一张图（看图省 token）；substrip=把底部字幕逐段竖拼成一张图（硬字幕视频最省）。多 P 视频用 p 指定第几个分P（默认 P1）。拿到文本后由你负责理解与总结。',
     parameters: {
       command: {
         type: 'string',
@@ -185,6 +185,14 @@ function apply(ctx) {
         type: 'string',
         description: 'command=sheet 时的格子，如 3x3 或 4x4（默认 3x3）。',
       },
+      limit: {
+        type: 'number',
+        description: 'command=search 时最多返回几条（默认 10）、command=hot 时取前 N 条（默认 10）。',
+      },
+      cred: {
+        type: 'string',
+        description: '可选的 B 站凭证 JSON 路径（只在 command=sub/text 时需要；不传就匿名，匿名拿不到 AI 字幕轨）。',
+      },
     },
     output: {
       // 注意：DSH 的 output.schema 是「author-facing spec」，编译时 allowRequired=false，
@@ -209,9 +217,12 @@ function apply(ctx) {
       if (typeof args.grid === 'string' && args.grid.trim()) extra.push('--grid', args.grid.trim())
       if (typeof args.days === 'number' && args.days > 0) extra.push('--days', String(Math.floor(args.days)))
       if (args.command === 'hot') {
-        const r = await lookup({ command: 'hot', bv: '' })
+        if (typeof args.limit === 'number' && args.limit > 0) extra.push('--limit', String(Math.floor(args.limit)))
+        const r = await lookup({ command: 'hot', bv: '', extra })
         return { ok: r.ok, text: r.text }
       }
+      if (typeof args.limit === 'number' && args.limit > 0) extra.push('--limit', String(Math.floor(args.limit)))
+      if (typeof args.cred === 'string' && args.cred.trim()) extra.push('--cred', args.cred.trim())
       const target = args.command === 'search' ? String(args.keyword ?? '').trim() : String(args.bv ?? '').trim()
       if (args.command === 'search' && !target) return { ok: false, text: 'search 需要 keyword 参数（要搜什么词）' }
       if (!target) return { ok: false, text: '缺少 BV 号或分享链接' }
