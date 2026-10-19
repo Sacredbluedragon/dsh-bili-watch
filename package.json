@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": false,
   "description": "Bilibili video reader for DSH: subtitles, ASR, frame OCR, comments, danmaku.",
   "type": "module",
