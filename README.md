@@ -2,9 +2,11 @@
 
 把一条 B 站视频变成模型能读的内容：元数据、评论、弹幕、AI 字幕、本地转写、抽帧 OCR。可以装在 DSH 里当插件，也能直接跑命令行。
 
-取内容的顺序是先用文字（字幕或转写），文字不够再抽帧看画面。缺哪一档依赖就跳过哪一档，命令本身不会失败。
+取内容的顺序是先用文字（字幕或转写），文字不够再抽帧看画面。只读元数据、评论、弹幕、搜索、热榜不需要任何额外依赖；抽帧相关命令要 ffmpeg，没装会明确报错并指出装法，不会假装成功。
 
 ## 安装
+
+### 装进 DSH 当插件
 
 ```bash
 dsh plugin --profile web add dsh-bili-watch
@@ -16,12 +18,21 @@ dsh plugin --profile web add dsh-bili-watch
 
 插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时 `index.js` 会报 `ERR_MODULE_NOT_FOUND`，先补装再重启。
 
+### 只当命令行工具
+
+```bash
+npm i -g dsh-bili-watch
+bili-watch view BV1EPnG6DEJC
+```
+
+不装全局也行：clone 仓库后在目录里跑 `node tools/look.mjs view BV1EPnG6DEJC`。命令行的依赖和插件完全一样，`scripts/fetch-deps` 同样可用。
+
 ## 依赖
 
 | 能力 | 需要 | 没有时 |
 |---|---|---|
 | 元数据 / 评论 / 弹幕 / 搜索 / 热榜 | 无（匿名 HTTP） | — |
-| 抽帧 / 九宫格 / 字幕带 | `ffmpeg` | 跳过，文字档仍可用 |
+| 抽帧 / 九宫格 / 字幕带 | `ffmpeg` | 报错并提示装法（`text` 会降级到读图） |
 | AI 字幕 | 一次扫码登录（SESSDATA） | 返回「无字幕轨」，自动降级 |
 | 本地转写 | Python 3.10+ 与 faster-whisper（`deps/.venv-asr`） | 跳过，自动降级 |
 | 画面 OCR | Python 3.10+ 与 rapidocr_onnxruntime（`deps/.venv-ocr`） | 跳过，只剩基础抽帧 |
@@ -94,9 +105,11 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 | `search <关键词> [--days 3]` | 搜视频 |
 | `hot [--limit 10]` | 综合热门榜 |
 | `login [--check] [--poll]` | 扫码登录 |
-| `clean` | 清空临时目录 `%TEMP%\bili-watch` |
+| `clean` | 清空系统临时目录下的 `bili-watch`（Windows 是 `%TEMP%\bili-watch`） |
 
 工具侧的等价入口：`bili_watch` 工具（参数 `command` + `bv`），或 `/bili` 命令。
+
+表里只列常用参数。完整参数（`--out`、`--fresh`、`--scene`、`--ffmpeg`、`--cred`、`--fast`、`--mark-seen`、`--p` 等）跑 `bili-watch help` 看。
 
 ## 通用视频 URL
 
