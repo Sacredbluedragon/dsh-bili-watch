@@ -1,0 +1,8 @@
+# 统一换行：脚本在 Windows 检出也要能执行
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.exe binary
+*.py text eol=lf
+*.mjs text eol=lf

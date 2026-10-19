@@ -1,0 +1,67 @@
+{
+  "name": "dsh-bili-watch",
+  "version": "0.2.0",
+  "private": false,
+  "description": "A DSH plugin that lets an AI agent \"watch\" Bilibili videos: AI subtitles, local ASR, frame OCR, danmaku heatmap, comments, and nine-grid frame sheets.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "bili-watch": "tools/look.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "tools/",
+    "scripts/",
+    "deps/.gitkeep",
+    "deps/_bili-asr.py"
+  ],
+  "keywords": [
+    "bilibili",
+    "video",
+    "asr",
+    "ocr",
+    "danmaku",
+    "dsh",
+    "deepseek",
+    "subtitles"
+  ],
+  "author": "Sacredbluedragon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sacredbluedragon/dsh-bili-watch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sacredbluedragon/dsh-bili-watch/issues"
+  },
+  "homepage": "https://github.com/Sacredbluedragon/dsh-bili-watch#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+_bili-asr.py —— 把本地音频/视频文件转成文字（faster-whisper，CPU int8）
+
+为什么单独有这个文件：
+  B 站很多新视频没有 AI 字幕轨（刚发布几小时还没转写完，或者 UP 没开），
+  只靠 B 站字幕会把一大半候选判成「不可信」。本地转写能补上这一块。
+
+口径：
+  · 只跑 CPU + int8：本机 PyPI 版 ctranslate2 没有 CUDA 算子，装 GPU 版要另配 cuDNN，不值得。
+  · 模型默认 small（约 250 MB，一个 3 分钟视频约 30–45 秒）；可 --model 换 base/tiny。
+  · 模型与缓存落 D 盘项目目录（HF_HOME），不碰用户主目录。
+  · 音频由调用方先转成 16 kHz 单声道 wav 再传进来——这里不碰网络、不碰 B 站接口。
+
+用法：
+  .venv-asr\\Scripts\\python.exe _bili-asr.py <音频或视频文件> [-o 输出.txt] [--model small] [--lang zh]
+  不给 -o 就往 stdout 打正文（调用方直接取 stdout 更省事）。
+"""
+import argparse
+import os
+import sys
+
+# ⭐ 必须在 import faster_whisper 之前设好，否则它会先按默认去连 HuggingFace
+_HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-home"))
+# 国内直连 huggingface.co 基本下不动，默认走镜像；已经能直连的可以自己改回
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# ⭐ 必须关掉 Xet：新版本 huggingface_hub 默认走 cas-server.xethub.hf.co，
+#   镜像站不代理那条重建接口，会报 CAS Client Error: 401 Unauthorized（2026-10-17 实测）。
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# 避免 OpenMP 在多核上抢线程把机器拖死
+os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src", help="音频或视频文件路径")
+    ap.add_argument("-o", "--out", help="输出文本文件；不给就打印到 stdout")
+    ap.add_argument("--model", default=os.environ.get("BILI_ASR_MODEL", "small"),
+                    help="Whisper 模型：tiny / base / small / medium（默认 small）")
+    ap.add_argument("--lang", default="zh", help="语言，默认 zh（自动识别可传 auto）")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.src):
+        print("[asr] 找不到文件：" + args.src, file=sys.stderr)
+        return 2
+
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:  # noqa: BLE001
+        print("[asr] 导入 faster_whisper 失败：%s" % e, file=sys.stderr)
+        return 3
+
+    print("[asr] 加载模型 %s（首次会下载，之后本地读）…" % args.model, file=sys.stderr)
+    try:
+        model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    except Exception as e:  # noqa: BLE001
+        print("[asr] 加载模型失败：%s" % e, file=sys.stderr)
+        return 4
+
+    print("[asr] 开始转写…", file=sys.stderr)
+
+    # ⭐ 先自己解码一次 + 量 VAD 语音时长，用来区分两种「空转写」（2026-10-17 实测踩到）：
+    #   · 纯 BGM 骑车视频，音频很响（mean -14.4 dB）但没人说话 → 语音时长≈0，空是内容结果；
+    #   · 转写环境坏了（模型没加载/依赖缺/静音检测误杀）→ 明明有语音段却零字。
+    # 只看「有没有音频/时长多少」判不出来，必须看 VAD 到底找到了多少「像人说话」的片段。
+    speech_sec = 0.0
+    audio = None
+    vad_ok = False
+    try:
+        import numpy as np  # noqa: F401
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        audio = decode_audio(args.src, sampling_rate=16000)
+        stamps = get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=400))
+        speech_sec = sum(float(s["end"]) - float(s["start"]) for s in stamps) / 16000.0
+        vad_ok = True
+        print("[asr] VAD 语音段 %d 个，共 %.1f 秒" % (len(stamps), speech_sec), file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        # 量不出来不影响转写本身，但调用方会少一条判据，必须显式标出来（不能静默）
+        print("[asr] VAD 不可用：预检失败（不影响转写，但空文本将无法归因）：%s" % e, file=sys.stderr)
+
+    try:
+        segments, info = model.transcribe(
+            args.src,
+            language=None if args.lang == "auto" else args.lang,
+            vad_filter=True,              # 掐掉静音段，纯画面/纯音乐的视频会得到空文本
+            vad_parameters={"min_silence_duration_ms": 400},
+            beam_size=5,
+            condition_on_previous_text=False,  # 防止长视频里一段错就带着后面全错
+        )
+        parts = []
+        for seg in segments:
+            t = (seg.text or "").strip()
+            if t:
+                parts.append(t)
+    except Exception as e:  # noqa: BLE001
+        print("[asr] 转写失败：%s" % e, file=sys.stderr)
+        return 5
+
+    text = "".join(parts).strip()
+    print("[asr] 完成：%d 段，%d 字，语种 %s" % (len(parts), len(text), info.language), file=sys.stderr)
+    # 给调用方的机器可读标记：转写为空时靠它判「没人说话」还是「环境坏了」
+    # vad_ok 单独标出来：取不到语音秒数时调用方要报「VAD 不可用」，不能当成 0 秒
+    print("[asr] vad_ok=%d" % (1 if vad_ok else 0), file=sys.stderr)
+    print("[asr] speech_seconds=%.2f" % speech_sec, file=sys.stderr)
+    # ⭐ 段数给调用方做辅助判据：
+    #   总时长短不代表是噪声——「说了两句短话」每句 1 秒、两段，和「咳嗽一声」一段，
+    #   总时长都是 2 秒。段数 ≥2 说明有过多次发声，更可能是短话而非噪声。
+    print("[asr] speech_segments=%d" % (len(stamps) if vad_ok else -1), file=sys.stderr)
+    print("[asr] chars=%d" % len(text), file=sys.stderr)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text + "\n")
+        print("[asr] 已写入：" + args.out, file=sys.stderr)
+    else:
+        sys.stdout.write(text + "\n")
+    # 空文本是结果不是错误：纯音乐 / 纯录屏 / 无声演示的视频就该是空的
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

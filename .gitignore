@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# deps/ 只发布脚本与占位；运行时状态、模型缓存、venv、二进制不进仓库
+deps/*
+!deps/.gitkeep
+!deps/_bili-asr.py
+
+# 运行时状态（即使被白名单列出也绝不提交）
+deps/login-key.json
+deps/credential.json
+deps/seen.md
+deps/.hf-home/
+deps/.venv-asr/
+deps/.venv-ocr/
+
+*.tmp
+bili-watch-*/
