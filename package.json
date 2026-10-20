@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": false,
   "description": "Bilibili video reader for DSH: subtitles, ASR, frame OCR, comments, danmaku.",
   "type": "module",
@@ -10,16 +10,25 @@
   },
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "tools/",
     "scripts/",

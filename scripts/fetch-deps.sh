@@ -4,7 +4,7 @@
 # 用法：
 #   bash scripts/fetch-deps.sh all
 #   bash scripts/fetch-deps.sh ytdlp
-#   BILI_LOOK_MIRROR=cn bash scripts/fetch-deps.sh all   # 国内网络
+#   BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all   # 国内网络
 #
 # 目标：
 #   ffmpeg  只提示用系统包管理器安装（脚本不下载）
@@ -19,7 +19,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEPS="$ROOT/deps"
 mkdir -p "$DEPS"
 TARGET="${1:-all}"
-MIRROR="${BILI_LOOK_MIRROR:-}"
+MIRROR="${BILI_WATCH_MIRROR:-}"
 
 if [ "$MIRROR" = "cn" ]; then
   GH="https://gh-proxy.com/https://github.com"

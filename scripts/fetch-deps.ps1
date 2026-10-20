@@ -39,7 +39,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Deps = Join-Path $Root 'deps'
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $Deps | Out-Null }
 
-$UseCn = ($Mirror -eq 'cn') -or (($Mirror -eq 'auto') -and ($env:BILI_LOOK_MIRROR -eq 'cn'))
+$UseCn = ($Mirror -eq 'cn') -or (($Mirror -eq 'auto') -and ($env:BILI_WATCH_MIRROR -eq 'cn'))
 $GhProxy = if ($UseCn) { 'https://gh-proxy.com/' } else { '' }
 $PyIndex = if ($UseCn) { 'https://pypi.tuna.tsinghua.edu.cn/simple' } else { 'https://pypi.org/simple' }
 $HfEndpoint = if ($UseCn) { 'https://hf-mirror.com' } else { 'https://huggingface.co' }
@@ -75,7 +75,7 @@ function Ensure-Ffmpeg {
     # 80 MB 的 BtbN zip 在 GitHub 直连不稳时大概率断流；给替代路径，别让安装卡死在这
     Write-Warning 'ffmpeg 下载失败。可选替代路径：'
     Write-Host '  1) 手动下载 ffmpeg.exe 放进 deps\ 后重跑本脚本（会自动跳过）'
-    Write-Host '  2) 已有 ffmpeg 时设 $env:BILI_LOOK_FFMPEG = <ffmpeg.exe 路径>'
+    Write-Host '  2) 已有 ffmpeg 时设 $env:BILI_WATCH_FFMPEG = <ffmpeg.exe 路径>'
     Write-Host '  3) 换镜像重试：-Mirror cn（走 gh-proxy）'
     throw 'ffmpeg 未安装（见上面的替代路径）'
   }

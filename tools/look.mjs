@@ -36,9 +36,9 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-// 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_LOOK_PROJ
+// 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ
 const DEPS = join(HERE, '..', 'deps')
-const PROJ = process.env.BILI_LOOK_PROJ || DEPS
+const PROJ = process.env.BILI_WATCH_PROJ || DEPS
 const pick = (...cands) => cands.find((p) => existsSync(p)) ?? cands[cands.length - 1]
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
@@ -47,10 +47,10 @@ const ASR_SCRIPT = pick(join(DEPS, '_bili-asr.py'), join(PROJ, '_bili-asr.py'))
 const OCR_PY = pick(join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(PROJ, '.venv-ocr', PY_DIR, PY_EXE))
 const HF_HOME_DIR = pick(join(DEPS, '.hf-home'), join(PROJ, '.hf-home'))
 const OCR_SCRIPT = join(HERE, 'ocr.py')
-const FFMPEG_CAND = process.env.BILI_LOOK_FFMPEG || ''
+const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || ''
 // 缺 ffmpeg 时的统一指路（一键脚本 / 环境变量 / --ffmpeg 三条出路）
 const FFMPEG_HINT =
-  '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_LOOK_FFMPEG，或用 --ffmpeg 传路径'
+  '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
 const CACHE = join(tmpdir(), 'bili-watch')
 const require = createRequire(import.meta.url)
 const CRED_FILE = join(DEPS, 'credential.json')
@@ -1112,7 +1112,7 @@ async function cmdLogin(opts = {}) {
   try { chmodSync(LOGIN_KEY_FILE, 0o600) } catch {}
 }
 
-const SEEN_FILE = process.env.BILI_LOOK_SEEN || join(DEPS, 'seen.md')
+const SEEN_FILE = process.env.BILI_WATCH_SEEN || join(DEPS, 'seen.md')
 
 /**
  * 往项目判重表追加一行「看过」。只在 --mark-seen 时调用：
@@ -1260,7 +1260,7 @@ function resolveSource(input) {
 // 定位 yt-dlp：环境变量 → 插件 deps\yt-dlp.exe → PATH；找到后 --version 验一次
 function findYtDlp() {
   const localExe = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'
-  const cands = [process.env.BILI_LOOK_YTDLP, join(DEPS, localExe), 'yt-dlp'].filter(Boolean)
+  const cands = [process.env.BILI_WATCH_YTDLP, join(DEPS, localExe), 'yt-dlp'].filter(Boolean)
   for (const c of cands) {
     if (c !== 'yt-dlp' && !existsSync(c)) continue
     try {
@@ -1488,7 +1488,7 @@ const HELP = `用法:
 
   多 P 视频加 --p N 指定第几个分P（默认 P1）。
   B 站目标可以直接贴分享链接，会自己提取 BV 号；短链 b23.tv/... 要先展开成完整链接。
-  通用视频 URL（YouTube/X 等）需要 yt-dlp：跑 scripts/fetch-deps.ps1 -Target ytdlp 装到 deps\\yt-dlp.exe（或设 BILI_LOOK_YTDLP / 系统 PATH）。
+  通用视频 URL（YouTube/X 等）需要 yt-dlp：跑 scripts/fetch-deps.ps1 -Target ytdlp 装到 deps\\yt-dlp.exe（或设 BILI_WATCH_YTDLP / 系统 PATH）。
 `
 try {
   if (srcErr || src.type === 'error') {
