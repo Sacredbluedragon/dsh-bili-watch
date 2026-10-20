@@ -1,8 +1,8 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": false,
-  "description": "Bilibili video reader for DSH: subtitles, ASR, frame OCR, comments, danmaku.",
+  "description": "Reads Bilibili (and generic URLs via yt-dlp) into text for DSH agents: search, hot, metadata, comments, danmaku, AI subtitles, local ASR, frame OCR.",
   "type": "module",
   "main": "index.js",
   "bin": {
