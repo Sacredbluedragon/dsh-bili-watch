@@ -25,7 +25,7 @@ dsh plugin --profile web add dsh-bili-watch
 
 插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时 `index.js` 会报 `ERR_MODULE_NOT_FOUND`，先补装再重启。
 
-插件尚未收录到插件市场，目前只能按上面的命令装。
+插件市场已收录（2026-10-21）：在市场里搜 `dsh-bili-watch` 直接安装，这是最省事的方式；市场里暂时搜不到时，按上面的命令装。
 
 ### 只当命令行工具
 
@@ -47,7 +47,7 @@ dsh plugin --profile web remove dsh-bili-watch
 
 ## 插件面板
 
-装进 DSH 后，设置 → 插件 → `dsh-bili-watch` 的详情页有一块面板，常规操作无需去对话里敲命令：
+装进 DSH 后，打开插件列表，点 `dsh-bili-watch` 卡片进详情页，里面有一块面板（不用先进设置），常规操作无需去对话里敲命令：
 
 - **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点击行末「下载」，后台跑 `scripts/fetch-deps`（体积是估算值，实际以跑完为准）。
 - **扫码登录**：凭证未登录时点「重新扫码」，面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `deps/credential.json`。
