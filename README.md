@@ -19,6 +19,8 @@ dsh plugin --profile web add dsh-bili-watch
 
 **第二步易漏**：打开 profile 的 `package.json`，在 `dsh.profile.bundles` 数组里加一行 `"dsh-bili-watch"`。`dsh plugin add` 只写 `dependencies`，不写 bundles。漏了这步插件装了但不生效，也不报错。改完重启 DSH。
 
+装完可以验证：`dsh --profile web --dump-config` 里能搜到 `dsh-bili-watch` 才算进了装配。
+
 也可以把本仓库直接放进 `profiles/<名字>/node_modules/dsh-bili-watch`。
 
 插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时 `index.js` 会报 `ERR_MODULE_NOT_FOUND`，先补装再重启。
@@ -122,13 +124,13 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 |---|---|
 | `view <BV或链接或URL>` | 元数据 + 简介 + 热评 |
 | `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（最便宜；仅 B 站） |
-| `sub <BV>` | AI 字幕 + 三判据（字/秒、关键词命中、时长） |
+| `sub <BV或链接>` | AI 字幕 + 三判据（字/秒、关键词命中、时长） |
 | `comments <BV> [N]` | 评论区，默认按热度排序 |
 | `asr <BV或URL>` | 本地转写音频 |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
 | `ocr <BV>` | 抽帧并 OCR |
 | `text <BV或URL>` | 四级链：字幕 → 转写 → 抽帧 OCR |
-| `sheet <BV> [--grid 3x3]` | 均匀挑 9/16 帧拼成一张图 |
+| `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（只支持 `3x3` / `4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
 | `search <关键词> [--days 3]` | 搜视频 |
@@ -169,20 +171,20 @@ AI 字幕（需登录）
 | `BILI_WATCH_PROJ` | ASR/OCR 环境目录（默认插件 `deps/`） |
 | `BILI_WATCH_FFMPEG` | ffmpeg 可执行文件路径 |
 | `BILI_WATCH_YTDLP` | yt-dlp 可执行文件路径 |
-| `BILI_WATCH_SEEN` | `seen.md` 去重文件路径（默认 `deps/seen.md`） |
+| `BILI_WATCH_SEEN` | `seen.md` 去重文件路径（默认 `deps/seen.md`）。文件不存在时 `--mark-seen` 记不了，先建一个空文件即可 |
 
 ## 成本
 
-- 字幕一次请求，最省。
+- 字幕接口带一次重试；`text` 最多次试两次（先匿名、有凭证再试一次）。
 - 抽帧会下载视频（360p）并跑 ffmpeg。`--step` 调低抽帧频率，脚本另外限了 `-threads 2`。
-- 九宫格和字幕带把多帧压成一张图，省 token。
+- 拼图和字幕带把多帧压成一张图，省 token。
 
 ## 限制与风险
 
 - **不支持**：点赞、评论、发弹幕、留观看历史；B 站侧只读。本机会写登录凭证、抽帧缓存与 `seen.md` 去重文件。
 - **只支持 B 站与 yt-dlp 能下的站点**；`peek` / `sub` / `comments` / `danmaku` / `sheet` / `substrip` / `ocr` 仅限 B 站。
 - **凭证**：等同账号登录态，泄露即被盗。只存本机，不进日志。
-- **频率**：正常看几条没问题；批量扫几百条会触发风控。
+- **频率**：脚本没有硬限速（只在字幕重试时随机等几百毫秒）；批量跑请自己加 sleep，别连着扫。
 - **任意 http(s) 地址都会被请求**：通用 URL 走 yt-dlp 时不做内网地址过滤，别拿它请求内网服务。
 
 ## 许可
