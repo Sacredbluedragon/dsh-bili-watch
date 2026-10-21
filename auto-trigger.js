@@ -10,7 +10,7 @@ const RE_FULL = /https?:\/\/(?:www\.|m\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{1
 // 短链：能识别，但 look.mjs 不能展开（tools/look.mjs:1249-1251），调用方要单独处理
 const RE_SHORT = /https?:\/\/b23\.tv\/[0-9A-Za-z]{5,12}(?:[/?#][^\s<>"'）)]*)?/gi
 // ?bvid=BV… 形态（tools/look.mjs:1254 支持）
-const RE_BVID_Q = /[?&]bvid=(BV[0-9A-Za-z]{10})/gi
+const RE_BVID_Q = /https?:\/\/(?:www\.|m\.)?bilibili\.com\/video\/[^\s<>"'）)]*?[?&]bvid=(BV[0-9A-Za-z]{10})[^\s<>"'）)]*/gi
 // 裸 BV 号：前后不许粘字母数字
 const RE_BARE = /(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g
 
@@ -33,6 +33,9 @@ function stripWrappers(raw) {
       return ' '
     })
   }
+  // `<https://…>` 是常见自动链接写法；标签块已整段删掉之后，再剥掉包着单个
+  // 无空格 token 的尖括号，避免把 <system-reminder> 这类壳提前破坏。
+  text = text.replace(/<([^<>\s]{8,})>/g, '$1')
   const kept = []
   for (const ln of text.split('\n')) {
     if (/^\s*>/.test(ln)) {
