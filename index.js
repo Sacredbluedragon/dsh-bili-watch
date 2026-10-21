@@ -23,6 +23,17 @@ try {
   defineTool = null
 }
 import QRCode from 'qrcode'
+import { matchSingleVideoLink, textOfUserMessage } from './auto-trigger.js'
+// dsh-llm 同样是可选依赖：拿不到 createUserMessage 就只保留「工具描述」这一层，
+// 不能因为少一个提示能力让整个插件加载失败（同上方 defineTool 的处理方式）
+let createUserMessage = null
+let boundContextSummary = null
+try {
+  ({ createUserMessage, boundContextSummary } = await import('@deepseek-ai/dsh-llm'))
+} catch {
+  createUserMessage = null
+  boundContextSummary = null
+}
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LOOK = join(HERE, 'tools', 'look.mjs')
@@ -46,7 +57,7 @@ const HF_HOME = [join(DEPS, '.hf-home'), join(PROJ, '.hf-home')]
 const SCRIPTS = join(HERE, 'scripts')
 const CACHE_CFG = join(DEPS, 'cache-config.json')
 const UI_CFG = join(DEPS, 'ui-config.json')
-const DEFAULT_UI_CFG = { hintDismissed: false, activationSeen: false, showInSettings: true }
+const DEFAULT_UI_CFG = { hintDismissed: false, activationSeen: false, showInSettings: true, autoHint: true }
 
 function uiCfg() {
   try {
@@ -81,7 +92,7 @@ const QR_POLL = (key) =>
 const SPI = 'https://api.bilibili.com/x/frontend/finger/spi'
 
 const name = 'dsh-bili-watch'
-const inject = ['commands', 'tools', 'webServer']
+const inject = ['commands', 'tools', 'webServer', 'agents']
 
 function runLook(args, { timeoutMs = 1_200_000 } = {}) {
   return new Promise((resolve) => {
@@ -584,6 +595,52 @@ function apply(ctx) {
     },
   })
 
+  // ①-b 单条链接软提示：只往消息流里加一条旁白，绝不替用户调用工具
+  //     开关落 deps/ui-config.json 的 autoHint（DEFAULT_UI_CFG 见上）
+  try {
+    if (createUserMessage && uiCfg().autoHint !== false) {
+      const hinted = new Map() // message.id → true，同一条消息只提示一次
+      const hint = (msg) => {
+        const { ok, text } = textOfUserMessage(msg)
+        if (!ok) return null
+        const r = matchSingleVideoLink(text)
+        if (!r.hit) return null
+        const line = r.kind === 'short'
+          // 短链：look.mjs 不能展开，只让用户展开
+          ? '[bili-watch] 这条消息只有一条 b23.tv 短链。本插件不能展开短链，先请用户把浏览器地址栏里的完整链接发过来；不要凭短链猜内容。'
+          : `[bili-watch] 这条消息只有一条 B 站视频链接（BV ${r.bv}）。要读内容就调 bili_watch（command=peek 最便宜）；用户没说要看时不要自己跑。`
+        return createUserMessage({
+          content: [{ type: 'text', text: line }],
+          source: { kind: name, form: 'notice', summary: boundContextSummary?.('检测到单条 B 站视频链接') ?? '检测到单条 B 站视频链接' },
+        })
+      }
+      ctx.on('agent/pre-step', async (payload, next) => {
+        const decision = await next()
+        try {
+          if (decision.kind !== 'enter' || payload.step !== 1) return decision
+          if (payload.signal?.aborted) return decision
+          const fresh = []
+          for (const msg of decision.messages) {
+            if (msg?.source?.kind !== 'user') continue
+            if (hinted.has(msg.id)) continue
+            const extra = hint(msg)
+            if (!extra) continue
+            hinted.set(msg.id, true)
+            fresh.push(extra)
+          }
+          if (!fresh.length) return decision
+          return { ...decision, messages: [...decision.messages, ...fresh] }
+        } catch (e) {
+          // 提示是旁白，出任何错都不许影响这一步
+          try { ctx.logger?.info?.(`[dsh-bili-watch] 自动提示跳过：${e?.message ?? e}`) } catch {}
+          return decision
+        }
+      })
+    }
+  } catch (e) {
+    try { ctx.logger?.info?.(`[dsh-bili-watch] pre-step 钩子没挂上：${e?.message ?? e}`) } catch {}
+  }
+
   // ② 同名工具：模型可调，需要看视频时自己来，不依赖用户敲命令
   //    必须用 defineTool 包一层：ctx.tools.register 收的是编译好的 tool 对象，
   //    直接传 options 会让发往模型的 parameters 变成 null（报 INVALID_REQUEST: schema must be type "object"）。
@@ -736,6 +793,7 @@ function apply(ctx) {
                 if (typeof body?.hintDismissed === 'boolean') patch.hintDismissed = body.hintDismissed
                 if (typeof body?.activationSeen === 'boolean') patch.activationSeen = body.activationSeen
                 if (typeof body?.showInSettings === 'boolean') patch.showInSettings = body.showInSettings
+                if (typeof body?.autoHint === 'boolean') patch.autoHint = body.autoHint
                 const next = writeUiCfg(patch)
                 return sendJson(res, 200, { ok: true, data: next })
               }
