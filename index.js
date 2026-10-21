@@ -14,7 +14,14 @@ import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync, statSync
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+// @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
+// 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
+let defineTool = null
+try {
+  ({ defineTool } = await import('@deepseek-ai/dsh-tools'))
+} catch {
+  defineTool = null
+}
 import QRCode from 'qrcode'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -565,6 +572,7 @@ function apply(ctx) {
   // ② 同名工具：模型可调，需要看视频时自己来，不依赖用户敲命令
   //    必须用 defineTool 包一层：ctx.tools.register 收的是编译好的 tool 对象，
   //    直接传 options 会让发往模型的 parameters 变成 null（报 INVALID_REQUEST: schema must be type "object"）。
+  if (defineTool) {
   ctx.tools.register(defineTool({
     name: 'bili_watch',
     description:
@@ -643,6 +651,9 @@ function apply(ctx) {
       return { ok: r.ok, text: r.text }
     },
   }))
+  } else {
+    console.warn('[dsh-bili-watch] 未找到 @deepseek-ai/dsh-tools，bili_watch 工具未注册（/bili 命令与插件面板不受影响）')
+  }
 
   // ③ 设置页：读盘状态 + 清缓存（只读优先；唯一写操作是删本机抽帧缓存目录）
   try {
