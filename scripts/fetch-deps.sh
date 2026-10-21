@@ -24,11 +24,11 @@ MIRROR="${BILI_WATCH_MIRROR:-}"
 if [ "$MIRROR" = "cn" ]; then
   GH="https://gh-proxy.com/https://github.com"
   PY_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
-  HF_ENDPOINT="https://hf-mirror.com"
+  HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 else
   GH="https://github.com"
   PY_INDEX="https://pypi.org/simple"
-  HF_ENDPOINT="https://huggingface.co"
+  HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 fi
 
 fetch_ytdlp() {
