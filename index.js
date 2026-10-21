@@ -92,7 +92,7 @@ const QR_POLL = (key) =>
 const SPI = 'https://api.bilibili.com/x/frontend/finger/spi'
 
 const name = 'dsh-bili-watch'
-const inject = ['commands', 'tools', 'webServer', 'agents']
+const inject = ['commands', 'webServer', 'agents']
 
 function runLook(args, { timeoutMs = 1_200_000 } = {}) {
   return new Promise((resolve) => {
@@ -445,11 +445,23 @@ function runDownload(target) {
   try {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
   } catch {}
-  const child = spawn(
-    'powershell.exe',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Target', target],
-    { windowsHide: true, stdio: 'ignore', detached: true },
-  )
+  const win = process.platform === 'win32'
+  const cmd = win ? 'powershell.exe' : 'bash'
+  const args = win
+    ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Target', target]
+    : [script.replace(/\.ps1$/i, '.sh'), target]
+  let child = null
+  try {
+    child = spawn(cmd, args, { windowsHide: true, stdio: 'ignore', detached: true })
+  } catch (e) {
+    return { started: false, error: String(e?.message ?? e) }
+  }
+  // detached 子进程不会把 spawn 失败同步抛给我们，必须自己接 error，否则 ENOENT 会带崩宿主
+  child.on('error', (e) => {
+    try {
+      appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 启动失败 ${target}：${e?.message ?? e}\n`, 'utf8')
+    } catch {}
+  })
   child.unref()
   return { started: true, log: DOWNLOAD_LOG }
 }
@@ -517,7 +529,7 @@ function parseCommandLine(raw) {
     .split(/\s+/)
     .filter(Boolean)
   const command = tokens.shift()
-  const bv = tokens.length && !tokens[0].startsWith('--') ? tokens.shift() : ''
+  const positionals = []
   const extra = []
   let step = ''
   let cred = ''
@@ -543,12 +555,16 @@ function parseCommandLine(raw) {
       extra.push('--out', tokens.shift())
     } else if (t === '--ffmpeg' && tokens.length) {
       extra.push('--ffmpeg', tokens.shift())
+    } else if (t === '--format' && tokens.length) {
+      extra.push('--format', tokens.shift())
     } else if (t === '--fresh' || t === '--ocr' || t === '--poll' || t === '--check' || t === '--fast' || t === '--scene' || t === '--mark-seen') {
       extra.push(t)
+    } else if (!t.startsWith('--')) {
+      // 非选项 token 都当位置参数收着：BV / 搜索词 / 评论条数都可能出现在选项前后
+      positionals.push(t)
     }
-    // 其余 token 直接丢弃（命令本身不接受别的参数）
   }
-  return { command, bv, extra, step, cred }
+  return { command, bv: positionals[0] || '', extra, step, cred }
 }
 
 async function lookup({ command, bv, extra = [] }) {
@@ -586,7 +602,7 @@ function apply(ctx) {
     name: 'bili',
     description: '看 B 站视频内容：字幕 → 本地转写 → 抽帧 OCR，输出最可信的一份文本',
     input: {
-      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3]',
+      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json] [--out 文件]',
     },
     handler: async (invocation) => {
       const { command, bv, extra } = parseCommandLine(invocation?.rawInput)
@@ -644,7 +660,7 @@ function apply(ctx) {
   // ② 同名工具：模型可调，需要看视频时自己来，不依赖用户敲命令
   //    必须用 defineTool 包一层：ctx.tools.register 收的是编译好的 tool 对象，
   //    直接传 options 会让发往模型的 parameters 变成 null（报 INVALID_REQUEST: schema must be type "object"）。
-  if (defineTool) {
+  if (defineTool && ctx.tools) {
   ctx.tools.register(defineTool({
     name: 'bili_watch',
     description:
@@ -689,6 +705,18 @@ function apply(ctx) {
         type: 'string',
         description: 'command=sheet 时的格子，如 3x3 或 4x4（默认 3x3）。',
       },
+      format: {
+        type: 'string',
+        description: 'command=sub 时可选 srt 或 json（带官方时间戳）；command=text 时可选 json（含时间轴口径：字幕 exact，转写与 OCR 是估算）。不传默认纯文本。',
+      },
+      out: {
+        type: 'string',
+        description: 'command=sub/text 且传了 format 时，把结果写到这个文件路径；不传打印到标准输出。',
+      },
+      limit: {
+        type: 'number',
+        description: 'command=hot/search 的结果条数（hot 默认 10，search 默认 10）。',
+      },
     },
     output: {
       // 注意：DSH 的 output.schema 是「author-facing spec」，编译时 allowRequired=false，
@@ -712,8 +740,18 @@ function apply(ctx) {
       if (args.scene) extra.push('--scene')
       if (typeof args.grid === 'string' && args.grid.trim()) extra.push('--grid', args.grid.trim())
       if (typeof args.days === 'number' && args.days > 0) extra.push('--days', String(Math.floor(args.days)))
+      if (typeof args.limit === 'number' && args.limit > 0) extra.push('--limit', String(Math.floor(args.limit)))
+      if (typeof args.format === 'string' && args.format.trim()) extra.push('--format', args.format.trim())
+      if (typeof args.out === 'string' && args.out.trim()) {
+        const out = args.out.trim()
+        // 工具层是模型可调的：只允许写工作区内的相对路径，挡住绝对路径 / 盘符 / .. 与家目录
+        if (/^([/\\]|[A-Za-z]:|~)|\.\./.test(out)) {
+          return { ok: false, text: '--out 只接受工作区内的相对路径（不能用绝对路径、盘符、~ 或 ..）' }
+        }
+        extra.push('--out', out)
+      }
       if (args.command === 'hot') {
-        const r = await lookup({ command: 'hot', bv: '' })
+        const r = await lookup({ command: 'hot', bv: '', extra })
         return { ok: r.ok, text: r.text }
       }
       const target = args.command === 'search' ? String(args.keyword ?? '').trim() : String(args.bv ?? '').trim()
@@ -812,4 +850,4 @@ function apply(ctx) {
   }
 }
 
-export { apply, inject, name }
+export { apply, inject, name, parseCommandLine }
