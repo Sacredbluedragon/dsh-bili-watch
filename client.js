@@ -41,6 +41,11 @@ window.__ModuleLoader__.load({
 [data-bl-name]{min-width:150px;flex:none;}
 [data-bl-detail]{flex:1;min-width:0;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;word-break:break-all;}
 [data-bl-size]{flex:none;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;min-width:64px;text-align:right;}
+[data-bl-overlay-icon]{font-size:14px;line-height:1;color:#d97706}
+[data-bl-overlay-text]{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;overflow:hidden}[data-bl-overlay-line]{display:flex;align-items:baseline;gap:8px;overflow:hidden}[data-bl-overlay-hint]{font-size:11.5px;color:#a16207;opacity:.92;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+[data-bl-overlay-text b]{font-weight:600;white-space:nowrap}
+[data-bl-overlay-sub]{color:#9a6a1e;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+[data-bl-overlay-actions]{display:flex;gap:8px;align-items:center;flex-shrink:0}
 [data-bl-btn]{font-size:12px;min-height:26px;padding:2px 10px;border-radius:6px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.16));background:transparent;color:inherit;flex:none;}
 [data-bl-btn:disabled]{opacity:.45;cursor:default;}
 [data-bl-input]{width:64px;font-size:12px;padding:2px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.16));background:transparent;color:inherit;}
@@ -89,6 +94,21 @@ window.__ModuleLoader__.load({
             : h('button', { 'data-bl-btn': '', disabled: true, title: d.removableWhy || '不在插件目录内' }, '删除'),
         d.id === 'credential' && d.path ? h('span', { 'data-bl-note': '' }, '文件：' + d.path) : null,
       )
+    }
+
+    // 设置页入口：先在插件详情页关掉「在设置页显示」时，这里自动隐身
+    function SettingsPanel() {
+      const [show, setShow] = React.useState(null)
+      React.useEffect(() => {
+        jget('/status')
+          .then((j) => setShow(j.ok && j.data.ui?.showInSettings !== false))
+          .catch(() => setShow(false))
+        const onUi = (e) => setShow(!!e?.detail?.showInSettings)
+        window.addEventListener('bili-watch-ui', onUi)
+        return () => window.removeEventListener('bili-watch-ui', onUi)
+      }, [])
+      if (!show) return null
+      return h(Panel, null)
     }
 
     function Panel() {
@@ -278,6 +298,27 @@ window.__ModuleLoader__.load({
       const lastRun = st.lastRun || {}
 
       return h('div', { 'data-bl-page': '' },
+        h('div', { 'data-bl-sec': '' },
+          h('div', { 'data-bl-sechead': '' },
+            h('span', { 'data-bl-sec-title': '' }, '显示'),
+            h('label', { 'data-bl-dlgrow': '' },
+              h('input', {
+                type: 'checkbox',
+                checked: st.ui?.showInSettings !== false,
+                onChange: async (e) => {
+                  const v = e.target.checked
+                  try {
+                    await jpost('/config', { showInSettings: v })
+                    try { window.__biliWatchSyncSettings && window.__biliWatchSyncSettings(v) } catch {}
+                    await load()
+                  } catch {}
+                },
+              }),
+              h('span', { 'data-bl-name': '' }, '在设置页也显示'),
+            ),
+          ),
+          h('div', { 'data-bl-note': '' }, '关掉只隐藏设置页入口；插件详情页这块面板一直保留。'),
+        ),
         h('div', { 'data-bl-head': '' },
           h('span', { 'data-bl-title': '' }, '依赖与状态'),
           h('span', { 'data-bl-sub': '' }, '缺什么点下载，装好后这里会变绿。')),
@@ -386,13 +427,19 @@ window.__ModuleLoader__.load({
       const names = missing.map((d) => d.name).join('、')
 
       return h('div', { 'data-bl-overlay': '' },
-        h('span', { 'data-bl-overlay-text': '' }, `bili-watch 还缺 ${missing.length} 个依赖（${names}）`),
-        h('button', { 'data-bl-btn': 'primary', onClick: async () => { await jpost('/download', { target: 'all' }) } }, '去安装'),
-        h('button', { 'data-bl-btn': '', onClick: () => setDismissed(true) }, '×'),
-        h('button', { 'data-bl-btn': '', onClick: async () => {
-          await jpost('/config', { hintDismissed: true })
-          setDismissed(true)
-        } }, '不再提示'),
+        h('span', { 'data-bl-overlay-icon': '' }, '⚠'),
+        h('span', { 'data-bl-overlay-text': '' },
+          h('span', { 'data-bl-overlay-line': '' },
+            h('b', {}, 'bili-watch 缺 ' + missing.length + ' 个依赖'),
+            h('span', { 'data-bl-overlay-sub': '' }, names + '　—　元数据、评论、弹幕、搜索照常可用')),
+          h('span', { 'data-bl-overlay-hint': '' }, '也可以到「设置 → bili-watch」的依赖面板里逐个安装，能看到进度和体积')),
+        h('span', { 'data-bl-overlay-actions': '' },
+          h('button', { 'data-bl-btn': 'primary', onClick: async () => { await jpost('/download', { target: 'all' }) } }, '去安装'),
+          h('button', { 'data-bl-btn': 'ghost', onClick: () => setDismissed(true) }, '关闭'),
+          h('button', { 'data-bl-btn': 'ghost', onClick: async () => {
+            await jpost('/config', { hintDismissed: true })
+            setDismissed(true)
+          } }, '不再提示')),
       )
     }
 
@@ -423,7 +470,7 @@ window.__ModuleLoader__.load({
         const style = document.createElement('style')
         style.setAttribute('data-plugin-css', 'dsh-bili-watch')
         style.textContent = CSS + `
-[data-bl-overlay]{position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;gap:12px;padding:8px 16px;background:var(--dsw-alias-bg-strong,#2d2d2d);color:var(--dsw-alias-label-primary,#e5e7eb);font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.3);}
+[data-bl-overlay]{position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;gap:10px;padding:9px 16px;background:#fffbeb;color:#7c2d12;border-bottom:1px solid #fcd34d;border-left:4px solid #f59e0b;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.06);}[data-bl-btn='primary']{background:#f59e0b;border-color:#f59e0b;color:#fff;font-weight:600;}[data-bl-btn='primary']:hover{background:#d97706;}[data-bl-btn='ghost']{border-color:transparent;color:#92400e;}[data-bl-btn='ghost']:hover{background:rgba(146,64,14,.08);}
 [data-bl-overlay-text]{flex:1;}
 [data-bl-activation]{display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.18));border-radius:8px;background:var(--dsw-alias-bg2,rgba(255,255,255,.04));}
 `
@@ -447,19 +494,31 @@ window.__ModuleLoader__.load({
 
         // ③ 缺依赖横幅（全页浮层）
         slots.inject('shell.overlay', () => slots.register(
-          { name: 'shell.overlay', key: PKG },
+          { name: 'shell.overlay', id: 'bili-watch.overlay' },
           OverlayBanner,
         ))
 
-        // ④ 设置页双面板（读 showInSettings 决定是否注册）
-        jget('/status').then((j) => {
-          if (j.ok && j.data.ui?.showInSettings !== false) {
-            slots.inject('settings.section', () => slots.register(
-              { name: 'settings.section', key: PKG, title: '刷B站' },
-              Panel,
-            ))
+        // ④ 设置页双面板：注册/注销跟着 showInSettings 走（组件返回 null 删不掉左侧 tab）
+        let settingsReg = null
+        const syncSettings = (on) => {
+          if (on) {
+            if (settingsReg) return
+            slots.inject('settings.section', () => {
+              settingsReg = slots.register(
+                { name: 'settings.section', id: 'bili-watch', order: 32, label: 'bili-watch' },
+                Panel,
+              )
+              return settingsReg
+            })
+          } else if (settingsReg) {
+            try { settingsReg() } catch {}
+            settingsReg = null
           }
-        }).catch(() => {})
+        }
+        try { window.__biliWatchSyncSettings = syncSettings } catch {}
+        jget('/status')
+          .then((j) => syncSettings(!!(j.ok && j.data.ui?.showInSettings !== false)))
+          .catch(() => {})
       },
     }
   },
