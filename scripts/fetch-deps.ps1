@@ -181,7 +181,7 @@ function Ensure-Model {
     return
   }
   $env:HF_HOME = $hfHome
-  $env:HF_ENDPOINT = $HfEndpoint
+  if (-not $env:HF_ENDPOINT) { $env:HF_ENDPOINT = $HfEndpoint }
   $env:HF_HUB_DISABLE_XET = '1'
   & $asrPy -c "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"
   if ($LASTEXITCODE -ne 0) { throw '模型下载失败' }
