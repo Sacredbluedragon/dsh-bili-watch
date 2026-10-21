@@ -17,15 +17,15 @@
 dsh plugin --profile web add dsh-bili-watch
 ```
 
-**第二步易漏**：打开 profile 的 `package.json`，在 `dsh.profile.bundles` 数组里加一行 `"dsh-bili-watch"`。`dsh plugin add` 只写 `dependencies`，不写 bundles。漏了这步插件装了但不生效，也不报错。改完重启 DSH。
+装完重启 DSH 即可。DSH 0.2.0-rc.2 起，`dsh plugin add` 会把包自动写进 profile 的 `dsh.profile.bundles`；若用更早的内核，需要自己打开 profile 的 `package.json`，在 `dsh.profile.bundles` 数组里补一行 `"dsh-bili-watch"`。
 
 装完可以验证：`dsh --profile web --dump-config` 里能搜到 `dsh-bili-watch` 才算进了装配。
 
 也可以把本仓库直接放进 `profiles/<名字>/node_modules/dsh-bili-watch`。
 
-插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时 `index.js` 会报 `ERR_MODULE_NOT_FOUND`，先补装再重启。
+插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时不会报错：`bili_watch` 工具不注册，`/bili` 命令与插件面板照常可用，日志里会打一行提示。
 
-插件市场已收录（2026-10-21）：在市场里搜 `dsh-bili-watch` 直接安装，这是最省事的方式；市场里暂时搜不到时，按上面的命令装。
+插件市场已收录（2026-10-21）：在市场里搜 `dsh-bili-watch` 安装。新装插件默认不自动启用，装完到「插件」页把它的开关打开，再重启 DSH；市场里暂时搜不到时，按上面的命令装。
 
 ### 只当命令行工具
 
@@ -43,14 +43,14 @@ dsh plugin --profile web add dsh-bili-watch@latest
 dsh plugin --profile web remove dsh-bili-watch
 ```
 
-升级后重启 DSH。卸载不会删除 `deps/` 里的模型、环境与凭证；要清理就在面板里逐项删，或手动删目录。
+升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境、凭证一起删掉；要长期保留就把 `BILI_WATCH_PROJ` / `BILI_WATCH_SEEN` 指到包外。日常清理在面板里逐项删即可。
 
 ## 插件面板
 
 装进 DSH 后，打开插件列表，点 `dsh-bili-watch` 卡片进详情页，里面有一块面板（不用先进设置），常规操作无需去对话里敲命令：
 
-- **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点击行末「下载」，后台跑 `scripts/fetch-deps`（体积是估算值，实际以跑完为准）。
-- **扫码登录**：凭证未登录时点「重新扫码」，面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `deps/credential.json`。
+- **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点击行末「一键下载」，后台跑 `scripts/fetch-deps`（体积是估算值，实际以跑完为准）。
+- **扫码登录**：凭证未登录时点「去扫码登录」（已登录是「重新扫码」），面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `deps/credential.json`。
 - **删除**：面板按实际路径判断——装在插件目录里的（yt-dlp、转写模型、登录凭证）可直接删；装在插件目录外的（比如复用系统 ffmpeg 或已有的 Python 环境）按钮置灰，旁边标出它实际在哪。
 - **批量**：标题行的「批量下载 / 批量清理」打开勾选清单，默认勾上所有可操作的项，删除前会再确认一次。
 - **抽帧缓存**：显示当前占用与文件数，「立即清除」一键清空；不点则会按规则自动清理——保留天数（默认 7 天）与总量上限（默认 2048 MB），超过则从最旧的删起。规则存在 `deps/cache-config.json`，插件启动和打开面板时各检查一次。
@@ -123,14 +123,14 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 | 命令 | 做什么 |
 |---|---|
 | `view <BV或链接或URL>` | 元数据 + 简介 + 热评 |
-| `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（最便宜；仅 B 站） |
-| `sub <BV或链接>` | AI 字幕 + 三判据（字/秒、关键词命中、时长） |
+| `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（最便宜；装了 OCR 环境时会顺带识别这 5 帧，成本略高；仅 B 站） |
+| `sub <BV或链接> [--format srt|json] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT 或 JSON（带官方时间戳） |
 | `comments <BV> [N]` | 评论区，默认按热度排序 |
 | `asr <BV或URL>` | 本地转写音频 |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
 | `ocr <BV>` | 抽帧并 OCR |
-| `text <BV或URL>` | 四级链：字幕 → 转写 → 抽帧 OCR |
-| `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（只支持 `3x3` / `4x4`，默认 9 帧） |
+| `text <BV或URL> [--format srt|json]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format srt|json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算） |
+| `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（`NxM` 如 `3x3`、`4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
 | `search <关键词> [--days 3]` | 搜视频 |
@@ -141,6 +141,14 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 工具侧的等价入口：`bili_watch` 工具（参数 `command` + `bv`），或 `/bili` 命令。
 
 表里只列常用参数。完整参数（`--out`、`--fresh`、`--scene`、`--ffmpeg`、`--cred`、`--fast`、`--mark-seen`、`--p` 等）跑 `bili-watch help` 看。
+
+## 单条链接软提示
+
+用户的消息里只有一条 B 站视频链接（BV 号或 `b23.tv` 短链）时，插件往消息流里补一句提示，告诉 agent 有这条链接可读、`peek` 最便宜。它**不会**替用户调用工具，也不会自动跑起来——只是让「贴链接不说话」这种场景不容易被漏掉。
+
+- `b23.tv` 短链只提示不展开（插件不解析短链，会请用户换成浏览器地址栏里的完整链接）。
+- 关掉：`deps/ui-config.json` 里 `"autoHint": false`。
+- 消息里除了链接还有别的文字（问题、指令）时不提示，避免打断正常对话。
 
 ## 通用视频 URL
 
@@ -172,11 +180,14 @@ AI 字幕（需登录）
 | `BILI_WATCH_FFMPEG` | ffmpeg 可执行文件路径 |
 | `BILI_WATCH_YTDLP` | yt-dlp 可执行文件路径 |
 | `BILI_WATCH_SEEN` | `seen.md` 去重文件路径（默认 `deps/seen.md`）。文件不存在时 `--mark-seen` 记不了，先建一个空文件即可 |
+| `BILI_WATCH_MIRROR` | `cn` 时 `scripts/fetch-deps.*` 走镜像下载（gh-proxy / 清华 PyPI / hf-mirror） |
+| `HF_ENDPOINT` | 转写模型的 HuggingFace 端，默认 `https://hf-mirror.com`；海外可设官方站 |
+| `BILI_ASR_MODEL` | 本地转写用的 faster-whisper 模型名，默认 `small` |
 
 ## 成本
 
 - 字幕接口带一次重试；`text` 最多次试两次（先匿名、有凭证再试一次）。
-- 抽帧会下载视频（360p）并跑 ffmpeg。`--step` 调低抽帧频率，脚本另外限了 `-threads 2`。
+- 抽帧会下载视频（360p）并跑 ffmpeg。`--step` 的秒数调大能减少抽帧数，脚本另外限了 `-threads 2`。
 - 拼图和字幕带把多帧压成一张图，省 token。
 
 ## 限制与风险
