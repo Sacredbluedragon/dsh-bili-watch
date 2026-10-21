@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    // 包名：生产插件是 dsh-bili-watch，发布树派生时改成 dsh-bili-watch
+    // 包名 = 插件详情页挂点的 key：生产与发布树同名 dsh-bili-watch
     const PKG = 'dsh-bili-watch'
     const API = '/api/bili-watch'
     const jget = async (p) => (await fetch(API + p, { credentials: 'same-origin' })).json()
@@ -94,21 +94,6 @@ window.__ModuleLoader__.load({
             : h('button', { 'data-bl-btn': '', disabled: true, title: d.removableWhy || '不在插件目录内' }, '删除'),
         d.id === 'credential' && d.path ? h('span', { 'data-bl-note': '' }, '文件：' + d.path) : null,
       )
-    }
-
-    // 设置页入口：先在插件详情页关掉「在设置页显示」时，这里自动隐身
-    function SettingsPanel() {
-      const [show, setShow] = React.useState(null)
-      React.useEffect(() => {
-        jget('/status')
-          .then((j) => setShow(j.ok && j.data.ui?.showInSettings !== false))
-          .catch(() => setShow(false))
-        const onUi = (e) => setShow(!!e?.detail?.showInSettings)
-        window.addEventListener('bili-watch-ui', onUi)
-        return () => window.removeEventListener('bili-watch-ui', onUi)
-      }, [])
-      if (!show) return null
-      return h(Panel, null)
     }
 
     function Panel() {
