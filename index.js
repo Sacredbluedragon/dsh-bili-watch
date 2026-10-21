@@ -45,6 +45,21 @@ const FFMPEG_CANDS = [
 const HF_HOME = [join(DEPS, '.hf-home'), join(PROJ, '.hf-home')]
 const SCRIPTS = join(HERE, 'scripts')
 const CACHE_CFG = join(DEPS, 'cache-config.json')
+const UI_CFG = join(DEPS, 'ui-config.json')
+const DEFAULT_UI_CFG = { hintDismissed: false, activationSeen: false, showInSettings: true }
+
+function uiCfg() {
+  try {
+    const raw = JSON.parse(readFileSync(UI_CFG, 'utf8'))
+    return { ...DEFAULT_UI_CFG, ...raw }
+  } catch { return { ...DEFAULT_UI_CFG } }
+}
+function writeUiCfg(patch) {
+  const cur = uiCfg()
+  const next = { ...cur, ...patch }
+  writeFileSync(UI_CFG, JSON.stringify(next, null, 2), 'utf8')
+  return next
+}
 const DEFAULT_CACHE_DAYS = 7
 const DEFAULT_CACHE_MAX_MB = 2048
 const DOWNLOAD_LOG = join(DEPS, 'download.log')
@@ -674,6 +689,7 @@ function apply(ctx) {
                     deps: depRows(),
                     cache: { ...dirStat(CACHE), ...cacheCfg(), lastAutoClean: cleaned },
                     lastRun: readLastRun(),
+                    ui: uiCfg(),
                   },
                 })
               }
@@ -713,6 +729,15 @@ function apply(ctx) {
                 const r = await loginPollOnce(String(body?.key ?? ''))
                 if (r.state === 'ok') writeLastRun('login', 0)
                 return sendJson(res, 200, r)
+              }
+              if (req.method === 'POST' && url.pathname === '/api/bili-watch/config') {
+                const body = await readJsonBody(req)
+                const patch = {}
+                if (typeof body?.hintDismissed === 'boolean') patch.hintDismissed = body.hintDismissed
+                if (typeof body?.activationSeen === 'boolean') patch.activationSeen = body.activationSeen
+                if (typeof body?.showInSettings === 'boolean') patch.showInSettings = body.showInSettings
+                const next = writeUiCfg(patch)
+                return sendJson(res, 200, { ok: true, data: next })
               }
               sendJson(res, 404, { ok: false, why: 'not found' })
             } catch (e) {

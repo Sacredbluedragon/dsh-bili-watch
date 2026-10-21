@@ -364,22 +364,102 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // 缺依赖横幅（shell.overlay）
+    function OverlayBanner() {
+      const [st, setSt] = React.useState(null)
+      const [visible, setVisible] = React.useState(false)
+      const [dismissed, setDismissed] = React.useState(false)
+
+      React.useEffect(() => {
+        jget('/status').then((j) => {
+          if (!j.ok) return
+          setSt(j.data)
+          const missing = (j.data.deps || []).filter((d) => !d.ok)
+          if (missing.length > 0 && j.data.ui?.hintDismissed !== true) {
+            setVisible(true)
+          }
+        }).catch(() => {})
+      }, [])
+
+      if (!visible || dismissed) return null
+      const missing = (st?.deps || []).filter((d) => !d.ok)
+      const names = missing.map((d) => d.name).join('、')
+
+      return h('div', { 'data-bl-overlay': '' },
+        h('span', { 'data-bl-overlay-text': '' }, `bili-watch 还缺 ${missing.length} 个依赖（${names}）`),
+        h('button', { 'data-bl-btn': 'primary', onClick: async () => { await jpost('/download', { target: 'all' }) } }, '去安装'),
+        h('button', { 'data-bl-btn': '', onClick: () => setDismissed(true) }, '×'),
+        h('button', { 'data-bl-btn': '', onClick: async () => {
+          await jpost('/config', { hintDismissed: true })
+          setDismissed(true)
+        } }, '不再提示'),
+      )
+    }
+
+    // 启用指引（plugins.bundle.activation）
+    function ActivationGuide() {
+      const [seen, setSeen] = React.useState(false)
+      React.useEffect(() => {
+        jget('/status').then((j) => {
+          if (j.ok && j.data.ui?.activationSeen === true) setSeen(true)
+        }).catch(() => {})
+      }, [])
+      if (seen) return null
+      return h('div', { 'data-bl-activation': '' },
+        h('div', { 'data-bl-title': '' }, 'B站看视频插件已启用'),
+        h('div', { 'data-bl-note': '' }, '用它之前建议先装依赖：ffmpeg（抽帧/取音轨）、转写模型（本地转写）。没装也能用：元数据、评论、弹幕、搜索、热榜。'),
+        h('div', { 'data-bl-row': '' },
+          h('button', { 'data-bl-btn': 'primary', onClick: async () => { await jpost('/download', { target: 'all' }) } }, '去安装'),
+          h('button', { 'data-bl-btn': '', onClick: async () => {
+            await jpost('/config', { activationSeen: true })
+            setSeen(true)
+          } }, '先不装')),
+      )
+    }
+
     return {
       inject: ['slots'],
       apply(ctx) {
         const style = document.createElement('style')
         style.setAttribute('data-plugin-css', 'dsh-bili-watch')
-        style.textContent = CSS
+        style.textContent = CSS + `
+[data-bl-overlay]{position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;gap:12px;padding:8px 16px;background:var(--dsw-alias-bg-strong,#2d2d2d);color:var(--dsw-alias-label-primary,#e5e7eb);font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.3);}
+[data-bl-overlay-text]{flex:1;}
+[data-bl-activation]{display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.18));border-radius:8px;background:var(--dsw-alias-bg2,rgba(255,255,255,.04));}
+`
         document.head.appendChild(style)
         if (typeof ctx.effect === 'function') ctx.effect(() => () => style.remove(), 'dsh-bili-watch: 面板样式')
 
         const slots = (typeof ctx.get === 'function' ? ctx.get('slots') : undefined) || ctx.slots
         if (!slots) return
-        // 插件详情页的配置区：key 用包名，按包页面 dispatch（见 Slot 清单 plugins.bundle.config）
+
+        // ① 插件详情页配置区（原有）
         slots.inject('plugins.bundle.config', () => slots.register(
           { name: 'plugins.bundle.config', key: PKG },
           Panel,
         ))
+
+        // ② 启用指引（用户从插件列表点「启用」后渲染）
+        slots.inject('plugins.bundle.activation', () => slots.register(
+          { name: 'plugins.bundle.activation', key: PKG },
+          ActivationGuide,
+        ))
+
+        // ③ 缺依赖横幅（全页浮层）
+        slots.inject('shell.overlay', () => slots.register(
+          { name: 'shell.overlay', key: PKG },
+          OverlayBanner,
+        ))
+
+        // ④ 设置页双面板（读 showInSettings 决定是否注册）
+        jget('/status').then((j) => {
+          if (j.ok && j.data.ui?.showInSettings !== false) {
+            slots.inject('settings.section', () => slots.register(
+              { name: 'settings.section', key: PKG, title: '刷B站' },
+              Panel,
+            ))
+          }
+        }).catch(() => {})
       },
     }
   },
