@@ -691,6 +691,32 @@ function cuesToSrt(cues) {
   return rows.join('\n')
 }
 
+// Markdown（2026-10-22 加）：每条带「跳回原片」的时间戳链接，进笔记软件是原生的
+function cuesToMd(cues, meta = {}) {
+  const rows = []
+  const bv = String(meta.bv || '').trim()
+  const title = String(meta.title || '').trim()
+  if (title) rows.push(`# ${title}`, '')
+  const info = []
+  if (meta.up) info.push(`UP：${meta.up}`)
+  if (meta.dur) info.push(`时长：${fmtSec(meta.dur)}`)
+  if (meta.lan) info.push(`字幕语言：${meta.lan}`)
+  if (meta.estimated) info.push('时间轴：估算（不是官方字幕）')
+  if (info.length) rows.push(info.join(' · '), '')
+  let n = 0
+  for (const c of cues || []) {
+    const text = String(c?.content ?? '').trim()
+    if (!text) continue
+    const sec = Math.max(0, Math.floor(Number(c?.from ?? 0)))
+    const mm = String(Math.floor(sec / 60)).padStart(2, '0')
+    const ss = String(sec % 60).padStart(2, '0')
+    const link = bv ? `https://www.bilibili.com/video/${bv}?t=${sec}` : ''
+    n++
+    rows.push(link ? `- [${mm}:${ss}](${link}) ${text}` : `- ${mm}:${ss} ${text}`)
+  }
+  return { text: rows.join('\n') + '\n', count: n }
+}
+
 // text 命令的 --format json：把「这一档拿到的东西 + 时间轴口径」一起吐出去
 function emitTextJson(opts, payload) {
   if (String(opts?.format || '').toLowerCase() !== 'json') return false
@@ -702,21 +728,61 @@ function emitTextJson(opts, payload) {
   return true
 }
 
+// text 命令的 --format md：有 cues 就出时间轴（可跳回原片），没有就出「标题 + 元信息 + 全文」
+function emitTextMd(opts, payload) {
+  if (String(opts?.format || '').toLowerCase() !== 'md') return false
+  const cues = Array.isArray(payload?.cues) ? payload.cues : []
+  const meta = {
+    bv: payload?.video?.bv,
+    title: payload?.video?.title,
+    up: payload?.video?.up,
+    dur: payload?.video?.dur,
+    estimated: payload?.timeline?.exact === false,
+  }
+  let text
+  if (cues.length) {
+    text = cuesToMd(cues, meta).text
+  } else {
+    const head = []
+    if (meta.title) head.push(`# ${meta.title}`, '')
+    const info = []
+    if (meta.up) info.push(`UP：${meta.up}`)
+    if (meta.dur) info.push(`时长：${fmtSec(meta.dur)}`)
+    if (payload?.source) info.push(`来源：${payload.source}`)
+    if (meta.estimated) info.push('时间轴：估算（不是官方字幕）')
+    if (info.length) head.push(info.join(' · '), '')
+    head.push(String(payload?.text ?? '').trim(), '')
+    text = head.join('\n')
+  }
+  if (opts.out) {
+    writeFileSync(opts.out, text, 'utf8')
+    console.log(`✓ 已写入 ${opts.out}（source=${payload?.source ?? '?'}）`)
+  } else console.log(text)
+  return true
+}
+
+// 按 --format 分派（json / md；其他格式返回 false 走原流程）
+function emitText(opts, payload) {
+  if (emitTextJson(opts, payload)) return true
+  if (emitTextMd(opts, payload)) return true
+  return false
+}
+
 // --format 输出结构化数据时，过程说明一律走 stderr，保证 stdout 能被 jq / 管道直接消费
 let QUIET = false
 const say = (...a) => (QUIET ? console.error : console.log)(...a)
 
 async function cmdSub(bv, credPath, p = 1, opts = {}) {
-  QUIET = opts.format === 'srt' || opts.format === 'json'
+  QUIET = opts.format === 'srt' || opts.format === 'json' || opts.format === 'md'
   const format = String(opts.format || 'text').toLowerCase()
   const out = String(opts.out || '')
-  if (out && format !== 'json' && format !== 'srt') {
-    console.log('✗ --out 要配合 --format srt|json；纯文本会直接打印到标准输出')
+  if (out && format !== 'json' && format !== 'srt' && format !== 'md') {
+    console.log('✗ --out 要配合 --format srt|json|md；纯文本会直接打印到标准输出')
     process.exitCode = 1
     return
   }
-  if (!['text', 'json', 'srt'].includes(format)) {
-    console.log(`✗ 不认识的 --format：${format}（可选 text|srt|json）`)
+  if (!['text', 'json', 'srt', 'md'].includes(format)) {
+    console.log(`✗ 不认识的 --format：${format}（可选 text|srt|json|md）`)
     process.exitCode = 1
     return
   }
@@ -732,7 +798,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
     process.exitCode = 1
     return
   }
-  if (format === 'json' || format === 'srt') {
+  if (format === 'json' || format === 'srt' || format === 'md') {
     const cues = Array.isArray(s.cues) ? s.cues : []
     const usable = cues.filter((c) => String(c?.content ?? '').trim()).length
     if (usable === 0) {
@@ -746,6 +812,14 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
         writeFileSync(out, text, 'utf8')
         console.log(`✓ 已写入 ${out}（${usable} 条，官方时间戳）`)
       } else console.log(text)
+      return
+    }
+    if (format === 'md') {
+      const r = cuesToMd(cues, { bv, title: v.title, up: v.owner, dur: v.dur, lan: s.lan ?? '' })
+      if (out) {
+        writeFileSync(out, r.text, 'utf8')
+        console.log(`✓ 已写入 ${out}（${r.count} 条，时间戳可跳回原片）`)
+      } else console.log(r.text)
       return
     }
     const payload = {
@@ -1222,7 +1296,7 @@ function markSeen(bv, title) {
 
 /** 四级链：字幕 → ASR → 抽帧 OCR。输出最可信的一份文本。 */
 async function cmdText(bv, credPath, opts = {}) {
-  QUIET = opts.format === 'json'
+  QUIET = opts.format === 'json' || opts.format === 'md'
   const t0 = Date.now()
   const cred = credFor(credPath)
   const v = await viewOf(bv, opts.p)
@@ -1249,7 +1323,7 @@ async function cmdText(bv, credPath, opts = {}) {
   // 信道优先：官方字幕能拿到就是可信内容，语速/关键词只作提示，不拦
   // 口径差异（有意）：自动化选片链路会把「语速/关键词不合格」当硬拦，
   // 这里是人看的排查通道，取到就用、质量交给调用方判断。同一判据两种策略，别当 bug 报。
-    if (emitTextJson(opts, {
+    if (emitText(opts, {
       video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
       source: 'subtitle',
       lan: s.lan ?? null,
@@ -1279,7 +1353,7 @@ async function cmdText(bv, credPath, opts = {}) {
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
       const rate = v.dur > 0 ? a.chars / v.dur : 0
       if (rate >= 2) {
-        if (emitTextJson(opts, {
+        if (emitText(opts, {
           video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
           source: 'asr',
           timeline: { exact: false, source: 'asr-estimate', note: '无官方时间戳；按标点与字数估算' },
@@ -1309,7 +1383,7 @@ async function cmdText(bv, credPath, opts = {}) {
     const r = await grabFrames(bv, { step: opts.step ?? 0, p: v.p })
     const text = await runOcr(r.dir)
     if (text && !text.startsWith('[ocr] 失败')) {
-      if (emitTextJson(opts, {
+      if (emitText(opts, {
         video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
         source: 'ocr',
         timeline: { exact: false, source: 'frame-ocr', step: opts.step ?? 'auto' },
@@ -1329,7 +1403,7 @@ async function cmdText(bv, credPath, opts = {}) {
   }
 
   // ④ 兜底：抽帧读图
-  if (emitTextJson(opts, {
+  if (emitText(opts, {
     video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
     source: 'vision',
     timeline: { exact: false, source: 'frames-for-vision' },
