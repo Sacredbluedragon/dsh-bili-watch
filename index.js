@@ -660,8 +660,9 @@ function apply(ctx) {
   // ② 同名工具：模型可调，需要看视频时自己来，不依赖用户敲命令
   //    必须用 defineTool 包一层：ctx.tools.register 收的是编译好的 tool 对象，
   //    直接传 options 会让发往模型的 parameters 变成 null（报 INVALID_REQUEST: schema must be type "object"）。
-  if (defineTool && ctx.tools) {
-  ctx.tools.register(defineTool({
+  const toolsSvc = (() => { try { return ctx.get?.('tools') } catch { return null } })()
+  if (defineTool && toolsSvc?.register) {
+  toolsSvc.register(defineTool({
     name: 'bili_watch',
     description:
       '用户给出 B 站视频链接 / BV 号，要我看、总结、判断这条视频讲了什么、有没有坑、值不值得看时使用。读取一个 B 站视频的内容材料（只读、匿名）。优先级：字幕 → 本地 ASR 转写 → 抽帧 OCR。command=peek 最便宜：只拿标题/简介/热评 + 均匀 5 帧，用来先判断是口播还是画面，再决定走 text 还是 ocr；command=text 会按优先级自动降级并返回最可信的一份文本（推荐）；view=元数据与热评；comments=评论区；asr=强制本地转写；frames=抽帧（可加 ocr=true 顺带识别画面文字）；ocr=抽帧并识别画面文字；sub=只要字幕；search=按关键词搜视频（配 days 可只留最近 N 天发布的，结果按播放量降序，用来看「这几天有什么值得看」）；hot=综合热门榜（B 站按热度排的前 N 条）；danmaku=弹幕热区（观众在哪一段反应最集中，判断名场面在哪）；sheet=把 N 帧拼成九宫格一张图（看图省 token）；substrip=把底部字幕逐段竖拼成一张图（硬字幕视频最省）。多 P 视频用 p 指定第几个分P（默认 P1）。拿到文本后由你负责理解与总结。',
