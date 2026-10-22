@@ -1171,6 +1171,7 @@ async function cmdLogin(opts = {}) {
       }
       if (r.state === 'expired') {
         console.log('\n✗ 二维码已过期，重新跑 node look.mjs login')
+        process.exitCode = 1
         return
       }
       if (r.state !== last) {
@@ -1180,6 +1181,7 @@ async function cmdLogin(opts = {}) {
       await sleep(3000)
     }
     console.log('\n✗ 超时（5 分钟），重新跑 node look.mjs login')
+    process.exitCode = 1
     return
   }
 
