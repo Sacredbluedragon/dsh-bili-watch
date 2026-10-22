@@ -124,12 +124,12 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 |---|---|
 | `view <BV或链接或URL>` | 元数据 + 简介 + 热评 |
 | `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（最便宜；装了 OCR 环境时会顺带识别这 5 帧，成本略高；仅 B 站） |
-| `sub <BV或链接> [--format srt|json] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT 或 JSON（带官方时间戳） |
+| `sub <BV或链接> [--format srt|json|md] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT、JSON（带官方时间戳）或 Markdown（每条带跳回原片的链接） |
 | `comments <BV> [N]` | 评论区，默认按热度排序 |
 | `asr <BV或URL>` | 本地转写音频 |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
 | `ocr <BV>` | 抽帧并 OCR |
-| `text <BV或URL> [--format json]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算）；SRT 只有 `sub` 支持 |
+| `text <BV或URL> [--format json|md]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算）；`md` 有字幕时出时间轴，没有就出标题+全文；SRT 只有 `sub` 支持 |
 | `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（`NxM` 如 `3x3`、`4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
