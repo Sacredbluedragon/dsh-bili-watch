@@ -129,7 +129,7 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 | `asr <BV或URL>` | 本地转写音频 |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
 | `ocr <BV>` | 抽帧并 OCR |
-| `text <BV或URL> [--format srt|json]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format srt|json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算） |
+| `text <BV或URL> [--format json]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算）；SRT 只有 `sub` 支持 |
 | `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（`NxM` 如 `3x3`、`4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
