@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "private": false,
   "description": "Reads Bilibili (and generic URLs via yt-dlp) into text for DSH agents: search, hot, metadata, comments, danmaku, AI subtitles, local ASR, frame OCR.",
   "type": "module",
@@ -34,7 +34,8 @@
     "scripts/",
     "deps/.gitkeep",
     "deps/_bili-asr.py",
-    "auto-trigger.js"
+    "auto-trigger.js",
+    "LICENSE"
   ],
   "keywords": [
     "bilibili",
