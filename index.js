@@ -602,7 +602,7 @@ function apply(ctx) {
     name: 'bili',
     description: '看 B 站视频内容：字幕 → 本地转写 → 抽帧 OCR，输出最可信的一份文本',
     input: {
-      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json] [--out 文件]',
+      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json] [--out 文件（需配合 --format）]',
     },
     handler: async (invocation) => {
       const { command, bv, extra } = parseCommandLine(invocation?.rawInput)
@@ -711,7 +711,7 @@ function apply(ctx) {
       },
       out: {
         type: 'string',
-        description: 'command=sub/text 且传了 format 时，把结果写到这个文件路径；不传打印到标准输出。',
+        description: 'command=sub/text 且传了 format 时，把结果写到这个文件（只接受工作区内的相对路径）；不传打印到标准输出。',
       },
       limit: {
         type: 'number',
