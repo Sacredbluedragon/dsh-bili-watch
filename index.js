@@ -533,6 +533,7 @@ function parseCommandLine(raw) {
   const extra = []
   let step = ''
   let cred = ''
+  let badOut = false
   while (tokens.length) {
     const t = tokens.shift()
     if (t === '--step' && tokens.length) {
@@ -552,7 +553,10 @@ function parseCommandLine(raw) {
     } else if (t === '--grid' && tokens.length) {
       extra.push('--grid', tokens.shift())
     } else if (t === '--out' && tokens.length) {
-      extra.push('--out', tokens.shift())
+      const out = tokens.shift()
+      // 斜杠命令层与工具层同一口径：只允许工作区内的相对路径
+      if (/^([/\\]|[A-Za-z]:|~)|\.\./.test(out)) badOut = true
+      else extra.push('--out', out)
     } else if (t === '--ffmpeg' && tokens.length) {
       extra.push('--ffmpeg', tokens.shift())
     } else if (t === '--format' && tokens.length) {
@@ -564,10 +568,11 @@ function parseCommandLine(raw) {
       positionals.push(t)
     }
   }
-  return { command, bv: positionals[0] || '', extra, step, cred }
+  return { command, bv: positionals[0] || '', extra, step, cred, badOut }
 }
 
-async function lookup({ command, bv, extra = [] }) {
+async function lookup({ command, bv, extra = [], badOut = false }) {
+  if (badOut) return { ok: false, text: '--out 只接受工作区内的相对路径（不能用绝对路径、盘符、~ 或 ..）' }
   if (!command || !COMMANDS.includes(command)) {
     return { ok: false, text: `用法：/bili <${COMMANDS.join('|')}> <BV> [--step 2] [--cred 凭证路径]` }
   }
@@ -602,11 +607,11 @@ function apply(ctx) {
     name: 'bili',
     description: '看 B 站视频内容：字幕 → 本地转写 → 抽帧 OCR，输出最可信的一份文本',
     input: {
-      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json|md] [--out 文件（需配合 --format）]',
+      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json|md|txt] [--out 文件（需配合 --format）]',
     },
     handler: async (invocation) => {
-      const { command, bv, extra } = parseCommandLine(invocation?.rawInput)
-      const r = await lookup({ command, bv, extra })
+      const { command, bv, extra, badOut } = parseCommandLine(invocation?.rawInput)
+      const r = await lookup({ command, bv, extra, badOut })
       return { kind: r.ok ? 'success' : 'error', text: r.text }
     },
   })
@@ -708,11 +713,11 @@ function apply(ctx) {
       },
       format: {
         type: 'string',
-        description: 'command=sub 时可选 srt、json（带官方时间戳）或 md（Markdown，每条带跳回原片的链接）；command=text 时可选 json（含时间轴口径：字幕 exact，转写与 OCR 是估算）或 md。不传默认纯文本。',
+        description: 'command=sub 时可选 srt、json、md 或 txt（srt/md 带官方时间戳，md 的时间戳可跳回原片，txt 是一行一句）；command=text 时可选 json（含时间轴口径：字幕 exact，转写与 OCR 是估算）或 md；command=comments/danmaku 时可选 json（stdout 只有 JSON）。不传默认纯文本。',
       },
       out: {
         type: 'string',
-        description: 'command=sub/text 且传了 format 时，把结果写到这个文件（只接受工作区内的相对路径）；不传打印到标准输出。',
+        description: 'command=sub/text/comments/danmaku 且传了 format 时，把结果写到这个文件（只接受工作区内的相对路径）；不传打印到标准输出。',
       },
       limit: {
         type: 'number',
