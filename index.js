@@ -602,7 +602,7 @@ function apply(ctx) {
     name: 'bili',
     description: '看 B 站视频内容：字幕 → 本地转写 → 抽帧 OCR，输出最可信的一份文本',
     input: {
-      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json] [--out 文件（需配合 --format）]',
+      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json|md] [--out 文件（需配合 --format）]',
     },
     handler: async (invocation) => {
       const { command, bv, extra } = parseCommandLine(invocation?.rawInput)
@@ -707,7 +707,7 @@ function apply(ctx) {
       },
       format: {
         type: 'string',
-        description: 'command=sub 时可选 srt 或 json（带官方时间戳）；command=text 时可选 json（含时间轴口径：字幕 exact，转写与 OCR 是估算）。不传默认纯文本。',
+        description: 'command=sub 时可选 srt、json（带官方时间戳）或 md（Markdown，每条带跳回原片的链接）；command=text 时可选 json（含时间轴口径：字幕 exact，转写与 OCR 是估算）或 md。不传默认纯文本。',
       },
       out: {
         type: 'string',
