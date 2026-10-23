@@ -18,6 +18,7 @@ _bili-asr.py —— 把本地音频/视频文件转成文字（faster-whisper，
   不给 -o 就往 stdout 打正文（调用方直接取 stdout 更省事）。
 """
 import argparse
+import json
 import os
 import sys
 
@@ -41,6 +42,8 @@ def main() -> int:
     ap.add_argument("--model", default=os.environ.get("BILI_ASR_MODEL", "small"),
                     help="Whisper 模型：tiny / base / small / medium（默认 small）")
     ap.add_argument("--lang", default="zh", help="语言，默认 zh（自动识别可传 auto）")
+    ap.add_argument("--json", action="store_true",
+                    help="输出 JSON（正文 + 分段 + VAD 统计），供调用方做转写可信度判定")
     args = ap.parse_args()
 
     if not os.path.isfile(args.src):
@@ -93,10 +96,19 @@ def main() -> int:
             condition_on_previous_text=False,  # 防止长视频里一段错就带着后面全错
         )
         parts = []
+        segs = []
         for seg in segments:
             t = (seg.text or "").strip()
             if t:
                 parts.append(t)
+                # 分段与模型自评分要留给调用方：判断「这段转写可信不可信」靠的就是它们
+                segs.append({
+                    "start": round(float(seg.start), 2),
+                    "end": round(float(seg.end), 2),
+                    "text": t,
+                    "no_speech_prob": round(float(getattr(seg, "no_speech_prob", 0.0) or 0.0), 3),
+                    "avg_logprob": round(float(getattr(seg, "avg_logprob", 0.0) or 0.0), 3),
+                })
     except Exception as e:  # noqa: BLE001
         print("[asr] 转写失败：%s" % e, file=sys.stderr)
         return 5
@@ -112,6 +124,20 @@ def main() -> int:
     #   总时长都是 2 秒。段数 ≥2 说明有过多次发声，更可能是短话而非噪声。
     print("[asr] speech_segments=%d" % (len(stamps) if vad_ok else -1), file=sys.stderr)
     print("[asr] chars=%d" % len(text), file=sys.stderr)
+    if args.json:
+        # 给调用方判「听到了」还是「编出来的」：正文 + 分段 + VAD 统计
+        payload = {
+            "text": text,
+            "segments": segs,
+            "vad": {
+                "ok": bool(vad_ok),
+                "sec": round(speech_sec, 2),
+                "n": len(stamps) if vad_ok else -1,
+            },
+            "language": info.language,
+        }
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return 0
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             f.write(text + "\n")

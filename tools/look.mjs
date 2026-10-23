@@ -318,14 +318,25 @@ async function downloadTo(url, dest) {
 }
 
 // 同目录并发保护：拿到锁的进程抽帧，另一个等它写完再按缓存判
+// 判锁的主人是否还活着：被 Ctrl-C / 超时 kill 的进程会留下 .lock，不判活就永远等一个不存在的进程
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
+}
 function tryLock(dir) {
   const f = join(dir, '.lock')
-  try {
-    writeFileSync(f, String(process.pid), { flag: 'wx' })
-    return f
-  } catch {
-    return null
+  for (let i = 0; i < 2; i++) {
+    try {
+      writeFileSync(f, String(process.pid), { flag: 'wx' })
+      return f
+    } catch {
+      let owner = 0
+      try { owner = Number(readFileSync(f, 'utf8').trim()) } catch {}
+      if (pidAlive(owner)) return null
+      unlock(f)
+    }
   }
+  return null
 }
 function unlock(f) {
   try {
@@ -1585,12 +1596,74 @@ const flag = (name) => argv.includes(`--${name}`)
 
 // ── 通用入口（yt-dlp）：B 站外任意 http(s) 视频 ──────────────────────
 // 目标可以是裸 BV 号，也可以是 App/网页分享出来的整条链接（带 buvid/spmid/unique_k 等参数）。
-// 只认链接里的 BV 号；短链 b23.tv 需要网络重定向解析，这里不支持，会按原样返回让调用方看到错误。
-function resolveSource(input) {
+// 短链 b23.tv 先按公共 DNS 展开（本机内网 DNS 会把它答成 31.13.x.x 这类错误地址，见 2026-10-23 实测）。
+const B23_DNS_SERVERS = ['223.5.5.5', '119.29.29.29', '1.1.1.1']
+
+/**
+ * 展开 b23.tv 短链：绕过系统 DNS，直接问公共 DNS 拿 IP，再按 IP 直连读 30x 的 Location。
+ * 失败返回 null，由调用方给出可执行的替代方案（贴 BV 号）。
+ */
+async function expandB23(shortUrl) {
+  const m = String(shortUrl).match(/b23\.tv\/([A-Za-z0-9]+)/i)
+  if (!m) return null
+  const code = m[1]
+  let ips = []
+  try {
+    const { Resolver } = await import('node:dns/promises')
+    const resolver = new Resolver({ timeout: 3000, tries: 2 })
+    resolver.setServers(B23_DNS_SERVERS)
+    ips = await resolver.resolve4('b23.tv')
+  } catch { ips = [] }
+  // 31.13.0.0/16 是污染常见落点（Facebook 段），直接剔掉
+  ips = (ips || []).filter((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !/^31\.13\./.test(ip)).slice(0, 3)
+  if (ips.length === 0) return null
+  const { request } = await import('node:https')
+  for (const ip of ips) {
+    let loc = ''
+    let body = ''
+    try {
+      const got = await new Promise((resolve, reject) => {
+        const req = request({
+          host: 'b23.tv', servername: 'b23.tv', port: 443, path: `/${code}`,
+          method: 'GET',
+          headers: { host: 'b23.tv', 'user-agent': UA, referer: REF, accept: '*/*' },
+          // Node 20+ 开了 autoSelectFamily 时会用 {all:true} 回调，两种签名都要兼容
+          lookup: (_hostname, opts, cb) => (opts && opts.all
+            ? cb(null, [{ address: ip, family: 4 }])
+            : cb(null, ip, 4)),
+          timeout: 6000,
+          autoSelectFamily: false,
+        }, (res) => {
+          let buf = ''
+          res.setEncoding('utf8')
+          res.on('data', (chunk) => {
+            if (buf.length < 8192) buf += chunk
+            else res.destroy()
+          })
+          res.on('end', () => resolve({ location: String(res.headers.location || ''), body: buf }))
+          res.on('error', () => resolve({ location: String(res.headers.location || ''), body: buf }))
+        })
+        req.on('timeout', () => req.destroy(new Error('timeout')))
+        req.on('error', reject)
+        req.end()
+      })
+      loc = got.location
+      body = got.body
+    } catch { continue }
+    // 正常短链是 302 + Location；少数短链返回带跳转的 HTML/JS，再从正文里捞一次
+    const bv = `${loc}\n${body}`.match(/BV[0-9A-Za-z]{10}/)
+    if (bv) return bv[0]
+  }
+  return null
+}
+
+async function resolveSource(input) {
   const s = String(input ?? '').trim()
   if (!s) return { type: 'empty' }
   if (/^https?:\/\/b23\.tv\//i.test(s)) {
-    return { type: 'error', message: 'b23.tv 短链要先展开：在浏览器打开它，把地址栏里的完整 https://www.bilibili.com/video/BV... 链接复制过来' }
+    const bv = await expandB23(s)
+    if (bv) return { type: 'bilibili', bv }
+    return { type: 'error', message: 'b23.tv 短链展开失败：本机 DNS 把 b23.tv 解析到了错误地址，公共 DNS 也没连上。请在浏览器打开短链，把地址栏里的完整链接复制过来，或直接贴 BV 号。' }
   }
   const direct = s.match(/BV[0-9A-Za-z]{10}/)
   if (direct) return { type: 'bilibili', bv: direct[0] }
@@ -1815,7 +1888,7 @@ let BV = ''
 let src = { type: 'empty' }
 let srcErr = ''
 try {
-  src = resolveSource(pos[1])
+  src = await resolveSource(pos[1])
   if (src.type === 'bilibili') BV = src.bv
 } catch (e) {
   srcErr = e?.message ?? String(e)
@@ -1845,7 +1918,7 @@ const HELP = `用法:
   --format：sub 支持 text|srt|json|md|txt（srt/md 带真时间戳，md 的时间戳可跳回原片，txt 是一行一句）；
   text 支持 text|json|md（json 带时间轴口径：字幕 exact / 转写与 OCR 是估算）；
   comments 与 danmaku 支持 json（stdout 只有 JSON，可接 jq）。
-  B 站目标可以直接贴分享链接，会自己提取 BV 号；短链 b23.tv/... 要先展开成完整链接。
+  B 站目标可以直接贴分享链接，会自己提取 BV 号；短链 b23.tv/... 也会先按公共 DNS 展开成 BV 号。
   通用视频 URL（YouTube/X 等）需要 yt-dlp：跑 scripts/fetch-deps.ps1 -Target ytdlp 装到 deps\\yt-dlp.exe（或设 BILI_WATCH_YTDLP / 系统 PATH）。
 `
 try {

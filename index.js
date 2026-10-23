@@ -503,6 +503,21 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj))
 }
 
+/** 写端点的同源闸：Origin 主机名须等于 Host，回环互放；sec-fetch-site 只认 same-origin/none。 */
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"])
+function sameOriginBlocked(req) {
+  const host = String(req.headers?.host ?? "").split(":")[0]
+  const origin = req.headers?.origin
+  if (origin) {
+    let oh = ""
+    try { oh = new URL(origin).hostname } catch { return "非法 Origin 头" }
+    if (oh !== host && !(LOOPBACK.has(host) && LOOPBACK.has(oh))) return "跨源访问被拒绝"
+  }
+  const site = req.headers?.["sec-fetch-site"]
+  if (site && site !== "same-origin" && site !== "none") return `跨站请求被拒绝（sec-fetch-site=${site}）`
+  return null
+}
+
 /** 读 POST 的小 JSON body；读不到就返回 {}，端点自己决定默认值。 */
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -627,8 +642,8 @@ function apply(ctx) {
         const r = matchSingleVideoLink(text)
         if (!r.hit) return null
         const line = r.kind === 'short'
-          // 短链：look.mjs 不能展开，只让用户展开
-          ? '[bili-watch] 这条消息只有一条 b23.tv 短链。本插件不能展开短链，先请用户把浏览器地址栏里的完整链接发过来；不要凭短链猜内容。'
+          // 短链：look.mjs 会先按公共 DNS 展开；展开失败才让用户贴 BV 号
+          ? '[bili-watch] 这条消息只有一条 b23.tv 短链。要读内容就调 bili_watch，它会先按公共 DNS 展开短链；只有展开失败时才请用户贴 BV 号。不要凭短链猜内容。'
           : `[bili-watch] 这条消息只有一条 B 站视频链接（BV ${r.bv}）。要读内容就调 bili_watch（command=peek 最便宜）；用户没说要看时不要自己跑。`
         return createUserMessage({
           content: [{ type: 'text', text: line }],
@@ -779,6 +794,8 @@ function apply(ctx) {
           kind: 'prefix',
           path: '/api/bili-watch',
           handler: async (req, res) => {
+            const blocked = sameOriginBlocked(req)
+            if (blocked) return sendJson(res, 403, { ok: false, error: blocked })
             try {
               const url = new URL(req.url, 'http://127.0.0.1')
               if (req.method === 'GET' && url.pathname === '/api/bili-watch/status') {
