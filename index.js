@@ -10,7 +10,7 @@
  * 只读、匿名，不改任何业务状态。
  */
 import { spawn } from 'node:child_process'
-import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -58,7 +58,24 @@ function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEP
 const CRED_FILE = join(DEPS, 'credential.json')
 const LAST_RUN = join(DEPS, 'last-run.json')
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > 系统临时目录。发布版不含本机路径。
-const CACHE = process.env.BILI_WATCH_CACHE || depsCfg().cache || join(tmpdir(), 'bili-watch')
+// 自定义目录不可写时不让功能哑掉：回退到临时目录，并把原因挂进 /status.warnings。
+function pickCacheDir() {
+  const want = process.env.BILI_WATCH_CACHE || depsCfg().cache || join(tmpdir(), 'bili-watch')
+  try {
+    mkdirSync(want, { recursive: true })
+    const probe = join(want, `.write-test-${process.pid}`)
+    writeFileSync(probe, 'ok')
+    rmSync(probe, { force: true })
+    return { dir: want, fallback: null }
+  } catch (e) {
+    const fb = join(tmpdir(), 'bili-watch')
+    try { mkdirSync(fb, { recursive: true }) } catch {}
+    return { dir: fb, fallback: String(e?.message || e) }
+  }
+}
+const cachePick = pickCacheDir()
+const CACHE = cachePick.dir
+if (cachePick.fallback) cfgWarning = `缓存目录不可写，已回退到 ${CACHE}：${cachePick.fallback}`
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
 function venvAsr() { const p = projDir(); return [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(p, '.venv-asr', PY_DIR, PY_EXE)] }
@@ -327,6 +344,37 @@ function writeCacheCfg(days, maxMb) {
   try {
     writeFileSync(CACHE_CFG, JSON.stringify({ days, maxMb }), 'utf8')
   } catch {}
+}
+
+/** 合并写 deps\deps-config.json（只动指定字段，保留用户原有配置）。 */
+function writeDepsCfg(patch) {
+  const p = join(DEPS, 'deps-config.json')
+  let cur = {}
+  try { cur = JSON.parse(readFileSync(p, 'utf8')) } catch {}
+  const next = { ...cur, ...patch }
+  writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')
+  return next
+}
+
+/**
+ * 弹原生选目录框（Windows）。脚本里只用 ASCII，避免 PS 5.1 按 ANSI 解码中文变乱。
+ * 取消返回 null；非 Windows 直接报错，让面板提示手填。
+ */
+function pickFolderDialog() {
+  return new Promise((resolve, reject) => {
+    if (process.platform !== 'win32') return reject(new Error('folder picker is Windows only; set the path manually'))
+    const script = 'Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = "bili-watch cache folder"; if ($d.ShowDialog() -eq "OK") { [Console]::Out.Write($d.SelectedPath) }'
+    const ps = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: false })
+    let out = ''
+    let err = ''
+    ps.stdout.on('data', (c) => { out += c })
+    ps.stderr.on('data', (c) => { err += c })
+    ps.on('close', (code) => {
+      if (code !== 0) return reject(new Error(err.trim() || ('powershell exit ' + code)))
+      resolve(out.trim() || null)
+    })
+    ps.on('error', reject)
+  })
 }
 
 /**
@@ -843,6 +891,16 @@ function apply(ctx) {
                     warnings: cfgWarning ? [cfgWarning] : [],
                   },
                 })
+              }
+              if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/pick') {
+                try {
+                  const dir = await pickFolderDialog()
+                  if (!dir) return sendJson(res, 200, { ok: false, why: '已取消' })
+                  writeDepsCfg({ cache: dir })
+                  return sendJson(res, 200, { ok: true, data: { dir, restart: true } })
+                } catch (e) {
+                  return sendJson(res, 500, { ok: false, why: String(e?.message || e) })
+                }
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)

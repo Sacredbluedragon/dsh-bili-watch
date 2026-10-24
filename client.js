@@ -382,11 +382,23 @@ window.__ModuleLoader__.load({
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '位置'),
             h('span', { 'data-bl-detail': '' }, cache.dir || '(系统临时目录)'),
-            null),
+            h('button', {
+              'data-bl-btn': '',
+              onClick: async () => {
+                setSaveErr('')
+                try {
+                  const r = await jpost('/cache/pick', {})
+                  if (r.ok && r.data?.dir) setMsg(`已选择：${r.data.dir}（重启 DSH 生效）`)
+                  else if (r.ok === false) setMsg(r.why || '已取消')
+                  else setMsg('选择失败')
+                } catch (e) { setSaveErr(`选择目录失败：${String(e?.message || e)}`) }
+              },
+            }, '选择目录…')),
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '改位置'),
-            h('span', { 'data-bl-detail': '' }, '设环境变量 BILI_WATCH_CACHE，或在 deps/deps-config.json 里加 "cache": "D:\\\\路径"；改完重启 DSH 生效。'),
+            h('span', { 'data-bl-detail': '' }, '或用环境变量 BILI_WATCH_CACHE / deps/deps-config.json 的 "cache"；改完重启 DSH 生效。'),
             null),
+          msg ? h('div', { 'data-bl-note': '' }, msg) : null,
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '自动清理规则'),
             h('span', { 'data-bl-detail': '' },
