@@ -1,6 +1,6 @@
 # dsh-bili-watch
 
-将一条 B 站视频变成模型能读的内容：元数据、评论、弹幕、AI 字幕、本地转写、抽帧 OCR。可作为 DSH 插件运行，也可直接当命令行工具。
+将一条 B 站视频变成模型能读的内容：元数据、评论、弹幕、AI 字幕、本地转写、抽帧 OCR。可作为 DSH 插件运行，也可直接当命令行工具。支持 `b23.tv` 短链与 av 号；抽帧缓存放在哪可以自己定——面板里点「选择目录…」、设环境变量 `BILI_WATCH_CACHE`、或改 `deps/deps-config.json` 的 `cache`。
 
 取内容的顺序是先用文字（字幕或转写），文字不够则抽帧看画面。只读元数据、评论、弹幕、搜索、热榜不需要任何额外依赖；抽帧相关命令需要 ffmpeg，未安装会明确报错并指出装法。
 
@@ -191,6 +191,7 @@ AI 字幕（需登录）
 | `BILI_WATCH_FFMPEG` | ffmpeg 可执行文件路径 |
 | `BILI_WATCH_YTDLP` | yt-dlp 可执行文件路径 |
 | `BILI_WATCH_SEEN` | `seen.md` 去重文件路径（默认 `deps/seen.md`）。文件不存在时 `--mark-seen` 记不了，先建一个空文件即可 |
+| `BILI_WATCH_CACHE` | 抽帧缓存目录（默认系统临时目录）。优先级：这个变量 > `deps/deps-config.json` 的 `cache` > 临时目录；目录不可写时自动回退临时目录，并在面板警告里写明原因 |
 | `BILI_WATCH_MIRROR` | `cn` 时 `scripts/fetch-deps.*` 走镜像下载（gh-proxy / 清华 PyPI / hf-mirror） |
 | `HF_ENDPOINT` | 转写模型的 HuggingFace 端，默认 `https://hf-mirror.com`；海外可设官方站 |
 | `BILI_ASR_MODEL` | 本地转写用的 faster-whisper 模型名，默认 `small` |
