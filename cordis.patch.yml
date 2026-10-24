@@ -3,3 +3,4 @@
 - insert:
     - id: dsh-bili-watch
       name: dsh-bili-watch
+      disabled: true

@@ -41,19 +41,35 @@ const COMMANDS = ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku',
 
 // 设置页端点读的落点，与 tools/look.mjs 同源（look.mjs:41/52/54/46/48/51）
 const DEPS = join(HERE, 'deps')
-const PROJ = process.env.BILI_WATCH_PROJ || DEPS
+// 本机路径来源：env 优先，其次 deps\deps-config.json（写文件即生效，不必重启），最后 deps 自身。
+// 配置文件不进包（deps 只留空目录），发布时无需脱敏。
+// 解析失败不写 stdout/stderr（会污染 --format json 与 PowerShell 管道），
+// 而是记进 cfgWarning，由 /status 的 warnings 带给面板；ENOENT（没配过）不算异常。
+let cfgWarning = null
+function depsCfg() {
+  try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
+    if (e?.code !== 'ENOENT') {
+      cfgWarning = `deps-config.json 解析失败，已改用 deps 目录：${String(e?.message || e)}`
+    }
+    return {}
+  }
+}
+function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
 const CRED_FILE = join(DEPS, 'credential.json')
 const LAST_RUN = join(DEPS, 'last-run.json')
 const CACHE = join(tmpdir(), 'bili-watch')
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
-const VENV_ASR = [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(PROJ, '.venv-asr', PY_DIR, PY_EXE)]
-const VENV_OCR = [join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(PROJ, '.venv-ocr', PY_DIR, PY_EXE)]
-const FFMPEG_CANDS = [
-  process.env.BILI_WATCH_FFMPEG,
-  join(DEPS, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
-].filter(Boolean)
-const HF_HOME = [join(DEPS, '.hf-home'), join(PROJ, '.hf-home')]
+function venvAsr() { const p = projDir(); return [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(p, '.venv-asr', PY_DIR, PY_EXE)] }
+function venvOcr() { const p = projDir(); return [join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(p, '.venv-ocr', PY_DIR, PY_EXE)] }
+function ffmpegCands() {
+  return [
+    process.env.BILI_WATCH_FFMPEG,
+    depsCfg().ffmpeg,
+    join(DEPS, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+  ].filter(Boolean)
+}
+function hfHomes() { const p = projDir(); return [join(DEPS, '.hf-home'), join(p, '.hf-home')] }
 const SCRIPTS = join(HERE, 'scripts')
 const CACHE_CFG = join(DEPS, 'cache-config.json')
 const UI_CFG = join(DEPS, 'ui-config.json')
@@ -209,7 +225,7 @@ async function loginPollOnce(key) {
           null,
           2,
         ),
-        'utf8',
+        { encoding: 'utf8', mode: 0o600 },
       )
     } catch (e) {
       return { ok: false, state: 'error', why: `凭证写入失败：${e?.message ?? e}` }
@@ -230,9 +246,9 @@ function writeLastRun(command, code) {
 function readLastRun() {
   try {
     const j = JSON.parse(readFileSync(LAST_RUN, 'utf8'))
-    return { time: j.time ?? null, command: j.command ?? null, ok: j.ok ?? null }
+    return { time: j.time ?? null, command: j.command ?? null, code: j.code ?? null, ok: j.ok ?? null }
   } catch {
-    return { time: null, command: null, ok: null }
+    return { time: null, command: null, code: null, ok: null }
   }
 }
 
@@ -354,7 +370,7 @@ function autoCleanCache() {
 
 /** 面板上的依赖行：一条依赖一个状态 + 体积 + 是否需要下载。 */
 function depRows() {
-  const ffmpeg = FFMPEG_CANDS.find((p) => existsSync(p)) || ''
+  const ffmpeg = ffmpegCands().find((p) => existsSync(p)) || ''
   let ffmpegSize = 0
   try {
     ffmpegSize = ffmpeg ? statSync(ffmpeg).size : 0
@@ -364,9 +380,9 @@ function depRows() {
   try {
     ytdlpSize = existsSync(ytdlp) ? statSync(ytdlp).size : 0
   } catch {}
-  const asrPython = VENV_ASR.find((p) => existsSync(p)) || ''
-  const ocrPython = VENV_OCR.find((p) => existsSync(p)) || ''
-  const model = HF_HOME.find((d) => existsSync(d)) || ''
+  const asrPython = venvAsr().find((p) => existsSync(p)) || ''
+  const ocrPython = venvOcr().find((p) => existsSync(p)) || ''
+  const model = hfHomes().find((d) => existsSync(d)) || ''
   const rows = [
     {
       id: 'ffmpeg',
@@ -503,10 +519,25 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj))
 }
 
-/** 写端点的同源闸：Origin 主机名须等于 Host，回环互放；sec-fetch-site 只认 same-origin/none。 */
+/** 写端点的同源闸：Host 必须是回环（挡 DNS rebinding），Origin 主机名须等于 Host，sec-fetch-site 只认 same-origin/none。 */
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"])
+/** 从 Host 头取主机名：同时支持 example.com:3080 与 [::1]:3080。 */
+function hostNameOf(value) {
+  const raw = String(value ?? "").trim().toLowerCase()
+  if (!raw) return ""
+  if (raw.startsWith("[")) {
+    const close = raw.indexOf("]")
+    return close >= 0 ? raw.slice(0, close + 1) : raw
+  }
+  const colon = raw.lastIndexOf(":")
+  return colon >= 0 && /^\d+$/.test(raw.slice(colon + 1)) ? raw.slice(0, colon) : raw
+}
 function sameOriginBlocked(req) {
-  const host = String(req.headers?.host ?? "").split(":")[0]
+  const host = hostNameOf(req.headers?.host)
+  // DNS rebinding：攻击者把自己的域名解析到 127.0.0.1，Origin 与 Host 就都是他自己的域名，
+  // 只比两者相等挡不住（2026-10-24 wb 第二轮实测 Host/Origin 同为 evil.example:3080 返回 200）。
+  // 所以先要求 Host 是回环，再比 Origin。
+  if (!LOOPBACK.has(host)) return "非本机请求被拒绝（Host 必须是回环地址）"
   const origin = req.headers?.origin
   if (origin) {
     let oh = ""
@@ -808,6 +839,7 @@ function apply(ctx) {
                     cache: { ...dirStat(CACHE), ...cacheCfg(), lastAutoClean: cleaned },
                     lastRun: readLastRun(),
                     ui: uiCfg(),
+                    warnings: cfgWarning ? [cfgWarning] : [],
                   },
                 })
               }

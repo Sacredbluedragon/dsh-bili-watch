@@ -99,6 +99,7 @@ window.__ModuleLoader__.load({
     function Panel() {
       const [st, setSt] = React.useState(null)
       const [err, setErr] = React.useState('')
+      const [saveErr, setSaveErr] = React.useState('')
       const [msg, setMsg] = React.useState('')
       const [busy, setBusy] = React.useState('')
       const [days, setDays] = React.useState('7')
@@ -294,15 +295,24 @@ window.__ModuleLoader__.load({
                   const v = e.target.checked
                   try {
                     await jpost('/config', { showInSettings: v })
+                    setSaveErr('')
                     try { window.__biliWatchSyncSettings && window.__biliWatchSyncSettings(v) } catch {}
                     await load()
-                  } catch {}
+                  } catch (e) {
+                    // 用独立状态：load() 成功后会把 err 清空，写进 err 等于这条提示活不过一帧。
+                    setSaveErr(`保存失败：服务端未确认，刷新后可能回滚（${String(e?.message || e)}）`)
+                    await load()
+                  }
                 },
               }),
               h('span', { 'data-bl-name': '' }, '在设置页也显示'),
             ),
           ),
           h('div', { 'data-bl-note': '' }, '关掉只隐藏设置页入口；插件详情页这块面板一直保留。'),
+          saveErr ? h('div', { 'data-bl-note': '', style: { color: '#c0392b' } }, saveErr) : null,
+          (st.warnings || []).length
+            ? h('div', { 'data-bl-note': '', style: { color: '#b36b00' } }, st.warnings.join('；'))
+            : null,
         ),
         h('div', { 'data-bl-head': '' },
           h('span', { 'data-bl-title': '' }, '依赖与状态'),
@@ -388,6 +398,22 @@ window.__ModuleLoader__.load({
             h('button', { 'data-bl-btn': '', onClick: load }, '刷新'))),
         msg ? h('div', { 'data-bl-note': '' }, msg) : null,
       )
+    }
+
+    // 多个插件的顶部横幅都固定在 top:0，会互相盖住；按 DOM 顺序统一往下排。
+    function relayoutBanners() {
+      const els = document.querySelectorAll('[data-pmc-banner],[data-ms-overlay],[data-bl-overlay]');
+      let top = 0;
+      for (const el of els) {
+        const height = el.offsetHeight;
+        if (!height) continue;
+        el.style.top = top + 'px';
+        top += height;
+      }
+    }
+    if (typeof window !== 'undefined' && !window.__dshBannerRelayout) {
+      window.__dshBannerRelayout = setInterval(relayoutBanners, 2000);
+      setTimeout(relayoutBanners, 300);
     }
 
     // 缺依赖横幅（shell.overlay）

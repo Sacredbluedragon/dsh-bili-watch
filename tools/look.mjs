@@ -36,9 +36,17 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-// 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ
+// 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ / deps\deps-config.json
 const DEPS = join(HERE, '..', 'deps')
-const PROJ = process.env.BILI_WATCH_PROJ || DEPS
+// 解析失败不静默：写 stderr（不进 stdout，JSON 模式安全）；ASCII 前缀避免 PS 管道按 GBK 渲染成乱码。
+function readDepsCfg() {
+  try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
+    if (e?.code !== 'ENOENT') process.stderr.write(`[bili-watch] deps-config.json parse failed, using deps dir: ${String(e?.message || e)}\n`)
+    return {}
+  }
+}
+const depsCfg = readDepsCfg()
+const PROJ = process.env.BILI_WATCH_PROJ || depsCfg.proj || DEPS
 const pick = (...cands) => cands.find((p) => existsSync(p)) ?? cands[cands.length - 1]
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
@@ -47,7 +55,7 @@ const ASR_SCRIPT = pick(join(DEPS, '_bili-asr.py'), join(PROJ, '_bili-asr.py'))
 const OCR_PY = pick(join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(PROJ, '.venv-ocr', PY_DIR, PY_EXE))
 const HF_HOME_DIR = pick(join(DEPS, '.hf-home'), join(PROJ, '.hf-home'))
 const OCR_SCRIPT = join(HERE, 'ocr.py')
-const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || ''
+const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || depsCfg.ffmpeg || ''
 // 缺 ffmpeg 时的统一指路（一键脚本 / 环境变量 / --ffmpeg 三条出路）
 const FFMPEG_HINT =
   '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
@@ -1601,11 +1609,13 @@ const B23_DNS_SERVERS = ['223.5.5.5', '119.29.29.29', '1.1.1.1']
 
 /**
  * 展开 b23.tv 短链：绕过系统 DNS，直接问公共 DNS 拿 IP，再按 IP 直连读 30x 的 Location。
- * 失败返回 null，由调用方给出可执行的替代方案（贴 BV 号）。
+ * 返回 { bv } 或 { error }：error 区分 dns（没解析出来）/ network（连不上）/ not-found（短码不存在）/ unknown。
+ * 注意 b23.tv 对不存在的短码返回 HTTP 200 + {"code":-404,...}，所以「没拿到 Location」不等于网络坏
+ * （2026-10-24 wb 第二轮实测，归因错会把用户引向查 DNS）。
  */
 async function expandB23(shortUrl) {
   const m = String(shortUrl).match(/b23\.tv\/([A-Za-z0-9]+)/i)
-  if (!m) return null
+  if (!m) return { error: 'unknown' }
   const code = m[1]
   let ips = []
   try {
@@ -1616,8 +1626,9 @@ async function expandB23(shortUrl) {
   } catch { ips = [] }
   // 31.13.0.0/16 是污染常见落点（Facebook 段），直接剔掉
   ips = (ips || []).filter((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !/^31\.13\./.test(ip)).slice(0, 3)
-  if (ips.length === 0) return null
+  if (ips.length === 0) return { error: 'dns' }
   const { request } = await import('node:https')
+  let netErr = false
   for (const ip of ips) {
     let loc = ''
     let body = ''
@@ -1649,24 +1660,75 @@ async function expandB23(shortUrl) {
       })
       loc = got.location
       body = got.body
-    } catch { continue }
+    } catch { netErr = true; continue }
     // 正常短链是 302 + Location；少数短链返回带跳转的 HTML/JS，再从正文里捞一次
     const bv = `${loc}\n${body}`.match(/BV[0-9A-Za-z]{10}/)
-    if (bv) return bv[0]
+    if (bv) return { bv: bv[0] }
+    // P2-3：有的旧视频短链跳到 /video/av<数字>，里面没有 BV 号。先换成 bvid 再返回，
+    // 让下游只认一种标识。
+    const av = `${loc}\n${body}`.match(/\/video\/av(\d+)/i)
+    if (av) {
+      const converted = await aidToBvid(av[1])
+      if (converted) return { bv: converted }
+    }
+    // 没拿到跳转：b23.tv 对不存在的短码回 200 + JSON error body（实测 code=-404），
+    // 这种情况是「链接不对」，不是「DNS 坏了」。
+    let bodyCode = null
+    try {
+      const j = JSON.parse(body)
+      if (j && typeof j.code === 'number') bodyCode = j.code
+    } catch { /* 不是 JSON，继续看下一个 IP */ }
+    if (bodyCode !== null && bodyCode !== 0) return { error: 'not-found', code: bodyCode }
   }
-  return null
+  return { error: netErr ? 'network' : 'unknown' }
+}
+
+/** P2-3：av 号转 bvid。view 接口两个都收，但下游只认 bvid，这里一次性换掉。 */
+async function aidToBvid(aid) {
+  try {
+    const r = await fetch(`https://api.bilibili.com/x/web-interface/view?aid=${encodeURIComponent(aid)}`, {
+      headers: { 'user-agent': UA, referer: REF, accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    })
+    const j = await r.json()
+    const bv = j?.data?.bvid
+    return typeof bv === 'string' && /^BV[0-9A-Za-z]{10}$/.test(bv) ? bv : null
+  } catch {
+    return null
+  }
 }
 
 async function resolveSource(input) {
   const s = String(input ?? '').trim()
   if (!s) return { type: 'empty' }
   if (/^https?:\/\/b23\.tv\//i.test(s)) {
-    const bv = await expandB23(s)
-    if (bv) return { type: 'bilibili', bv }
-    return { type: 'error', message: 'b23.tv 短链展开失败：本机 DNS 把 b23.tv 解析到了错误地址，公共 DNS 也没连上。请在浏览器打开短链，把地址栏里的完整链接复制过来，或直接贴 BV 号。' }
+    const r = await expandB23(s)
+    if (r && r.bv) return { type: 'bilibili', bv: r.bv }
+    const why = r?.error
+    const msg = why === 'not-found'
+      ? `b23.tv 短链展开失败：这个短码不存在（b23.tv 返回 code=${r.code}，不是跳转）。先确认链接有没有复制完整；也可以贴浏览器地址栏里的完整链接或 BV 号。`
+      : why === 'dns'
+        ? 'b23.tv 短链展开失败：本机与公共 DNS 都没解析出 b23.tv 的地址（内网 DNS 会把它答成 31.13.x.x 这类错误地址）。请贴完整链接或 BV 号。'
+        : why === 'network'
+          ? 'b23.tv 短链展开失败：域名解析到了，但连接超时或被拦。请稍后重试，或直接贴完整链接 / BV 号。'
+          : 'b23.tv 短链展开失败：没拿到跳转，原因不明。请贴完整链接或 BV 号。'
+    return { type: 'error', message: msg }
   }
   const direct = s.match(/BV[0-9A-Za-z]{10}/)
   if (direct) return { type: 'bilibili', bv: direct[0] }
+  // 裸 av 号（用户从别处抄来的 aid）：先转 BV，转不出来给出可操作的提示。
+  const bareAv = s.match(/^av(\d+)$/i)
+  if (bareAv) {
+    const converted = await aidToBvid(bareAv[1])
+    if (converted) return { type: 'bilibili', bv: converted }
+    return { type: 'error', message: `av 号 ${s} 转换失败。请贴完整链接 https://www.bilibili.com/video/av${bareAv[1]}，或直接给 BV 号。` }
+  }
+  // 完整链接也可能是 av 型（老视频），一并换成 bv，避免落到 generic 走 yt-dlp
+  const avDirect = s.match(/\/video\/av(\d+)/i)
+  if (avDirect) {
+    const converted = await aidToBvid(avDirect[1])
+    if (converted) return { type: 'bilibili', bv: converted }
+  }
   const q = s.match(/[?&]bvid=([^&#]+)/)
   if (q && /^BV[0-9A-Za-z]{10}$/.test(q[1])) return { type: 'bilibili', bv: q[1] }
   if (/^https?:\/\//i.test(s)) return { type: 'generic', url: s }
