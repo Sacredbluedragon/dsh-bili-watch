@@ -357,21 +357,32 @@ function writeDepsCfg(patch) {
 }
 
 /**
- * 弹原生选目录框（Windows）。脚本里只用 ASCII，避免 PS 5.1 按 ANSI 解码中文变乱。
+ * 弹原生选目录框（Windows）。脚本里只用 ASCII，避免 PS 5.1 按 ANSI 解码中文变乱；
+ * 选中的路径经 UTF-8 文件回传，不走 stdout——PS 5.1 的管道输出是当前代码页（中文系统为 GBK），
+ * 中文路径经管道会变成问号（2026-10-24 实测：「D:\007 Dsh工作区」显示成「D:\007 Dsh????」）。
  * 取消返回 null；非 Windows 直接报错，让面板提示手填。
  */
 function pickFolderDialog() {
   return new Promise((resolve, reject) => {
     if (process.platform !== 'win32') return reject(new Error('folder picker is Windows only; set the path manually'))
-    const script = 'Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = "bili-watch cache folder"; if ($d.ShowDialog() -eq "OK") { [Console]::Out.Write($d.SelectedPath) }'
+    const outFile = join(tmpdir(), `bili-watch-pick-${Date.now()}.txt`)
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+      '$d.Description = "bili-watch cache folder"',
+      'if ($d.ShowDialog() -eq "OK") { [IO.File]::WriteAllText(\'' + outFile + '\', $d.SelectedPath, (New-Object Text.UTF8Encoding($false))) }',
+    ].join('; ')
     const ps = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: false })
-    let out = ''
     let err = ''
-    ps.stdout.on('data', (c) => { out += c })
     ps.stderr.on('data', (c) => { err += c })
     ps.on('close', (code) => {
+      let picked = ''
+      try {
+        if (existsSync(outFile)) picked = readFileSync(outFile, 'utf8').trim()
+      } catch {}
+      try { rmSync(outFile, { force: true }) } catch {}
       if (code !== 0) return reject(new Error(err.trim() || ('powershell exit ' + code)))
-      resolve(out.trim() || null)
+      resolve(picked || null)
     })
     ps.on('error', reject)
   })
