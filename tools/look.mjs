@@ -59,7 +59,8 @@ const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || depsCfg.ffmpeg || ''
 // 缺 ffmpeg 时的统一指路（一键脚本 / 环境变量 / --ffmpeg 三条出路）
 const FFMPEG_HINT =
   '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
-const CACHE = join(tmpdir(), 'bili-watch')
+// 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > 系统临时目录（与 index.js 同一口径）。
+const CACHE = process.env.BILI_WATCH_CACHE || depsCfg.cache || join(tmpdir(), 'bili-watch')
 const require = createRequire(import.meta.url)
 const CRED_FILE = join(DEPS, 'credential.json')
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')

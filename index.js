@@ -57,7 +57,8 @@ function depsCfg() {
 function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
 const CRED_FILE = join(DEPS, 'credential.json')
 const LAST_RUN = join(DEPS, 'last-run.json')
-const CACHE = join(tmpdir(), 'bili-watch')
+// 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > 系统临时目录。发布版不含本机路径。
+const CACHE = process.env.BILI_WATCH_CACHE || depsCfg().cache || join(tmpdir(), 'bili-watch')
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
 function venvAsr() { const p = projDir(); return [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(p, '.venv-asr', PY_DIR, PY_EXE)] }
@@ -836,7 +837,7 @@ function apply(ctx) {
                   data: {
                     credential: credState(),
                     deps: depRows(),
-                    cache: { ...dirStat(CACHE), ...cacheCfg(), lastAutoClean: cleaned },
+                    cache: { ...dirStat(CACHE), ...cacheCfg(), dir: CACHE, lastAutoClean: cleaned },
                     lastRun: readLastRun(),
                     ui: uiCfg(),
                     warnings: cfgWarning ? [cfgWarning] : [],
