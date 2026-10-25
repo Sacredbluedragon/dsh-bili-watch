@@ -420,20 +420,43 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // 多个插件的顶部横幅都固定在 top:0，会互相盖住；按 DOM 顺序统一往下排。
+    // 内核的 shell.overlay 是 position:absolute;inset:0 的一层，子元素各自定位、不会自动堆叠，
+    // 所以几个插件的顶部横幅都写 top:0 时会互相盖住，需要有东西统一往下排。
+    //
+    // 2026-10-25 改（P2-66）：原来每 2 秒全量重排一次，既白白占 CPU，也会把别人在两次重排之间
+    // 自己调的 top 覆盖掉。现在只在真的变化时排：子节点增删（插件挂载/卸载）+ 容器高度变化。
+    // 写 top 前先比较，值相同就不写——否则会触发自己观察到的再次变化，形成回环。
+    // 只动 top 一个属性，其余内联样式不碰。
     function relayoutBanners() {
-      const els = document.querySelectorAll('[data-pmc-banner],[data-ms-overlay],[data-bl-overlay]');
+      const layer = document.querySelector('[data-shell-overlay]');
+      if (!layer) return;
       let top = 0;
-      for (const el of els) {
+      for (const el of layer.children) {
         const height = el.offsetHeight;
         if (!height) continue;
-        el.style.top = top + 'px';
+        const want = top + 'px';
+        if (el.style.top !== want) el.style.top = want;
         top += height;
       }
     }
     if (typeof window !== 'undefined' && !window.__dshBannerRelayout) {
-      window.__dshBannerRelayout = setInterval(relayoutBanners, 2000);
-      setTimeout(relayoutBanners, 300);
+      let scheduled = false;
+      const schedule = () => {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => { scheduled = false; relayoutBanners(); });
+      };
+      const layer = document.querySelector('[data-shell-overlay]');
+      const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+      const watchHeights = () => {
+        if (!ro) return;
+        for (const el of document.querySelectorAll('[data-pmc-banner],[data-ms-overlay],[data-bl-overlay]')) ro.observe(el);
+      };
+      if (layer) {
+        new MutationObserver(() => { schedule(); watchHeights(); }).observe(layer, { childList: true });
+      }
+      setTimeout(() => { relayoutBanners(); watchHeights(); }, 300);
+      window.__dshBannerRelayout = true;
     }
 
     // 缺依赖横幅（shell.overlay）

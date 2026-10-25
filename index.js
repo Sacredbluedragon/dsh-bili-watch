@@ -359,7 +359,7 @@ function writeDepsCfg(patch) {
 /**
  * 弹原生选目录框（Windows）。脚本里只用 ASCII，避免 PS 5.1 按 ANSI 解码中文变乱；
  * 选中的路径经 UTF-8 文件回传，不走 stdout——PS 5.1 的管道输出是当前代码页（中文系统为 GBK），
- * 中文路径经管道会变成问号（2026-10-24 实测：「D:\007 Dsh工作区」显示成「D:\007 Dsh????」）。
+ * 中文路径经管道会变成问号（2026-10-24 实测：带中文的目录名过管道后，中文段全变成 ?）。
  * 取消返回 null；非 Windows 直接报错，让面板提示手填。
  */
 function pickFolderDialog() {
