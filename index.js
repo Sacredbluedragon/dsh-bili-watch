@@ -741,9 +741,16 @@ async function lookup({ command, bv, extra = [], badOut = false }) {
   const r = await runLook(args)
   // login 只生成二维码，真正的登录成功由面板 poll 写；命令层不记 lastRun，避免「生成成功」被读成「已登录」
   if (command !== 'login') writeLastRun(command, r.code)
-  const body = (r.out || r.err || '').trim()
-  const text = body || `（${command} 没有输出，退出码 ${r.code ?? '?'}；完整日志看 bili-watch 的 stderr）`
-  return { ok: r.code === 0, text }
+  const failed = r.code !== 0
+  const err = String(r.err || '').trim()
+  const out = String(r.out || '').trim()
+  const parts = []
+  if (failed) parts.push(`（${command} 失败，退出码 ${r.code ?? '?'}）`)
+  // 失败时先给 stderr（诊断），再给 stdout（可能是半截数据）；成功时反过来（T31-3）
+  if (failed ? err : out) parts.push(failed ? err : out)
+  if (failed && out) parts.push(out)
+  if (!parts.length) parts.push(`（${command} 没有输出，退出码 ${r.code ?? '?'}；完整日志看 bili-watch 的 stderr）`)
+  return { ok: !failed, text: parts.join(String.fromCharCode(10)) }
 }
 
 function apply(ctx) {
@@ -887,9 +894,17 @@ function apply(ctx) {
           text: { type: 'string', description: '输出文本' },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '').slice(0, 2500) }],
+      render: (_args, value) => {
+        const s = String(value?.text ?? '')
+        // 失败要把 ok 说出来，否则模型会把错误提示当成视频内容（2026-10-26 T31-1）
+        const head = value?.ok === false ? '⚠ 本次调用失败（ok=false），下面是错误信息，不是视频内容。' + String.fromCharCode(10) : ''
+        if (s.length <= 2500) return [{ type: 'text', text: head + s }]
+        // 超长时保头也保尾：尾部通常是「全文已存 → read 这个文件」，切掉就等于没给路（T31-2）
+        return [{ type: 'text', text: head + s.slice(0, 2000) + String.fromCharCode(10) + '…（已截断，全文见上面提示里的路径）…' + String.fromCharCode(10) + s.slice(-400) }]
+      },
     },
     execute: async (args) => {
+      try {
       const extra = []
       if (typeof args.p === 'number' && Number.isInteger(args.p) && args.p > 0) extra.push('--p', String(args.p))
       if (typeof args.step === 'number' && Number.isFinite(args.step) && args.step > 0) extra.push('--step', String(args.step))
@@ -917,6 +932,10 @@ function apply(ctx) {
       if (!target) return { ok: false, text: '缺少 BV 号或分享链接' }
       const r = await lookup({ command: args.command, bv: target, extra })
       return { ok: r.ok, text: trimForModel(r.text, args.command, target) }
+      } catch (e) {
+        // T41：别的 defineTool 都包了 try/catch，我们没包——runLook 抛错会让整轮失败
+        return { ok: false, text: `工具执行异常：${String(e?.message || e)}；可以先用 --fast 或换一个 BV 再试` }
+      }
     },
   }))
   } else {
