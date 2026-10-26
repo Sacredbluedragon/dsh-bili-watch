@@ -433,7 +433,7 @@ function findFfmpeg(arg) {
   for (const c of cands) {
     if (c !== 'ffmpeg' && !existsSync(c)) continue
     try {
-      execFileSync(c, ['-version'], { stdio: 'ignore' })
+      execFileSync(c, ['-version'], { stdio: 'ignore', timeout: 300000 })
       return c
     } catch {}
   }
@@ -623,12 +623,12 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
       // 场景吸附：逐点 -ss 抽帧
       frameTimes.forEach((t, i) => {
         const out = join(dir, `${bv}-${String(i + 1).padStart(2, '0')}.jpg`)
-        execFileSync(bin, ['-y', '-threads', '2', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '2', out], { stdio: 'ignore' })
+        execFileSync(bin, ['-y', '-threads', '2', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '2', out], { stdio: 'ignore', timeout: 300000 })
       })
     } else {
       // 默认等间隔
       const pattern = join(dir, `${bv}-%02d.jpg`)
-      execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore' })
+      execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: 300000 })
     }
 
     const n = jpgs().length
@@ -1364,7 +1364,7 @@ async function cmdSheet(bv, opts = {}) {
   if (!bin) { process.exitCode = 1; console.log('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
   const out = join(CACHE, 'sheets', `${bv}-p${opts.p ?? 1}-${grid}.jpg`)
   mkdirSync(dirname(out), { recursive: true })
-  execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], { stdio: 'ignore' })
+  execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], { stdio: 'ignore', timeout: 300000 })
   console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
   console.log('读这张图就能过一遍画面；要精确读字用 ocr <BV>。')
 }
@@ -1385,7 +1385,7 @@ async function cmdSubstrip(bv, opts = {}) {
   if (!bin) { process.exitCode = 1; console.log('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
   const out = join(CACHE, 'sheets', `${bv}-p${opts.p ?? 1}-substrip.jpg`)
   mkdirSync(dirname(out), { recursive: true })
-  execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `crop=iw:ih*0.20:0:ih*0.80,scale=1280:-1,tile=1x${take}`, '-frames:v', '1', out], { stdio: 'ignore' })
+  execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `crop=iw:ih*0.20:0:ih*0.80,scale=1280:-1,tile=1x${take}`, '-frames:v', '1', out], { stdio: 'ignore', timeout: 300000 })
   console.log(`字幕带: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${take} 条）`)
   console.log('一张图里是整片底部字幕；硬字幕视频用它比逐帧 OCR 省很多。')
 }
@@ -1782,6 +1782,11 @@ async function cmdText(bv, credPath, opts = {}) {
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
       const rate = v.dur > 0 ? a.chars / v.dur : 0
       if (rate >= 2) {
+        // T40：ASR 也会把杂音/背景音听成字，主入口同样要过诱饵信号（原先只有字幕分支有）
+        const asrBait = baitSignals(a.text, v, credibility(v, a.text))
+        if (asrBait.suspect) {
+          say(`[track] ⚠ 转写可疑：${asrBait.reasons.join('；')}（机器转写本来就可能听错，要看画面加 --verify 再跑一次）`)
+        }
         if (emitText(opts, {
           video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
           source: 'asr',
@@ -2011,7 +2016,7 @@ function findYtDlp() {
   for (const c of cands) {
     if (c !== 'yt-dlp' && !existsSync(c)) continue
     try {
-      execFileSync(c, ['--version'], { stdio: 'ignore' })
+      execFileSync(c, ['--version'], { stdio: 'ignore', timeout: 300000 })
       return c
     } catch {}
   }
@@ -2151,7 +2156,7 @@ async function grabFramesLocal(mp4, tag, dur, { step = 0 } = {}) {
     const bin = findFfmpeg()
     if (!bin) throw new Error('找不到 ffmpeg：' + FFMPEG_HINT)
     const pattern = join(dir, `${tag}-%02d.jpg`)
-    execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore' })
+    execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: 300000 })
     const n = jpgs().length
     if (!n) throw new Error('抽帧没产出图片（可能源流异常）')
     writeManifest(dir, { ok: true, tag, step: useStep, scene: false, frames: n })
