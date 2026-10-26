@@ -30,7 +30,9 @@ function cleanKey(s) {
 
 /** 按视频分目录：CACHE/<BV>/<cmd>.txt —— 同一个视频各命令的输出收在一处 */
 function videoDir(key) {
-  const base = cleanKey(key)
+  // T34-P0-1：模型可能把整条链接当 key 传进来，先取 BV 再建目录，别在缓存根下建乱码目录
+  const bvHit = /(BV[0-9A-Za-z]{10})/.exec(String(key || ''))
+  const base = cleanKey(bvHit ? bvHit[1] : key)
   mkdirSync(CACHE, { recursive: true })
   // 同一个 BV 已经有目录（可能被 CLI 改成「BV_标题」）就用它，别建第二个兄弟目录（2026-10-26 审查 T01/T02）
   try {
@@ -687,7 +689,13 @@ function parseCommandLine(raw) {
   let cred = ''
   let badOut = false
   while (tokens.length) {
-    const t = tokens.shift()
+    let t = tokens.shift()
+    // T15-4：支持 --option=value（原来整串被当位置参数静默吞掉）
+    if (t.startsWith('--') && t.includes('=')) {
+      const eq = t.indexOf('=')
+      tokens.unshift(t.slice(eq + 1))
+      t = t.slice(0, eq)
+    }
     if (t === '--step' && tokens.length) {
       step = tokens.shift()
       extra.push('--step', step)
@@ -724,10 +732,10 @@ function parseCommandLine(raw) {
       positionals.push(t)
     }
   }
-  return { command, bv: positionals[0] || '', extra, step, cred, badOut }
+  return { command, bv: positionals[0] || '', positionals, extra, step, cred, badOut }
 }
 
-async function lookup({ command, bv, extra = [], badOut = false }) {
+async function lookup({ command, bv, positionals = [], extra = [], badOut = false }) {
   if (badOut) return { ok: false, text: '--out 只接受工作区内的相对路径（不能用绝对路径、盘符、~ 或 ..）' }
   if (!command || !COMMANDS.includes(command)) {
     return { ok: false, text: `用法：/bili <${COMMANDS.join('|')}> <BV> [--step 2] [--cred 凭证路径]` }
@@ -742,7 +750,9 @@ async function lookup({ command, bv, extra = [], badOut = false }) {
         ? ['login', ...extra]
         : command === 'hot'
           ? ['hot', ...extra]
-          : [command, bv, ...extra]
+          : command === 'comments' && String(positionals[1] || '').trim()
+            ? [command, bv, String(positionals[1]).trim(), ...extra]  // T34-P0-3：评论条数是第二个位置参数，别静默丢掉
+            : [command, bv, ...extra]
   const r = await runLook(args)
   // login 只生成二维码，真正的登录成功由面板 poll 写；命令层不记 lastRun，避免「生成成功」被读成「已登录」
   if (command !== 'login') writeLastRun(command, r.code)
@@ -774,8 +784,8 @@ function apply(ctx) {
       hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json|md|txt] [--out 文件（需配合 --format）]',
     },
     handler: async (invocation) => {
-      const { command, bv, extra, badOut } = parseCommandLine(invocation?.rawInput)
-      const r = await lookup({ command, bv, extra, badOut })
+      const { command, bv, positionals, extra, badOut } = parseCommandLine(invocation?.rawInput)
+      const r = await lookup({ command, bv, positionals, extra, badOut })
       return { kind: r.ok ? 'success' : 'error', text: trimForModel(r.text, command, bv) }
     },
   })

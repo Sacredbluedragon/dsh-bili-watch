@@ -579,7 +579,9 @@ async function cmdPeek(bv, opts = {}) {
 async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page = 1, scene = false } = {}) {
   const v = await viewOf(bv, page)
   const useStep = step > 0 ? step : autoStep(v.dur)
-  const dirTag = scene ? `scene-${useStep}s` : `${useStep}s`
+  // T34-P0-2：时长拿不到（0/异常）时别用 2 秒间隔——3 小时视频会抽几千帧
+  const safeStep = (v.dur > 0) ? safeStep : Math.max(safeStep, 10)
+  const dirTag = scene ? `scene-${safeStep}s` : `${safeStep}s`
   const dir = outDir || join(CACHE, 'frames', `${bv}-p${v.p}-${dirTag}`)
   // --out 指向用户目录时绝不整目录递归删：只覆盖本工具产物（下面会重下 mp4、清 jpg）
   // --fresh 的清理**必须等拿到锁之后**：锁外删会把别人刚写的 .lock 一起删掉，两个进程都以为持锁（2026-10-26 审查 T24）
@@ -588,13 +590,13 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   const jpgs = () => readdirSync(dir).filter((f) => f.endsWith('.jpg'))
   // 只有 manifest 说这批帧抽完了才算缓存有效；残帧（中途被打断）会重抽
   const m0 = readManifest(dir)
-  if (!fresh && m0?.ok && m0.step === useStep && m0.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
+  if (!fresh && m0?.ok && m0.step === safeStep && m0.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
   const lock = tryLock(dir)
   if (!lock) {
     for (let i = 0; i < 60; i++) {
       await sleep(1000)
       const m = readManifest(dir)
-      if (m?.ok && m.step === useStep && m.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
+      if (m?.ok && m.step === safeStep && m.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
     }
     throw new Error('同目录有另一个实例在抽帧，等不到结果')
   }
@@ -619,7 +621,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     let sceneTh = 0
     if (scene) {
       // 等间隔模式会抽多少帧，scene 模式就挑多少个变化点
-      const targetN = Math.max(3, Math.ceil(v.dur / useStep))
+      const targetN = Math.max(3, Math.ceil(v.dur / safeStep))
       for (const th of [0.3, 0.15, 0.08]) {
         const pts = sceneTimes(mp4, th, bin)
         if (pts.length >= targetN) { sceneTh = th; frameTimes = pickEvenly(pts, targetN); break }
@@ -638,12 +640,12 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     } else {
       // 默认等间隔
       const pattern = join(dir, `${bv}-%02d.jpg`)
-      execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: 300000 })
+      execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${safeStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: 300000 })
     }
 
     const n = jpgs().length
     if (!n) throw new Error('抽帧没产出图片（可能源流异常）')
-    writeManifest(dir, { ok: true, bv, p: v.p, step: useStep, scene, sceneTh: scene ? sceneTh : 0, frames: n })
+    writeManifest(dir, { ok: true, bv, p: v.p, step: safeStep, scene, sceneTh: scene ? sceneTh : 0, frames: n })
     return { dir, mp4, frames: n, sceneTh: scene ? sceneTh : 0 }
   } finally {
     unlock(lock)
@@ -1070,7 +1072,7 @@ async function cmdComments(bv, ps = 10, opts = {}) {
   if (format === 'json') {
     const payload = { ok: true, source: 'comments', bv, title: v.title, count: items.length, items }
     const s = JSON.stringify(payload, null, 2)
-    if (out) { writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
+    if (out) { try { mkdirSync(dirname(out), { recursive: true }) } catch {}; writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
     else process.stdout.write(s + '\n')
     return
   }
@@ -1133,7 +1135,7 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
     const items = all.map((x) => ({ time: x.t, mode: x.mode, size: x.size, color: x.color, text: x.text }))
     const payload = { ok: true, source: 'danmaku', bv, cid: v.cid, count: items.length, items }
     const s = JSON.stringify(payload, null, 2)
-    if (out) { writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
+    if (out) { try { mkdirSync(dirname(out), { recursive: true }) } catch {}; writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
     else process.stdout.write(s + '\n')
     return
   }
@@ -1793,12 +1795,12 @@ async function cmdText(bv, credPath, opts = {}) {
   say(`[track] 字幕: miss（${s.why}）`)
 
   // ② 本地 ASR 转写（无字幕时最靠谱，零 token；--fast 跳过，直接走画面）
-  if (!opts.fast && asrReady() && v.dur > 1800) {
-    say(`[track] 转写: skip（时长 ${fmtSec(v.dur)} 超过 30 分钟，转写会超时）`)
+  if (!opts.fast && asrReady() && v.dur > 900) {
+    say(`[track] 转写: skip（时长 ${fmtSec(v.dur)} 超过 15 分钟，转写会超时）`)
   }
   if (!opts.fast && asrReady() && v.dur <= 1800) {
-    say(`[track] 转写: 开始（faster-whisper，最多等 3 分钟）…`)
-    const a = await transcribe(bv, { timeoutMs: 180_000, p: v.p })
+    say(`[track] 转写: 开始（faster-whisper，最多等 4 分钟）…`)
+    const a = await transcribe(bv, { timeoutMs: 240_000, p: v.p })
     if (a.ok) {
       // 口播类正常 4–6 字/秒；低于 2 字/秒多半是背景音乐、外语歌或纯画面，
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
@@ -2152,7 +2154,7 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = 900_000 
       }
     } catch {}
     if (!text && existsSync(cacheTxt)) text = readFileSync(cacheTxt, 'utf8').trim()
-    if (!text) return { ok: false, why: `转写零字（stderr 末尾：${String(r.stderr || '').slice(-160)}）` }
+    if (!text) return { ok: false, why: `转写零字（stderr 末尾：${String(r.stderr || '').split(String.fromCharCode(10)).filter(Boolean).slice(-6).join(' | ').slice(-1200)}）` }
     return { ok: true, text, chars: text.length, verify }
   } catch (e) {
     return { ok: false, why: `转写失败：${String(e?.stderr ?? e?.message ?? e).slice(-200)}` }
