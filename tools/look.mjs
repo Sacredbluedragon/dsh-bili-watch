@@ -93,7 +93,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread)
 
 async function jget(url, headers = H, timeoutMs = 30000) {
-  const r = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
+  // T36-P1-2：只对网络层抖动重试一次（B 站偶发 ECONNRESET）；业务 code（-352/-404）不重试
+  let r
+  for (let attempt = 0; ; attempt++) {
+    try {
+      r = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
+      if (!(r.status >= 500) || attempt >= 1) break
+    } catch (e) {
+      if (attempt >= 1) throw e
+    }
+    await sleep(300 + Math.floor(Math.random() * 400))
+  }
   const t = await r.text()
   if (!r.ok) return { code: -r.status, message: `HTTP ${r.status}` }
   try {
@@ -1781,7 +1791,7 @@ async function cmdText(bv, credPath, opts = {}) {
       // 口播类正常 4–6 字/秒；低于 2 字/秒多半是背景音乐、外语歌或纯画面，
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
       const rate = v.dur > 0 ? a.chars / v.dur : 0
-      if (rate >= 2) {
+      if (rate >= 2 && !(a.verify && a.verify.suspect)) {
         // T40：ASR 也会把杂音/背景音听成字，主入口同样要过诱饵信号（原先只有字幕分支有）
         const asrBait = baitSignals(a.text, v, credibility(v, a.text))
         if (asrBait.suspect) {
@@ -1800,6 +1810,8 @@ async function cmdText(bv, credPath, opts = {}) {
         printText(a.text, opts, bv)
         done()
         return
+      } else if (a.verify && a.verify.suspect) {
+        say(`[track] 转写: ⚠ 疑似幻觉（${(a.verify.reasons || []).join('；')}），降级到抽帧/OCR`)
       }
       say(`[track] 转写: 质量低（${a.chars} 字，${rate.toFixed(1)} 字/秒），继续往下试`)
     } else {
