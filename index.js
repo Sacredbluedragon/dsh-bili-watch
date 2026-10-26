@@ -433,7 +433,11 @@ function pickFolderDialog() {
  * 缓存自动清理：先按天数删过期文件，再按总量从最旧删到阈值内。
  * 返回被删统计，供面板显示。
  */
-function autoCleanCache() {
+let lastCleanAt = 0
+
+function autoCleanCache(opts = {}) {
+  // T31-P2-6：面板每 8 秒轮询 /status，不许每次都全量 walk 缓存目录
+  if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true }
   if (!existsSync(CACHE)) return { removed: 0, bytes: 0 }
   const { days, maxMb } = cacheCfg()
   const cutoff = Date.now() - days * 86400000
@@ -466,6 +470,7 @@ function autoCleanCache() {
       if (total <= limit) break
     }
   }
+  lastCleanAt = Date.now()
   return { removed, bytes }
 }
 
@@ -756,7 +761,7 @@ async function lookup({ command, bv, extra = [], badOut = false }) {
 function apply(ctx) {
   // 启动时按「天数 + 总量阈值」清一次缓存，不点按钮也不会无限涨
   try {
-    const r = autoCleanCache()
+    const r = autoCleanCache({ force: true })
     if (r.removed) ctx.logger?.info?.(`[dsh-bili-watch] 自动清理缓存 ${r.removed} 个文件 / ${(r.bytes / 1048576).toFixed(1)} MB`)
   } catch {}
 
@@ -780,6 +785,7 @@ function apply(ctx) {
   try {
     if (createUserMessage && uiCfg().autoHint !== false) {
       const hinted = new Map() // message.id → true，同一条消息只提示一次
+      const HINT_CAP = 500 // T31-P2-5：常驻 Map 不能无限涨，满了整体清空（只影响重复提示）
       const hint = (msg) => {
         const { ok, text } = textOfUserMessage(msg)
         if (!ok) return null
@@ -806,6 +812,7 @@ function apply(ctx) {
             const extra = hint(msg)
             if (!extra) continue
             hinted.set(msg.id, true)
+            if (hinted.size > HINT_CAP) hinted.clear()
             fresh.push(extra)
           }
           if (!fresh.length) return decision

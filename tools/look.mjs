@@ -1376,6 +1376,18 @@ async function cmdSheet(bv, opts = {}) {
   mkdirSync(dirname(out), { recursive: true })
   execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], { stdio: 'ignore', timeout: 300000 })
   console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
+  // T42：九宫格没有时间轴，模型看图不知道「第几格是第几秒」；写一份 manifest 并打一行
+  const stepUsed = Number((/-([0-9]+)s$/.exec(r.dir) || [])[1] || opts.step || 0)
+  const cellSec = (f, i) => {
+    const m = /-([0-9]+)\.jpg$/.exec(f)
+    const n = m ? Number(m[1]) : i + 1
+    return stepUsed > 0 ? Math.max(0, (n - 1) * stepUsed) : null
+  }
+  const cells = picked.map((f, i) => { const sec = cellSec(f, i); return { cell: i + 1, file: basename(f), sec, mmss: sec == null ? '?' : fmtSec(sec) } })
+  try {
+    writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
+  } catch {}
+  console.log('每格时间：' + cells.map((x) => `#${x.cell}=${x.mmss}`).join('  '))
   console.log('读这张图就能过一遍画面；要精确读字用 ocr <BV>。')
 }
 
