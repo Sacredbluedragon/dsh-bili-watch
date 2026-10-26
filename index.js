@@ -11,11 +11,52 @@
  */
 import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
+// 工具输出上限：超了就把全文落文件、只回摘要。
+// 由来：2026-10-26 一段 14 分钟视频的字幕 4,449 字整段塞进上下文，把会话挤爆两次。
+const TOOL_TEXT_CAP = 2000
+const TOOL_TEXT_HEAD = 800
+
+function cleanKey(s) {
+  // 只留字母数字与 _ . -；挡掉 .. / . / Windows 保留设备名，避免输入直接决定磁盘路径
+  const k = String(s || '').replace(/[^\w.-]/g, '').replace(/^\.+$/, '').slice(0, 40)
+  if (!k || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(k)) return '_misc'
+  return k
+}
+
+/** 按视频分目录：CACHE/<BV>/<cmd>.txt —— 同一个视频各命令的输出收在一处 */
+function videoDir(key) {
+  const base = cleanKey(key)
+  mkdirSync(CACHE, { recursive: true })
+  // 同一个 BV 已经有目录（可能被 CLI 改成「BV_标题」）就用它，别建第二个兄弟目录（2026-10-26 审查 T01/T02）
+  try {
+    for (const d of readdirSync(CACHE)) {
+      if (d === base || d.startsWith(base + '_')) return join(CACHE, d)
+    }
+  } catch {}
+  const d = join(CACHE, base)
+  mkdirSync(d, { recursive: true })
+  return d
+}
+
+/** 长文本 → 落盘 + 摘要；短文本原样返回（不论长短都先落一份到缓存） */
+function trimForModel(text, tag = 'out', bv = '') {
+  const s = String(text ?? '')
+  let f = ''
+  try {
+    const name = String(tag || 'out').replace(/[^\w.-]/g, '') || 'out'
+    f = join(videoDir(bv), `${name}.tool.txt`) // .tool 后缀：别覆盖 CLI 落的同名全文
+    writeFileSync(f, s, 'utf8')
+  } catch { f = '' }
+  if (!f) return s // 落盘失败：原样返回，不截断（保护是 best-effort，正确性优先）
+  if (s.length <= TOOL_TEXT_CAP) return s
+  return `${s.slice(0, TOOL_TEXT_HEAD)}\n\n…（全文 ${s.length} 字，只回了前 ${TOOL_TEXT_HEAD} 字${f ? '；全文已存：' + f : ''}）\n要看完整版：用 read 工具打开上面的文件（别再跑一遍命令）；或换更细的 command 分段取。`
+}
+
 let defineTool = null
 try {
   ({ defineTool } = await import('@deepseek-ai/dsh-tools'))
@@ -60,7 +101,7 @@ const LAST_RUN = join(DEPS, 'last-run.json')
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > 系统临时目录。发布版不含本机路径。
 // 自定义目录不可写时不让功能哑掉：回退到临时目录，并把原因挂进 /status.warnings。
 function pickCacheDir() {
-  const want = process.env.BILI_WATCH_CACHE || depsCfg().cache || join(tmpdir(), 'bili-watch')
+  const want = process.env.BILI_WATCH_CACHE || depsCfg().cache || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch')
   try {
     mkdirSync(want, { recursive: true })
     const probe = join(want, `.write-test-${process.pid}`)
@@ -68,7 +109,7 @@ function pickCacheDir() {
     rmSync(probe, { force: true })
     return { dir: want, fallback: null }
   } catch (e) {
-    const fb = join(tmpdir(), 'bili-watch')
+    const fb = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch')
     try { mkdirSync(fb, { recursive: true }) } catch {}
     return { dir: fb, fallback: String(e?.message || e) }
   }
@@ -665,6 +706,10 @@ function parseCommandLine(raw) {
       else extra.push('--out', out)
     } else if (t === '--ffmpeg' && tokens.length) {
       extra.push('--ffmpeg', tokens.shift())
+    } else if (t === '--head' && tokens.length) {
+      extra.push('--head', tokens.shift())
+    } else if (t === '--full' || t === '--verify') {
+      extra.push(t)
     } else if (t === '--format' && tokens.length) {
       extra.push('--format', tokens.shift())
     } else if (t === '--fresh' || t === '--ocr' || t === '--poll' || t === '--check' || t === '--fast' || t === '--scene' || t === '--mark-seen') {
@@ -696,7 +741,8 @@ async function lookup({ command, bv, extra = [], badOut = false }) {
   const r = await runLook(args)
   // login 只生成二维码，真正的登录成功由面板 poll 写；命令层不记 lastRun，避免「生成成功」被读成「已登录」
   if (command !== 'login') writeLastRun(command, r.code)
-  const text = (r.out || r.err || '').trim() || '（没有输出）'
+  const body = (r.out || r.err || '').trim()
+  const text = body || `（${command} 没有输出，退出码 ${r.code ?? '?'}；完整日志看 bili-watch 的 stderr）`
   return { ok: r.code === 0, text }
 }
 
@@ -718,7 +764,7 @@ function apply(ctx) {
     handler: async (invocation) => {
       const { command, bv, extra, badOut } = parseCommandLine(invocation?.rawInput)
       const r = await lookup({ command, bv, extra, badOut })
-      return { kind: r.ok ? 'success' : 'error', text: r.text }
+      return { kind: r.ok ? 'success' : 'error', text: trimForModel(r.text, command, bv) }
     },
   })
 
@@ -841,7 +887,7 @@ function apply(ctx) {
           text: { type: 'string', description: '输出文本' },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '').slice(0, 24000) }],
+      render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '').slice(0, 2500) }],
     },
     execute: async (args) => {
       const extra = []
@@ -864,13 +910,13 @@ function apply(ctx) {
       }
       if (args.command === 'hot') {
         const r = await lookup({ command: 'hot', bv: '', extra })
-        return { ok: r.ok, text: r.text }
+        return { ok: r.ok, text: trimForModel(r.text, 'hot', '_hot') }
       }
       const target = args.command === 'search' ? String(args.keyword ?? '').trim() : String(args.bv ?? '').trim()
       if (args.command === 'search' && !target) return { ok: false, text: 'search 需要 keyword 参数（要搜什么词）' }
       if (!target) return { ok: false, text: '缺少 BV 号或分享链接' }
       const r = await lookup({ command: args.command, bv: target, extra })
-      return { ok: r.ok, text: r.text }
+      return { ok: r.ok, text: trimForModel(r.text, args.command, target) }
     },
   }))
   } else {

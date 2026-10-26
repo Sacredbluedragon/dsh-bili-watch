@@ -19,6 +19,8 @@
  *                                      下载 360p 抽帧；加 --ocr 顺带识别画面文字
  *   node look.mjs ocr <BV> [--step 2]  抽帧 + RapidOCR 出文字（不读图）
  *   node look.mjs text <BV> [--cred 凭证]  四级链：字幕 → ASR → OCR，输出最可信的一份文本
+ *                                      超过 800 字只给开头 400 字摘要，全文落 <缓存目录>/<BV>/<命令>.txt
+ *                                      （--head N 自定义摘要长度，--full 打全文）
  *   node look.mjs peek <BV>            先看标题/简介/热评 + 5 帧 OCR
  *   node look.mjs clean                清空 %TEMP%\bili-watch
  *
@@ -32,7 +34,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join, dirname, basename } from 'node:path'
 import * as zlib from 'node:zlib'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -60,7 +62,9 @@ const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || depsCfg.ffmpeg || ''
 const FFMPEG_HINT =
   '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > 系统临时目录（与 index.js 同一口径）。
-const CACHE = process.env.BILI_WATCH_CACHE || depsCfg.cache || join(tmpdir(), 'bili-watch')
+const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
+// 缓存根：环境变量 / 插件配置优先，兜底落 DSH_HOME。曾用 tmpdir，会跟着临时清理一起没（2026-10-26 改）
+const CACHE = process.env.BILI_WATCH_CACHE || depsCfg.cache || join(DSH_HOME, 'bili-watch')
 const require = createRequire(import.meta.url)
 const CRED_FILE = join(DEPS, 'credential.json')
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')
@@ -291,6 +295,63 @@ function speedScore(subText, durSec) {
   const ok = rate >= 2.0 && rate <= 8.5
   return { ok, rate: Math.round(rate * 10) / 10, why: ok ? '' : `${rate.toFixed(1)} 字/秒，超出 2.0–8.5 正常口播区间` }
 }
+// ── 反钓鱼自查（2026-10-26 加，来源 BV19bna6NE7i 那类实验）──────────────
+// 有些视频的标题/简介/字幕是故意错配的诱饵（画面放歌词、字幕讲假的日报），
+// 只读字幕就会复述一套不存在的内容。默认不抽帧，只有字幕自己露出马脚才付抽帧成本。
+const BAIT_WORD = /实验说明|实验\s*\d+\s*[/／]\s*\d+|这是实验|钓鱼视频|钓鱼视频|测试视频|诱饵| bait\b/i
+
+function bigramSet(s) {
+  const t = String(s || '').replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+  const set = new Set()
+  for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2))
+  return set
+}
+
+/** 可疑判据：语速不在口播区间、字幕自称实验/钓鱼，任一命中；关键词命中率低只在语速也异常时作为补充理由。 */
+function baitSignals(text, v, c) {
+  const reasons = []
+  let speedBad = false
+  if (c?.sp && typeof c.sp.rate === 'number' && Number.isFinite(c.sp.rate)) {
+    if (c.sp.rate < 2.0) { reasons.push(`语速 ${c.sp.rate} 字/秒（低于口播常见的 2–8.5）`); speedBad = true }
+    else if (c.sp.rate > 8.5) { reasons.push(`语速 ${c.sp.rate} 字/秒（高于口播常见的 2–8.5）`); speedBad = true }
+  }
+  if (BAIT_WORD.test(String(text || ''))) reasons.push('字幕自称「实验/钓鱼」')
+  // 命中率不能单独触发：ASR 常把英文读成中文谐音（DeepSeek→deep sick），
+  // 正常视频也会低命中（2026-10-26 实测 BV19dJQ6sE9F 命中 2/13、语速 5 字/秒）。
+  if (speedBad && c?.ks && c.ks.total >= 8 && c.ks.hit / c.ks.total < 0.3) {
+    reasons.push(`关键词只命中 ${c.ks.hit}/${c.ks.total}（字幕和标题/UP 对不上）`)
+  }
+  return { suspect: reasons.length > 0, reasons }
+}
+
+/** 可疑时抽 5 帧（复用 peek 的缓存）+ OCR，拿画面文字跟字幕对一遍。 */
+async function checkBaitFrames(bv, v, subtitleText, opts = {}) {
+  if (!ocrReady()) return { ok: false, why: 'OCR 环境不可用，核实不了画面' }
+  try {
+    const r = await peekFrames(bv, v, { ffmpeg: opts.ffmpeg })
+    const lines = await peekOcrLines(r.dir)
+    if (!lines || !lines.length) return { ok: false, why: '画面里没 OCR 出字' }
+    const frameText = lines.map((x) => x.text || '').join(' ')
+    const first = String(lines.map((x) => String(x?.text || '').trim()).find(Boolean) || '')
+    const a = bigramSet(subtitleText)
+    const b = bigramSet(frameText)
+    const small = Math.min(a.size, b.size)
+    const shared = small ? [...a].filter((g) => b.has(g)).length : 0
+    const overlap = small ? shared / small : 0
+    return {
+      ok: true,
+      overlap,
+      first,
+      flagFirst: BAIT_WORD.test(first),
+      frameText: frameText.slice(0, 400),
+      dir: r.dir,
+      cached: !!r.cached,
+    }
+  } catch (e) {
+    return { ok: false, why: `抽帧/OCR 失败：${String(e?.message ?? e).slice(0, 160)}` }
+  }
+}
+
 function credibility(v, text) {
   const sp = speedScore(text, v.dur)
   const ks = keywordScore(text, extractKeywords(v.title, v.owner))
@@ -472,6 +533,8 @@ async function cmdPeek(bv, opts = {}) {
   console.log(`视频: ${v.title}`)
   console.log(`UP: ${v.owner}  时长 ${fmtSec(v.dur)}  播放 ${v.view ?? '?'}  评论 ${v.reply ?? '?'}${pTag}`)
   if (v.desc) console.log(`简介: ${v.desc.replace(/\s+/g, ' ').slice(0, 260)}`)
+  // 目录名带标题（view 通常最先跑，正好把目录定下来）
+  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error("[meta-debug]", e.message) }
   const c = await topComments(v.aid, 5)
   if (c.ok && c.list.length) {
     console.log('\n热评:')
@@ -508,8 +571,8 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   const useStep = step > 0 ? step : autoStep(v.dur)
   const dirTag = scene ? `scene-${useStep}s` : `${useStep}s`
   const dir = outDir || join(CACHE, 'frames', `${bv}-p${v.p}-${dirTag}`)
-  // --out 指向用户目录时绝不整目录递归删：只覆盖本工具产物（下面 :505/:506 会重下 mp4、清 jpg）
-  if (fresh && !outDir && existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  // --out 指向用户目录时绝不整目录递归删：只覆盖本工具产物（下面会重下 mp4、清 jpg）
+  // --fresh 的清理**必须等拿到锁之后**：锁外删会把别人刚写的 .lock 一起删掉，两个进程都以为持锁（2026-10-26 审查 T24）
   mkdirSync(dir, { recursive: true })
   const mp4 = join(dir, `${bv}.mp4`)
   const jpgs = () => readdirSync(dir).filter((f) => f.endsWith('.jpg'))
@@ -526,6 +589,12 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     throw new Error('同目录有另一个实例在抽帧，等不到结果')
   }
   try {
+    if (fresh && !outDir) {
+      for (const e of readdirSync(dir)) {
+        if (e === '.lock') continue // 锁留着，只清产物
+        try { rmSync(join(dir, e), { recursive: true, force: true }) } catch {}
+      }
+    }
     const p = await jget(
       `https://api.bilibili.com/x/player/playurl?avid=${v.aid}&cid=${v.cid}&qn=16&fnval=1&platform=html5&fourk=0`,
     )
@@ -745,6 +814,8 @@ async function cmdView(bv, p = 1) {
   console.log(`UP: ${v.owner} (mid ${v.ownerMid})  时长 ${fmtSec(v.dur)}  播放 ${v.view ?? '?'}  评论 ${v.reply ?? '?'}${pTag}`)
   console.log(`aid=${v.aid} cid=${v.cid}`)
   if (v.desc) console.log(`简介: ${v.desc.replace(/\s+/g, ' ').slice(0, 300)}`)
+  // 目录名带标题（view 常是第一个跑的，正好把目录定下来）
+  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error('[meta-debug]', e.message) }
   const c = await topComments(v.aid, 5)
   if (c.ok && c.list.length) {
     console.log('\n热评:')
@@ -913,7 +984,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
       if (out) {
         writeFileSync(out, text, 'utf8')
         say(`✓ 已写入 ${out}（${usable} 条，官方时间戳）`)
-      } else console.log(text)
+      } else printText(text, { ...opts, dataOnly: true }, bv, 'sub-srt')
       return
     }
     if (format === 'txt') {
@@ -921,7 +992,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
       if (out) {
         writeFileSync(out, r.text, 'utf8')
         say(`✓ 已写入 ${out}（${r.count} 行，纯文本）`)
-      } else console.log(r.text)
+      } else printText(r.text, { ...opts, dataOnly: true }, bv, 'sub-txt')
       return
     }
     if (format === 'md') {
@@ -929,7 +1000,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
       if (out) {
         writeFileSync(out, r.text, 'utf8')
         say(`✓ 已写入 ${out}（${r.count} 条，时间戳可跳回原片）`)
-      } else console.log(r.text)
+      } else printText(r.text, { ...opts, dataOnly: true }, bv, 'sub-md')
       return
     }
     const payload = {
@@ -942,7 +1013,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
     if (out) {
       writeFileSync(out, text, 'utf8')
       say(`✓ 已写入 ${out}（${payload.cues.length} 条）`)
-    } else console.log(text)
+    } else printText(text, { ...opts, dataOnly: true }, bv, 'sub-json')
     return
   }
   const c = credibility(v, s.text)
@@ -954,7 +1025,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
   say(
     `  提示 · 关键词重合 ${c.ks.hit}/${c.ks.total}${c.ks.hits.length ? `（${c.ks.hits.join('、')}）` : ''}${c.ks.hit === 0 ? '（零命中，可能标题与主题词不同）' : ''}`,
   )
-  console.log(`\n字幕全文：\n${s.text}`)
+  printText(s.text, opts, bv, 'sub')
 }
 
 async function cmdComments(bv, ps = 10, opts = {}) {
@@ -1204,7 +1275,7 @@ async function cmdAsr(bv, p = 1, ffmpeg = '') {
   }
   const vf = r.verify
   const tag = vf ? (vf.suspect ? '⚠ 疑似幻觉' : '✓ 可信') : ''
-  console.log(`\n转写 ${r.chars} 字${tag ? `（${tag}）` : ''}：\n${r.text}`)
+  printText(r.text, { head: opt('head'), full: flag('full') }, bv, 'asr')
   if (vf?.suspect) {
     console.log(`\n⚠ 转写可信度存疑：${vf.reasons.join('；')}`)
     console.log('  可能是 ASR 在没人声时填的模板句，别当台词用；要确认先抽帧看画面或跑 OCR。')
@@ -1233,7 +1304,7 @@ async function cmdFrames(bv, opts = {}) {
     }
     console.log('\nOCR 识别画面文字…')
     const text = await runOcr(r.dir)
-    console.log(text || '（画面里没识别到文字）')
+    printText(text || '（画面里没识别到文字）', opts, bv, 'ocr-frames')
   }
 }
 
@@ -1247,7 +1318,7 @@ async function cmdOcr(bv, opts = {}) {
   console.log(`抽帧目录: ${r.dir}${r.cached ? '（复用）' : ''}`)
   console.log('OCR 识别画面文字…\n')
   const text = await runOcr(r.dir)
-  console.log(text || '（画面里没识别到文字）')
+  printText(text || '（画面里没识别到文字）', opts, bv, 'ocr')
 }
 
 // ── 拼图：N 帧拼一张，比逐帧读省好几倍 ──
@@ -1456,6 +1527,111 @@ function markSeen(bv, title) {
 }
 
 /** 四级链：字幕 → ASR → 抽帧 OCR。输出最可信的一份文本。 */
+const TEXT_LIMIT = 800 // 超过这个字数就不往终端打，落盘 + 给路径（上下文保护）
+
+/**
+ * 打印或落盘：
+ *   ≤800 字直接打全文；超过就只给摘要（开头 400 字）＋总字数＋落盘路径。
+ *   --head N 指定摘要长度；--full 强制打全文。
+ *   全文总是落盘到 CACHE/<BV>/<kind>.txt，深读直接 read 那个文件。
+ */
+function cleanKey(s) {
+  // 只留字母数字与 _ . -；挡掉 .. / . / Windows 保留设备名，避免输入直接决定磁盘路径
+  const k = String(s || '').replace(/[^\w.-]/g, '').replace(/^\.+$/, '').slice(0, 40)
+  if (!k || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(k)) return '_misc'
+  return k
+}
+
+/** 按视频分目录：CACHE/<BV>/<kind>.txt —— 同一个视频识别到的各层都收在同一个文件夹里 */
+function videoDir(bv) {
+  const base = cleanKey(bv)
+  mkdirSync(CACHE, { recursive: true })
+  // 同一个 BV 已经有目录（可能带标题后缀）就用它，别建第二个
+  try {
+    for (const d of readdirSync(CACHE)) {
+      if (d === base || d.startsWith(base + '_')) return join(CACHE, d)
+    }
+  } catch {}
+  const d = join(CACHE, base)
+  mkdirSync(d, { recursive: true })
+  return d
+}
+
+/** 拿到标题后把目录改成「BV_标题」，人一眼能认；改名失败就用原目录 */
+/** 目录名用的标题片段：保留中文与字母数字，只去掉路径非法字符（cleanKey 会把中文删光，不能复用） */
+function slugTitle(s) {
+  return String(s || '')
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/[\u0000-\u001f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 20)
+}
+
+function nameVideoDir(bv, title) {
+  const dir = videoDir(bv)
+  const base = cleanKey(bv)
+  if (!title || basename(dir) !== base) return dir
+  const slug = slugTitle(title)
+  if (!slug) return dir
+  const nice = join(dirname(dir), `${base}_${slug}`)
+  try { renameSync(dir, nice); return nice } catch { return dir }
+}
+
+/** 每个视频目录一份 meta.json：是哪条视频、什么时候抓的、抓了哪些文件各多少字节 */
+function writeMeta(bv, extra = {}, dirHint = '') {
+  const dir = dirHint || videoDir(bv)
+  const p = join(dir, 'meta.json')
+  let meta = {}
+  try { meta = JSON.parse(readFileSync(p, 'utf8')) } catch {}
+  Object.assign(meta, { bv, updatedAt: new Date().toISOString() }, extra)
+  if (!meta.createdAt) meta.createdAt = meta.updatedAt
+  try {
+    meta.files = readdirSync(dir)
+      .filter((f) => f !== 'meta.json')
+      .map((f) => ({ name: f, bytes: statSync(join(dir, f)).size }))
+    writeFileSync(p, JSON.stringify(meta, null, 2) + '\n', 'utf8')
+  } catch {}
+  return dir
+}
+
+function printText(text, opts, bv, kind = 'text') {
+  const full = String(text || '').trim()
+  if (!full) return
+  // 数据模式（--format json/srt/md/txt 且没给 --out）：stdout 只许有数据，不截断、不落盘、不打提示
+  if (opts && opts.dataOnly) { process.stdout.write(full + (full.endsWith('\n') ? '' : '\n')); return }
+  let file = ''
+  try {
+    file = join(videoDir(bv), `${kind}.txt`)
+    writeFileSync(file, full, 'utf8')
+  } catch { file = '' }
+  if (file) { try { writeMeta(bv, { [`${kind}Chars`]: full.length }) } catch {} }
+  if (!file) {
+    // 缓存目录不可写：宁可变长也不丢内容
+    console.log(`\n${full}`)
+    console.error('⚠ 全文落盘失败（缓存目录不可写），已直接打印全文；检查 BILI_WATCH_CACHE 或 deps 里的 cache')
+    return
+  }
+  const head = Number(opts.head) > 0 ? Number(opts.head) : 0
+  if (opts.full) {
+    console.log(`\n${full}`)
+    if (file) console.log(`[text] 全文 ${full.length} 字（--full）`)
+    return
+  }
+  if (head) {
+    console.log(`\n${full.slice(0, head)}`)
+    console.log(`\n[text] 全文 ${full.length} 字，这里给前 ${head} 字；全文：${file || '（落盘失败）'}`)
+    return
+  }
+  if (full.length <= TEXT_LIMIT) { console.log(`\n${full}`); return }
+  const brief = 400
+  console.log(`\n${full.slice(0, brief)}`)
+  console.log(`\n…（全文 ${full.length} 字，这里只给开头 ${brief} 字）`)
+  if (file) console.log(`全文已存：${file}`)
+  console.log('要看更多：--head 1200 给前 1200 字；--full 打全文')
+  if (file) console.log(`模型/agent：直接 read ${file} 拿全文，别再跑一遍命令`)
+}
+
 async function cmdText(bv, credPath, opts = {}) {
   QUIET = opts.format === 'json' || opts.format === 'md'
   const t0 = Date.now()
@@ -1481,6 +1657,26 @@ async function cmdText(bv, credPath, opts = {}) {
   }
   if (s.ok) {
     const c = credibility(v, s.text)
+    const bait = baitSignals(s.text, v, c)
+    let check = null
+    if (bait.suspect) {
+      // 默认只提示、不抽帧：语速异常在 MV / 音乐 / 风景片里很常见，
+      // 自动下载整片核对等于给常态任务加十几秒成本。要看画面加 --verify。
+      say(`[track] ⚠ 字幕可疑：${bait.reasons.join('；')}${opts.verify ? '' : '（要看画面加 --verify）'}`)
+      if (opts.verify) {
+        say('[track] 抽帧核对画面…')
+        check = await checkBaitFrames(bv, v, s.text, opts)
+        if (!check.ok) {
+          say(`[track] ⚠ 画面核对做不了：${check.why}（字幕仍给，但请自己看画面）`)
+        } else if (check.flagFirst) {
+          say(`[track] ⚠⚠ 首帧写着「${check.first.slice(0, 60)}」——这是实验/钓鱼片，字幕和简介都可能是饵`)
+        } else if (check.overlap < 0.05) {
+          say(`[track] ⚠⚠ 画面文字跟字幕几乎不重合（重合度 ${(check.overlap * 100).toFixed(1)}%，首帧「${check.first.slice(0, 50)}」）`)
+        } else {
+          say(`[track] 画面核对：重合度 ${(check.overlap * 100).toFixed(1)}%，未见诱饵迹象`)
+        }
+      }
+    }
   // 信道优先：官方字幕能拿到就是可信内容，语速/关键词只作提示，不拦
   // 口径差异（有意）：自动化选片链路会把「语速/关键词不合格」当硬拦，
   // 这里是人看的排查通道，取到就用、质量交给调用方判断。同一判据两种策略，别当 bug 报。
@@ -1491,12 +1687,13 @@ async function cmdText(bv, credPath, opts = {}) {
       timeline: { exact: true, source: 'official-subtitle' },
       cues: (s.cues || []).map((c) => ({ from: Number(c?.from ?? 0), to: Number(c?.to ?? 0), content: String(c?.content ?? '') })),
       text: s.text,
+      warnings: check ? { suspect: bait.suspect, reasons: bait.reasons, ...check } : undefined,
     })) {
       done()
       return
     }
     say(`[track] ${via}: ok ${s.text.length} 字（语速 ${c.sp.rate ?? '?'} 字/秒，关键词 ${c.ks.hit}/${c.ks.total}）`)
-    console.log(`\n${s.text}`)
+    printText(s.text, opts, bv)
     done()
     return
   }
@@ -1524,7 +1721,7 @@ async function cmdText(bv, credPath, opts = {}) {
           return
         }
         say(`[track] 转写: ok ${a.chars} 字（${rate.toFixed(1)} 字/秒${a.cached ? '，缓存命中' : ''}；机器转写，专有名词可能有错）`)
-        console.log(`\n${a.text}`)
+        printText(a.text, opts, bv)
         done()
         return
       }
@@ -1554,7 +1751,7 @@ async function cmdText(bv, credPath, opts = {}) {
         return
       }
       say(`[track] 画面 OCR: ok（${r.dir}；这是画面上的字，不是口播内容）`)
-      console.log(`\n${text}`)
+      printText(text, opts, bv)
       done()
       return
     }
@@ -1579,7 +1776,7 @@ async function cmdText(bv, credPath, opts = {}) {
 const argv = process.argv.slice(2)
 const cmd = argv[0]
 // 带值的选项：解析位置参数时必须跳过它们的值，否则 `hot --limit 2` 会把 "2" 当成 BV
-const VALUE_OPTS = new Set(['cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format'])
+const VALUE_OPTS = new Set(['cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head'])
 function positional(list) {
   const out = []
   for (let i = 0; i < list.length; i++) {
@@ -1941,8 +2138,7 @@ async function runGeneric(cmd, src, opts = {}) {
     const r = await transcribeLocal(dl.path, tag, { timeoutMs: cmd === 'text' ? 180_000 : 900_000 })
     if (!r.ok) { console.error(`✗ ${r.why}`); process.exit(1) }
     console.log(`\n转写 ${r.chars} 字：${r.cached ? '（缓存命中）' : ''}`)
-    if (cmd === 'text') console.log(`\n${r.text.slice(0, 6000)}`)
-    else console.log(`\n${r.text}`)
+    printText(r.text, {}, tag, cmd === 'text' ? 'text' : 'asr')
     return
   }
 }
@@ -1973,11 +2169,13 @@ const HELP = `用法:
   node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2]   N 帧拼一张九宫格（仅 B 站）
   node look.mjs substrip <BV或链接> [--step 7]          底部字幕带竖拼一张图（仅 B 站）
   node look.mjs ocr <BV或链接> [--step 2]     抽帧 + OCR 出文字（仅 B 站）
-  node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--format json] [--out 文件]
+  node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--verify] [--head N] [--full] [--format json] [--out 文件]
   node look.mjs login [--poll] [--check]    扫码登录，拿 AI 字幕用的本地凭证
   node look.mjs clean
 
   多 P 视频加 --p N 指定第几个分P（默认 P1）。
+  --verify：text 拿到字幕后，若字幕可疑（语速不在 2–8.5 字/秒、关键词命中过低、字幕自称实验/钓鱼）
+            再加抽帧 OCR 核对画面，报「字幕与画面不重合」；不加只打一行提示，不花抽帧时间。
   --format：sub 支持 text|srt|json|md|txt（srt/md 带真时间戳，md 的时间戳可跳回原片，txt 是一行一句）；
   text 支持 text|json|md（json 带时间轴口径：字幕 exact / 转写与 OCR 是估算）；
   comments 与 danmaku 支持 json（stdout 只有 JSON，可接 jq）。
@@ -2004,7 +2202,7 @@ try {
   } else if (cmd === 'view') {
     await cmdView(BV, P)
   } else if (cmd === 'sub') {
-    await cmdSub(BV, CRED, P, { format: opt('format') || 'text', out: opt('out') || '' })
+    await cmdSub(BV, CRED, P, { format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full') })
   } else if (cmd === 'comments') {
     await cmdComments(BV, Number(pos[2] || 10), { format: opt('format') || 'text', out: opt('out') || '' })
   } else if (cmd === 'danmaku') {
@@ -2020,7 +2218,7 @@ try {
   } else if (cmd === 'ocr') {
     await cmdOcr(BV, { step: STEP, p: P })
   } else if (cmd === 'text') {
-    await cmdText(BV, CRED, { step: STEP, p: P, fast: flag('fast'), mark: flag('mark-seen'), format: opt('format') || 'text', out: opt('out') || '' })
+    await cmdText(BV, CRED, { step: STEP, p: P, fast: flag('fast'), mark: flag('mark-seen'), verify: flag('verify'), format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full') })
   } else if (cmd === 'clean') {
     if (existsSync(CACHE)) {
       rmSync(CACHE, { recursive: true, force: true })
