@@ -28,7 +28,9 @@ const check = (name, fn) => {
 }
 const must = (cond, msg) => { if (!cond) throw new Error(msg) }
 // 依赖网络的断言默认跳过：网络抖动不该让守卫变红（静态断言永远可跑）。VERIFY_ONLINE=1 才联网验。
-const skip = (name, why) => results.push({ name, ok: true, skip: true, detail: why })
+// C1（2026-10-27 批次8）：skip 以前记成 ok:true——汇总把跳过当通过，「8/8 通过」是虚的。
+//   现在记成 ok:false + skip:true，汇总时单独数跳过，不再混进通过数，也不算失败。
+const skip = (name, why) => results.push({ name, ok: false, skip: true, detail: why })
 const online = process.env.VERIFY_ONLINE === "1"
 
 // —— 静态断言 ——
@@ -40,7 +42,7 @@ check('版本号不是 0.2.22（P0：sync-release 会把新版覆盖成旧版）
 
 check('--fresh 的删除在 tryLock 之后（P0：锁外删会删掉别人的 .lock）', () => {
   const t = read('tools/look.mjs')
-  const iLock = t.indexOf('const lock = tryLock(dir)')
+  const iLock = t.indexOf('await tryLock(dir)')
   const iFresh = t.indexOf("if (fresh && !outDir) {\n      for (const e of readdirSync(dir))")
   must(iLock > 0, '找不到 tryLock')
   must(iFresh > 0, '找不到锁内的 fresh 清理块')
@@ -98,12 +100,14 @@ if (!online) {
   skip('sub --format json 纯 JSON', '联网断言，设 VERIFY_ONLINE=1 才跑')
 }
 
-// —— 汇总 ——
-let bad = 0
+// —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
+let pass = 0, fail = 0, skipN = 0
 for (const r of results) {
-  if (!r.ok) bad++
+  if (r.skip) skipN++
+  else if (r.ok) pass++
+  else fail++
   const tag = r.skip ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'
   console.log(`${tag}  ${r.name}${r.detail ? '  —  ' + r.detail : ''}`)
 }
-console.log(`\n${results.length - bad}/${results.length} 通过`)
-process.exit(bad ? 1 : 0)
+console.log(`\n${pass} 通过 / ${fail} 失败 / ${skipN} 跳过`)
+process.exit(fail ? 1 : 0)

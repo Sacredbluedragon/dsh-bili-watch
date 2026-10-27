@@ -21,12 +21,20 @@
     · -DryRun 只打印将执行的命令，不下载不写盘。
     · 国内网络用 -Mirror cn：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror。
     · ffmpeg 来源是 BtbN 的 latest 构建，版本随上游变化，不锁具体版本。
+    · pip 包锁死三版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
+      rapidocr-onnxruntime==1.2.3。yt-dlp 不锁版本，必须跟上游走。
+    · 二进制不锁版本，但装完会把 ffmpeg -version 首行与 yt-dlp --version 记进
+      deps\last-run.json（便于对账；该文件同时是运行时记录，下次跑 CLI 会被覆盖）。
+    · -VerifyHash：可选开关。不传则跳过哈希校验；传了则在下载完成后打印每个二进制
+      的 SHA256 摘要（仓库暂不内置期望摘要，仅打印供人工比对，不据此失败）。
+    · curl.exe 强制 https（--proto =https --proto-redir =https），不允许明文 http 跳转。
 #>
 param(
   [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model')]
   [string]$Target = 'all',
   [switch]$Force,
   [switch]$DryRun,
+  [switch]$VerifyHash,
   [ValidateSet('auto', 'cn', 'global')]
   [string]$Mirror = 'auto'
 )
@@ -49,18 +57,22 @@ function Write-Skip([string]$msg) { Write-Host "    $msg（已存在，跳过；
 
 function Invoke-Download([string]$url, [string]$out, [string]$label) {
   if ($DryRun) {
-    Write-Host "    [dry-run] curl.exe -L --fail -o `"$out`" `"$url`""
+    Write-Host "    [dry-run] curl.exe -L --fail --proto =https --proto-redir =https -o `"$out`" `"$url`""
     return
   }
   $tmp = "$out.part"
   if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
   Write-Host "    下载 $label ..."
-  & curl.exe -L --fail --retry 3 --connect-timeout 20 -o $tmp $url
+  & curl.exe -L --fail --proto =https --proto-redir =https --retry 3 --connect-timeout 20 -o $tmp $url
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
     throw "下载失败：$url"
   }
   Move-Item -LiteralPath $tmp -Destination $out -Force
+  if ($VerifyHash) {
+    $h = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash
+    Write-Host "    SHA256($label) = $h"
+  }
 }
 
 function Ensure-Ffmpeg {
@@ -122,17 +134,17 @@ function Ensure-Asr {
     Write-Host '    venv 存在但 faster_whisper 不可用，重建' -ForegroundColor Yellow
     Remove-Item -LiteralPath $venv -Recurse -Force
   }
-  Write-Step 'ASR 环境（deps\.venv-asr + faster-whisper）'
+  Write-Step 'ASR 环境（deps\.venv-asr + faster-whisper==1.2.1）'
   if ($DryRun) {
     Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
-    Write-Host "    [dry-run] `"$py`" -m pip install faster-whisper -i $PyIndex"
+    Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" -i $PyIndex"
     return
   }
   $sysPy = Get-SystemPython
   & $sysPy -m venv $venv
   if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
   & $py -m pip install --upgrade pip -i $PyIndex
-  & $py -m pip install faster-whisper -i $PyIndex
+  & $py -m pip install "faster-whisper==1.2.1" "av==15.1.0" -i $PyIndex
   if ($LASTEXITCODE -ne 0) {
     # 本次失败立刻清掉半成品，别留给下次 Skip 继续踩
     Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
@@ -150,17 +162,17 @@ function Ensure-Ocr {
     Write-Host '    venv 存在但 rapidocr_onnxruntime 不可用，重建' -ForegroundColor Yellow
     Remove-Item -LiteralPath $venv -Recurse -Force
   }
-  Write-Step 'OCR 环境（deps\.venv-ocr + rapidocr-onnxruntime）'
+  Write-Step 'OCR 环境（deps\.venv-ocr + rapidocr-onnxruntime==1.2.3）'
   if ($DryRun) {
     Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
-    Write-Host "    [dry-run] `"$py`" -m pip install rapidocr-onnxruntime -i $PyIndex"
+    Write-Host "    [dry-run] `"$py`" -m pip install `"rapidocr-onnxruntime==1.2.3`" -i $PyIndex"
     return
   }
   $sysPy = Get-SystemPython
   & $sysPy -m venv $venv
   if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
   & $py -m pip install --upgrade pip -i $PyIndex
-  & $py -m pip install rapidocr-onnxruntime -i $PyIndex
+  & $py -m pip install "rapidocr-onnxruntime==1.2.3" -i $PyIndex
   if ($LASTEXITCODE -ne 0) {
     Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
     throw '安装 rapidocr-onnxruntime 失败（已删除半成品 venv，重跑即可重试）'
@@ -186,6 +198,35 @@ function Ensure-Model {
   & $asrPy -c "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"
   if ($LASTEXITCODE -ne 0) { throw '模型下载失败' }
   Write-Host "    ✓ $hfHome"
+}
+
+# 二进制不锁版本，但记录实际装到的版本：ffmpeg -version 首行 + yt-dlp --version。
+# 2026-10-26 收口（DSH 拍板拆文件）：只写 deps\last-bin.json（装包版本快照），不碰 deps\last-run.json
+# （运行排障记录，只由 index.js 写）。两个文件互不 read-modify-write 对方。
+function Record-BinaryVersions {
+  if ($DryRun) {
+    Write-Host "    [dry-run] 记录 ffmpeg -version 首行 与 yt-dlp --version 到 deps\last-bin.json"
+    return
+  }
+  $record = [ordered]@{
+    ffmpeg    = '<未获取>'
+    ytDlp     = '<未获取>'
+    at        = (Get-Date).ToString('o')
+  }
+  $ff = Join-Path $Deps 'ffmpeg.exe'
+  if (Test-Path -LiteralPath $ff) {
+    try { $v = (& $ff -version 2>&1 | Select-Object -First 1) } catch { $v = '<获取失败>' }
+    $record['ffmpeg'] = "$v"
+  }
+  $yt = Join-Path $Deps 'yt-dlp.exe'
+  if (Test-Path -LiteralPath $yt) {
+    try { $v = (& $yt --version 2>&1 | Select-Object -First 1) } catch { $v = '<获取失败>' }
+    $record['ytDlp'] = "$v"
+  }
+  $out = Join-Path $Deps 'last-bin.json'
+  $json = $record | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText($out, $json, (New-Object Text.UTF8Encoding($false)))
+  Write-Host "    ✓ 二进制版本记录 -> $out"
 }
 
 $failed = 0
@@ -219,4 +260,5 @@ if ($failed -gt 0) {
   Write-Warning "有 $failed 项失败，看上面每项的原因；已完成的项不受影响。"
   exit 1
 }
+Record-BinaryVersions
 Write-Host '完成。验证：node --check tools/look.mjs 与 node tools/look.mjs view <BV号>' -ForegroundColor Green

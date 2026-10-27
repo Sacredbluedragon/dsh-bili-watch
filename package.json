@@ -1,10 +1,14 @@
 {
     "name":  "dsh-bili-watch",
-    "version":  "0.2.29",
+    "version":  "0.2.30",
     "private":  false,
     "description":  "把 B 站视频读成文本给 DSH agent 用：元数据、评论、弹幕、字幕、本地转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。只读命令零依赖。",
     "type":  "module",
     "main":  "index.js",
+    "scripts":  {
+                    "verify":  "node tools/verify.mjs",
+                    "smoke":  "node tools/verify.mjs"
+                },
     "bin":  {
                 "bili-watch":  "tools/look.mjs"
             },
@@ -32,10 +36,11 @@
                   "cordis.patch.yml",
                   "tools/",
                   "scripts/",
-                  "deps/.gitkeep",
                   "deps/_bili-asr.py",
                   "auto-trigger.js",
-                  "LICENSE"
+                  "LICENSE",
+                  "README.md",
+                  "THIRD_PARTY_NOTICES.md"
               ],
     "keywords":  [
                      "bilibili",
@@ -64,8 +69,9 @@
                          "qrcode":  "^1.5.4"
                      },
     "peerDependencies":  {
-                             "@deepseek-ai/dsh":  "\u003e=0.2.0-rc.1 \u003c0.3.0-0",
-                             "@deepseek-ai/dsh-tools":  "\u003e=0.2.0-rc.1 \u003c0.3.0-0"
+                             "@deepseek-ai/dsh":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0",
+                             "@deepseek-ai/dsh-tools":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0",
+                             "@deepseek-ai/dsh-llm":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0"
                          },
     "peerDependenciesMeta":  {
                                  "@deepseek-ai/dsh":  {
@@ -73,6 +79,9 @@
                                                       },
                                  "@deepseek-ai/dsh-tools":  {
                                                                 "optional":  true
-                                                            }
+                                                            },
+                                 "@deepseek-ai/dsh-llm":  {
+                                                              "optional":  true
+                                                          }
                              }
 }

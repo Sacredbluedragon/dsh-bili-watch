@@ -215,8 +215,12 @@ window.__ModuleLoader__.load({
 
       const saveRule = async () => {
         try {
-          await jpost('/cache/clear', { days: Number(days), maxMb: Number(maxMb) })
-        } catch {}
+          const j = await jpost('/config', { days: Number(days), maxMb: Number(maxMb) })
+          setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
+        } catch (e) {
+          // A2（2026-10-27 批次8）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
+          setMsg('保存失败：' + String(e?.message || e))
+        }
       }
 
       const rows = st?.deps || []
@@ -381,7 +385,7 @@ window.__ModuleLoader__.load({
             h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除')),
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '位置'),
-            h('span', { 'data-bl-detail': '' }, cache.dir || '(系统临时目录)'),
+            h('span', { 'data-bl-detail': '' }, cache.dir || '(未设置)'),
             h('button', {
               'data-bl-btn': '',
               onClick: async () => {

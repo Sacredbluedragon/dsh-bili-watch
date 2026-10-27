@@ -25,6 +25,8 @@ dsh plugin --profile web add dsh-bili-watch
 
 插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools`（peer，optional）。profile 里缺这个包时不会报错：`bili_watch` 工具不注册，`/bili` 命令与插件面板照常可用，日志里会打一行提示。
 
+0.2.30 起要求 DSH ≥ 0.2.0-rc.2（`engines` 不硬卡，代码层兼容 0.2.0）。
+
 插件市场已收录（2026-10-21）：在市场里搜 `dsh-bili-watch` 安装。新装插件默认不自动启用，装完到「插件」页把它的开关打开，再重启 DSH；市场里暂时搜不到时，按上面的命令装。
 
 ### 只当命令行工具
@@ -43,18 +45,45 @@ dsh plugin --profile web add dsh-bili-watch@latest
 dsh plugin --profile web remove dsh-bili-watch
 ```
 
-升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境、凭证一起删掉；要长期保留就把 `BILI_WATCH_PROJ` / `BILI_WATCH_SEEN` 指到包外。日常清理在面板里逐项删即可。
+升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境、凭证一起删掉；要长期保留就把 `BILI_WATCH_PROJ` / `BILI_WATCH_SEEN` 指到包外。**抽帧缓存根在包目录外**（默认 `~/.dsh/bili-watch/cache`，即 `$DSH_HOME/bili-watch/cache`；自定义过 `BILI_WATCH_CACHE` 就指到你自己设的位置，插件会在那个目录下再建一层 `bili-watch-cache/` 当缓存根），`dsh plugin remove` 不会动它，卸载后需手动删这个缓存目录。**只删 `cache/` 这一层：登录凭证是它的兄弟文件 `$DSH_HOME/bili-watch/credential.json`，删了要重新扫码。** 日常清理在面板里逐项删即可。
+
+## 模块架构
+
+```mermaid
+flowchart TD
+    subgraph L1["① index.js（插件入口，跑在 DSH 进程内）"]
+        DT["defineTool<br/>注册 bili_watch 工具"]
+        CR["commands.register<br/>注册 /bili 斜杠命令"]
+        WS["webServer 路由<br/>插件面板（状态/扫码登录/删依赖）"]
+    end
+    subgraph L2["② tools/look.mjs（独立 node 子进程）"]
+        LOOK["node tools/look.mjs &lt;cmd&gt;"]
+    end
+    subgraph L3["③ 外部可执行（可选依赖）"]
+        PY["python deps/_bili-asr.py<br/>本地 ASR 转写（可选）"]
+        FF["ffmpeg<br/>抽帧 / 取音轨（可选）"]
+        YT["yt-dlp<br/>通用 URL 下载（可选）"]
+    end
+    DT -->|spawn| LOOK
+    CR -->|spawn| LOOK
+    WS -.->|面板扫码直写凭证，内容命令仍 spawn| LOOK
+    LOOK -->|spawn| PY
+    LOOK -->|spawn| FF
+    LOOK -->|spawn| YT
+```
+
+所有内容命令（search/hot/peek/view/sub/asr/frames/ocr/...）最终都走 `tools/look.mjs` 这一份实现；`index.js` 只负责把 DSH 的工具/命令/面板入口接到同一个 spawn 上。`deps/_bili-asr.py`、`ffmpeg`、`yt-dlp` 都是可选依赖，没装时对应档位自动降级或报错（见下「依赖」）。
 
 ## 插件面板
 
 装进 DSH 后，打开插件列表，点 `dsh-bili-watch` 卡片进详情页，里面有一块面板（不用先进设置），常规操作无需去对话里敲命令：
 
 - **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点击行末「一键下载」，后台跑 `scripts/fetch-deps`（体积是估算值，实际以跑完为准）。
-- **扫码登录**：凭证未登录时点「去扫码登录」（已登录是「重新扫码」），面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `deps/credential.json`。
+- **扫码登录**：凭证未登录时点「去扫码登录」（已登录是「重新扫码」），面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `$DSH_HOME/bili-watch/credential.json`。
 - **删除**：面板按实际路径判断——装在插件目录里的（yt-dlp、转写模型、登录凭证）可直接删；装在插件目录外的（比如复用系统 ffmpeg 或已有的 Python 环境）按钮置灰，旁边标出它实际在哪。
 - **批量**：标题行的「批量下载 / 批量清理」打开勾选清单，默认勾上所有可操作的项，删除前会再确认一次。
 - **抽帧缓存**：显示当前占用与文件数，「立即清除」一键清空；不点则会按规则自动清理——保留天数（默认 7 天）与总量上限（默认 2048 MB），超过则从最旧的删起。规则存在 `deps/cache-config.json`，插件启动和打开面板时各检查一次。
-- **缓存位置**：默认在 DSH 家目录（`$DSH_HOME/bili-watch`；`$DSH_HOME` 就是 DSH 的家目录，Windows 下通常是用户目录里的 `.dsh`）。要换位置就设环境变量 `BILI_WATCH_CACHE`，或在 `deps/deps-config.json` 里写 `"cache": "D:\你想要的目录"`；改完重启 DSH 生效，面板「抽帧缓存 → 位置」会显示当前实际路径。
+- **缓存位置**：默认在 DSH 家目录下再往下一层的 `cache/`（`$DSH_HOME/bili-watch/cache`；`$DSH_HOME` 就是 DSH 的家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的**兄弟文件** `$DSH_HOME/bili-watch/credential.json`，清缓存时别把上一层一起删。要换位置就设环境变量 `BILI_WATCH_CACHE`，或在 `deps/deps-config.json` 里写 `"cache": "<你的缓存目录>"`（指到一个还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根）；改完重启 DSH 生效，面板「抽帧缓存 → 位置」会显示当前实际路径。
 - **最近一次调用**：显示命令、时间、成败，用来判断上一次看视频是否卡住。
 
 装完第一次重启 DSH，面板才会出现。
@@ -72,7 +101,7 @@ dsh plugin --profile web remove dsh-bili-watch
 
 环境：Node.js ≥ 22。装在 DSH 里时 DSH 自带 node，命令行跑也一样。
 
-`ffmpeg` 查找顺序：`--ffmpeg` 参数 → `BILI_WATCH_FFMPEG` → 插件 `deps/` → PATH。
+`ffmpeg` 查找顺序：`--ffmpeg` 参数 → `BILI_WATCH_FFMPEG` → `deps/deps-config.json` 里的 `ffmpeg` → 插件 `deps/ffmpeg.exe` → PATH。
 
 `deps/` 用来放运行期文件：Python venv、模型、yt-dlp、凭证，默认不进 git（见 `.gitignore`）。ASR 和 OCR 的 Python 环境是可选的，不装也能用，只是少这两档。
 
@@ -112,10 +141,10 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 
 只有拿 AI 字幕需要登录，二选一：
 
-1. `login`：插件出二维码，手机 B 站扫码。凭证存在插件 `deps/credential.json`，不出本机。
+1. `login`：插件出二维码，手机 B 站扫码。凭证存在 `$DSH_HOME/bili-watch/credential.json`，不出本机。
 2. `--cred <文件路径>`：读一份现成的 `{sessdata, bili_jct, buvid3, buvid4}` JSON。
 
-凭证顺序：给了 `--cred` 就只用它，读不到就按匿名跑；没给 `--cred` 才用 `deps/credential.json`；两者都没有就匿名。
+凭证顺序：给了 `--cred` 就只用它，读不到就按匿名跑；没给 `--cred` 才用 `$DSH_HOME/bili-watch/credential.json`；两者都没有就匿名。
 
 这份文件等同账号登录态。请勿分享、提交、上传。
 
@@ -123,9 +152,9 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 
 | 命令 | 做什么 |
 |---|---|
-| `view <BV或链接或URL>` | 元数据 + 简介 + 热评 |
-| `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（最便宜；装了 OCR 环境时会顺带识别这 5 帧，成本略高；仅 B 站） |
-| `sub <BV或链接> [--format srt|json|md] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT、JSON（带官方时间戳）或 Markdown（每条带跳回原片的链接） |
+| `view <BV或链接或URL>` | 元数据 + 简介 + 热评（不下载、不依赖 ffmpeg，永远能跑） |
+| `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（需下载 360p 约每分钟 1 MB + 抽帧约 2 秒；装了 OCR 环境时会顺带识别这 5 帧；仅 B 站） |
+| `sub <BV或链接> [--format srt|json|md|txt] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT、JSON（带官方时间戳）、Markdown（每条带跳回原片的链接）或纯文本 txt（不带时间戳） |
 | `comments <BV> [N]` | 评论区，默认按热度排序 |
 | `asr <BV或URL>` | 本地转写音频，并给出「可信 / 疑似幻觉」判定（见下节） |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
@@ -134,10 +163,10 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 | `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（`NxM` 如 `3x3`、`4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
-| `search <关键词> [--days 3]` | 搜视频 |
+| `search <关键词> [--days 3] [--limit 10] [--order pubdate|click]` | 搜视频 |
 | `hot [--limit 10]` | 综合热门榜 |
-| `login [--check] [--poll]` | 扫码登录 |
-| `clean` | 清空缓存根（默认 `$DSH_HOME/bili-watch`） |
+| `login [--check] [--poll] [--key KEY]` | 扫码登录。`--check` = 检查本地凭证是否还有效（不会重新登录）；`--key KEY` 需配合 `--poll` 才生效（单独 `login --key X` 会被静默忽略） |
+| `clean` | 清空缓存根（默认 `$DSH_HOME/bili-watch/cache`；只清本插件自己写的 `BV*` 与 `frames/`、`asr/`、`_logs/` 等目录，同一层里别人的文件不动，凭证在上一层不会被碰到） |
 
 工具侧的等价入口：`bili_watch` 工具（参数 `command` + `bv`），或 `/bili` 命令。
 
@@ -145,7 +174,7 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 
 ## 单条链接软提示
 
-用户的消息里只有一条 B 站视频链接（BV 号或 `b23.tv` 短链）时，插件往消息流里补一句提示，告诉 agent 有这条链接可读、`peek` 最便宜。它**不会**替用户调用工具，也不会自动跑起来；作用只是让「贴链接不说话」这种场景不容易被漏掉。
+用户的消息里只有一条 B 站视频链接（BV 号或 `b23.tv` 短链）时，插件往消息流里补一句提示，告诉 agent 有这条链接可读、用 `peek` 先看一眼（需下载 360p 约每分钟 1 MB + 抽帧约 2 秒）。它**不会**替用户调用工具，也不会自动跑起来；作用只是让「贴链接不说话」这种场景不容易被漏掉。
 
 - `b23.tv` 短链会先自动展开：问公共 DNS（`223.5.5.5` → `119.29.29.29` → `1.1.1.1`）拿真实 IP，再直连读 302 里的 BV 号，绕开系统 DNS；展开失败才提示用户换成浏览器地址栏里的完整链接。
 - 为什么要兜底：部分内网 DNS 会把 `b23.tv` 答成 `31.13.x.x`（Facebook 段），这种环境下只有公共 DNS 这条路能展开（2026-10-23 实测）。
@@ -190,7 +219,7 @@ AI 字幕（需登录）
 `text` 会做一次便宜的判断，命中任一条就打一行提示：
 
 - 字幕语速不在 2–8.5 字/秒（真人口播的常见区间）
-- 关键词命中不到 30%（字幕和标题/UP 名对不上）
+- 关键词命中率低（字幕和标题/UP 名对不上）：不单独触发，要和语速异常同时出现才算补充理由
 - 字幕里自称「实验 / 钓鱼 / 测试」
 
 想进一步确认就加 `--verify`：它会抽 5 帧做 OCR，拿画面文字跟字幕比一遍，报「首帧写着某实验说明」或「画面与字幕几乎不重合」。
@@ -209,7 +238,7 @@ node tools/look.mjs text BV1xxxxxxxxx --verify
 | `BILI_WATCH_FFMPEG` | ffmpeg 可执行文件路径 |
 | `BILI_WATCH_YTDLP` | yt-dlp 可执行文件路径 |
 | `BILI_WATCH_SEEN` | `seen.md` 去重文件路径（默认 `deps/seen.md`）。文件不存在时 `--mark-seen` 记不了，先建一个空文件即可 |
-| `BILI_WATCH_CACHE` | 抽帧缓存目录（默认系统临时目录）。优先级：这个变量 > `deps/deps-config.json` 的 `cache` > 临时目录；目录不可写时自动回退临时目录，并在面板警告里写明原因 |
+| `BILI_WATCH_CACHE` | 抽帧缓存目录（默认 `$DSH_HOME/bili-watch/cache`）。优先级：这个变量 > `deps/deps-config.json` 的 `cache` > 默认路径；指到外部目录时插件会在里面建 `bili-watch-cache/` 当缓存根，不直接占用你的目录；目录不可写时面板侧回退到默认路径并写进警告（命令行直接跑 `look.mjs` 没有这层回退，会直接报错） |
 | `BILI_WATCH_MIRROR` | `cn` 时 `scripts/fetch-deps.*` 走镜像下载（gh-proxy / 清华 PyPI / hf-mirror） |
 | `HF_ENDPOINT` | 转写模型的 HuggingFace 端，默认 `https://hf-mirror.com`；海外可设官方站 |
 | `BILI_ASR_MODEL` | 本地转写用的 faster-whisper 模型名，默认 `small` |
@@ -227,6 +256,7 @@ node tools/look.mjs text BV1xxxxxxxxx --verify
 - **凭证**：等同账号登录态，泄露即被盗。只存本机，不进日志。
 - **频率**：脚本没有硬限速（只在字幕重试时随机等几百毫秒）；批量跑请自己加 sleep，别连着扫。
 - **任意 http(s) 地址都会被请求**：通用 URL 走 yt-dlp 时不做内网地址过滤，别拿它请求内网服务。
+- **撞名覆盖**：本插件注册 `bili_watch` 工具与 `/bili` 命令；若与其他插件撞名，后注册者静默覆盖，不报错。
 
 ## 致谢
 
@@ -242,7 +272,7 @@ MIT
 
 ## 长文本保护（2026-10-26）
 
-`text` / `sub` / `asr` 的正文超过 **800 字**时，终端只给开头 400 字摘要 + 一行落盘路径，全文写进缓存目录下按视频分的文件夹：`<缓存目录>/<BV>/<命令>.txt`。
+`text` / `sub` / `asr` 的正文超过 **800 字**时，终端只给开头 400 字摘要 + 一行落盘路径，全文写进缓存目录下按视频分的文件夹：`<缓存目录>/<BV>_<标题>/<命令>.txt`。
 
 - `--head N`：自定义摘要长度
 - `--full`：打全文
