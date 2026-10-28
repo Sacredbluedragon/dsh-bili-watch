@@ -8,7 +8,9 @@ _bili-asr.py —— 把本地音频/视频文件转成文字（faster-whisper，
   只靠 B 站字幕会把一大半候选判成「不可信」。本地转写能补上这一块。
 
 口径：
-  · 只跑 CPU + int8：本机 PyPI 版 ctranslate2 没有 CUDA 算子，装 GPU 版要另配 cuDNN，不值得。
+  · 默认 CPU + int8；有可用 GPU 时可以 --device cuda（自动探测，失败回落 CPU，不会炸）。
+    GPU 要真跑起来还得有 CUDA 12 的 cuBLAS + cuDNN：要么系统装了 CUDA 12 运行时，
+    要么在虚拟环境里 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12（本脚本会自动把它们的 bin 加进 DLL 搜索路径）。
   · 模型默认 small（约 250 MB，一个 3 分钟视频约 30–45 秒）；可 --model 换 base/tiny。
   · 模型与缓存落 D 盘项目目录（HF_HOME），不碰用户主目录。
   · 音频由调用方先转成 16 kHz 单声道 wav 再传进来——这里不碰网络、不碰 B 站接口。
@@ -35,6 +37,33 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))
 
 
+def _add_nvidia_dll_dirs() -> None:
+    """Windows 上把 pip 装的 nvidia-*-cu12 的 bin 目录加进 DLL 搜索路径。
+
+    为什么要这一步：ctranslate2 在 Windows 上靠系统 PATH 找 cublas64_12.dll / cudnn64_9.dll。
+    用户按 issue #3 的做法 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 之后，
+    DLL 躺在本环境的 site-packages/nvidia/<lib>/bin 里，不主动加路径就还是找不到。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import sysconfig
+        site = sysconfig.get_paths().get("purelib") or ""
+    except Exception:  # noqa: BLE001
+        return
+    if not site:
+        return
+    import glob
+    for d in sorted(glob.glob(os.path.join(site, "nvidia", "*", "bin"))):
+        if not os.path.isdir(d):
+            continue
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(d)  # Python 3.8+：显式 DLL 目录，比只改 PATH 可靠
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src", help="音频或视频文件路径")
@@ -47,6 +76,8 @@ def main() -> int:
     ap.add_argument("--device", default=os.environ.get("BILI_ASR_DEVICE", "auto"),
                     help="推理设备：auto / cpu / cuda（默认 auto：有可用 CUDA 就用，失败回落 CPU）")
     args = ap.parse_args()
+
+    _add_nvidia_dll_dirs()
 
     if not os.path.isfile(args.src):
         print("[asr] 找不到文件：" + args.src, file=sys.stderr)

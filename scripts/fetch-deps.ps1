@@ -185,6 +185,7 @@ function Ensure-Asr {
   if ($DryRun) {
     Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
     Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
+    Write-Host '    [dry-run] 若检测到 NVIDIA 显卡，再装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（约 500 MB，让 --device auto 真能用 GPU）'
     return
   }
   $sysPy = Get-SystemPython
@@ -196,6 +197,23 @@ function Ensure-Asr {
     # 本次失败把半成品改名留档（不递归删，避免撞用户的删除守卫）
     Move-SemiVenv $venv
     throw '安装 faster-whisper 失败（半成品 venv 已改名留档，重跑即可重试）'
+  }
+  # issue #3 第 4 条（2026-10-29）实测：不装 CUDA 12 的 cuBLAS + cuDNN 时，
+  #   --device auto 能探到 GPU、模型也能加载，但一转写就报 Library cublas64_12.dll is not found。
+  #   有 N 卡就顺手装上（pip 包，约 500 MB，不用装整套 CUDA Toolkit），没有就跳过、继续用 CPU。
+  $nv = $false
+  try { & nvidia-smi -L 2>&1 | Out-Null; $nv = ($LASTEXITCODE -eq 0) } catch { $nv = $false }
+  if ($nv) {
+    Write-Host '    检测到 NVIDIA 显卡，补装 CUDA 12 运行库（cuBLAS + cuDNN，约 500 MB）…'
+    Invoke-PipInstall $py @('install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12')
+    & $py -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("nvidia") else 1)' 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host '    ✓ GPU 运行库就绪：--device auto 会走 GPU（显存不足会自动回落 CPU）'
+    } else {
+      Write-Host '    ! GPU 运行库没装上，ASR 继续用 CPU（不影响功能，只是慢些）' -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host '    未检测到 NVIDIA 显卡，跳过 GPU 运行库（ASR 用 CPU）' -ForegroundColor DarkGray
   }
   Write-Host "    ✓ $py"
 }
