@@ -38,7 +38,8 @@ param(
   [switch]$DryRun,
   [switch]$VerifyHash,
   [ValidateSet('auto', 'cn', 'global')]
-  [string]$Mirror = 'auto'
+  [string]$Mirror = 'auto',
+  [string]$PythonPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,6 +57,31 @@ $HfEndpoint = if ($UseCn) { 'https://hf-mirror.com' } else { 'https://huggingfac
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Skip([string]$msg) { Write-Host "    $msg（已存在，跳过；-Force 重下）" -ForegroundColor DarkGray }
+
+function Move-SemiVenv([string]$venv) {
+  # 半成品 venv 不用递归批量删——会撞上用户的删除守卫（issue #3 实测）。
+  # 改成改名留档，用户确认无用后自己删。
+  if (-not (Test-Path -LiteralPath $venv)) { return }
+  $leaf = Split-Path -Leaf $venv
+  $dst = "$leaf.old-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+  try {
+    Rename-Item -LiteralPath $venv -NewName $dst
+    Write-Host "    半成品 venv 已改名为 deps\\$dst（确认无用后可手动删）" -ForegroundColor Yellow
+  } catch {
+    Write-Host "    ! 半成品 venv 改名失败：$_" -ForegroundColor Yellow
+    Write-Host "      可手动删除：$venv" -ForegroundColor DarkGray
+  }
+}
+
+function Invoke-PipInstall {
+  # 镜像失败自动回退官方 PyPI（issue #3：清华未同步 faster-whisper==1.2.1）
+  param([string]$Py, [string[]]$PipArgs)
+  & $Py -m pip @PipArgs -i $PyIndex
+  if ($LASTEXITCODE -eq 0) { return }
+  if ($PyIndex -eq 'https://pypi.org/simple') { return }
+  Write-Host "    ! 镜像装不上（$PyIndex），改走官方 PyPI 重试" -ForegroundColor Yellow
+  & $Py -m pip @PipArgs -i 'https://pypi.org/simple'
+}
 
 function Invoke-Download([string]$url, [string]$out, [string]$label) {
   if ($DryRun) {
@@ -117,13 +143,32 @@ function Ensure-Ytdlp {
 }
 
 function Get-SystemPython {
-  foreach ($c in @('py', 'python', 'python3')) {
+  # 版本必须「有上界」：onnxruntime 目前没有 3.13+ 的 wheel，
+  # 只判 >=3.10 会让 py 启动器挑到最新的 3.15，pip 报 No matching distribution（issue #3 实测）。
+  if ($PythonPath) {
+    if (-not (Test-Path -LiteralPath $PythonPath)) { throw "指定的 Python 不存在：$PythonPath" }
+    $v = & $PythonPath -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "指定的 Python 跑不起来：$PythonPath" }
+    if ($v -notmatch '^3\.(1[0-4])$') { throw "指定的 Python 是 $v，需要 3.10–3.14（onnxruntime 尚无更高版本的 wheel）" }
+    return $PythonPath
+  }
+  $pyLauncher = Get-Command 'py' -ErrorAction SilentlyContinue
+  if ($pyLauncher) {
+    foreach ($v in @('3.14', '3.13', '3.12', '3.11', '3.10')) {
+      $exe = & $pyLauncher.Source "-$v" -c "import sys;print(sys.executable)" 2>$null
+      if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ($exe.Trim()))) { return $exe.Trim() }
+    }
+  }
+  foreach ($c in @('python', 'python3')) {
     $cmd = Get-Command $c -ErrorAction SilentlyContinue
     if (-not $cmd) { continue }
-    & $c -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>$null
-    if ($LASTEXITCODE -eq 0) { return $c }
+    $v = & $cmd.Source -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
+    if ($LASTEXITCODE -ne 0) { continue }
+    if ($v -notmatch '^3\.(1[0-4])$') { continue }
+    $exe = & $cmd.Source -c "import sys;print(sys.executable)" 2>$null
+    if ($exe -and (Test-Path -LiteralPath ($exe.Trim()))) { return $exe.Trim() }
   }
-  throw '找不到可用的 Python 3.10+。请先安装 Python 并加入 PATH，或用 -Target 单独装其它项。'
+  throw '找不到 Python 3.10–3.14（更高版本 onnxruntime 还没有 wheel）。请装一个 3.12，或用 -PythonPath 指定解释器路径。'
 }
 
 function Ensure-Asr {
@@ -134,7 +179,7 @@ function Ensure-Asr {
     & $py -c 'import faster_whisper' 2>$null
     if ($LASTEXITCODE -eq 0) { Write-Skip 'deps\.venv-asr'; return }
     Write-Host '    venv 存在但 faster_whisper 不可用，重建' -ForegroundColor Yellow
-    Remove-Item -LiteralPath $venv -Recurse -Force
+    Move-SemiVenv $venv
   }
   Write-Step 'ASR 环境（deps\.venv-asr + faster-whisper==1.2.1）'
   if ($DryRun) {
@@ -145,12 +190,12 @@ function Ensure-Asr {
   $sysPy = Get-SystemPython
   & $sysPy -m venv $venv
   if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
-  & $py -m pip install --upgrade pip -i $PyIndex
-  & $py -m pip install "faster-whisper==1.2.1" "av==15.1.0" "ctranslate2==4.8.3" -i $PyIndex
+  Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  Invoke-PipInstall $py @('install', 'faster-whisper==1.2.1', 'av==15.1.0', 'ctranslate2==4.8.3')
   if ($LASTEXITCODE -ne 0) {
-    # 本次失败立刻清掉半成品，别留给下次 Skip 继续踩
-    Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
-    throw '安装 faster-whisper 失败（已删除半成品 venv，重跑即可重试）'
+    # 本次失败把半成品改名留档（不递归删，避免撞用户的删除守卫）
+    Move-SemiVenv $venv
+    throw '安装 faster-whisper 失败（半成品 venv 已改名留档，重跑即可重试）'
   }
   Write-Host "    ✓ $py"
 }
@@ -162,7 +207,7 @@ function Ensure-Ocr {
     & $py -c 'import rapidocr_onnxruntime' 2>$null
     if ($LASTEXITCODE -eq 0) { Write-Skip 'deps\.venv-ocr'; return }
     Write-Host '    venv 存在但 rapidocr_onnxruntime 不可用，重建' -ForegroundColor Yellow
-    Remove-Item -LiteralPath $venv -Recurse -Force
+    Move-SemiVenv $venv
   }
   Write-Step 'OCR 环境（deps\.venv-ocr + rapidocr-onnxruntime==1.2.3）'
   if ($DryRun) {
@@ -173,8 +218,8 @@ function Ensure-Ocr {
   $sysPy = Get-SystemPython
   & $sysPy -m venv $venv
   if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
-  & $py -m pip install --upgrade pip -i $PyIndex
-  & $py -m pip install "rapidocr-onnxruntime==1.2.3" -i $PyIndex
+  Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  Invoke-PipInstall $py @('install', 'rapidocr-onnxruntime==1.2.3')
   if ($LASTEXITCODE -ne 0) {
     Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
     throw '安装 rapidocr-onnxruntime 失败（已删除半成品 venv，重跑即可重试）'

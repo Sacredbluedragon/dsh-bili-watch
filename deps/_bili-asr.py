@@ -44,6 +44,8 @@ def main() -> int:
     ap.add_argument("--lang", default="zh", help="语言，默认 zh（自动识别可传 auto）")
     ap.add_argument("--json", action="store_true",
                     help="输出 JSON（正文 + 分段 + VAD 统计），供调用方做转写可信度判定")
+    ap.add_argument("--device", default=os.environ.get("BILI_ASR_DEVICE", "auto"),
+                    help="推理设备：auto / cpu / cuda（默认 auto：有可用 CUDA 就用，失败回落 CPU）")
     args = ap.parse_args()
 
     if not os.path.isfile(args.src):
@@ -56,12 +58,33 @@ def main() -> int:
         print("[asr] 导入 faster_whisper 失败：%s" % e, file=sys.stderr)
         return 3
 
-    print("[asr] 加载模型 %s（首次会下载，之后本地读）…" % args.model, file=sys.stderr)
-    try:
-        model = WhisperModel(args.model, device="cpu", compute_type="int8")
-    except Exception as e:  # noqa: BLE001
-        print("[asr] 加载模型失败：%s" % e, file=sys.stderr)
-        return 4
+    # 设备：auto 时探 CUDA（ctranslate2 自带探测，不额外依赖 torch）
+    want = (args.device or "auto").strip().lower()
+    if want not in ("auto", "cpu", "cuda"):
+        want = "auto"
+    if want == "auto":
+        try:
+            import ctranslate2  # noqa: F401
+            want = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        except Exception:  # noqa: BLE001
+            want = "cpu"
+
+    print("[asr] 加载模型 %s（设备 %s，首次会下载，之后本地读）…" % (args.model, want), file=sys.stderr)
+    model = None
+    if want == "cuda":
+        try:
+            model = WhisperModel(args.model, device="cuda", compute_type="float16")
+            print("[asr] 已启用 GPU（float16）", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            # 显存不足 / cuDNN 缺失 / 驱动太旧，都可能在这里炸——回落 CPU 继续跑，别让整条链断掉
+            print("[asr] GPU 初始化失败，回落 CPU：%s" % e, file=sys.stderr)
+            want = "cpu"
+    if model is None:
+        try:
+            model = WhisperModel(args.model, device="cpu", compute_type="int8")
+        except Exception as e:  # noqa: BLE001
+            print("[asr] 加载模型失败：%s" % e, file=sys.stderr)
+            return 4
 
     print("[asr] 开始转写…", file=sys.stderr)
 
