@@ -1,7 +1,7 @@
 # dsh-bili-watch
 
-[![version](https://img.shields.io/badge/version-0.3.2-blue.svg)]()
-[![node](https://img.shields.io/node/v/%3E%3D22-brightgreen.svg)]()
+[![version](https://img.shields.io/npm/v/dsh-bili-watch?label=version)](https://www.npmjs.com/package/dsh-bili-watch)
+[![node](https://img.shields.io/node/v/dsh-bili-watch?label=node)](https://www.npmjs.com/package/dsh-bili-watch)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
 
 DSH 插件 / CLI 工具：将 B 站视频解析为模型可消费的结构化内容（元数据、评论、弹幕、AI 字幕、本地 ASR 转写、抽帧 OCR）。
