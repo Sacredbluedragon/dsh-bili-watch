@@ -39,7 +39,7 @@ window.__ModuleLoader__.load({
 [data-bl-dot="ok"]{background:#3c9a5f;}
 [data-bl-dot="bad"]{background:#d9534f;}
 [data-bl-name]{min-width:150px;flex:none;}
-[data-bl-detail]{flex:1;min-width:0;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;word-break:break-all;}
+[data-bl-detail]{flex:1;min-width:140px;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;word-break:break-all;}
 [data-bl-size]{flex:none;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;min-width:64px;text-align:right;}
 [data-bl-overlay-icon]{font-size:14px;line-height:1;color:#d97706}
 [data-bl-overlay-text]{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;overflow:hidden}[data-bl-overlay-line]{display:flex;align-items:baseline;gap:8px;overflow:hidden}[data-bl-overlay-hint]{font-size:11.5px;color:#a16207;opacity:.92;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -50,6 +50,9 @@ window.__ModuleLoader__.load({
 [data-bl-btn:disabled]{opacity:.45;cursor:default;}
 [data-bl-input]{width:64px;font-size:12px;padding:2px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.16));background:transparent;color:inherit;}
 [data-bl-note]{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8a9099);}
+/* 2026-10-28：凭证行的「文件：<长路径>」原来挤在同一 flex 行里，把更新时间那一列压到几十像素、
+   中文被逐字换行成竖排。让 note 在 flex 行里独占一行（flex-basis:100%），并允许长路径整词断开。 */
+[data-bl-row] [data-bl-note]{flex-basis:100%;min-width:0;word-break:break-all;}
 [data-bl-bad]{color:#d9534f;}
 [data-bl-good]{color:#3c9a5f;}
 [data-bl-qrbox]{display:flex;gap:16px;align-items:center;flex-wrap:wrap;}
@@ -96,6 +99,19 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // 参数分层（2026-10-28 阶段B）：一项 = 输入框 + 默认值提示 + 范围 + 一句话后果 + 恢复默认。
+    // 只写 h()，不引新依赖；保存/恢复都由外面传进来的回调走 /config。
+    function TuneRow({ label, value, unit, onChange, onSave, onRestore, def, range, hint }) {
+      return h('div', { 'data-bl-row': '' },
+        h('span', { 'data-bl-name': '' }, label),
+        h('span', { 'data-bl-detail': '' },
+          h('input', { 'data-bl-input': '', value, onChange: (e) => onChange(e.target.value), inputMode: 'numeric' }),
+          unit ? h('span', {}, ' ' + unit) : null,
+          h('span', { 'data-bl-note': '' }, `默认 ${def}，范围 ${range}。${hint}`)),
+        h('button', { 'data-bl-btn': '', onClick: onSave }, '保存'),
+        h('button', { 'data-bl-btn': '', onClick: onRestore }, '恢复默认'))
+    }
+
     function Panel() {
       const [st, setSt] = React.useState(null)
       const [err, setErr] = React.useState('')
@@ -104,6 +120,14 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState('')
       const [days, setDays] = React.useState('7')
       const [maxMb, setMaxMb] = React.useState('2048')
+      // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
+      const [asrMin, setAsrMin] = React.useState('30')
+      const [frames, setFrames] = React.useState('500')
+      const [asrTmo, setAsrTmo] = React.useState('900')
+      const [ffTmo, setFfTmo] = React.useState('300')
+      const [cmdTmo, setCmdTmo] = React.useState('180')
+      const [advOpen, setAdvOpen] = React.useState(false)
+      const [tuneMeta, setTuneMeta] = React.useState(null)
       const [qr, setQr] = React.useState(null)
       const [qrState, setQrState] = React.useState('')
       const [dlg, setDlg] = React.useState(null) // 'download' | 'clean'
@@ -117,6 +141,17 @@ window.__ModuleLoader__.load({
             setErr('')
             setDays(String(j.data.cache?.days ?? 7))
             setMaxMb(String(j.data.cache?.maxMb ?? 2048))
+            // 参数分层：初值取 /status 的 tuning / tuningDefaults / tuningRanges
+            const tv = j.data.tuning || {}
+            const td = j.data.tuningDefaults || {}
+            const tr = j.data.tuningRanges || {}
+            setTuneMeta({ defaults: td, ranges: tr })
+            const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
+            setAsrMin(String(Math.round(sec / 60)))
+            setFrames(String(tv.maxFrames ?? td.maxFrames ?? 500))
+            setAsrTmo(String(tv.asrTimeoutSec ?? td.asrTimeoutSec ?? 900))
+            setFfTmo(String(tv.ffmpegTimeoutSec ?? td.ffmpegTimeoutSec ?? 300))
+            setCmdTmo(String(tv.cmdTimeoutSec ?? td.cmdTimeoutSec ?? 180))
           } else {
             setErr(j.why || '状态读取失败')
           }
@@ -221,6 +256,31 @@ window.__ModuleLoader__.load({
           // A2（2026-10-27 批次8）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
           setMsg('保存失败：' + String(e?.message || e))
         }
+      }
+
+      // 参数分层：保存一项（patch 里只带一个键）；恢复默认 = POST 该键为 null
+      const saveTune = async (patch, okText) => {
+        try {
+          const j = await jpost('/config', patch)
+          if (j?.ok === false) {
+            setMsg('保存失败：' + (j.why || '未知错误'))
+            return
+          }
+          setMsg(okText)
+          await load()
+        } catch (e) {
+          setMsg('保存失败：' + String(e?.message || e))
+        }
+      }
+      const saveAsrMax = () => {
+        const m = Number(asrMin)
+        const sec = Math.round(m * 60)
+        // 服务端 asrMaxSec 范围 300–3600 秒；超界会被静默回落默认值，这里先拦一下免得用户以为存上了
+        if (!Number.isFinite(m) || sec < 300 || sec > 3600) {
+          setMsg('转写闸门需在 5–60 分钟之间（服务端上限 3600 秒），未保存。')
+          return
+        }
+        saveTune({ asrMaxSec: sec }, `转写闸门已保存（${m} 分钟）。`)
       }
 
       const rows = st?.deps || []
@@ -414,6 +474,74 @@ window.__ModuleLoader__.load({
             h('button', { 'data-bl-btn': '', onClick: saveRule }, '保存规则')),
           h('div', { 'data-bl-note': '' },
             '不点也会按上面的规则自动清（每次打开面板与插件启动时检查一次）。')),
+        // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
+        h('div', { 'data-bl-sec': '' },
+          h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),
+          h(TuneRow, {
+            label: '转写闸门',
+            value: asrMin,
+            unit: '分钟',
+            onChange: setAsrMin,
+            onSave: saveAsrMax,
+            onRestore: () => saveTune({ asrMaxSec: null }, '转写闸门已恢复默认（30 分钟）。'),
+            def: '30 分钟',
+            range: `${Math.round((tuneMeta?.ranges?.asrMaxSec?.[0] ?? 300) / 60)}–${Math.round((tuneMeta?.ranges?.asrMaxSec?.[1] ?? 3600) / 60)} 分钟`,
+            hint: '低于视频长度时，超长视频只出画面描述、不出字幕。',
+          }),
+          h(TuneRow, {
+            label: '抽帧张数上限',
+            value: frames,
+            unit: '张',
+            onChange: setFrames,
+            onSave: () => saveTune({ maxFrames: Number(frames) }, '抽帧张数上限已保存。'),
+            onRestore: () => saveTune({ maxFrames: null }, '抽帧张数上限已恢复默认（500 张）。'),
+            def: '500 张',
+            range: `${tuneMeta?.ranges?.maxFrames?.[0] ?? 100}–${tuneMeta?.ranges?.maxFrames?.[1] ?? 1000} 张`,
+            hint: '抽得越多越费时间和磁盘，但关键画面更不容易漏。',
+          }),
+          h('div', { 'data-bl-row': '' },
+            h('button', { 'data-bl-btn': '', onClick: () => setAdvOpen((v) => !v) },
+              (advOpen ? '▾ ' : '▸ ') + '高级设置（不建议修改）'))),
+        // 高级设置：折叠，默认收起。改错会让长视频静默降级，所以放在折叠区里。
+        advOpen
+          ? h('div', { 'data-bl-sec': '' },
+              h('span', { 'data-bl-sec-title': '' }, '高级设置（不建议修改）'),
+              h(TuneRow, {
+                label: 'ASR 超时',
+                value: asrTmo,
+                unit: '秒',
+                onChange: setAsrTmo,
+                onSave: () => saveTune({ asrTimeoutSec: Number(asrTmo) }, 'ASR 超时已保存。'),
+                onRestore: () => saveTune({ asrTimeoutSec: null }, 'ASR 超时已恢复默认（900 秒）。'),
+                def: '900 秒',
+                range: `${tuneMeta?.ranges?.asrTimeoutSec?.[0] ?? 300}–${tuneMeta?.ranges?.asrTimeoutSec?.[1] ?? 3600} 秒`,
+                hint: '太短会把长音频判成转写失败。',
+              }),
+              h(TuneRow, {
+                label: 'ffmpeg 超时',
+                value: ffTmo,
+                unit: '秒',
+                onChange: setFfTmo,
+                onSave: () => saveTune({ ffmpegTimeoutSec: Number(ffTmo) }, 'ffmpeg 超时已保存。'),
+                onRestore: () => saveTune({ ffmpegTimeoutSec: null }, 'ffmpeg 超时已恢复默认（300 秒）。'),
+                def: '300 秒',
+                range: `${tuneMeta?.ranges?.ffmpegTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.ffmpegTimeoutSec?.[1] ?? 1800} 秒`,
+                hint: '太短会让大视频截帧失败。',
+              }),
+              h(TuneRow, {
+                label: '命令超时',
+                value: cmdTmo,
+                unit: '秒',
+                onChange: setCmdTmo,
+                onSave: () => saveTune({ cmdTimeoutSec: Number(cmdTmo) }, '命令超时已保存。'),
+                onRestore: () => saveTune({ cmdTimeoutSec: null }, '命令超时已恢复默认（180 秒）。'),
+                def: '180 秒',
+                range: `${tuneMeta?.ranges?.cmdTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.cmdTimeoutSec?.[1] ?? 900} 秒`,
+                hint: '太短会让长视频的 text 命令超时。',
+              }),
+              h('div', { 'data-bl-note': '' },
+                '这几项会写进 deps/deps-config.json，改完立即生效，不用重启。「恢复默认」= 把这个键从配置里删掉。'))
+          : null,
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '最近一次调用'),
           h('div', { 'data-bl-row': '' },

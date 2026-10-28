@@ -6,7 +6,7 @@
 
 > [!IMPORTANT]
 > 面板要重启 DSH 后才出现，插件只在启动时加载。
-> 抽帧类命令（`frames` / `ocr` / `sheet` / `substrip` / `text` 的兜底档）需要 ffmpeg，没有会直接报错，不会静默降级。
+> 抽帧类命令（`peek` 的 5 帧 / `frames` / `ocr` / `sheet` / `substrip` / `text` 的兜底档）需要 ffmpeg，没有会直接报错，不会静默降级。
 > 登录只影响 AI 字幕；其余命令匿名可用。
 
 ## 安装
@@ -45,7 +45,7 @@ dsh plugin --profile web add dsh-bili-watch@latest
 dsh plugin --profile web remove dsh-bili-watch
 ```
 
-升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境、凭证一起删掉；要长期保留就把 `BILI_WATCH_PROJ` / `BILI_WATCH_SEEN` 指到包外。**抽帧缓存根在包目录外**（默认 `~/.dsh/bili-watch/cache`，即 `$DSH_HOME/bili-watch/cache`；自定义过 `BILI_WATCH_CACHE` 就指到你自己设的位置，插件会在那个目录下再建一层 `bili-watch-cache/` 当缓存根），`dsh plugin remove` 不会动它，卸载后需手动删这个缓存目录。**只删 `cache/` 这一层：登录凭证是它的兄弟文件 `$DSH_HOME/bili-watch/credential.json`，删了要重新扫码。** 日常清理在面板里逐项删即可。
+升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境一起删掉（**登录凭证不在 `deps/`**，它已经搬到 `$DSH_HOME/bili-watch/`）；把 `BILI_WATCH_SEEN` 指到包外可以保住「已看过」记录。**注意 `BILI_WATCH_PROJ` 只影响运行时查找顺序，不影响 `fetch-deps` 的安装位置**——`fetch-deps` 永远装进包内 `deps/`，而且查找时 `deps/` 优先，所以「指到包外」这一步要真的生效，得先让包内 `deps/.venv-*` 不存在。**抽帧缓存根在包目录外**（默认 `~/.dsh/bili-watch/cache`，即 `$DSH_HOME/bili-watch/cache`；自定义过 `BILI_WATCH_CACHE` 就指到你自己设的位置，插件会在那个目录下再建一层 `bili-watch-cache/` 当缓存根），`dsh plugin remove` 不会动它，卸载后需手动删这个缓存目录。**只删 `cache/` 这一层：登录凭证是它的兄弟文件 `$DSH_HOME/bili-watch/credential.json`，删了要重新扫码。** 日常清理在面板里逐项删即可。
 
 ## 模块架构
 
@@ -80,7 +80,7 @@ flowchart TD
 
 - **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点击行末「一键下载」，后台跑 `scripts/fetch-deps`（体积是估算值，实际以跑完为准）。
 - **扫码登录**：凭证未登录时点「去扫码登录」（已登录是「重新扫码」），面板里弹出二维码，手机 B 站扫完自动刷新。凭证保存在本机 `$DSH_HOME/bili-watch/credential.json`。
-- **删除**：面板按实际路径判断——装在插件目录里的（yt-dlp、转写模型、登录凭证）可直接删；装在插件目录外的（比如复用系统 ffmpeg 或已有的 Python 环境）按钮置灰，旁边标出它实际在哪。
+- **删除**：面板按实际路径判断——yt-dlp、转写模型、登录凭证可直接删；ffmpeg / ASR 环境 / OCR 环境不提供删除按钮（环境删了要重跑 `fetch-deps` 装回来，代价大于省下的空间），旁边标出它实际在哪。
 - **批量**：标题行的「批量下载 / 批量清理」打开勾选清单，默认勾上所有可操作的项，删除前会再确认一次。
 - **抽帧缓存**：显示当前占用与文件数，「立即清除」一键清空；不点则会按规则自动清理——保留天数（默认 7 天）与总量上限（默认 2048 MB），超过则从最旧的删起。规则存在 `deps/cache-config.json`，插件启动和打开面板时各检查一次。
 - **缓存位置**：默认在 DSH 家目录下再往下一层的 `cache/`（`$DSH_HOME/bili-watch/cache`；`$DSH_HOME` 就是 DSH 的家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的**兄弟文件** `$DSH_HOME/bili-watch/credential.json`，清缓存时别把上一层一起删。要换位置就设环境变量 `BILI_WATCH_CACHE`，或在 `deps/deps-config.json` 里写 `"cache": "<你的缓存目录>"`（指到一个还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根）；改完重启 DSH 生效，面板「抽帧缓存 → 位置」会显示当前实际路径。
@@ -103,7 +103,7 @@ flowchart TD
 
 `ffmpeg` 查找顺序：`--ffmpeg` 参数 → `BILI_WATCH_FFMPEG` → `deps/deps-config.json` 里的 `ffmpeg` → 插件 `deps/ffmpeg.exe` → PATH。
 
-`deps/` 用来放运行期文件：Python venv、模型、yt-dlp、凭证，默认不进 git（见 `.gitignore`）。ASR 和 OCR 的 Python 环境是可选的，不装也能用，只是少这两档。
+`deps/` 用来放运行期文件：Python venv、模型、yt-dlp，默认不进 git（见 `.gitignore`）。登录凭证**不在** `deps/`，见上文的 `$DSH_HOME/bili-watch/credential.json`。ASR 和 OCR 的 Python 环境是可选的，不装也能用，只是少这两档。
 
 `deps/_bili-asr.py` 默认从 `hf-mirror.com` 下模型，国内快。海外网络可以先设 `HF_ENDPOINT=https://huggingface.co` 再跑 `fetch-deps`。
 
@@ -144,7 +144,7 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 1. `login`：插件出二维码，手机 B 站扫码。凭证存在 `$DSH_HOME/bili-watch/credential.json`，不出本机。
 2. `--cred <文件路径>`：读一份现成的 `{sessdata, bili_jct, buvid3, buvid4}` JSON。
 
-凭证顺序：给了 `--cred` 就只用它，读不到就按匿名跑；没给 `--cred` 才用 `$DSH_HOME/bili-watch/credential.json`；两者都没有就匿名。
+凭证顺序：给了 `--cred` 就只用它，读不到就按匿名跑；没给 `--cred` 才用 `$DSH_HOME/bili-watch/credential.json`；两者都没有就匿名。**例外：** 本机若同时装有 bili-duty，且它的 `$DSH_HOME/bili-duty/bili_credential.json` 比 watch 自己那份更新，watch 会优先用那一份（同一台机器复用登录态）。因此「在面板里删掉凭证」不等于「立刻变匿名」——bili-duty 那份还在时会继续用它。
 
 这份文件等同账号登录态。请勿分享、提交、上传。
 
@@ -154,23 +154,24 @@ macOS/Linux 的 ffmpeg 用系统包管理器装，脚本只给提示。其余目
 |---|---|
 | `view <BV或链接或URL>` | 元数据 + 简介 + 热评（不下载、不依赖 ffmpeg，永远能跑） |
 | `peek <BV或链接>` | 元数据 + 热评 + 5 张均匀帧（需下载 360p 约每分钟 1 MB + 抽帧约 2 秒；装了 OCR 环境时会顺带识别这 5 帧；仅 B 站） |
-| `sub <BV或链接> [--format srt|json|md|txt] [--out 文件]` | AI 字幕 + 三判据（字/秒、关键词命中、时长）；`--format` 输出 SRT、JSON（带官方时间戳）、Markdown（每条带跳回原片的链接）或纯文本 txt（不带时间戳） |
+| `sub <BV或链接> [--format srt\|json\|md\|txt] [--out 文件（需配合 --format）]` | AI 字幕 + 两判据（字/秒、关键词重合；时长只用作语速的分母）；`--format` 输出 SRT、JSON（带官方时间戳）、Markdown（每条带跳回原片的链接）或纯文本 txt（不带时间戳） |
 | `comments <BV> [N]` | 评论区，默认按热度排序 |
 | `asr <BV或URL>` | 本地转写音频，并给出「可信 / 疑似幻觉」判定（见下节） |
 | `frames <BV或URL> [--step 秒] [--ocr]` | 抽帧；`--ocr` 顺带识别画面文字 |
 | `ocr <BV>` | 抽帧并 OCR |
-| `text <BV或URL> [--format json|md]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算）；`md` 有字幕时出时间轴，没有就出标题+全文；SRT 只有 `sub` 支持 |
+| `text <BV或URL> [--format json\|md]` | 四级链：字幕 → 转写 → 抽帧 OCR；`--format json` 带上时间轴口径（字幕 exact，转写与 OCR 是估算）；`md` 有字幕时出时间轴，没有就出标题+全文；SRT 只有 `sub` 支持 |
 | `sheet <BV> [--grid 3x3]` | 均匀挑帧拼成一张图（`NxM` 如 `3x3`、`4x4`，默认 9 帧） |
 | `substrip <BV> [--step 秒]` | 底部字幕竖拼成一张图 |
 | `danmaku <BV>` | 弹幕热区（按时间桶统计峰值） |
-| `search <关键词> [--days 3] [--limit 10] [--order pubdate|click]` | 搜视频 |
+| `local <文件路径> [--ocr] [--frames]` | 本地视频文件走同一条四级链（字幕层不适用，直接从转写起）。**仅 CLI 可用**，`bili_watch` 工具与 `/bili` 不提供 |
+| `search <关键词> [--days 3] [--limit 10] [--order pubdate\|click]` | 搜视频。`--days` 生效时最多抓 3 页再筛，结果仍按 `--limit` 截断 |
 | `hot [--limit 10]` | 综合热门榜 |
 | `login [--check] [--poll] [--key KEY]` | 扫码登录。`--check` = 检查本地凭证是否还有效（不会重新登录）；`--key KEY` 需配合 `--poll` 才生效（单独 `login --key X` 会被静默忽略） |
-| `clean` | 清空缓存根（默认 `$DSH_HOME/bili-watch/cache`；只清本插件自己写的 `BV*` 与 `frames/`、`asr/`、`_logs/` 等目录，同一层里别人的文件不动，凭证在上一层不会被碰到） |
+| `clean` | 清空缓存根（默认 `$DSH_HOME/bili-watch/cache`；只清本插件自己写的 `BV*` 与 `frames/`、`asr/`、`_logs/` 等目录，同一层里别人的文件不动，凭证在上一层不会被碰到）。有任务在跑（存在 `*.lock` 且持有进程还活着）时会拒绝清理并返回非零退出码；进程已被强杀的残留锁不算占用 |
 
-工具侧的等价入口：`bili_watch` 工具（参数 `command` + `bv`），或 `/bili` 命令。
+工具侧的等价入口：13 个内容命令在 `bili_watch` 工具、`/bili` 命令、CLI 三处等价（工具参数是 `command` + `bv`，另有 `format` / `out` / `limit` 等字段）；`login` 与 `clean` 只有 `/bili` 和 CLI；`local` 只有 CLI。
 
-表里只列常用参数。完整参数（`--out`、`--fresh`、`--scene`、`--ffmpeg`、`--cred`、`--fast`、`--mark-seen`、`--p` 等）跑 `bili-watch help` 看。
+表里只列常用参数。完整参数（`--out`（**必须配合 `--format`，只给 `--out` 会报错退出**）、`--fresh`、`--scene`、`--ffmpeg`、`--cred`、`--fast`、`--mark-seen`、`--p`、`--asr-max`（转写时长闸门，默认 30 分钟，单位毫秒）等）跑 `bili-watch help` 看。
 
 ## 单条链接软提示
 
@@ -222,7 +223,7 @@ AI 字幕（需登录）
 - 关键词命中率低（字幕和标题/UP 名对不上）：不单独触发，要和语速异常同时出现才算补充理由
 - 字幕里自称「实验 / 钓鱼 / 测试」
 
-想进一步确认就加 `--verify`：它会抽 5 帧做 OCR，拿画面文字跟字幕比一遍，报「首帧写着某实验说明」或「画面与字幕几乎不重合」。
+想进一步确认就加 `--verify`：它会抽 5 帧做 OCR，拿画面文字跟字幕比一遍，报「首帧写着某实验说明」或「画面与字幕几乎不重合」。**注意 `--verify` 只在字幕已被上面三条信号判为可疑时才生效**；字幕正常时它不抽帧、不 OCR，也不会额外提示（行为与不加 `--verify` 完全一样）。
 
 ```
 node tools/look.mjs text BV1xxxxxxxxx --verify
@@ -272,7 +273,7 @@ MIT
 
 ## 长文本保护（2026-10-26）
 
-`text` / `sub` / `asr` 的正文超过 **800 字**时，终端只给开头 400 字摘要 + 一行落盘路径，全文写进缓存目录下按视频分的文件夹：`<缓存目录>/<BV>_<标题>/<命令>.txt`。
+`text` / `sub` / `asr` 的正文超过 **800 字**时，终端只给开头 400 字摘要 + 一行落盘路径，全文写进缓存目录下按视频分的文件夹：`<缓存目录>/<BV>[_<标题>]/<命令>.txt`。标题段只在先跑过 `view` / `peek` 时才有——直接 `text BVxxx` 建的是纯 `<BV>` 目录，之后再跑 `view` / `peek` 会把它改名成 `<BV>_<标题>`。
 
 - `--head N`：自定义摘要长度
 - `--full`：打全文
