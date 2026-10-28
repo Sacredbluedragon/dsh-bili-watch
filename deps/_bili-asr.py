@@ -109,24 +109,22 @@ def main() -> int:
         # 量不出来不影响转写本身，但调用方会少一条判据，必须显式标出来（不能静默）
         print("[asr] VAD 不可用：预检失败（不影响转写，但空文本将无法归因）：%s" % e, file=sys.stderr)
 
-    try:
-        segments, info = model.transcribe(
+    def do_transcribe(m):
+        segments, info = m.transcribe(
             args.src,
             language=None if args.lang == "auto" else args.lang,
             # issue #2 P3-1（2026-10-28）：原来硬编码 True。VAD 预检失败（vad_ok=False）时，
             #   同一个 vad 模块会在 transcribe 里再炸一次、整段转写直接失败；所以预检失败就关掉过滤。
-            vad_filter=vad_ok,            # 正常情况掐掉静音段，纯画面/纯音乐的视频会得到空文本
+            vad_filter=vad_ok,
             vad_parameters={"min_silence_duration_ms": 400},
             beam_size=5,
-            condition_on_previous_text=False,  # 防止长视频里一段错就带着后面全错
+            condition_on_previous_text=False,
         )
-        parts = []
-        segs = []
+        parts, segs = [], []
         for seg in segments:
             t = (seg.text or "").strip()
             if t:
                 parts.append(t)
-                # 分段与模型自评分要留给调用方：判断「这段转写可信不可信」靠的就是它们
                 segs.append({
                     "start": round(float(seg.start), 2),
                     "end": round(float(seg.end), 2),
@@ -134,9 +132,30 @@ def main() -> int:
                     "no_speech_prob": round(float(getattr(seg, "no_speech_prob", 0.0) or 0.0), 3),
                     "avg_logprob": round(float(getattr(seg, "avg_logprob", 0.0) or 0.0), 3),
                 })
+        return parts, segs, info
+
+    # issue #3 第 4 条（2026-10-29）：模型能在 CUDA 上「加载成功」不代表能转写——
+    #   实测本机 WhisperModel(device="cuda") 初始化没报错、VAD 也跑完了，
+    #   真正调 cuBLAS 时才炸：Library cublas64_12.dll is not found or cannot be loaded。
+    #   普通用户装了 ctranslate2 但没装 CUDA 12 运行时，就是这个下场。
+    #   所以回落必须包住「转写本身」，不能只包「加载模型」。
+    try:
+        parts, segs, info = do_transcribe(model)
     except Exception as e:  # noqa: BLE001
-        print("[asr] 转写失败：%s" % e, file=sys.stderr)
-        return 5
+        if want == "cuda":
+            print("[asr] GPU 转写失败，回落 CPU 重试：%s" % e, file=sys.stderr)
+            try:
+                model = WhisperModel(args.model, device="cpu", compute_type="int8")
+                parts, segs, info = do_transcribe(model)
+                want = "cpu"
+                print("[asr] 已回落 CPU 完成（要彻底避开这个开销请用 --device cpu）", file=sys.stderr)
+            except Exception as e2:  # noqa: BLE001
+                print("[asr] CPU 回落也失败：%s" % e2, file=sys.stderr)
+                return 5
+        else:
+            print("[asr] 转写失败：%s" % e, file=sys.stderr)
+            return 5
+    print("[asr] device=%s" % want, file=sys.stderr)
 
     text = "".join(parts).strip()
     print("[asr] 完成：%d 段，%d 字，语种 %s" % (len(parts), len(text), info.language), file=sys.stderr)
