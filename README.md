@@ -45,7 +45,7 @@ dsh plugin --profile web add dsh-bili-watch@latest
 dsh plugin --profile web remove dsh-bili-watch
 ```
 
-升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境一起删掉（**登录凭证不在 `deps/`**，它已经搬到 `$DSH_HOME/bili-watch/`）；把 `BILI_WATCH_SEEN` 指到包外可以保住「已看过」记录。**注意 `BILI_WATCH_PROJ` 只影响运行时查找顺序，不影响 `fetch-deps` 的安装位置**——`fetch-deps` 永远装进包内 `deps/`，而且查找时 `deps/` 优先，所以「指到包外」这一步要真的生效，得先让包内 `deps/.venv-*` 不存在。**抽帧缓存根在包目录外**（默认 `~/.dsh/bili-watch/cache`，即 `$DSH_HOME/bili-watch/cache`；自定义过 `BILI_WATCH_CACHE` 就指到你自己设的位置，插件会在那个目录下再建一层 `bili-watch-cache/` 当缓存根），`dsh plugin remove` 不会动它，卸载后需手动删这个缓存目录。**只删 `cache/` 这一层：登录凭证是它的兄弟文件 `$DSH_HOME/bili-watch/credential.json`，删了要重新扫码。** 日常清理在面板里逐项删即可。
+升级后重启 DSH。`deps/` 在包目录内，卸载或重装会连模型、环境一起删掉（**登录凭证不在 `deps/`**，它已经搬到 `$DSH_HOME/bili-watch/`）。**面板里调过的东西也在 `deps/` 里**——`deps-config.json`（5 个调优参数与自定义缓存路径）、`cache-config.json`、`ui-config.json`、`seen.md`，卸载前先拷出来，重装后原样放回；把 `BILI_WATCH_SEEN` 指到包外可以保住「已看过」记录。**注意 `BILI_WATCH_PROJ` 只影响运行时查找顺序，不影响 `fetch-deps` 的安装位置**——`fetch-deps` 永远装进包内 `deps/`，而且查找时 `deps/` 优先，所以「指到包外」这一步要真的生效，得先让包内 `deps/.venv-*` 不存在。**抽帧缓存根在包目录外**（默认 `~/.dsh/bili-watch/cache`，即 `$DSH_HOME/bili-watch/cache`；自定义过 `BILI_WATCH_CACHE` 就指到你自己设的位置，插件会在那个目录下再建一层 `bili-watch-cache/` 当缓存根），`dsh plugin remove` 不会动它，卸载后需手动删这个缓存目录。**只删 `cache/` 这一层：登录凭证是它的兄弟文件 `$DSH_HOME/bili-watch/credential.json`，删了要重新扫码。** 日常清理在面板里逐项删即可。
 
 ## 模块架构
 

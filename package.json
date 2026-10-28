@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-watch",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": false,
   "description": "把 B 站视频读成文本给 DSH agent 用：元数据、评论、弹幕、字幕、本地转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。只读命令零依赖。",
   "type": "module",

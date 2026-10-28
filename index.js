@@ -248,19 +248,19 @@ const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'subst
 function hasBvLayout(dir) {
   // 判据一：我们写过的标记（新用户、二次运行都靠它）
   try { if (existsSync(join(dir, CACHE_MARK))) return true } catch {}
-  // 判据二（N05-A1，2026-10-27 改）：BV* 目录 **且** 我们必建的工作目录之一，两条同时成立才算。
-  //   原来只看 BV*，可目标用户就是 B 站素材库——目录名全以 BV 开头，于是把用户自己的素材库
-  //   认成缓存根，removeOwned / autoCleanCache 会成片删掉 original.mp4。
-  //   单看 frames/asr 也不行（通用名，别人也会有），所以改成「两者同时成立」。
+  // 判据二（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
+  //   N05-A1 那版用「BV* + frames/asr/_logs 之一」，实测仍会误判：用户素材库只要同时有 BV 目录和
+  //   一个 frames 目录，clean 就把 BV 目录整片删掉（rc=0、无警告），还顺手写下 .bili-watch-root 自我固化，
+  //   此后永远走删的那条路、不会自己纠正。frames/asr/_logs 是通用名，等于拿别人的东西证明自己的身份；
+  //   meta.json 只有 writeMeta() 会写，用户素材库不会有。
   //   口径必须与 tools/look.mjs 的同名函数逐字一致，否则面板与 CLI 判据分叉。
-  let hasBv = false
-  let hasWork = false
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
       if (!e.isDirectory()) continue
-      if (/^BV[0-9A-Za-z]{10}/i.test(e.name)) hasBv = true
-      else if (e.name === 'frames' || e.name === 'asr' || e.name === '_logs') hasWork = true
-      if (hasBv && hasWork) return true
+      if (!/^BV[0-9A-Za-z]{10}/i.test(e.name)) continue
+      try {
+        if (existsSync(join(dir, e.name, 'meta.json'))) return true
+      } catch {}
     }
   } catch {}
   return false
