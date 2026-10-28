@@ -185,11 +185,13 @@ dsh plugin --profile web remove dsh-bili-watch
 | 元数据 / 评论 / 弹幕 / 搜索 / 热榜 | 无（匿名 HTTP） | — |
 | 抽帧 / 九宫格 / 字幕带 | ffmpeg | 报错并提示安装方式 |
 | AI 字幕 | B 站登录态（SESSDATA） | 返回无字幕轨，降级至下一级 |
-| 本地 ASR | Python ≥ 3.10 + faster-whisper（`deps/.venv-asr`） | 跳过，降级 |
-| 画面 OCR | Python ≥ 3.10 + rapidocr_onnxruntime（`deps/.venv-ocr`） | 跳过，仅基础抽帧 |
+| 本地 ASR | Python 3.10–3.14 + faster-whisper（`deps/.venv-asr`）+ VC++ 运行库 | 跳过，降级 |
+| 画面 OCR | Python 3.10–3.14 + rapidocr_onnxruntime（`deps/.venv-ocr`）+ VC++ 运行库 | 跳过，仅基础抽帧 |
 | 通用 URL | yt-dlp | 仅支持 B 站 |
 
 环境要求：Node.js ≥ 22。
+
+> **VC++ 运行库**：ASR 与 OCR 用的 `faster-whisper` / `onnxruntime` 是 C++ 编译的 wheel，运行时要 `vcruntime140.dll`。Windows 10/11 一般自带，但精简过的企业镜像可能没有——症状是 pip 装得上、`import` 时报 `DLL load failed while importing …`。这时装一遍 [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)，与 Python 版本无关，不必重装 venv。
 
 `ffmpeg` 查找顺序：`--ffmpeg` > `BILI_WATCH_FFMPEG` > `deps/deps-config.json` > `deps/ffmpeg.exe` > `PATH`。
 

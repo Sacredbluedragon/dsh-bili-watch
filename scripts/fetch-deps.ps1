@@ -262,8 +262,8 @@ function Ensure-Ocr {
   Invoke-PipInstall $py @('install', '--upgrade', 'pip')
   Invoke-PipInstall $py @('install', 'rapidocr-onnxruntime==1.2.3')
   if ($LASTEXITCODE -ne 0) {
-    Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
-    throw '安装 rapidocr-onnxruntime 失败（已删除半成品 venv，重跑即可重试）'
+    Move-SemiVenv $venv
+    throw '安装 rapidocr-onnxruntime 失败（半成品 venv 已改名留档，重跑即可重试）'
   }
   Write-Host "    ✓ $py"
 }
