@@ -1031,19 +1031,13 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
           if (base !== f) continue  // 含路径分隔符，拒绝
           try { unlinkSync(join(dir, f)) } catch {}
         }
-      } else if (m0) {
-        // 老 manifest：存在但没有 files 字段——按命名兜底删本工具产物（peek-NN / 纯数字帧 / ${bv}-NN.jpg）
-        const ownRe = new RegExp(`^${bv}-\\d+\\.jpg$`)
-        for (const f of jpgs()) {
-          if (/^peek-\d+\.jpg$/.test(f) || /^\d+\.jpg$/.test(f) || ownRe.test(f)) {
-            try { unlinkSync(join(dir, f)) } catch {}
-          }
-        }
       } else {
-        // A5（2026-10-27 批次8）：连 manifest 都没有——说明这个目录不是本工具跑出来的缓存，
-        //   多半是用户自己的 --out 目录（里面可能放着用户自己的 1.jpg）。绝不能按命名猜着删，
-        //   一个都不碰，只打一行提示。
-        say('没有 manifest，跳过清理（目录里的文件一概不动）')
+        // A5（2026-10-27 批次8）+ X-01（2026-10-28）：没有 manifest，或 manifest 里没有 files 清单，
+        //   都说明「这目录不是本工具这一次跑出来的」——绝不能按文件名猜着删。
+        //   原来老 manifest（有文件、无 files）走命名兜底删 数字.jpg 与 peek-NN.jpg，
+        //   用户的 1.jpg / 2.jpg 正好被第一条命中：`--fresh --out <用户目录>` 实测会把它们删掉。
+        //   想在旧缓存上重抽，删掉整个缓存目录即可；这里一律不碰。
+        say(m0 ? 'manifest 没有 files 清单，跳过清理（目录里的文件一概不动）' : '没有 manifest，跳过清理（目录里的文件一概不动）')
       }
     }
 

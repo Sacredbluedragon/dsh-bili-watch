@@ -12,7 +12,7 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
@@ -200,14 +200,42 @@ function readTuning() {
   return out
 }
 /**
+ * 读 deps-config.json，坏文件先备份再退回默认值（X-16a，2026-10-28 WB-CN N12 §2 头号）。
+ *
+ * 原来两处写入口都是 `try { cur = JSON.parse(readFileSync(p)) } catch {}`：
+ * 解析失败 cur 变 `{}`，下次改**任意一个**参数就整份写回——ffmpeg 路径、cache 目录、
+ * proj、17 项调优参数全被擦掉。单写者就能触发，不需要并发，用户只会看到「配置莫名其妙没了」。
+ *
+ * 现在：文件不存在 → 默认值（正常）；存在但坏了 → 改名成 `.broken-<ts>` 留档 + 默认值 + 一次告警。
+ * 留档而不是直接拒绝写，是因为拒绝写会让面板「保存」一直失败、用户也不知道该改哪个文件。
+ */
+function readDepsCfgFile(p) {
+  let raw
+  try {
+    raw = readFileSync(p, 'utf8')
+  } catch (e) {
+    if (e?.code !== 'ENOENT') cfgWarning = `${basename(p)} 读取失败：${String(e?.message || e)}`
+    return {}
+  }
+  if (!raw.trim()) return {}
+  try {
+    const j = JSON.parse(raw)
+    return (j && typeof j === 'object' && !Array.isArray(j)) ? j : {}
+  } catch (e) {
+    const bak = `${p}.broken-${Date.now()}`
+    try { renameSync(p, bak) } catch {}
+    cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
+    return {}
+  }
+}
+/**
  * 参数分层专用写入口：一次读盘 → 按白名单改/删 → 整份写回。
  * 不能复用 writeDepsCfg：它是合并写，删键（面板「恢复默认」）在合并写里删不掉。
  * 表外的键不认；表内键但值非法则忽略（保持原值），都不报错。
  */
 function writeTuning(body) {
   const p = join(DEPS, 'deps-config.json')
-  let cur = {}
-  try { cur = JSON.parse(readFileSync(p, 'utf8')) } catch {}
+  let cur = readDepsCfgFile(p)
   if (!cur || typeof cur !== 'object' || Array.isArray(cur)) cur = {}
   if (!body || typeof body !== 'object') return { ok: true, data: cur }
   let touched = false
@@ -510,7 +538,20 @@ function uiCfg() {
   try {
     const raw = JSON.parse(readFileSync(UI_CFG, 'utf8'))
     return { ...DEFAULT_UI_CFG, ...raw }
-  } catch { return { ...DEFAULT_UI_CFG } }
+  } catch (e) {
+    // X-16a 同族（2026-10-28）：原来坏文件静默回默认值，紧接着 writeUiCfg 就把坏文件覆盖掉——
+    // 用户手改坏的 4 个开关再也找不回来。这里先改名留档（rename 后文件就不存在了，不会重复备份）。
+    if (e?.code !== 'ENOENT') {
+      const bak = `${UI_CFG}.broken-${Date.now()}`
+      try {
+        renameSync(UI_CFG, bak)
+        cfgWarning = `ui-config.json 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
+      } catch (e2) {
+        cfgWarning = `ui-config.json 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
+      }
+    }
+    return { ...DEFAULT_UI_CFG }
+  }
 }
 function writeUiCfg(patch) {
   const cur = uiCfg()
@@ -862,17 +903,21 @@ function cacheCfg() {
   }
 }
 
+// WB-CN N13（2026-10-28）：原来吞异常、无返回值，三处调用都不看结果——「保存规则」写盘失败仍回
+// 200 {ok:true}，与 BLK-02 同族（BLK-02 只修了 tuning 那条）。现在把结果交出去，调用方按失败处理。
 function writeCacheCfg(days, maxMb) {
   try {
     writeFileSync(CACHE_CFG, JSON.stringify({ days, maxMb }), 'utf8')
-  } catch {}
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, why: String(e?.message || e) }
+  }
 }
 
 /** 合并写 deps\deps-config.json（只动指定字段，保留用户原有配置）。失败返回 {ok:false,error}，不抛。 */
 function writeDepsCfg(patch) {
   const p = join(DEPS, 'deps-config.json')
-  let cur = {}
-  try { cur = JSON.parse(readFileSync(p, 'utf8')) } catch {}
+  const cur = readDepsCfgFile(p)
   const next = { ...cur, ...patch }
   try {
     writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')
@@ -1717,10 +1762,11 @@ function apply(ctx) {
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
                 if (Number.isFinite(body?.days) || Number.isFinite(body?.maxMb)) {
-                  writeCacheCfg(
+                  const wc = writeCacheCfg(
                     Number.isFinite(body?.days) ? Math.max(1, body.days) : cacheCfg().days,
                     Number.isFinite(body?.maxMb) ? Math.max(100, body.maxMb) : cacheCfg().maxMb,
                   )
+                  if (!wc.ok) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${wc.why || '未知错误'}` })
                 }
                 // A7（2026-10-27 批次8）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
                 //   不再像以前那样「先删完再补一句 warning」（锁外删会跟运行中的抽帧抢目录）。
@@ -1779,16 +1825,19 @@ function apply(ctx) {
                 // A2（2026-10-27 批次8）：面板「保存规则」把 days/maxMb POST 到这里，以前被静默丢。
                 //   落到 cache-config.json（与 /cache/clear 同源），不写进 ui-config.json。
                 let rule = null
+                let cacheErr = null
                 if (Number.isFinite(body?.days) && body.days > 0) {
                   const cur = cacheCfg()
                   const days = Math.max(1, Math.floor(body.days))
                   const maxMb = Number.isFinite(body?.maxMb) && body.maxMb > 0 ? Math.max(100, Math.floor(body.maxMb)) : cur.maxMb
-                  writeCacheCfg(days, maxMb)
+                  const wc = writeCacheCfg(days, maxMb)
+                  if (!wc.ok) cacheErr = wc.why || '未知错误'
                   rule = { days, maxMb }
                 } else if (Number.isFinite(body?.maxMb) && body.maxMb > 0) {
                   const cur = cacheCfg()
                   const maxMb = Math.max(100, Math.floor(body.maxMb))
-                  writeCacheCfg(cur.days, maxMb)
+                  const wc = writeCacheCfg(cur.days, maxMb)
+                  if (!wc.ok) cacheErr = wc.why || '未知错误'
                   rule = { days: cur.days, maxMb }
                 }
                 // 参数分层（阶段B）：五个白名单键写进 deps-config.json，表外的键忽略、不报错。
@@ -1799,6 +1848,7 @@ function apply(ctx) {
                   if (!w.ok) tuneErr = w.why || '未知错误'
                 }
                 if (tuneErr) return sendJson(res, 500, { ok: false, why: `参数保存失败：${tuneErr}` })
+                if (cacheErr) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${cacheErr}` })
                 return sendJson(res, 200, { ok: true, data: { ...next, ...(rule || {}), tuning: readTuning() } })
               }
               sendJson(res, 404, { ok: false, why: 'not found' })
