@@ -1,6 +1,7 @@
 # dsh-bili-watch bundle patch layer
 # profile 的 dsh.profile.bundles 列出本包名即整层生效
+# 2026-10-28：去掉 disabled: true。0.2.17（10-24 应急修 DNS rebinding）时误加，
+# 之后 7 个版本一直带着，装完重启命令不存在、用户以为装坏了。不要再改回 true。
 - insert:
     - id: dsh-bili-watch
       name: dsh-bili-watch
-      disabled: true

@@ -101,6 +101,23 @@ window.__ModuleLoader__.load({
 
     // 参数分层（2026-10-28 阶段B）：一项 = 输入框 + 默认值提示 + 范围 + 一句话后果 + 恢复默认。
     // 只写 h()，不引新依赖；保存/恢复都由外面传进来的回调走 /config。
+    // 2026-10-28 老大要求「高级设置放开」：这 8 项原来是代码里的硬编码，现在都能在面板里调。
+    // 元数据跟后端 TUNING_DEFS 一一对应（键名、默认值、上下界都从 /status 的 tuningDefaults/tuningRanges 取，
+    // 这里只放文案），加项时后端 TUNING_DEFS 与这张表各加一行即可。
+    const ADV_TUNING = [
+      { key: 'asrMemMB', label: '转写内存门槛', unit: 'MB', def: '1536', hint: '该值用于控制本地转写的内存门槛。可用内存低于此值时跳过转写、降级至字幕或抽帧；增大后更早放弃转写，减小后内存紧张时仍强制执行可能崩溃。默认 1536 MB。' },
+      { key: 'lockTtlMin', label: '残留锁过期', unit: '分钟', def: '30', hint: '该值用于控制残留锁的过期时长。进程异常退出后锁文件超过此时长视为过期，新任务可接管；缩短后运行中的长转写可能被误判过期，延长后残留锁阻塞更久。默认 30 分钟。' },
+      { key: 'unitLimit', label: '单条内容上限', unit: '字', def: '5000', hint: '该值用于控制单条评论或弹幕的截断阈值。超出时截断并标注省略字数；增大后内容更完整但占用更多上下文，减小后省上下文但长评论截断更短。默认 5000 字。' },
+      { key: 'textLimit', label: '文本层默认字数', unit: '字', def: '800', hint: '该值用于控制文本层单次返回正文上限。超出时仅返回开头摘要与落盘路径；增大后对话内正文更长但占用更多上下文，减小后更早落盘。默认 800 字。' },
+      { key: 'toolTextCap', label: '工具层总字数', unit: '字', def: '2000', hint: '该值用于控制工具层单次返回正文总上限。增大后每次工具返回的正文更长，占用更多对话上下文；减小后更早落盘。默认 2000 字。' },
+      { key: 'toolHead', label: '工具层默认头部', unit: '字', def: '800', hint: '该值用于控制工具层默认返回的正文头部字数，超出部分写入落盘文件。增大后对话内暴露更多开头内容，减小后更早切换至落盘路径。默认 800 字。' },
+      { key: 'dmBucketSec', label: '弹幕分桶宽度', unit: '秒', def: '30', hint: '该值用于控制弹幕热区的分桶时长。增大后热区粒度更粗、覆盖更长时段；减小后定位更精确但可能分散。默认 30 秒。' },
+      { key: 'dmTop', label: '弹幕热区条数', unit: '桶', def: '5', hint: '该值用于控制弹幕热区输出的桶数。增大后列出更多时段但输出更长；减小后仅保留最突出时段。默认 5 桶。' },
+      { key: 'downloadMaxMB', label: '单文件下载上限', unit: 'MB', def: '512', hint: '该值用于控制单个媒体文件的下载体积上限。超出时下载中止，需增大后重试；增大后允许更大文件但增加磁盘与带宽占用，减小后拒绝大文件。默认 512 MB。' },
+      { key: 'subRateMin10', label: '字幕语速下限 ×10', unit: '（20=2.0 字/秒）', def: '20', hint: '该值用于控制字幕语速下限（×10，即 2.0 字/秒），低于此值判定为「字幕可疑」。减小后慢口播更不易误判但可能漏检诱饵，增大后慢口播更易误判。默认 2.0 字/秒。' },
+      { key: 'subRateMax10', label: '字幕语速上限 ×10', unit: '（85=8.5 字/秒）', def: '85', hint: '该值用于控制字幕语速上限（×10，即 8.5 字/秒），高于此值判定为「字幕可疑」。增大后快语速更不易误判但可能漏检，减小后快语速更易误判。默认 8.5 字/秒。' },
+      { key: 'textBrief', label: '超长文本摘要字数', unit: '字', def: '400', hint: '该值用于控制超长文本的摘要长度。正文超过「文本层默认字数」时，对话内仅返回开头这么多字，全文落盘；增大后摘要更完整但增加上下文占用，减小后摘要更短。默认 400 字。' },
+    ]
     function TuneRow({ label, value, unit, onChange, onSave, onRestore, def, range, hint }) {
       return h('div', { 'data-bl-row': '' },
         h('span', { 'data-bl-name': '' }, label),
@@ -127,11 +144,17 @@ window.__ModuleLoader__.load({
       const [ffTmo, setFfTmo] = React.useState('300')
       const [cmdTmo, setCmdTmo] = React.useState('180')
       const [advOpen, setAdvOpen] = React.useState(false)
+      // 高级设置那 8 项统一放在一个对象里，避免再加 8 个 useState
+      const [advVals, setAdvVals] = React.useState({})
       const [tuneMeta, setTuneMeta] = React.useState(null)
       const [qr, setQr] = React.useState(null)
       const [qrState, setQrState] = React.useState('')
       const [dlg, setDlg] = React.useState(null) // 'download' | 'clean'
       const [picked, setPicked] = React.useState([])
+      // BLK-03（2026-10-28）：8 秒轮询原来无条件把输入框重置成服务端值，用户改完天数还没点保存
+      //   就被改回 7。用 ref 记「用户动过输入框」，轮询见到就跳过覆盖，保存成功后复位。
+      const dirtyRef = React.useRef(false)
+      const markDirty = () => { dirtyRef.current = true }
 
       const load = React.useCallback(async () => {
         try {
@@ -139,19 +162,22 @@ window.__ModuleLoader__.load({
           if (j.ok) {
             setSt(j.data)
             setErr('')
-            setDays(String(j.data.cache?.days ?? 7))
-            setMaxMb(String(j.data.cache?.maxMb ?? 2048))
             // 参数分层：初值取 /status 的 tuning / tuningDefaults / tuningRanges
             const tv = j.data.tuning || {}
             const td = j.data.tuningDefaults || {}
             const tr = j.data.tuningRanges || {}
             setTuneMeta({ defaults: td, ranges: tr })
-            const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
-            setAsrMin(String(Math.round(sec / 60)))
-            setFrames(String(tv.maxFrames ?? td.maxFrames ?? 500))
-            setAsrTmo(String(tv.asrTimeoutSec ?? td.asrTimeoutSec ?? 900))
-            setFfTmo(String(tv.ffmpegTimeoutSec ?? td.ffmpegTimeoutSec ?? 300))
-            setCmdTmo(String(tv.cmdTimeoutSec ?? td.cmdTimeoutSec ?? 180))
+            if (!dirtyRef.current) {
+              setDays(String(j.data.cache?.days ?? 7))
+              setMaxMb(String(j.data.cache?.maxMb ?? 2048))
+              const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
+              setAsrMin(String(Math.round(sec / 60)))
+              setFrames(String(tv.maxFrames ?? td.maxFrames ?? 500))
+              setAsrTmo(String(tv.asrTimeoutSec ?? td.asrTimeoutSec ?? 900))
+              setFfTmo(String(tv.ffmpegTimeoutSec ?? td.ffmpegTimeoutSec ?? 300))
+              setCmdTmo(String(tv.cmdTimeoutSec ?? td.cmdTimeoutSec ?? 180))
+              setAdvVals(Object.fromEntries(ADV_TUNING.map((x) => [x.key, String(tv[x.key] ?? td[x.key] ?? x.def)])))
+            }
           } else {
             setErr(j.why || '状态读取失败')
           }
@@ -186,7 +212,7 @@ window.__ModuleLoader__.load({
             if (j.state === 'expired' || j.state === 'error') {
               stop = true
               setQrState(j.state)
-              setMsg(j.why || (j.state === 'expired' ? '二维码已过期，点「重新扫码」再试。' : '轮询失败'))
+              setMsg(j.why || (j.state === 'expired' ? '二维码已过期，请点击「重新扫码」重试。' : '轮询失败'))
               return
             }
             setQrState(j.state)
@@ -230,7 +256,7 @@ window.__ModuleLoader__.load({
         setMsg('')
         try {
           const j = await jpost('/download', { target })
-          setMsg(j.ok ? `已开始下载（后台跑，日志 ${j.data.log}）。下载较久，过一会儿点刷新看状态。` : (j.data?.why || j.why || '启动失败'))
+          setMsg(j.ok ? `已开始下载（后台执行，日志 ${j.data.log}）。下载完成后点击刷新查看状态。` : (j.data?.why || j.why || '启动失败'))
         } catch (e) {
           setMsg(String(e?.message || e))
         } finally {
@@ -241,7 +267,8 @@ window.__ModuleLoader__.load({
       const saveCache = async () => {
         try {
           const j = await jpost('/cache/clear', { days: Number(days), maxMb: Number(maxMb) })
-          setMsg(j.ok ? `缓存已清（${j.data.removed} 个文件 / ${fmtBytes(j.data.bytes)}）；之后按 ${days} 天、${maxMb} MB 自动清` : (j.why || '清缓存失败'))
+          setMsg(j.ok ? `缓存已清理（${j.data.removed} 个文件 / ${fmtBytes(j.data.bytes)}）；此后按 ${days} 天、${maxMb} MB 自动清理` : (j.why || '清理缓存失败'))
+          dirtyRef.current = false
           await load()
         } catch (e) {
           setMsg(String(e?.message || e))
@@ -252,6 +279,7 @@ window.__ModuleLoader__.load({
         try {
           const j = await jpost('/config', { days: Number(days), maxMb: Number(maxMb) })
           setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
+          if (j?.ok !== false) { dirtyRef.current = false; await load() }
         } catch (e) {
           // A2（2026-10-27 批次8）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
           setMsg('保存失败：' + String(e?.message || e))
@@ -267,6 +295,7 @@ window.__ModuleLoader__.load({
             return
           }
           setMsg(okText)
+          dirtyRef.current = false
           await load()
         } catch (e) {
           setMsg('保存失败：' + String(e?.message || e))
@@ -305,7 +334,7 @@ window.__ModuleLoader__.load({
               await jpost('/download', { target: t })
             } catch {}
           }
-          setMsg(`已启动 ${picked.length} 个下载（后台跑，过一会儿刷新看状态）。`)
+          setMsg(`已启动 ${picked.length} 个下载（后台执行，稍后点击刷新查看状态）。`)
           return
         }
         if (!picked.length) {
@@ -325,7 +354,7 @@ window.__ModuleLoader__.load({
 
       const delOne = async (target) => {
         const row = rows.find((d) => d.id === target)
-        const label = target === 'credential' ? '登录凭证（删了要重新扫码）' : (row?.name || target)
+        const label = target === 'credential' ? '登录凭证（删除后需重新扫码）' : (row?.name || target)
         if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
           if (!window.confirm(`确定删除 ${label}？`)) return
         }
@@ -333,7 +362,7 @@ window.__ModuleLoader__.load({
           const j = await jpost('/delete', { targets: [target] })
           const d = j.data || {}
           const skipped = (d.skipped || []).map((s) => s.why).join('、')
-          setMsg(d.deleted?.length ? `已删除 ${target}` : `没删：${skipped || '未知原因'}`)
+          setMsg(d.deleted?.length ? `已删除 ${target}` : `未删除：${skipped || '未知原因'}`)
           await load()
         } catch (e) {
           setMsg('删除失败：' + String(e?.message || e))
@@ -380,7 +409,7 @@ window.__ModuleLoader__.load({
         ),
         h('div', { 'data-bl-head': '' },
           h('span', { 'data-bl-title': '' }, '依赖与状态'),
-          h('span', { 'data-bl-sub': '' }, '缺什么点下载，装好后这里会变绿。')),
+          h('span', { 'data-bl-sub': '' }, '缺失项点击行末按钮安装，完成后状态显示为已就绪。')),
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-sechead': '' },
             h('span', { 'data-bl-sec-title': '' }, '运行依赖'),
@@ -388,7 +417,7 @@ window.__ModuleLoader__.load({
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
           ...deps.map((d) => h(DepRow, { key: d.id, d, busy: busy === d.id, onDownload: download, onDelete: delOne })),
           h('div', { 'data-bl-note': '' },
-            '下载在后台跑，用插件自带的 fetch-deps 脚本；体积是预估，实际以跑完为准。')),
+            '下载在后台执行，使用内置 fetch-deps 脚本；体积为预估值，实际以完成后为准。')),
         dlg
           ? h('div', { 'data-bl-sec': '', 'data-bl-dlg': '' },
               h('span', { 'data-bl-sec-title': '' }, dlg === 'download' ? '批量下载（默认全勾选，可取消）' : '批量清理（默认全勾选，可取消）'),
@@ -415,7 +444,7 @@ window.__ModuleLoader__.load({
                       d.removable
                         ? d.ok
                           ? h('span', { 'data-bl-good': '' }, '可清理')
-                          : h('span', { 'data-bl-note': '' }, '没有可删的')
+                          : h('span', { 'data-bl-note': '' }, '无可清理项')
                         : h('span', { 'data-bl-note': '' }, d.removableWhy || '不在插件目录内'),
                     ),
                   )),
@@ -431,10 +460,10 @@ window.__ModuleLoader__.load({
                 h('div', { 'data-bl-qrside': '' },
                   h('div', { 'data-bl-note': '' },
                     qrState === 'scanned'
-                      ? '已扫码，请在手机 B 上点确认。'
+                      ? '请在 B 站手机客户端中确认登录。'
                       : qrState === 'loading'
                         ? '正在生成二维码…'
-                        : '用手机 B 站「扫一扫」扫左边这张；扫完这里会自动变绿。'),
+                        : '请使用 B 站手机 App 扫描二维码，确认后自动刷新登录状态。'),
                   h('button', { 'data-bl-btn': '', onClick: () => { setQr(null); setQrState('') } }, '取消'))))
           : null,
         h('div', { 'data-bl-sec': '' },
@@ -467,13 +496,13 @@ window.__ModuleLoader__.load({
             h('span', { 'data-bl-name': '' }, '自动清理规则'),
             h('span', { 'data-bl-detail': '' },
               '保留 ',
-              h('input', { 'data-bl-input': '', value: days, onChange: (e) => setDays(e.target.value), inputMode: 'numeric' }),
+              h('input', { 'data-bl-input': '', value: days, onChange: (e) => { markDirty(); setDays(e.target.value) }, inputMode: 'numeric' }),
               ' 天；总量超过 ',
-              h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => setMaxMb(e.target.value), inputMode: 'numeric' }),
+              h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => { markDirty(); setMaxMb(e.target.value) }, inputMode: 'numeric' }),
               ' MB 时从最旧的删。'),
             h('button', { 'data-bl-btn': '', onClick: saveRule }, '保存规则')),
           h('div', { 'data-bl-note': '' },
-            '不点也会按上面的规则自动清（每次打开面板与插件启动时检查一次）。')),
+            '即使不手动清理，也会按上述规则自动执行（每次打开面板与插件启动时检查一次）。')),
         // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),
@@ -481,7 +510,7 @@ window.__ModuleLoader__.load({
             label: '转写闸门',
             value: asrMin,
             unit: '分钟',
-            onChange: setAsrMin,
+            onChange: (v) => { markDirty(); setAsrMin(v) },
             onSave: saveAsrMax,
             onRestore: () => saveTune({ asrMaxSec: null }, '转写闸门已恢复默认（30 分钟）。'),
             def: '30 分钟',
@@ -492,7 +521,7 @@ window.__ModuleLoader__.load({
             label: '抽帧张数上限',
             value: frames,
             unit: '张',
-            onChange: setFrames,
+            onChange: (v) => { markDirty(); setFrames(v) },
             onSave: () => saveTune({ maxFrames: Number(frames) }, '抽帧张数上限已保存。'),
             onRestore: () => saveTune({ maxFrames: null }, '抽帧张数上限已恢复默认（500 张）。'),
             def: '500 张',
@@ -501,16 +530,16 @@ window.__ModuleLoader__.load({
           }),
           h('div', { 'data-bl-row': '' },
             h('button', { 'data-bl-btn': '', onClick: () => setAdvOpen((v) => !v) },
-              (advOpen ? '▾ ' : '▸ ') + '高级设置（不建议修改）'))),
+              (advOpen ? '▾ ' : '▸ ') + '高级设置（一般保持默认）'))),
         // 高级设置：折叠，默认收起。改错会让长视频静默降级，所以放在折叠区里。
         advOpen
           ? h('div', { 'data-bl-sec': '' },
-              h('span', { 'data-bl-sec-title': '' }, '高级设置（不建议修改）'),
+              h('span', { 'data-bl-sec-title': '' }, '高级设置（一般保持默认）'),
               h(TuneRow, {
                 label: 'ASR 超时',
                 value: asrTmo,
                 unit: '秒',
-                onChange: setAsrTmo,
+                onChange: (v) => { markDirty(); setAsrTmo(v) },
                 onSave: () => saveTune({ asrTimeoutSec: Number(asrTmo) }, 'ASR 超时已保存。'),
                 onRestore: () => saveTune({ asrTimeoutSec: null }, 'ASR 超时已恢复默认（900 秒）。'),
                 def: '900 秒',
@@ -521,7 +550,7 @@ window.__ModuleLoader__.load({
                 label: 'ffmpeg 超时',
                 value: ffTmo,
                 unit: '秒',
-                onChange: setFfTmo,
+                onChange: (v) => { markDirty(); setFfTmo(v) },
                 onSave: () => saveTune({ ffmpegTimeoutSec: Number(ffTmo) }, 'ffmpeg 超时已保存。'),
                 onRestore: () => saveTune({ ffmpegTimeoutSec: null }, 'ffmpeg 超时已恢复默认（300 秒）。'),
                 def: '300 秒',
@@ -532,13 +561,29 @@ window.__ModuleLoader__.load({
                 label: '命令超时',
                 value: cmdTmo,
                 unit: '秒',
-                onChange: setCmdTmo,
+                onChange: (v) => { markDirty(); setCmdTmo(v) },
                 onSave: () => saveTune({ cmdTimeoutSec: Number(cmdTmo) }, '命令超时已保存。'),
                 onRestore: () => saveTune({ cmdTimeoutSec: null }, '命令超时已恢复默认（180 秒）。'),
                 def: '180 秒',
                 range: `${tuneMeta?.ranges?.cmdTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.cmdTimeoutSec?.[1] ?? 900} 秒`,
                 hint: '太短会让长视频的 text 命令超时。',
               }),
+              // 2026-10-28 新增的 8 项：全部由 ADV_TUNING 驱动，加项只改那张表 + 后端 TUNING_DEFS
+              ...ADV_TUNING.map((x) => h(TuneRow, {
+                key: x.key,
+                label: x.label,
+                value: advVals[x.key] ?? x.def,
+                unit: x.unit,
+                onChange: (v) => { markDirty(); setAdvVals((s) => ({ ...s, [x.key]: v })) },
+                onSave: () => saveTune({ [x.key]: Number(advVals[x.key] ?? x.def) }, `${x.label}已保存。`),
+                onRestore: () => saveTune({ [x.key]: null }, `${x.label}已恢复默认（${x.def} ${x.unit}）。`),
+                def: `${x.def} ${x.unit}`,
+                range: (() => {
+                  const r = tuneMeta?.ranges?.[x.key]
+                  return r ? `${r[0]}–${r[1]} ${x.unit}` : `默认 ${x.def} ${x.unit}`
+                })(),
+                hint: x.hint,
+              })),
               h('div', { 'data-bl-note': '' },
                 '这几项会写进 deps/deps-config.json，改完立即生效，不用重启。「恢复默认」= 把这个键从配置里删掉。'))
           : null,

@@ -65,7 +65,7 @@ const FFMPEG_HINT =
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 // 缓存根标记：只有我们自己写过这个文件，才认「这个目录已经是缓存根」
 const CACHE_MARK = '.bili-watch-root'
-const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl'])
+const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
 function hasBvLayout(dir) {
   // 判据一：我们写过的标记（新用户、二次运行都靠它）
   try { if (existsSync(join(dir, CACHE_MARK))) return true } catch {}
@@ -98,6 +98,8 @@ function dirStat(dir) {
   let bytes = 0
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
+      // 10-28：标记文件与运行日志不算「缓存占用」（与 index.js dirStat 同口径）。
+      if (e.name === CACHE_MARK || e.name === '_logs') continue
       const p = join(dir, e.name)
       if (e.isDirectory()) { const sub = dirStat(p); files += sub.files; bytes += sub.bytes }
       else if (e.isFile()) { try { bytes += statSync(p).size } catch {}; files += 1 }
@@ -107,15 +109,23 @@ function dirStat(dir) {
 }
 // 2026-10-28：cleanKey 会把整条链接压成目录名（如 httpsb23.tvabc123）——短链没解析成 BV 时
 // 插件自己就建了这种目录，清理时必须认它，否则「立即清除」会留一堆删不掉的垃圾（用户实测剩 3 个）。
-// 两条一起用：名字以 http 开头（用户素材库不会有这种名字），且里面只有我们自己的产物。
+// 10-28 又实测剩两个：`search` 的落盘目录名来自查询词（如 `DeepSeekHarness`）、`hot` 落 `_hot`。
+// 判据：里面**只有**我们自己的产物，且至少有一个 `*.tool.txt`。用户素材目录装的是 mp4/jpg，不会是这个形态；
+// 要求「至少一个 tool.txt」是给「名字不像 URL 的目录」加门槛，空目录仍只认名字像 URL 的。
 function looksLikeOwnUrlDir(p, name) {
-  if (!/^https?/i.test(name)) return false
   let ents
   try { ents = readdirSync(p, { withFileTypes: true }) } catch { return false }
-  if (!ents.length) return true
-  return ents.every((e) => e.isDirectory()
-    ? OWN_CACHE_DIRS.has(e.name)
-    : /^(meta\.json|.*\.tool\.txt|.*\.lock)$/i.test(e.name))
+  if (!ents.length) return /^https?/i.test(name)
+  let hasToolTxt = false
+  for (const e of ents) {
+    if (e.isDirectory()) {
+      if (!OWN_CACHE_DIRS.has(e.name)) return false
+      continue
+    }
+    if (/\.tool\.txt$/i.test(e.name)) hasToolTxt = true
+    else if (!/^(meta\.json|.*\.lock)$/i.test(e.name)) return false
+  }
+  return hasToolTxt || /^https?/i.test(name)
 }
 function removeOwned(dir) {
   let files = 0
@@ -208,6 +218,18 @@ const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-
 const PANEL_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.json')
 const LEGACY_CRED = join(DEPS, 'credential.json')
 const CRED_FILE = SHARED_CRED
+// 2026-10-28：与 index.js 同源——面板扫码只写小号那份，这里把它单向复制到 SHARED（见 index.js 同名函数注释）。
+const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
+function syncPanelSmallToShared() {
+  try {
+    const panelAt = statSync(PANEL_SMALL).mtimeMs
+    let sharedAt = 0
+    try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
+    if (sharedAt && panelAt <= sharedAt) return
+    mkdirSync(dirname(SHARED_CRED), { recursive: true })
+    writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
+  } catch {}
+}
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')
 
 const UA =
@@ -292,8 +314,9 @@ function biliCodeReason(code, message) {
 }
 
 // ── 7-7：单条评论/弹幕长度上限（5000 字截断并标注）──
-const UNIT_LIMIT = 5000
-function clipLen(s, n = UNIT_LIMIT) {
+// 2026-10-28 高级设置放开：上限改从 tuning() 取（unitLimit，默认 5000），
+// 这里不能写死成模块级 const——tuning 每次读 deps-config.json，面板改完下次调用即生效。
+function clipLen(s, n = tuning().unitLimit) {
   const t = String(s || '')
   if (t.length <= n) return t
   return t.slice(0, n) + `…（后略 ${t.length - n} 字）`
@@ -381,6 +404,7 @@ function loadCred(path) {
 /** 显式 --cred 优先；其次 panel 大号凭证 / 插件自身凭证（谁新用谁）；都没有就匿名。 */
 function credFor(explicit) {
   if (explicit) return loadCred(explicit)
+  syncPanelSmallToShared()
   // 2026-10-27 批次9：与 index.js resolveCredPath() 同口径——panel 写 bili-duty\bili_credential.json、
   // 插件面板扫码写 bili-watch\credential.json，两处独立写入口，谁 mtime 新用谁。
   // 原来「SHARED 存在即返回」会让 panel 侧重登大号后这里永远读旧快照（AI 字幕静默失效）。
@@ -573,8 +597,10 @@ function keywordScore(subText, keywords) {
 function speedScore(subText, durSec) {
   if (!durSec || durSec <= 0) return { ok: true, rate: null, why: '无时长，跳过语速判据' }
   const rate = subText.length / durSec
-  const ok = rate >= 2.0 && rate <= 8.5
-  return { ok, rate: Math.round(rate * 10) / 10, why: ok ? '' : `${rate.toFixed(1)} 字/秒，超出 2.0–8.5 正常口播区间` }
+  const lo = tuning().subRateMin10 / 10
+  const hi = tuning().subRateMax10 / 10
+  const ok = rate >= lo && rate <= hi
+  return { ok, rate: Math.round(rate * 10) / 10, why: ok ? '' : `${rate.toFixed(1)} 字/秒，超出 ${lo.toFixed(1)}–${hi.toFixed(1)} 正常口播区间` }
 }
 // ── 反钓鱼自查（2026-10-26 加，来源 BV19bna6NE7i 那类实验）──────────────
 // 有些视频的标题/简介/字幕是故意错配的诱饵（画面放歌词、字幕讲假的日报），
@@ -593,8 +619,10 @@ function baitSignals(text, v, c) {
   const reasons = []
   let speedBad = false
   if (c?.sp && typeof c.sp.rate === 'number' && Number.isFinite(c.sp.rate)) {
-    if (c.sp.rate < 2.0) { reasons.push(`语速 ${c.sp.rate} 字/秒（低于口播常见的 2–8.5）`); speedBad = true }
-    else if (c.sp.rate > 8.5) { reasons.push(`语速 ${c.sp.rate} 字/秒（高于口播常见的 2–8.5）`); speedBad = true }
+    const lo0 = tuning().subRateMin10 / 10
+    const hi0 = tuning().subRateMax10 / 10
+    if (c.sp.rate < lo0) { reasons.push(`语速 ${c.sp.rate} 字/秒（低于口播常见的 ${lo0}–${hi0}）`); speedBad = true }
+    else if (c.sp.rate > hi0) { reasons.push(`语速 ${c.sp.rate} 字/秒（高于口播常见的 ${lo0}–${hi0}）`); speedBad = true }
   }
   if (BAIT_WORD.test(String(text || ''))) reasons.push('字幕自称「实验/钓鱼」')
   // 命中率不能单独触发：ASR 常把英文读成中文谐音（DeepSeek→deep sick），
@@ -656,7 +684,7 @@ const pickEvenly = (list, n) =>
 // 下载先写 .part 再原子改名：中断/并发都不会留下「看起来像完整的半截文件」
 async function downloadTo(url, dest) {
   const part = `${dest}.part`
-  const MAX = 512 * 1024 * 1024
+  const MAX = tuning().downloadMaxMB * 1024 * 1024 // 2026-10-28 高级设置：downloadMaxMB 默认 512 MB
   let r
   try {
     r = await fetch(url, { headers: { ...H, Referer: REF }, signal: AbortSignal.timeout(120000) })
@@ -682,7 +710,9 @@ async function downloadTo(url, dest) {
 // 锁内容 {pid, at, ttlMs}：
 //   pid 判活——被 Ctrl-C / 超时 kill 的进程会留下 .lock，不判活就永远等一个不存在的进程；
 //   ttl 判过期——操作卡死（坏源流、模型无响应）超过 30 分钟也不永久锁死目录。
-const LOCK_TTL_MS = 30 * 60 * 1000
+// 2026-10-28 高级设置放开：30 分钟改从 tuning().lockTtlMin 取（默认 30，范围 5–240）。
+// 用函数而不是模块级 const——tuning() 每次读盘，面板改完下次调用即生效。
+const lockTtlMs = () => tuning().lockTtlMin * 60 * 1000
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
@@ -696,12 +726,12 @@ function readLock(f) {
 }
 function lockExpired(owner) {
   if (!owner) return true
-  return Date.now() - (owner.at || 0) > (owner.ttlMs || LOCK_TTL_MS)
+  return Date.now() - (owner.at || 0) > (owner.ttlMs || lockTtlMs())
 }
 function tryLockSync(dir, name = '.lock') {
   const f = join(dir, name)
   try { mkdirSync(dir, { recursive: true }) } catch {}
-  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: LOCK_TTL_MS })
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: lockTtlMs() })
   for (let i = 0; i < 2; i++) {
     try {
       writeFileSync(f, mine, { flag: 'wx' })
@@ -717,7 +747,7 @@ function tryLockSync(dir, name = '.lock') {
 async function tryLock(dir, name = '.lock') {
   const f = join(dir, name)
   try { mkdirSync(dir, { recursive: true }) } catch {}
-  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: LOCK_TTL_MS })
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: lockTtlMs() })
   // 首抢 1 次，失败且主人活着时最多再等 3 次（间隔 500ms），仍拿不到就放弃由调用方报「另一个进程正在处理」
   for (let i = 0; i < 4; i++) {
     try {
@@ -1634,8 +1664,9 @@ async function cmdComments(bv, ps = 10, opts = {}) {
 }
 
 // ── 弹幕热区（观众在哪炸了）──────────────────────────────────────────────
-const DM_BUCKET = 30   // 分桶宽度（秒）
-const DM_TOP = 5       // 峰值桶数
+// 2026-10-28 高级设置放开：分桶宽度/峰值桶数改从 tuning() 取（dmBucketSec 默认 30、dmTop 默认 5）
+const dmBucketSec = () => tuning().dmBucketSec
+const dmTop = () => tuning().dmTop
 
 async function fetchDanmakuXml(cid) {
   const r = await fetch(`https://comment.bilibili.com/${cid}.xml`, {
@@ -1735,18 +1766,18 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
   // 30 秒分桶
   const buckets = new Map()
   for (const x of all) {
-    const k = Math.floor(x.t / DM_BUCKET) * DM_BUCKET
+    const k = Math.floor(x.t / dmBucketSec()) * dmBucketSec()
     if (!buckets.has(k)) buckets.set(k, { raw: [], real: [] })
     const b = buckets.get(k); b.raw.push(x); if (!isSpam(x.text)) b.real.push(x)
   }
   const realTotal = [...buckets.values()].reduce((n, b) => n + b.real.length, 0)
   const avgReal = realTotal / Math.max(1, buckets.size)
-  const peaks = [...buckets.entries()].sort((a, b) => b[1].real.length - a[1].real.length).slice(0, DM_TOP)
+  const peaks = [...buckets.entries()].sort((a, b) => b[1].real.length - a[1].real.length).slice(0, dmTop())
   console.log(`覆盖 ${buckets.size} 桶；剔刷屏后共 ${realTotal} 条，平均 ${avgReal.toFixed(1)} 条/桶`)
-  console.log(`\n--- 最热的 ${DM_TOP} 段（按有效条数排序）---`)
+  console.log(`\n--- 最热的 ${dmTop()} 段（按有效条数排序）---`)
   for (const [k, b] of peaks) {
     const hot = b.real.length >= avgReal * 1.5 ? '🔥' : '  '
-    console.log(`\n${hot} [${fmtSec(k)}–${fmtSec(k + DM_BUCKET)}]  有效 ${b.real.length} 条（原始 ${b.raw.length} 条）`)
+    console.log(`\n${hot} [${fmtSec(k)}–${fmtSec(k + dmBucketSec())}]  有效 ${b.real.length} 条（原始 ${b.raw.length} 条）`)
     const counts = {}
     for (const x of b.real) counts[x.text] = (counts[x.text] ?? 0) + 1
     const ranked = Object.entries(counts).sort((a, b2) => b2[1] - a[1]).slice(0, 5)
@@ -2211,7 +2242,7 @@ function markSeen(bv, title) {
 }
 
 /** 四级链：字幕 → ASR → 抽帧 OCR。输出最可信的一份文本。 */
-const TEXT_LIMIT = 800 // 超过这个字数就不往终端打，落盘 + 给路径（上下文保护）
+// 2026-10-28 高级设置放开：文本层上限改从 tuning().textLimit 取（默认 800）
 
 /**
  * 打印或落盘：
@@ -2464,8 +2495,8 @@ function printText(text, opts, bv, kind = 'text') {
     if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）')
     return
   }
-  if (full.length <= TEXT_LIMIT) { console.log(`\n${disp(full)}`); if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）'); return }
-  const brief = 400
+  if (full.length <= tuning().textLimit) { console.log(`\n${disp(full)}`); if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）'); return }
+  const brief = tuning().textBrief // 2026-10-28 高级设置：textBrief 默认 400
   console.log(`\n${disp(cutCp(full, brief))}`)
   console.log(`\n…（全文 ${full.length} 字，这里只给开头 ${brief} 字）`)
   if (file) console.log(`全文已存：${file}`)
@@ -2571,15 +2602,21 @@ async function cmdText(bv, credPath, opts = {}) {
   // ② 本地 ASR 转写（无字幕时最靠谱，零 token；--fast 跳过，直接走画面）
   // B18：内存预判——faster-whisper small 模型加载 ~1.5 GB；可用内存不足时跑长片会 mkl_malloc 崩
   const freeGB = freemem() / 1024 / 1024 / 1024
-  const asrMemOk = freeGB >= 1.5
+  const freeMB = freemem() / 1024 / 1024
+  // 2026-10-28 高级设置放开：门槛从硬编码 1.5 GB 改成 tuning().asrMemMB（默认 1536）。
+  const asrMemOk = freeMB >= t.asrMemMB
   if (!opts.fast && asrReady() && v.dur > t.asrMaxSec) {
     track(`[track] 超过 ${Math.round(t.asrMaxSec / 60)} 分钟跳过本地转写，直接走抽帧 OCR（时长 ${fmtSec(v.dur)}）`)
   } else if (!opts.fast && asrReady() && v.dur <= t.asrMaxSec && v.dur > 180 && !asrMemOk) {
-    track(`[track] 转写: skip（可用内存 ${freeGB.toFixed(1)} GB < 1.5 GB，whisper 长片会 mkl_malloc 崩；建议改用抽帧/ocr）`)
-  } else if (!opts.fast && asrReady() && v.dur <= t.asrMaxSec && asrMemOk) {
-    track(`[track] 转写: 开始（faster-whisper，最多等 4 分钟）…`)
+    track(`[track] 转写: skip（可用内存 ${freeGB.toFixed(1)} GB < ${(t.asrMemMB / 1024).toFixed(1)} GB，whisper 长片会 mkl_malloc 崩；建议改用抽帧/ocr）`)
+  // issue #2 P2-1（2026-10-28）：短片（≤180s）不受内存判据约束——whisper 崩的是长片。
+  // 原来这里只写 `&& asrMemOk`，于是「dur ≤ 180 且内存 < 1.5 GB」既不进 skip 分支也不进转写分支，
+  // 无声无息跳过，用户以为在转其实什么都没做。
+  } else if (!opts.fast && asrReady() && v.dur <= t.asrMaxSec && (asrMemOk || v.dur <= 180)) {
+    track(`[track] 转写: 开始（faster-whisper，最多等 ${Math.round(t.asrTimeoutSec / 60)} 分钟）…`)
     // W-27：transcribe 早就支持 ffmpeg 参数（见 :1119 的签名），只是这里一直没传——底层备好了上层没接。
-    const a = await transcribe(bv, { timeoutMs: 240_000, p: v.p, ffmpeg: opts.ffmpeg })
+    // BLK-04（2026-10-28）：超时原来写死 240_000，而面板上 asrTimeoutSec 能调到 3600 秒——调了等于没调。
+    const a = await transcribe(bv, { timeoutMs: t.asrTimeoutSec * 1000, p: v.p, ffmpeg: opts.ffmpeg })
     if (a.ok) {
       // 口播类正常 4–6 字/秒；低于 2 字/秒多半是背景音乐、外语歌或纯画面，
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
@@ -2744,7 +2781,7 @@ async function cmdLocal(filePath, opts = {}) {
         timeout: tuning().cmdTimeoutSec * 1000, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
       })
       if (!existsSync(wav)) throw new Error('ffmpeg 没产出 wav')
-      const a = await transcribeLocal(wav, tag, { timeoutMs: 240_000 })
+      const a = await transcribeLocal(wav, tag, { timeoutMs: tuning().asrTimeoutSec * 1000 })
       try { rmSync(wav, { force: true }) } catch {}
       if (a.ok) {
         out.text = a.text
@@ -2855,6 +2892,21 @@ const TUNING_DEFS = {
   asrTimeoutSec: { def: 900, min: 300, max: 3600 },
   ffmpegTimeoutSec: { def: 300, min: 60, max: 1800 },
   cmdTimeoutSec: { def: 180, min: 60, max: 900 },
+  // 2026-10-28 高级设置放开：与原硬编码一致，整数（clampTuning 会 Math.floor）。
+  // 键集必须与 index.js 那份 TUNING_DEFS 完全一致（verify.mjs C17 逐键比对）。
+  asrMemMB: { def: 1536, min: 512, max: 16384 },
+  lockTtlMin: { def: 30, min: 5, max: 240 },
+  unitLimit: { def: 5000, min: 1000, max: 20000 },
+  textLimit: { def: 800, min: 200, max: 5000 },
+  toolTextCap: { def: 2000, min: 500, max: 12000 },
+  toolHead: { def: 800, min: 200, max: 5000 },
+  dmBucketSec: { def: 30, min: 5, max: 120 },
+  dmTop: { def: 5, min: 1, max: 20 },
+  // 2026-10-28 第二批 3 项：语速用 ×10 整数存（20 = 2.0 字/秒），因为 clampTuning 会 Math.floor。
+  downloadMaxMB: { def: 512, min: 64, max: 4096 }, // 单个视频/音频下载上限（4K 素材会撞）
+  subRateMin10: { def: 20, min: 5, max: 60 },      // 字幕语速下限×10，低于判「可疑」
+  subRateMax10: { def: 85, min: 30, max: 200 },    // 字幕语速上限×10，高于判「可疑」
+  textBrief: { def: 400, min: 100, max: 3000 },    // 超长文本只给开头多少字（其余落盘）
 }
 function clampTuning(key, raw) {
   const d = TUNING_DEFS[key]

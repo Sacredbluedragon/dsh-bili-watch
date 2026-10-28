@@ -21,7 +21,9 @@
     · -DryRun 只打印将执行的命令，不下载不写盘。
     · 国内网络用 -Mirror cn：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror。
     · ffmpeg 来源是 BtbN 的 latest 构建，版本随上游变化，不锁具体版本。
-    · pip 包锁死三版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
+    · pip 包锁死四版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
+      ctranslate2==4.8.3（10-28 issue #2 P3-2：4.8.4 在部分机器加载模型即 0xC0000005 硬崩，
+      自己没有显式依赖，是 faster-whisper 拖进来的，所以必须自己钉）、
       rapidocr-onnxruntime==1.2.3。yt-dlp 不锁版本，必须跟上游走。
     · 二进制不锁版本，但装完会把 ffmpeg -version 首行与 yt-dlp --version 记进
       deps\last-run.json（便于对账；该文件同时是运行时记录，下次跑 CLI 会被覆盖）。
@@ -137,14 +139,14 @@ function Ensure-Asr {
   Write-Step 'ASR 环境（deps\.venv-asr + faster-whisper==1.2.1）'
   if ($DryRun) {
     Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
-    Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" -i $PyIndex"
+    Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
     return
   }
   $sysPy = Get-SystemPython
   & $sysPy -m venv $venv
   if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
   & $py -m pip install --upgrade pip -i $PyIndex
-  & $py -m pip install "faster-whisper==1.2.1" "av==15.1.0" -i $PyIndex
+  & $py -m pip install "faster-whisper==1.2.1" "av==15.1.0" "ctranslate2==4.8.3" -i $PyIndex
   if ($LASTEXITCODE -ne 0) {
     # 本次失败立刻清掉半成品，别留给下次 Skip 继续踩
     Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue

@@ -90,7 +90,9 @@ def main() -> int:
         segments, info = model.transcribe(
             args.src,
             language=None if args.lang == "auto" else args.lang,
-            vad_filter=True,              # 掐掉静音段，纯画面/纯音乐的视频会得到空文本
+            # issue #2 P3-1（2026-10-28）：原来硬编码 True。VAD 预检失败（vad_ok=False）时，
+            #   同一个 vad 模块会在 transcribe 里再炸一次、整段转写直接失败；所以预检失败就关掉过滤。
+            vad_filter=vad_ok,            # 正常情况掐掉静音段，纯画面/纯音乐的视频会得到空文本
             vad_parameters={"min_silence_duration_ms": 400},
             beam_size=5,
             condition_on_previous_text=False,  # 防止长视频里一段错就带着后面全错

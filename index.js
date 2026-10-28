@@ -18,8 +18,10 @@ import { fileURLToPath } from 'node:url'
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
 // 工具输出上限：超了就把全文落文件、只回摘要。
 // 由来：2026-10-26 一段 14 分钟视频的字幕 4,449 字整段塞进上下文，把会话挤爆两次。
-const TOOL_TEXT_CAP = 2000
-const TOOL_TEXT_HEAD = 800
+// 2026-10-28 高级设置放开：两个上限改从 readTuning() 每次取（toolTextCap 默认 2000、toolHead 默认 800）。
+// 不能写成模块级 const——index.js 是常驻进程，那样面板改了要重启才生效，和 cacheCfg 踩过的坑一样。
+const toolTextCap = () => readTuning().toolTextCap
+const toolTextHead = () => readTuning().toolHead
 
 // ── 进程级路由守卫（T41-P0-1）：fiber 重放/多实例下同一路径只注册一次 ──
 // 参照 dsh-memory-evolve/lib/route-guard.js（MIT）：claim 成功才注册；
@@ -80,10 +82,10 @@ function trimForModel(text, tag = 'out', bv = '', jsonMode = false, opts = {}) {
   // A8（2026-10-27 批次8）：--full 时工具层不要再把已放大的文本切回 800——
   //   full 走 20000 上限；用户给的 --head N 优先于默认 800；不传 full 仍 ≤2000。
   const full = !!opts.full
-  const cap = full ? 20000 : TOOL_TEXT_CAP
+  const cap = full ? 20000 : toolTextCap()
   const head = (Number.isFinite(opts.head) && opts.head > 0)
     ? Math.floor(opts.head)
-    : (full ? 20000 : TOOL_TEXT_HEAD)
+    : (full ? 20000 : toolTextHead())
   let f = ''
   try {
     const base = String(tag || 'out').replace(/[^\w.-]/g, '') || 'out'
@@ -140,6 +142,9 @@ const DEPS = join(HERE, 'deps')
 // 解析失败不写 stdout/stderr（会污染 --format json 与 PowerShell 管道），
 // 而是记进 cfgWarning，由 /status 的 warnings 带给面板；ENOENT（没配过）不算异常。
 let cfgWarning = null
+// issue #2 P3-3（2026-10-28）：bili_watch 工具没注册成功时原来只 console.warn，桌面端看不到控制台，
+// 用户会以为「工具坏了」。改成同时记一条，由 /status 的 warnings 带到面板。
+let toolsWarning = null
 function depsCfg() {
   try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
     if (e?.code !== 'ENOENT') {
@@ -159,6 +164,23 @@ const TUNING_DEFS = {
   asrTimeoutSec: { def: 900, min: 300, max: 3600 },
   ffmpegTimeoutSec: { def: 300, min: 60, max: 1800 },
   cmdTimeoutSec: { def: 180, min: 60, max: 900 },
+  // 2026-10-28 老大要求「高级设置放开，能调的都给调」：下面 8 项原来是硬编码。
+  // 全部整数（tuneOne 会 Math.floor，别写小数）；键集必须与 tools/look.mjs:2878 那份完全一致，
+  // verify.mjs 的 C17 会逐键比对，改一处漏一处直接红。
+  asrMemMB: { def: 1536, min: 512, max: 16384 },   // 跑本地转写要多少可用内存（MB），不够就跳
+  lockTtlMin: { def: 30, min: 5, max: 240 },       // 残留锁多久算过期（分钟）
+  unitLimit: { def: 5000, min: 1000, max: 20000 }, // 单个内容单元（字幕段/评论）字符上限
+  textLimit: { def: 800, min: 200, max: 5000 },    // 文本层默认给多少字
+  toolTextCap: { def: 2000, min: 500, max: 12000 },// 工具层单次回给模型的总字数（调大会挤占对话上下文）
+  toolHead: { def: 800, min: 200, max: 5000 },     // 工具层默认 head 字数
+  dmBucketSec: { def: 30, min: 5, max: 120 },      // 弹幕热区按多少秒一桶
+  dmTop: { def: 5, min: 1, max: 20 },              // 弹幕热区取前几桶
+  // 2026-10-28 第二批 3 项：都是「撞上了只能报 bug、自己没法自救」的。
+  // 语速用 ×10 整数存（20 = 2.0 字/秒），因为 tuneOne 会 Math.floor，不能写小数。
+  downloadMaxMB: { def: 512, min: 64, max: 4096 }, // 单个视频/音频下载上限（4K 素材会撞）
+  subRateMin10: { def: 20, min: 5, max: 60 },      // 字幕语速下限×10，低于判「可疑」
+  subRateMax10: { def: 85, min: 30, max: 200 },    // 字幕语速上限×10，高于判「可疑」
+  textBrief: { def: 400, min: 100, max: 3000 },    // 超长文本只给开头多少字（其余落盘）
 }
 const TUNING_KEYS = Object.keys(TUNING_DEFS)
 const tuningDefaults = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, TUNING_DEFS[k].def]))
@@ -201,7 +223,7 @@ function writeTuning(body) {
     writeFileSync(p, JSON.stringify(cur, null, 2), 'utf8')
     return { ok: true, data: cur }
   } catch (e) {
-    return { ok: false, error: String(e?.message || e) }
+    return { ok: false, why: String(e?.message || e) }
   }
 }
 function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
@@ -213,7 +235,23 @@ function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEP
 const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'credential.json')
 const PANEL_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.json')
 const LEGACY_CRED = join(DEPS, 'credential.json')
+// 2026-10-28：面板扫码写的是 bili-duty\bili_credential.small.json（小号），watch 这份不会跟着变。
+// 老大的口径是「两个地方用同一份，复制一下即可」——所以这里把它做成一次自动复制，
+// 不引入新的读取优先级：复制后 SHARED 的 mtime 就是现在，后面那段 mtime 仲裁照旧。
+// 单向（panel small → SHARED），不反向写，避免把 watch 扫的号盖掉面板那份。
+const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
+function syncPanelSmallToShared() {
+  try {
+    const panelAt = statSync(PANEL_SMALL).mtimeMs
+    let sharedAt = 0
+    try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
+    if (sharedAt && panelAt <= sharedAt) return
+    mkdirSync(dirname(SHARED_CRED), { recursive: true })
+    writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
+  } catch {}
+}
 function resolveCredPath() {
+  syncPanelSmallToShared()
   try {
     // mtime 比较：panel 侧重登大号（更常见）后 PANEL_CRED 更新，watch 立刻跟上；
     // watch 自己扫码登了新号则 SHARED 更新，用 SHARED。同 mtime 时偏好 panel（权威源）。
@@ -244,7 +282,7 @@ const LAST_RUN = join(DEPS, 'last-run.json')
 // 自定义目录不可写时不让功能哑掉：回退到默认路径（$DSH_HOME/bili-watch/cache），并把原因挂进 /status.warnings。
 // 缓存根标记：只有我们自己写过这个文件，才认「这个目录已经是缓存根」
 const CACHE_MARK = '.bili-watch-root'
-const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl'])
+const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
 function hasBvLayout(dir) {
   // 判据一：我们写过的标记（新用户、二次运行都靠它）
   try { if (existsSync(join(dir, CACHE_MARK))) return true } catch {}
@@ -281,7 +319,8 @@ function isOwnedEntry(p) {
 //   留下一个 .lock 会让 autoCleanCache 永远 locked、而唯一逃生口 clean 用同一判据也被堵死，
 //   缓存只涨不消且没有 --force。这里与 tryLock 用完全相同的判据：持有者进程还活着且未过期才算被占用。
 //   下面三个辅助函数与 tools/look.mjs:647-662 逐字一致。
-const LOCK_TTL_MS = 30 * 60 * 1000
+// 2026-10-28 高级设置放开：与 tools/look.mjs 同源，从 readTuning().lockTtlMin 取（默认 30 分钟）
+const lockTtlMs = () => readTuning().lockTtlMin * 60 * 1000
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
@@ -295,7 +334,7 @@ function readLock(f) {
 }
 function lockExpired(owner) {
   if (!owner) return true
-  return Date.now() - (owner.at || 0) > (owner.ttlMs || LOCK_TTL_MS)
+  return Date.now() - (owner.at || 0) > (owner.ttlMs || lockTtlMs())
 }
 function hasAnyLock(root) {
   const walk = (d, depth) => {
@@ -316,15 +355,23 @@ function hasAnyLock(root) {
 }
 // 2026-10-28：cleanKey 会把整条链接压成目录名（如 httpsb23.tvabc123）——短链没解析成 BV 时
 // 插件自己就建了这种目录，清理时必须认它，否则「立即清除」会留一堆删不掉的垃圾（用户实测剩 3 个）。
-// 两条一起用：名字以 http 开头（用户素材库不会有这种名字），且里面只有我们自己的产物。
+// 10-28 又实测剩两个：`search` 的落盘目录名来自查询词（如 `DeepSeekHarness`）、`hot` 落 `_hot`。
+// 判据：里面**只有**我们自己的产物，且至少有一个 `*.tool.txt`。用户素材目录装的是 mp4/jpg，不会是这个形态；
+// 要求「至少一个 tool.txt」是给「名字不像 URL 的目录」加门槛，空目录仍只认名字像 URL 的。
 function looksLikeOwnUrlDir(p, name) {
-  if (!/^https?/i.test(name)) return false
   let ents
   try { ents = readdirSync(p, { withFileTypes: true }) } catch { return false }
-  if (!ents.length) return true
-  return ents.every((e) => e.isDirectory()
-    ? OWN_CACHE_DIRS.has(e.name)
-    : /^(meta\.json|.*\.tool\.txt|.*\.lock)$/i.test(e.name))
+  if (!ents.length) return /^https?/i.test(name)
+  let hasToolTxt = false
+  for (const e of ents) {
+    if (e.isDirectory()) {
+      if (!OWN_CACHE_DIRS.has(e.name)) return false
+      continue
+    }
+    if (/\.tool\.txt$/i.test(e.name)) hasToolTxt = true
+    else if (!/^(meta\.json|.*\.lock)$/i.test(e.name)) return false
+  }
+  return hasToolTxt || /^https?/i.test(name)
 }
 function removeOwned(dir) {
   let files = 0
@@ -753,6 +800,9 @@ function dirStat(dir) {
   let files = 0
   const walk = (d) => {
     for (const e of readdirSync(d, { withFileTypes: true })) {
+      // 10-28：标记文件与运行日志不算「缓存占用」——面板「当前占用」应当等于「立即清除能清掉的量」，
+      // 否则清了以后永远显示 52 B + 日志大小，用户以为没清干净。
+      if (e.name === CACHE_MARK || e.name === '_logs') continue
       const p = join(d, e.name)
       if (e.isDirectory()) walk(p)
       else {
@@ -826,9 +876,12 @@ function writeDepsCfg(patch) {
   const next = { ...cur, ...patch }
   try {
     writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')
+    // issue #2 P2-2（2026-10-28）：resolveFfmpeg 有 5 分钟缓存，改了 ffmpeg 路径后 /status 还会
+    //   报旧路径 5 分钟。配置一写就清缓存，下一次 /status 立刻重探。
+    ffmpegProbeCache = { at: 0, path: '' }
     return { ok: true, data: next }
   } catch (e) {
-    return { ok: false, error: String(e?.message || e) }
+    return { ok: false, why: String(e?.message || e) }
   }
 }
 
@@ -1009,7 +1062,13 @@ function depRows() {
       id: 'ytdlp',
       name: 'yt-dlp（通用 URL）',
       ok: existsSync(ytdlp),
-      detail: existsSync(ytdlp) ? `版本 ${ytdlpVersion() || '未知'}` : '没找到，非 B 站 URL 不可用',
+      // 2026-10-28：原先 detail 只写「版本 X」，与其它依赖行（detail 都是路径）不一致，
+      // 面板上就变成「只有版本号、看不出装在哪」。改成路径，版本拼在括号里。
+      detail: (() => {
+        if (!existsSync(ytdlp)) return '没找到，非 B 站 URL 不可用'
+        const v = ytdlpVersion()
+        return `${maskAbs(ytdlp)}${v ? `（v${v}）` : ''}`
+      })(),
       path: maskAbs(ytdlp),
       removable: true,
       size: ytdlpSize,
@@ -1087,7 +1146,7 @@ function runDownload(target) {
   try {
     child = spawn(cmd, args, { windowsHide: true, stdio: 'ignore', detached: true })
   } catch (e) {
-    return { started: false, error: String(e?.message ?? e) }
+    return { started: false, why: String(e?.message ?? e) }
   }
   // detached 子进程不会把 spawn 失败同步抛给我们，必须自己接 error，否则 ENOENT 会带崩宿主
   child.on('error', (e) => {
@@ -1187,9 +1246,18 @@ function sameOriginBlocked(req) {
   const method = String(req.method || 'GET').toUpperCase()
   const mutating = method !== 'GET' && method !== 'HEAD'
   const origin = req.headers?.origin
+  const site = req.headers?.["sec-fetch-site"]
   // 14-6：写操作必须带 Origin 且同源。不带 Origin 的（curl 直打、旧浏览器）一律拒——
   // 原本 `if (origin)` 是可选的，等于裸 POST 没有任何同源校验。
-  if (mutating && !origin) return "跨站写请求被拒绝（缺少 Origin 头）"
+  // 2026-10-28 issue #2 P1-1 修正：DSH 桌面端壳层的同源 fetch **不带 Origin**（实测复现：
+  //   无 Origin 的 POST → 403「缺少 Origin 头」，面板所有写操作全废）。改成有 Origin 才严格同源，
+  //   没 Origin 时只拒 sec-fetch-site 明确写着跨站的（cross-site / same-site），
+  //   其余交给下面「必须 application/json」那条兜——CSRF 的简单请求向量走不到这里。
+  if (mutating && !origin) {
+    if (site === "cross-site" || site === "same-site") {
+      return `跨站写请求被拒绝（缺少 Origin 且 sec-fetch-site=${site}）`
+    }
+  }
   if (origin) {
     let oh = ""
     try { oh = new URL(origin).hostname } catch { return "非法 Origin 头" }
@@ -1201,7 +1269,7 @@ function sameOriginBlocked(req) {
     const ct = String(req.headers?.['content-type'] || '').split(';')[0].trim().toLowerCase()
     if (ct !== 'application/json') return `跨站写请求被拒绝（Content-Type 必须是 application/json，收到：${ct || '无'}）`
   }
-  const site = req.headers?.["sec-fetch-site"]
+  // site 在上面写操作分支已取过（2026-10-28 issue #2 P1-1），这里直接复用，不要重复声明。
   if (site && site !== "same-origin" && site !== "none") return `跨站请求被拒绝（sec-fetch-site=${site}）`
   return null
 }
@@ -1590,7 +1658,8 @@ function apply(ctx) {
     },
   }))
   } else {
-    console.warn('[dsh-bili-watch] 未找到 @deepseek-ai/dsh-tools，bili_watch 工具未注册（/bili 命令与插件面板不受影响）')
+    toolsWarning = '[dsh-bili-watch] 未找到 @deepseek-ai/dsh-tools，bili_watch 工具未注册（/bili 命令与插件面板不受影响）'
+    console.warn(toolsWarning)
   }
 
   // ③ 设置页：读盘状态 + 清缓存（只读优先；唯一写操作是删本机抽帧缓存目录）
@@ -1604,7 +1673,7 @@ function apply(ctx) {
           path: '/api/bili-watch',
           handler: async (req, res) => {
             const blocked = sameOriginBlocked(req)
-            if (blocked) return sendJson(res, 403, { ok: false, error: blocked })
+            if (blocked) return sendJson(res, 403, { ok: false, why: blocked })
             try {
               const url = new URL(req.url, 'http://127.0.0.1')
               if (req.method === 'GET' && url.pathname === '/api/bili-watch/status') {
@@ -1620,7 +1689,7 @@ function apply(ctx) {
                     tuningRanges: tuningRanges(),
                     lastRun: readLastRun(),
                     ui: uiCfg(),
-                    warnings: cfgWarning ? [cfgWarning] : [],
+                    warnings: [cfgWarning, toolsWarning].filter(Boolean),
                   },
                 })
               }
@@ -1639,7 +1708,7 @@ function apply(ctx) {
                   // 6-17：写 deps-config.json 可能失败（文件只读等），原来直接抛错被外层吞成 500，
                   // 面板可能显示已保存；这里显式回「保存失败」。
                   const w = writeDepsCfg({ cache: dir })
-                  if (!w.ok) return sendJson(res, 500, { ok: false, why: `保存失败：${w.error}` })
+                  if (!w.ok) return sendJson(res, 500, { ok: false, why: `保存失败：${w.why || '未知错误'}` })
                   return sendJson(res, 200, { ok: true, data: { dir, restart: true } })
                 } catch (e) {
                   return sendJson(res, 500, { ok: false, why: String(e?.message || e) })
@@ -1727,7 +1796,7 @@ function apply(ctx) {
                 let tuneErr = null
                 if (TUNING_KEYS.some((k) => body && Object.prototype.hasOwnProperty.call(body, k))) {
                   const w = writeTuning(body)
-                  if (!w.ok) tuneErr = w.error
+                  if (!w.ok) tuneErr = w.why || '未知错误'
                 }
                 if (tuneErr) return sendJson(res, 500, { ok: false, why: `参数保存失败：${tuneErr}` })
                 return sendJson(res, 200, { ok: true, data: { ...next, ...(rule || {}), tuning: readTuning() } })
