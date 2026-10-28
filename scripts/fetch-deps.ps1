@@ -20,6 +20,7 @@
     · 幂等：目标已存在默认跳过，-Force 重下。
     · -DryRun 只打印将执行的命令，不下载不写盘。
     · 国内网络用 -Mirror cn：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror。
+    · -Gpu ask|yes|no：要不要装 CUDA 运行库（cuBLAS + cuDNN，约 500 MB）。ask 会问一句：装了 ASR 能用 GPU 快 2-8 倍，不装就走 CPU。
     · ffmpeg 来源是 BtbN 的 latest 构建，版本随上游变化，不锁具体版本。
     · pip 包锁死四版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
       ctranslate2==4.8.3（10-28 issue #2 P3-2：4.8.4 在部分机器加载模型即 0xC0000005 硬崩，
@@ -35,6 +36,9 @@ param(
   [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model')]
   [string]$Target = 'all',
   [switch]$Force,
+  # GPU 运行库（cuBLAS + cuDNN，约 500 MB）怎么处理：ask=问一句（默认，非交互时按 no）/ yes / no
+  [ValidateSet('ask', 'yes', 'no')]
+  [string]$Gpu = 'ask',
   [switch]$DryRun,
   [switch]$VerifyHash,
   [ValidateSet('auto', 'cn', 'global')]
@@ -185,7 +189,7 @@ function Ensure-Asr {
   if ($DryRun) {
     Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
     Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
-    Write-Host '    [dry-run] 若检测到 NVIDIA 显卡，再装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（约 500 MB，让 --device auto 真能用 GPU）'
+    Write-Host '    [dry-run] 检测到 NVIDIA 显卡时会问一句「装 GPU 运行库吗（约 500 MB）」，选是才装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（非交互或 -Gpu no 则跳过）'
     return
   }
   $sysPy = Get-SystemPython
@@ -203,7 +207,24 @@ function Ensure-Asr {
   #   有 N 卡就顺手装上（pip 包，约 500 MB，不用装整套 CUDA Toolkit），没有就跳过、继续用 CPU。
   $nv = $false
   try { & nvidia-smi -L 2>&1 | Out-Null; $nv = ($LASTEXITCODE -eq 0) } catch { $nv = $false }
+  $wantGpu = $false
   if ($nv) {
+    if ($Gpu -eq 'yes') {
+      $wantGpu = $true
+    } elseif ($Gpu -eq 'no') {
+      $wantGpu = $false
+    } elseif ([Console]::IsInputRedirected) {
+      # 无人值守（脚本里被调）时不要卡在 Read-Host 上，按「不装」处理
+      $wantGpu = $false
+      Write-Host '    检测到 NVIDIA 显卡；非交互环境跳过 GPU 运行库（要装请传 -Gpu yes）' -ForegroundColor DarkGray
+    } else {
+      Write-Host '    检测到 NVIDIA 显卡。要不要装 CUDA 运行库（cuBLAS + cuDNN，约 500 MB）？' -ForegroundColor Cyan
+      Write-Host '      装了：ASR 用 GPU 转写，比 CPU 快 2-8 倍；不装：ASR 走 CPU，功能一样但慢些。' -ForegroundColor DarkGray
+      $ans = Read-Host '    装 GPU 运行库？[y/N]'
+      $wantGpu = ($ans -match '^(y|yes|是)$')
+    }
+  }
+  if ($wantGpu) {
     Write-Host '    检测到 NVIDIA 显卡，补装 CUDA 12 运行库（cuBLAS + cuDNN，约 500 MB）…'
     Invoke-PipInstall $py @('install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12')
     & $py -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("nvidia") else 1)' 2>&1 | Out-Null
@@ -212,6 +233,8 @@ function Ensure-Asr {
     } else {
       Write-Host '    ! GPU 运行库没装上，ASR 继续用 CPU（不影响功能，只是慢些）' -ForegroundColor Yellow
     }
+  } elseif ($nv) {
+    Write-Host '    按你的选择不装 GPU 运行库，ASR 走 CPU' -ForegroundColor DarkGray
   } else {
     Write-Host '    未检测到 NVIDIA 显卡，跳过 GPU 运行库（ASR 用 CPU）' -ForegroundColor DarkGray
   }
