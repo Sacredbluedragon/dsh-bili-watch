@@ -9,10 +9,10 @@
  *   <插件目录>\tools\look.mjs
  * 只读、匿名，不改任何业务状态。
  */
-import { spawn, execFileSync } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs'
+import { spawn, execFile, execFileSync } from 'node:child_process'
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { dirname, join, relative, basename } from 'node:path'
+import { dirname, join, relative, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
@@ -136,7 +136,67 @@ const KNOWN_FLAGS = ['--step', '--p', '--cred', '--days', '--limit', '--order', 
 //   生效，却不在这张表里——斜杠命令传 `--asr-max 60000` 会同时「报未知参数」并「真的生效」，自相矛盾。
 
 // 设置页端点读的落点，与 tools/look.mjs 同源（DEPS / CACHE / pickCacheDir / depsCfg 等常量定义处）
-const DEPS = join(HERE, 'deps')
+// X-30（2026-10-29）：deps 默认放到包目录之外。npm uninstall / 重装包会把包目录整个删掉，
+//   用户的参数、两个 venv、460 MB 模型跟着一起没（W-12 只是 README 提醒，没堵住升级路径）。
+//   放到 $DSH_HOME\bili-watch\deps 就与包的生命周期解耦；BILI_WATCH_DEPS 可覆盖（测试 / 多实例 / 换盘）。
+//   包内旧 deps\ 首次启动搬一次：先 cp 到 deps.migrating 再 rename（同盘原子，不留半截）；
+//   任何一步失败都回退用包内那份——功能不能因为搬家失败而哑掉。
+let depsWarning = null
+// X-30：手写递归复制。Node 22 的 fs.cpSync 在 Windows 中文路径下会进程级崩溃
+//   （exit 127、无异常栈，实测带空格的中文路径必崩），不能用来搬 460 MB 的 deps。
+function copyTreeSync(src, dst) {
+  const st = statSync(src)
+  if (st.isDirectory()) {
+    mkdirSync(dst, { recursive: true })
+    for (const e of readdirSync(src, { withFileTypes: true })) copyTreeSync(join(src, e.name), join(dst, e.name))
+  } else if (st.isFile()) {
+    copyFileSync(src, dst)
+  }
+}
+const DEPS_PREF = process.env.BILI_WATCH_DEPS || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'deps')
+const DEPS_LOCAL = join(HERE, 'deps')
+// X-30 第二轮（2026-10-29）：搬家的标记文件。只有搬成功才写，下次启动见到它才用新位置。
+const DEPS_MOVED_MARK = join(DEPS_PREF, '.deps-moved')
+// 当前用哪份——**同步决定、不搬东西**。
+//   第一轮是「模块加载期同步 copyTreeSync 搬 460 MB」，慢盘上堵事件循环 30–90 秒，
+//   cordis 可能误判插件无响应把进程杀掉。现在加载期只做几个 existsSync，搬家交给后台。
+const DEPS = (() => {
+  if (resolve(DEPS_PREF) === resolve(DEPS_LOCAL)) return DEPS_PREF
+  // 上次已经搬完（有标记）→ 用包外
+  if (existsSync(DEPS_MOVED_MARK)) return DEPS_PREF
+  // 包外已经有东西（用户手动放的 / 以前搬过但没标记）→ 用包外，不覆盖用户数据
+  if (existsSync(DEPS_PREF)) return DEPS_PREF
+  let srcHas = false
+  try { srcHas = existsSync(DEPS_LOCAL) && readdirSync(DEPS_LOCAL).length > 0 } catch {}
+  if (!srcHas) { try { mkdirSync(DEPS_PREF, { recursive: true }) } catch {} ; return DEPS_PREF }
+  // 包内有内容、包外还没有 → **本次先用包内**（功能立即能用，事件循环不堵），搬家排后台
+  return DEPS_LOCAL
+})()
+/**
+ * X-30 第二轮：后台把包内 deps 搬到包外，搬完写 .deps-moved，**下次启动生效**。
+ * 由 apply() 在插件注册完之后调，3 秒延迟——那时插件已经装好，堵一会儿不影响 cordis 判活。
+ * 迁到一半进程被杀：留下 deps.migrating，下次这里开头的 rmSync 会清掉重搬。
+ */
+function scheduleDepsMigration() {
+  if (resolve(DEPS) !== resolve(DEPS_LOCAL)) return // 已经在用包外，不用搬
+  const tmp = DEPS_PREF + '.migrating'
+  const t = setTimeout(() => {
+    try {
+      mkdirSync(dirname(DEPS_PREF), { recursive: true })
+      try { rmSync(tmp, { recursive: true, force: true }) } catch {} // 上次迁到一半的残留
+      copyTreeSync(DEPS_LOCAL, tmp)
+      try { rmSync(DEPS_PREF, { recursive: true, force: true }) } catch {} // 3 秒内可能被别人建出来
+      renameSync(tmp, DEPS_PREF)
+      writeFileSync(DEPS_MOVED_MARK, JSON.stringify({ at: new Date().toISOString(), from: DEPS_LOCAL }), 'utf8')
+      depsWarning = `依赖目录已迁到 ${DEPS_PREF}，下次启动生效；包内旧 deps\\ 可手动删除`
+    } catch (e) {
+      try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+      depsWarning = `依赖目录后台迁移失败，继续用包内 deps\\（${String(e?.message || e)}）；装依赖请先手动把 deps\\ 移到 ${DEPS_PREF}`
+    }
+  }, 3000)
+  // 别让这个定时器拖住宿主退出；宿主活着它照样会到点
+  try { t.unref?.() } catch {}
+}
 // 本机路径来源：env 优先，其次 deps\deps-config.json（写文件即生效，不必重启），最后 deps 自身。
 // 配置文件不进包（deps 只留空目录），发布时无需脱敏。
 // 解析失败不写 stdout/stderr（会污染 --format json 与 PowerShell 管道），
@@ -181,12 +241,22 @@ const TUNING_DEFS = {
   subRateMin10: { def: 20, min: 5, max: 60 },      // 字幕语速下限×10，低于判「可疑」
   subRateMax10: { def: 85, min: 30, max: 200 },    // 字幕语速上限×10，高于判「可疑」
   textBrief: { def: 400, min: 100, max: 3000 },    // 超长文本只给开头多少字（其余落盘）
+  // 第十条（2026-10-29）：ASR 推理设备。枚举项不走数值钳制（tuneOne 先看 kind）。
+  //   只有 auto / cpu 两态：auto = 有可用 CUDA 就用、失败回落 CPU（_bili-asr.py 里实现）。
+  //   不暴露 cuda 是因为「强制 cuda」在没有 GPU 的机器上只会多一次失败日志，没有收益。
+  asrDevice: { def: 'auto', kind: 'enum', values: ['auto', 'cpu'] },
 }
 const TUNING_KEYS = Object.keys(TUNING_DEFS)
 const tuningDefaults = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, TUNING_DEFS[k].def]))
-const tuningRanges = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, [TUNING_DEFS[k].min, TUNING_DEFS[k].max]]))
+// 第十条（2026-10-29）：枚举项（asrDevice）的「范围」是可选值数组，不是 [min, max]
+const tuningRanges = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, TUNING_DEFS[k].kind === 'enum' ? TUNING_DEFS[k].values : [TUNING_DEFS[k].min, TUNING_DEFS[k].max]]))
 function tuneOne(key, raw) {
   const d = TUNING_DEFS[key]
+  // 第十条（2026-10-29）：枚举项（asrDevice）不走数值钳制，否则 Math.floor('auto') = NaN
+  if (d.kind === 'enum') {
+    const s = String(raw ?? '').trim().toLowerCase()
+    return d.values.includes(s) ? s : d.def
+  }
   const n = Number(raw)
   if (!Number.isFinite(n)) return d.def
   if (n < d.min || n > d.max) return d.def
@@ -239,19 +309,34 @@ function writeTuning(body) {
   if (!cur || typeof cur !== 'object' || Array.isArray(cur)) cur = {}
   if (!body || typeof body !== 'object') return { ok: true, data: cur }
   let touched = false
+  // D-01/D-02（2026-10-29）：值非法以前是「忽略、保持原值」，调用方照样回 ok:true，
+  //   面板弹「已保存」而实际没写——这是「假保存」。现在收集所有非法项，一次报清楚，且一个都不写。
+  //   注意 null 仍是合法的「恢复默认」（面板的恢复默认按钮就发 null，这里删键回落到常量）。
+  const bad = []
   for (const k of TUNING_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(body, k)) continue
     const v = body[k]
     if (v === null) { delete cur[k]; touched = true; continue }
+    const d = TUNING_DEFS[k]
+    // 第十条（2026-10-29）：枚举项（asrDevice）按字符串白名单存，不走数值判据
+    if (d.kind === 'enum') {
+      const s = String(v ?? '').trim().toLowerCase()
+      if (d.values.includes(s)) { cur[k] = s; touched = true } else { bad.push(`${k}=${v} 只能是 ${d.values.join(' / ')}`) }
+      continue
+    }
     const n = Number(v)
-    if (Number.isFinite(n) && n >= TUNING_DEFS[k].min && n <= TUNING_DEFS[k].max) { cur[k] = Math.floor(n); touched = true }
+    if (!Number.isFinite(n)) { bad.push(`${k}=${v} 需要数字`) ; continue }
+    if (n < d.min || n > d.max) { bad.push(`${k}=${n} 超出范围 ${d.min}–${d.max}`); continue }
+    cur[k] = Math.floor(n)
+    touched = true
   }
+  if (bad.length) return { ok: false, code: 400, why: bad.join('；') }
   if (!touched) return { ok: true, data: cur }
   try {
     writeFileSync(p, JSON.stringify(cur, null, 2), 'utf8')
     return { ok: true, data: cur }
   } catch (e) {
-    return { ok: false, why: String(e?.message || e) }
+    return { ok: false, code: 500, why: String(e?.message || e) }
   }
 }
 function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
@@ -268,12 +353,26 @@ const LEGACY_CRED = join(DEPS, 'credential.json')
 // 不引入新的读取优先级：复制后 SHARED 的 mtime 就是现在，后面那段 mtime 仲裁照旧。
 // 单向（panel small → SHARED），不反向写，避免把 watch 扫的号盖掉面板那份。
 const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
+// X-10（2026-10-29）：用户主动删凭证后写这份抑制记录（含删除时刻 panel small 的 mtime）。
+//   放凭证同目录、同生命周期：凭证没了它也没意义，deps 被清空也不影响。
+const CRED_CLEARED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cred-cleared.json')
+// B-10（2026-10-29）：本进程刚扫码写进 SHARED_CRED 的那一次，记下写入后的 mtime。
+//   resolveCredPath 的仲裁是「panelAt >= sharedAt 就用 PANEL_CRED」——刚扫完码时 panel 那份
+//   恰好也被触碰（或同毫秒）就会把新号判给旧号，用户以为登了新号、实际 watch 还在用旧号。
+//   只要磁盘上还是我们自己写的那一份，就优先 SHARED，不参与 mtime 仲裁。
+let sharedWrittenAt = 0
 function syncPanelSmallToShared() {
   try {
     const panelAt = statSync(PANEL_SMALL).mtimeMs
     let sharedAt = 0
     try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
     if (sharedAt && panelAt <= sharedAt) return
+    // X-10（2026-10-29）：用户主动删过凭证后，panel 小号那份不能靠 8 秒轮询再复制回来。
+    //   判据用 mtime 而不是时间窗——panel 重新扫码时 PANEL_SMALL 的 mtime 会变新，复制自然恢复。
+    try {
+      const c = JSON.parse(readFileSync(CRED_CLEARED, 'utf8'))
+      if (Number.isFinite(c?.panelMtime) && panelAt <= c.panelMtime) return
+    } catch {}
     mkdirSync(dirname(SHARED_CRED), { recursive: true })
     writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
   } catch {}
@@ -286,6 +385,9 @@ function resolveCredPath() {
     const mtimeOf = (p) => { try { return statSync(p).mtimeMs } catch { return 0 } }
     const sharedAt = mtimeOf(SHARED_CRED)
     const panelAt = mtimeOf(PANEL_CRED)
+    // B-10（2026-10-29）：刚扫码写的那份优先。磁盘上还是它（mtime 没被别人改写）就直接用它，
+    //   不让 panelAt >= sharedAt 把刚登的新号盖成 panel 侧的旧号。
+    if (sharedWrittenAt && sharedAt === sharedWrittenAt) return SHARED_CRED
     if (panelAt && panelAt >= sharedAt) return PANEL_CRED
     if (sharedAt) return SHARED_CRED
     if (existsSync(LEGACY_CRED)) {
@@ -312,9 +414,11 @@ const LAST_RUN = join(DEPS, 'last-run.json')
 const CACHE_MARK = '.bili-watch-root'
 const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
 function hasBvLayout(dir) {
-  // 判据一：我们写过的标记（新用户、二次运行都靠它）
-  try { if (existsSync(join(dir, CACHE_MARK))) return true } catch {}
-  // 判据二（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
+  // X-02（2026-10-29）：原来这里有一条「存在 .bili-watch-root 标记就直接认」的捷径，标记一旦落下
+  //   就永久免检：用户后来把素材库指到这个目录（标记还在、BV* 目录也在、只是没有 meta.json），
+  //   clean 就把整片 BV* 删掉，还再写一次标记自我固化。标记只证明「我们曾经在这里写过」，
+  //   不证明「现在这里还是我们的缓存」，所以不再当判据；它只留给 dirStat / 清理白名单当「我们写过的文件」。
+  // 判据（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
   //   N05-A1 那版用「BV* + frames/asr/_logs 之一」，实测仍会误判：用户素材库只要同时有 BV 目录和
   //   一个 frames 目录，clean 就把 BV 目录整片删掉（rc=0、无警告），还顺手写下 .bili-watch-root 自我固化，
   //   此后永远走删的那条路、不会自己纠正。frames/asr/_logs 是通用名，等于拿别人的东西证明自己的身份；
@@ -348,7 +452,12 @@ function isOwnedEntry(p) {
 //   缓存只涨不消且没有 --force。这里与 tryLock 用完全相同的判据：持有者进程还活着且未过期才算被占用。
 //   下面三个辅助函数与 tools/look.mjs:647-662 逐字一致。
 // 2026-10-28 高级设置放开：与 tools/look.mjs 同源，从 readTuning().lockTtlMin 取（默认 30 分钟）
-const lockTtlMs = () => readTuning().lockTtlMin * 60 * 1000
+// X-14（2026-10-29）：TTL 还必须覆盖一次最长转写——asrTimeoutSec 上限 60 分钟 > 默认 TTL 30 分钟，
+//   转写跑满时锁先被判过期、别的进程抢进来 → 双持。所以取两者的较大值（与 CLI 同一判据）。
+const lockTtlMs = () => {
+  const t = readTuning()
+  return Math.max(t.lockTtlMin * 60 * 1000, (t.asrTimeoutSec + 120) * 1000)
+}
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
@@ -569,6 +678,7 @@ const ESTIMATES = {
   asr: '约 294 MB（venv）',
   ocr: '约 263 MB（venv）',
   model: '约 464 MB',
+  cuda: '约 500 MB（pip 三个 wheel）',
 }
 
 // 面板内扫码登录（与 tools/look.mjs 的 login 同一套接口，凭证落同一个文件）
@@ -744,7 +854,9 @@ async function fillBuvids(jar) {
 
 /** 生成扫码登录二维码：返回 qrcode_key 与可直接插进页面的 SVG。 */
 async function loginQr() {
-  const r = await fetch(QR_GEN, { headers: { 'User-Agent': UA } })
+  // B-01（2026-10-29）：以前没 signal，DNS 黑洞/TCP 挂死时这个请求永久 pending，
+  //   前端就一直转「正在生成二维码…」。8 秒拿不到就当网络问题报错。
+  const r = await fetch(QR_GEN, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) })
   const j = await r.json()
   const d = j?.data
   if (!d?.url || !d?.qrcode_key) return { ok: false, why: j?.message || '生成二维码失败' }
@@ -763,7 +875,8 @@ async function loginQr() {
  */
 async function loginPollOnce(key) {
   if (!key) return { ok: false, state: 'error', why: '缺少二维码 key' }
-  const res = await fetch(QR_POLL(key), { headers: { 'User-Agent': UA }, redirect: 'manual' })
+  // B-05（2026-10-29）：轮询同理，没有 signal 时断网会让每次 poll 都挂到 TCP 超时。
+  const res = await fetch(QR_POLL(key), { headers: { 'User-Agent': UA }, redirect: 'manual', signal: AbortSignal.timeout(8000) })
   const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
   let body = {}
   try {
@@ -795,6 +908,9 @@ async function loginPollOnce(key) {
     } catch (e) {
       return { ok: false, state: 'error', why: `凭证写入失败：${e?.message ?? e}` }
     }
+    // B-10（2026-10-29）：记下这次写的 mtime，resolveCredPath 见到它就优先用这份，
+    //   不让 panel 侧的旧号靠 mtime 仲裁把刚扫的号盖掉。
+    try { sharedWrittenAt = statSync(SHARED_CRED).mtimeMs } catch { sharedWrittenAt = 0 }
     return { ok: true, state: 'ok', data: { mid: jar.dedeuserid || '' } }
   }
   const map = { 86101: 'waiting', 86090: 'scanned', 86038: 'expired' }
@@ -970,17 +1086,20 @@ let lastCleanAt = 0
 
 function autoCleanCache(opts = {}) {
   // T31-P2-6：面板每 8 秒轮询 /status，不许每次都全量 walk 缓存目录
-  if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true }
-  if (!existsSync(CACHE)) return { removed: 0, bytes: 0 }
+  if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true, failed: [] }
+  if (!existsSync(CACHE)) return { removed: 0, bytes: 0, failed: [] }
   // W-04（2026-10-28 阶段B-①）：有正在跑的转写/抽帧（任何子目录有 .lock）就不自动清，
   //   否则会删掉正在写的 asr/sheet 产物（转写白跑且无提示）。与 /cache/clear 同判据。
-  if (hasAnyLock(CACHE)) return { removed: 0, bytes: 0, skipped: true, locked: true }
+  if (hasAnyLock(CACHE)) return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [] }
   const { days, maxMb } = cacheCfg()
   const cutoff = Date.now() - days * 86400000
   const limit = maxMb * 1024 * 1024
   const entries = walkEntries(CACHE)
   let removed = 0
   let bytes = 0
+  // M-05：删不掉的文件必须记下来。以前两处 catch {} 是空的，被占用 / 只读 / 超长路径时
+  //   静默跳过，removed 不加、bytes 不减，调用方以为清干净了（与 clearCache 的 failed 清单对齐）。
+  const failed = []
   const fresh = []
   for (const e of entries) {
     if (e.mtime < cutoff) {
@@ -988,7 +1107,9 @@ function autoCleanCache(opts = {}) {
         rmSync(e.path, { force: true })
         removed += 1
         bytes += e.size
-      } catch {}
+      } catch (err) {
+        failed.push({ name: relative(CACHE, e.path), why: String(err?.message || err) })
+      }
     } else {
       fresh.push(e)
     }
@@ -1002,14 +1123,16 @@ function autoCleanCache(opts = {}) {
         removed += 1
         bytes += e.size
         total -= e.size
-      } catch {}
+      } catch (err) {
+        failed.push({ name: relative(CACHE, e.path), why: String(err?.message || err) })
+      }
       if (total <= limit) break
     }
   }
   // 清单 1-7：只删文件会留一堆空目录（跑 100 个视频留 100 个空目录）；删完后自底向上清白名单内空目录
   pruneEmptyDirs(CACHE)
   lastCleanAt = Date.now()
-  return { removed, bytes }
+  return { removed, bytes, failed }
 }
 
 /** 清理后把插件自己名下（白名单 / BV_*）的空目录也删掉，根目录本身与别人的目录不动。 */
@@ -1072,8 +1195,121 @@ function ytdlpVersion() {
   return ver
 }
 
+// 第十条（2026-10-29）：GPU 状态。三个问题分开答，别混成一个布尔：
+//   deviceCount——有没有 NVIDIA 卡（nvidia-smi -L 的行数）
+//   dllReady——cuBLAS DLL 能不能真加载（派单要求：不看 pip 包名，真跑 ctypes.WinDLL）
+//   cudaLibs——venv 里有没有 nvidia 包（只作说明，不作 ok 判据）
+// 探测要跑两个子进程，/status 每 8 秒轮询一次，所以缓存 5 分钟；删完 GPU 运行库后 resetGpuCache() 立刻作废。
+// GPU 第二轮（2026-10-29）：原来 probeGpu 是同步 execFileSync，缓存失效那一次会堵住事件循环，
+//   而面板 8 秒轮询 + 用户手点刷新很容易同时来两个 /status。改成异步 + 模块级 in-flight Promise：
+//   在飞期间所有调用复用同一个 Promise，探测完清空，缓存照旧 5 分钟。超时从 5 秒砍到 3 秒。
+const GPU_PROBE_TIMEOUT_MS = 3000
+const GPU_CACHE_MS = 5 * 60 * 1000
+let _gpuCache = { at: 0, val: null }
+let _probePromise = null
+function resetGpuCache() {
+  _gpuCache = { at: 0, val: null }
+  _probePromise = null
+}
+function gpuStatus() {
+  // 没有 force 形参：强刷统一走 resetGpuCache()。留一个没人传的 force 会让下一个人
+  //   以为「传 true 能强刷」，而实际刷新路径已经改成 resetGpuCache()，两套机制并存会分叉。
+  if (_gpuCache.val && Date.now() - _gpuCache.at < GPU_CACHE_MS) return Promise.resolve(_gpuCache.val)
+  if (_probePromise) return _probePromise // 在飞就复用，并发 5 次也只起一套 nvidia-smi
+  _probePromise = probeGpu()
+    .then((val) => { _gpuCache = { at: Date.now(), val }; return val })
+    .catch(() => {
+      const val = { deviceCount: 0, dllReady: false, cudaLibs: false, note: 'GPU 探测异常，按无卡处理' }
+      _gpuCache = { at: Date.now(), val }
+      return val
+    })
+    .finally(() => { _probePromise = null })
+  return _probePromise
+}
+/** execFile 的 Promise 版：不 reject，统一回 {ok, stdout, err}，省得每处都 try。 */
+function execFileP(file, args, opts) {
+  return new Promise((resolveP) => {
+    try {
+      execFile(file, args, opts, (err, stdout) => resolveP({ ok: !err, stdout: String(stdout ?? ''), err }))
+    } catch (e) {
+      resolveP({ ok: false, stdout: '', err: e })
+    }
+  })
+}
+async function probeGpu() {
+  const notes = []
+  let deviceCount = 0
+  const smi = await execFileP('nvidia-smi', ['-L'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
+  if (smi.ok) {
+    deviceCount = smi.stdout.split('\n').filter((l) => /^\s*GPU\s+\d+:/.test(l)).length
+  } else {
+    notes.push('没有 nvidia-smi（未装 NVIDIA 驱动，或不是 NVIDIA 卡）')
+  }
+  const py = venvAsr().find((p) => existsSync(p)) || ''
+  let dllReady = false
+  let cudaLibs = false
+  if (py) {
+    const spec = await execFileP(py, ['-c', 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("nvidia") else 1)'], { timeout: GPU_PROBE_TIMEOUT_MS, stdio: 'ignore' })
+    cudaLibs = spec.ok
+    if (process.platform === 'win32') {
+      const dll = await execFileP(py, ['-c', 'import ctypes; ctypes.WinDLL("cublas64_12.dll")'], { timeout: GPU_PROBE_TIMEOUT_MS, stdio: 'ignore' })
+      dllReady = dll.ok
+      if (!dllReady) notes.push('cublas64_12.dll 加载失败（GPU 运行库未装，或装了但不在 DLL 搜索路径里）')
+    } else {
+      notes.push('非 Windows：GPU 运行库走系统 CUDA，不做 DLL 探测')
+    }
+  } else {
+    notes.push('ASR 环境还没装，装完才能判断 GPU 运行库')
+  }
+  return { deviceCount, dllReady, cudaLibs, note: notes.join('；') }
+}
+
+// C-04（2026-10-29）：面板以前只看 venv 里的 python.exe 在不在就标绿。缺 VC++ Redist 时
+//   import faster_whisper 抛 "DLL load failed: vcruntime140.dll not found"——面板绿着，一跑就崩。
+//   这里真跑一次 import。代价是 Windows 上 python 启动 + ctranslate2 import 约 0.5–2 秒，
+//   而 /status 每 8 秒轮询一次，不能每次都跑，所以按「python 路径 + 它自己的 mtime + 探针代码」缓存 5 分钟；
+//   venv 重装（python.exe 的 mtime 变）会立刻重探。
+const IMPORT_TTL_MS = 5 * 60 * 1000
+let importCache = {}
+// OCR 的模块名 1.x 是 rapidocr_onnxruntime、2.x 是 rapidocr，两个都试；
+// 真 __import__ 才能暴露 onnxruntime 的 DLL 问题，find_spec 只查得到包在不在。
+const OCR_IMPORT_CODE =
+  'import importlib.util as u, sys\n' +
+  'for m in ("rapidocr_onnxruntime", "rapidocr"):\n' +
+  '    if u.find_spec(m):\n' +
+  '        __import__(m)\n' +
+  '        sys.exit(0)\n' +
+  'sys.exit(1)\n'
+function pyProbe(py, code) {
+  if (!py) return { ok: false, why: '没有 python 环境' }
+  let stamp = 0
+  try { stamp = statSync(py).mtimeMs } catch {}
+  const key = `${py}|${stamp}|${code}`
+  const hit = importCache[key]
+  if (hit && Date.now() - hit.at < IMPORT_TTL_MS) return { ok: hit.ok, why: hit.why, cached: true }
+  let ok = false
+  let why = ''
+  try {
+    // stdio 必须显式写全：execFileSync 默认会把子进程 stderr 直接透到父进程 stderr，
+    // 探测失败时每次都会往 DSH 日志里刷一段 Python traceback。
+    execFileSync(py, ['-c', code], { timeout: 15000, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    ok = true
+  } catch (e) {
+    const raw = String(e?.stderr || e?.message || e)
+    why = (raw.split('\n').map((s) => s.trim()).filter(Boolean).slice(-1)[0] || '未知原因').slice(0, 160)
+  }
+  // 按 key 存，不能整体替换：depRows 每轮跑两个探针（asr 的 import faster_whisper、
+  //   ocr 的 rapidocr），整体替换会让后跑的挤掉先跑的，两条永远都不命中——5 分钟 TTL 直接失效，
+  //   真装了 ctranslate2 的机器上每 8 秒轮询会起 2 个子进程、阻塞事件循环 2–4 秒。
+  importCache[key] = { at: Date.now(), ok, why }
+  // 防涨：key 只可能来自「venv 路径 × python.exe mtime × 探针代码」这几种组合，正常 ≤4 条。
+  //   超过 8 条说明 mtime 一直在变（venv 反复重装），清掉旧的、只留当前这条。
+  if (Object.keys(importCache).length > 8) importCache = { [key]: importCache[key] }
+  return { ok, why }
+}
+
 /** 面板上的依赖行：一条依赖一个状态 + 体积 + 是否需要下载。 */
-function depRows() {
+async function depRows(gpuVal) {
   // W-57：用 resolveFfmpeg()（同 CLI 口径，含 PATH 试跑）而不是 existsSync 硬查文件
   const ffmpeg = resolveFfmpeg()
   const ffmpegOnPath = ffmpeg === 'ffmpeg'
@@ -1089,6 +1325,9 @@ function depRows() {
   const asrPython = venvAsr().find((p) => existsSync(p)) || ''
   const ocrPython = venvOcr().find((p) => existsSync(p)) || ''
   const model = hfHomes().find((d) => existsSync(d)) || ''
+  // C-04：python.exe 在 ≠ 环境能用。真 import 一次（5 分钟缓存），失败就把原因写进 detail。
+  const asrProbe = asrPython ? pyProbe(asrPython, 'import faster_whisper') : { ok: false, why: '' }
+  const ocrProbe = ocrPython ? pyProbe(ocrPython, OCR_IMPORT_CODE) : { ok: false, why: '' }
   const rows = [
     {
       id: 'ffmpeg',
@@ -1122,8 +1361,10 @@ function depRows() {
     {
       id: 'asr',
       name: 'ASR 环境（本地转写）',
-      ok: Boolean(asrPython),
-      detail: asrPython ? maskAbs(asrPython) : '没找到 python 环境，无字幕视频无法转写',
+      ok: Boolean(asrPython) && asrProbe.ok,
+      detail: !asrPython
+        ? '没找到 python 环境，无字幕视频无法转写'
+        : (asrProbe.ok ? maskAbs(asrPython) : `python 在，但 import faster_whisper 失败：${asrProbe.why || '未知原因'}`),
       path: maskAbs(asrPython),
       removable: false,
       // P1-2（2026-10-28 全量检查）：文案原来写「在插件目录外」——错的，默认就装在 deps/.venv-asr。
@@ -1135,8 +1376,10 @@ function depRows() {
     {
       id: 'ocr',
       name: 'OCR 环境（画面文字）',
-      ok: Boolean(ocrPython),
-      detail: ocrPython ? maskAbs(ocrPython) : '没找到 python 环境，画面文字无法识别',
+      ok: Boolean(ocrPython) && ocrProbe.ok,
+      detail: !ocrPython
+        ? '没找到 python 环境，画面文字无法识别'
+        : (ocrProbe.ok ? maskAbs(ocrPython) : `python 在，但 import rapidocr 失败：${ocrProbe.why || '未知原因'}`),
       path: maskAbs(ocrPython),
       removable: false,
       removableWhy: '环境目录不从这里删（删了要重跑 fetch-deps 装回来）',
@@ -1154,6 +1397,32 @@ function depRows() {
       estimate: ESTIMATES.model,
     },
   ]
+  // 第十条（2026-10-29）：第 7 项 GPU 运行库。ok 判据是「DLL 真能加载」，不是「pip 包在不在」
+  //   ——包可能在 site-packages 里而 DLL 在别处（或反之）。removable 只认 pip 装的那份
+  //   （系统装的 CUDA Toolkit 不归我们管，面板不给删）。
+  const gpu = gpuVal || (await gpuStatus())
+  const cudaSize = (() => {
+    try {
+      const py = venvAsr().find((p) => existsSync(p)) || ''
+      if (!py || process.platform !== 'win32') return 0
+      return dirStat(join(dirname(dirname(py)), 'Lib', 'site-packages', 'nvidia')).bytes
+    } catch { return 0 }
+  })()
+  rows.push({
+    id: 'cuda',
+    name: 'GPU 运行库（cuBLAS + cuDNN）',
+    ok: gpu.dllReady,
+    detail: gpu.dllReady
+      ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 卡）` : ''}，转写走 GPU`
+      : (gpu.deviceCount
+        ? `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——装上转写快 2-8 倍`
+        : (gpu.note || '没有 NVIDIA 卡，转写走 CPU')),
+    path: gpu.dllReady ? 'cublas64_12.dll' : '',
+    removable: gpu.cudaLibs,
+    removableWhy: gpu.cudaLibs ? '' : '还没装（或装在系统里，不归插件管），没什么可删的',
+    size: cudaSize,
+    estimate: ESTIMATES.cuda,
+  })
   const cred = credState()
   rows.push({
     id: 'credential',
@@ -1188,15 +1457,41 @@ function runDownload(target) {
     ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Target', target]
     : [script.replace(/\.ps1$/i, '.sh'), target]
   let child = null
+  // A-下载黑洞：以前是 stdio:'ignore'——脚本 throw 的文本（比如 fetch-deps.ps1 里
+  //   「找不到 Python 3.10–3.14」）全被丢掉，download.log 里只有「开始下载」一行，
+  //   用户等 5 分钟看到 ASR 还是红的，不知道是 Python 没装还是版本不对。
+  //   这里把子进程 stdout/stderr 直接重定向到 download.log 的文件描述符（不是 pipe）：
+  //   · 不占事件循环，detached + unref 的「关掉宿主也能继续下」语义不变；
+  //   · 脚本输出逐行落盘，失败时能看到真正的 throw 文本。
+  let logFd = null
   try {
-    child = spawn(cmd, args, { windowsHide: true, stdio: 'ignore', detached: true })
+    logFd = openSync(DOWNLOAD_LOG, 'a')
+  } catch {}
+  try {
+    child = spawn(cmd, args, {
+      windowsHide: true,
+      stdio: logFd === null ? 'ignore' : ['ignore', logFd, logFd],
+      detached: true,
+    })
   } catch (e) {
+    if (logFd !== null) try { closeSync(logFd) } catch {}
     return { started: false, why: String(e?.message ?? e) }
   }
+  // 父进程这侧的句柄用完就关；子进程继承的那一份仍然有效（Windows 句柄继承 / POSIX fork 语义）
+  if (logFd !== null) try { closeSync(logFd) } catch {}
   // detached 子进程不会把 spawn 失败同步抛给我们，必须自己接 error，否则 ENOENT 会带崩宿主
   child.on('error', (e) => {
     try {
       appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 启动失败 ${target}：${e?.message ?? e}\n`, 'utf8')
+    } catch {}
+  })
+  // A-下载黑洞（后半）：记退出码。以前脚本崩在 pip install / 模型下载中途，
+  //   日志里既没有 stdout 也没有退出码，排障无路。
+  child.on('exit', (code, signal) => {
+    try {
+      const tail = signal ? `信号 ${signal}` : `退出码 ${code ?? 'null'}`
+      const bad = (code ?? 0) !== 0 || Boolean(signal)
+      appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] ${target} 结束，${tail}${bad ? '（失败）' : '（成功）'}\n`, 'utf8')
     } catch {}
   })
   child.unref()
@@ -1229,11 +1524,36 @@ function deleteDeps(targets) {
       }
       if (anyDeleted) deleted.push(t)
       else skipped.push({ id: t, why: '本来就不存在' })
+      // X-10（2026-10-29）：删完记下「此刻 panel 小号那份的 mtime」。syncPanelSmallToShared 会跳过
+      //   不晚于它的复制，否则 8 秒轮询又把 panel small 复制回来，用户看到凭证「自己长回来」。
+      //   panel 重新扫码后 PANEL_SMALL 的 mtime 会变新 → 自动恢复复制，不需要用户手动解禁。
+      try {
+        let panelMtime = 0
+        try { panelMtime = statSync(PANEL_SMALL).mtimeMs } catch {}
+        mkdirSync(dirname(CRED_CLEARED), { recursive: true })
+        writeFileSync(CRED_CLEARED, JSON.stringify({ at: Date.now(), panelMtime }), 'utf8')
+      } catch {}
       // 2026-10-27 批次9：resolveCredPath() 现在是「两处写入口谁新用谁」，所以删掉 watch 自己的
       // 两份不等于「未登录」——panel 的大号凭证还在就会继续用它。这里如实说明，不删 PANEL
       // （那是业务侧只读身份，归 panel/业务管，watch 删它会毁掉大号）。
       if (existsSync(PANEL_CRED)) {
         skipped.push({ id: t, why: 'panel 大号凭证仍在（bili-duty/bili_credential.json），watch 会继续用它；要彻底未登录请到业务侧处理' })
+      }
+      continue
+    }
+    if (t === 'cuda') {
+      // 第十条（2026-10-29）：必须走 pip uninstall——只删目录会留下 *.dist-info，
+      //   重装时 pip 报「已安装」但文件没了。失败把 stderr 放进 skipped。
+      const py = venvAsr().find((p) => existsSync(p)) || ''
+      if (!py) { skipped.push({ id: t, why: 'ASR 环境还没装，没有 GPU 运行库可删' }); continue }
+      try {
+        execFileSync(py, ['-m', 'pip', 'uninstall', '-y', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cuda-nvrtc-cu12'], {
+          timeout: 120000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        deleted.push(t)
+        resetGpuCache() // 清探测缓存，面板下一次轮询就能看到「已删」
+      } catch (e) {
+        skipped.push({ id: t, why: String(e?.stderr || e?.message || e).slice(-300) })
       }
       continue
     }
@@ -1484,7 +1804,12 @@ function apply(ctx) {
   try {
     const r = autoCleanCache({ force: true })
     if (r.removed) ctx.logger?.info?.(`[dsh-bili-watch] 自动清理缓存 ${r.removed} 个文件 / ${(r.bytes / 1048576).toFixed(1)} MB`)
+    // M-05：删不掉的文件别再静默跳过，至少留一行可查的日志（被 ffmpeg/python 占用、只读、超长路径）
+    if (r.failed?.length) ctx.logger?.warn?.(`[dsh-bili-watch] 自动清理缓存有 ${r.failed.length} 个文件没删掉：${r.failed.slice(0, 3).map((f) => f.name).join('、')}${r.failed.length > 3 ? ' 等' : ''}`)
   } catch {}
+
+  // X-30 第二轮：deps 搬家排后台（3 秒后，那时插件已注册完）。本次启动仍用包内那份。
+  scheduleDepsMigration()
 
   // ① 斜杠命令：人敲，确定性执行，不花推理 token
   ctx.commands.register({
@@ -1723,18 +2048,23 @@ function apply(ctx) {
               const url = new URL(req.url, 'http://127.0.0.1')
               if (req.method === 'GET' && url.pathname === '/api/bili-watch/status') {
                 const cleaned = autoCleanCache()
+                // GPU 探测一次就够：depRows 的 cuda 行与 data.gpu 用同一份结果，别各探一遍
+                const gpuNow = await gpuStatus()
                 return sendJson(res, 200, {
                   ok: true,
                   data: {
                     credential: credState(),
-                    deps: depRows(),
+                    deps: await depRows(gpuNow),
+                    // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
+                    //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
+                    gpu: gpuNow,
                     cache: { ...dirStat(CACHE), ...cacheCfg(), dir: maskAbs(CACHE), lastAutoClean: cleaned },
                     tuning: readTuning(),
                     tuningDefaults: tuningDefaults(),
                     tuningRanges: tuningRanges(),
                     lastRun: readLastRun(),
                     ui: uiCfg(),
-                    warnings: [cfgWarning, toolsWarning].filter(Boolean),
+                    warnings: [cfgWarning, toolsWarning, depsWarning].filter(Boolean),
                   },
                 })
               }
@@ -1840,14 +2170,15 @@ function apply(ctx) {
                   if (!wc.ok) cacheErr = wc.why || '未知错误'
                   rule = { days: cur.days, maxMb }
                 }
-                // 参数分层（阶段B）：五个白名单键写进 deps-config.json，表外的键忽略、不报错。
-                // 值为 null = 恢复默认（从文件里删掉该键，回落到常量）；值非法 = 忽略、保持原值。
+                // 参数分层（阶段B）：白名单键写进 deps-config.json，表外的键忽略、不报错。
+                // 值为 null = 恢复默认（从文件里删掉该键，回落到常量）；值非法 = 400 报错（D-01/D-02）。
                 let tuneErr = null
+                let tuneCode = 500
                 if (TUNING_KEYS.some((k) => body && Object.prototype.hasOwnProperty.call(body, k))) {
                   const w = writeTuning(body)
-                  if (!w.ok) tuneErr = w.why || '未知错误'
+                  if (!w.ok) { tuneErr = w.why || '未知错误'; tuneCode = w.code || 500 }
                 }
-                if (tuneErr) return sendJson(res, 500, { ok: false, why: `参数保存失败：${tuneErr}` })
+                if (tuneErr) return sendJson(res, tuneCode, { ok: false, why: `参数保存失败：${tuneErr}` })
                 if (cacheErr) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${cacheErr}` })
                 return sendJson(res, 200, { ok: true, data: { ...next, ...(rule || {}), tuning: readTuning() } })
               }

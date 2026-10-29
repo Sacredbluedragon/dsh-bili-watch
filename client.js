@@ -9,7 +9,15 @@
  * 后端只走 host 的 /api/bili-watch（读盘 + 清缓存 + 起下载），面板不存任何凭证。
  * 挂载点：plugins.bundle.config（key = 包名），因此设置页里看不到它，只在插件详情页出现。
  */
-window.__ModuleLoader__.load({
+// DSH < 0.2.0-rc.2 的宿主没有 window.__ModuleLoader__，直接调用会抛 TypeError：面板白屏，且面板之外
+// 没有任何提示（普通用户不会开 F12）。这里补一个空实现让本文件正常加载完——面板不注册，但宿主不白屏，
+// 控制台留一行能看懂的警告。
+const MODULE_LOADER =
+  typeof window !== 'undefined' && window.__ModuleLoader__ && typeof window.__ModuleLoader__.load === 'function'
+    ? window.__ModuleLoader__
+    : { load() { console.warn('[dsh-bili-watch] 需要 DSH ≥ 0.2.0-rc.2（当前宿主缺 window.__ModuleLoader__），插件面板不会显示。请升级 DSH 后重试。') } }
+
+MODULE_LOADER.load({
   id: 'dsh-bili-watch',
   factory: (require) => {
     const React = require('react')
@@ -139,6 +147,9 @@ window.__ModuleLoader__.load({
       const [maxMb, setMaxMb] = React.useState('2048')
       // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
       const [asrMin, setAsrMin] = React.useState('30')
+      // 第十条（2026-10-29）：ASR 推理设备。面板上是「转写时用 GPU」一个开关（开=auto / 关=cpu），
+      //   后端存的是枚举字符串，不是布尔——所以这里单独一个 state，不走 TuneRow 的数值通道。
+      const [asrDev, setAsrDev] = React.useState('auto')
       const [frames, setFrames] = React.useState('500')
       const [asrTmo, setAsrTmo] = React.useState('900')
       const [ffTmo, setFfTmo] = React.useState('300')
@@ -172,6 +183,7 @@ window.__ModuleLoader__.load({
               setMaxMb(String(j.data.cache?.maxMb ?? 2048))
               const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
               setAsrMin(String(Math.round(sec / 60)))
+              setAsrDev(String(tv.asrDevice ?? td.asrDevice ?? 'auto'))
               setFrames(String(tv.maxFrames ?? td.maxFrames ?? 500))
               setAsrTmo(String(tv.asrTimeoutSec ?? td.asrTimeoutSec ?? 900))
               setFfTmo(String(tv.ffmpegTimeoutSec ?? td.ffmpegTimeoutSec ?? 300))
@@ -196,11 +208,27 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (!qr?.key) return undefined
         let stop = false
+        // B-04/B-05（2026-10-29）：以前只靠 B 站自己回 86038 才停，手机端点取消后 B 站仍回 86101，
+        //   用户要干等 180 秒；断网时 catch 里每 4 秒无限重试、没有上限。这里加两道硬闸：
+        //   ① 从二维码生成起算 180 秒总超时，到点自己停；② 连续失败 5 次（≈20 秒）就停。
+        const deadline = Date.now() + 180 * 1000
+        let fails = 0
+        const stopWith = (state, msg) => {
+          stop = true
+          setQr(null)
+          setQrState(state)
+          setMsg(msg)
+        }
         const tick = async () => {
           if (stop) return
+          if (Date.now() > deadline) {
+            stopWith('expired', '二维码已过期（超过 3 分钟），请点击「重新扫码」重试。')
+            return
+          }
           try {
             const j = await jpost('/login/poll', { key: qr.key })
             if (stop) return
+            fails = 0
             if (j.state === 'ok') {
               stop = true
               setQr(null)
@@ -218,7 +246,13 @@ window.__ModuleLoader__.load({
             setQrState(j.state)
             setTimeout(tick, 2500)
           } catch (e) {
-            if (!stop) setTimeout(tick, 4000)
+            if (stop) return
+            fails += 1
+            if (fails >= 5) {
+              stopWith('error', '网络中断，登录已暂停，请检查网络后重新扫码。')
+              return
+            }
+            setTimeout(tick, 4000)
           }
         }
         const t = setTimeout(tick, 1500)
@@ -256,7 +290,24 @@ window.__ModuleLoader__.load({
         setMsg('')
         try {
           const j = await jpost('/download', { target })
-          setMsg(j.ok ? `已开始下载（后台执行，日志 ${j.data.log}）。下载完成后点击刷新查看状态。` : (j.data?.why || j.why || '启动失败'))
+          // 后端回的是 { ok, data: { results: [{started, log} | {started:false, why}], started } }，
+          // 扁平读 j.data.log / j.data.why 永远是 undefined——成功时显示「日志 undefined」，
+          // 失败时把后端写明的具体原因全丢掉，只剩兜底的「启动失败」。
+          const results = Array.isArray(j?.data?.results) ? j.data.results : []
+          const good = results.filter((r) => r && r.started)
+          const bad = results.filter((r) => r && !r.started)
+          const log = good[0]?.log || j?.data?.log || ''
+          const why = bad.map((r) => r.why).filter(Boolean).join('；') || j?.data?.why || j?.why || ''
+          if (good.length && !bad.length) {
+            setMsg(`已开始下载（后台执行，日志 ${log || 'deps/download.log'}）。下载完成后点击刷新查看状态。`)
+          } else if (good.length && bad.length) {
+            setMsg(`部分已开始（${good.length} 项）；失败 ${bad.length} 项：${why || '原因未知'}`)
+          } else if (!results.length && (j?.ok || log)) {
+            // 老形状 / 空 results 但整体成功：别退化成「启动失败」
+            setMsg(`已开始下载（后台执行，日志 ${log || 'deps/download.log'}）。下载完成后点击刷新查看状态。`)
+          } else {
+            setMsg(why || '启动失败')
+          }
         } catch (e) {
           setMsg(String(e?.message || e))
         } finally {
@@ -276,8 +327,16 @@ window.__ModuleLoader__.load({
       }
 
       const saveRule = async () => {
+        // D-09（2026-10-29）：保留天数/总量上限填了非数字时，以前照样发、照样弹「已保存」，
+        //   服务端 Number.isFinite(null)=false 直接跳过，规则其实没变。
+        const d = Number(days)
+        const m = Number(maxMb)
+        if (!Number.isFinite(d) || !Number.isFinite(m)) {
+          setMsg('保留天数与总量上限都要填数字，未保存。')
+          return
+        }
         try {
-          const j = await jpost('/config', { days: Number(days), maxMb: Number(maxMb) })
+          const j = await jpost('/config', { days: d, maxMb: m })
           setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
           if (j?.ok !== false) { dirtyRef.current = false; await load() }
         } catch (e) {
@@ -286,8 +345,28 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // D-01/D-02（2026-10-29）：填了非数字（Number('abc')=NaN）或超出范围的数字时，以前照样发请求、
+      //   照样弹「已保存」——服务端把 NaN 序列化成 null 当成「恢复默认」把键删了，用户下次打开才发现值变回默认。
+      //   这里在发请求前先拦，返回非空字符串就是拦下的原因。
+      const tuneBad = (patch, label) => {
+        const ranges = tuneMeta?.ranges || {}
+        for (const [k, v] of Object.entries(patch || {})) {
+          if (v === null) continue // 恢复默认，合法
+          if (typeof v !== 'number') continue // 枚举项（asrDevice）走字符串，交给服务端白名单
+          const name = label || k
+          if (!Number.isFinite(v)) return `${name}需填数字，未保存。`
+          const r = ranges[k]
+          if (Array.isArray(r) && (v < r[0] || v > r[1])) return `${name}需在 ${r[0]}–${r[1]} 之间，未保存。`
+        }
+        return ''
+      }
       // 参数分层：保存一项（patch 里只带一个键）；恢复默认 = POST 该键为 null
-      const saveTune = async (patch, okText) => {
+      const saveTune = async (patch, okText, label) => {
+        const bad = tuneBad(patch, label)
+        if (bad) {
+          setMsg(bad)
+          return
+        }
         try {
           const j = await jpost('/config', patch)
           if (j?.ok === false) {
@@ -313,10 +392,14 @@ window.__ModuleLoader__.load({
       }
 
       const rows = st?.deps || []
+      // ADD-1（2026-10-29）：批量清理默认只勾「删了能一分钟重下」的行。
+      //   原来 `d.removable && d.ok` 把凭证行也勾上了——用户点「确定」顺手把登录态删了，
+      //   而恢复要重新扫码。模型（460 MB 重下）同理。venv 本来就 removable:false，不在候选里。
+      const CHEAP_TO_REMOVE = new Set(['ytdlp'])
       // 打开批量弹层：默认全勾选（可下载 = 缺的且不是凭证；可清理 = 插件目录内且已存在）
       const openDlg = (kind) => {
         if (kind === 'download') setPicked(rows.filter((d) => d.id !== 'credential' && !d.ok).map((d) => d.id))
-        else setPicked(rows.filter((d) => d.removable && d.ok).map((d) => d.id))
+        else setPicked(rows.filter((d) => d.removable && d.ok && CHEAP_TO_REMOVE.has(d.id)).map((d) => d.id))
         setDlg(kind)
       }
       const toggle = (id) => setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]))
@@ -506,6 +589,29 @@ window.__ModuleLoader__.load({
         // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),
+          // 第十条（2026-10-29）：转写设备开关。开=auto（有卡走 GPU，显存不足自动回落 CPU）/ 关=cpu。
+          //   没有 NVIDIA 卡时也能切，但切到 auto 实际还是走 CPU——所以下面按 gpu 三态补一句说明。
+          h('div', { 'data-bl-row': '' },
+            h('label', { 'data-bl-dlgrow': '' },
+              h('input', {
+                type: 'checkbox',
+                checked: asrDev === 'auto',
+                onChange: async (e) => {
+                  const v = e.target.checked ? 'auto' : 'cpu'
+                  setAsrDev(v)
+                  await saveTune({ asrDevice: v }, v === 'auto'
+                    ? '转写已改为「用 GPU」（有卡就用，显存不足自动回落 CPU）。'
+                    : '转写已改为「只用 CPU」。')
+                },
+              }),
+              h('span', { 'data-bl-name': '' }, '转写时用 GPU'),
+            ),
+            h('span', { 'data-bl-note': '' },
+              st.gpu && !st.gpu.deviceCount
+                ? '本机没检测到 NVIDIA 卡，开了也走 CPU。'
+                : (st.gpu && !st.gpu.dllReady
+                  ? '有卡，但 GPU 运行库没装好——见上方「GPU 运行库」那一行。'
+                  : '有卡且运行库就绪时比 CPU 快 2-8 倍。'))),
           h(TuneRow, {
             label: '转写闸门',
             value: asrMin,
@@ -522,7 +628,7 @@ window.__ModuleLoader__.load({
             value: frames,
             unit: '张',
             onChange: (v) => { markDirty(); setFrames(v) },
-            onSave: () => saveTune({ maxFrames: Number(frames) }, '抽帧张数上限已保存。'),
+            onSave: () => saveTune({ maxFrames: Number(frames) }, '抽帧张数上限已保存。', '抽帧张数上限'),
             onRestore: () => saveTune({ maxFrames: null }, '抽帧张数上限已恢复默认（500 张）。'),
             def: '500 张',
             range: `${tuneMeta?.ranges?.maxFrames?.[0] ?? 100}–${tuneMeta?.ranges?.maxFrames?.[1] ?? 1000} 张`,
@@ -540,7 +646,7 @@ window.__ModuleLoader__.load({
                 value: asrTmo,
                 unit: '秒',
                 onChange: (v) => { markDirty(); setAsrTmo(v) },
-                onSave: () => saveTune({ asrTimeoutSec: Number(asrTmo) }, 'ASR 超时已保存。'),
+                onSave: () => saveTune({ asrTimeoutSec: Number(asrTmo) }, 'ASR 超时已保存。', 'ASR 超时'),
                 onRestore: () => saveTune({ asrTimeoutSec: null }, 'ASR 超时已恢复默认（900 秒）。'),
                 def: '900 秒',
                 range: `${tuneMeta?.ranges?.asrTimeoutSec?.[0] ?? 300}–${tuneMeta?.ranges?.asrTimeoutSec?.[1] ?? 3600} 秒`,
@@ -551,7 +657,7 @@ window.__ModuleLoader__.load({
                 value: ffTmo,
                 unit: '秒',
                 onChange: (v) => { markDirty(); setFfTmo(v) },
-                onSave: () => saveTune({ ffmpegTimeoutSec: Number(ffTmo) }, 'ffmpeg 超时已保存。'),
+                onSave: () => saveTune({ ffmpegTimeoutSec: Number(ffTmo) }, 'ffmpeg 超时已保存。', 'ffmpeg 超时'),
                 onRestore: () => saveTune({ ffmpegTimeoutSec: null }, 'ffmpeg 超时已恢复默认（300 秒）。'),
                 def: '300 秒',
                 range: `${tuneMeta?.ranges?.ffmpegTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.ffmpegTimeoutSec?.[1] ?? 1800} 秒`,
@@ -562,7 +668,7 @@ window.__ModuleLoader__.load({
                 value: cmdTmo,
                 unit: '秒',
                 onChange: (v) => { markDirty(); setCmdTmo(v) },
-                onSave: () => saveTune({ cmdTimeoutSec: Number(cmdTmo) }, '命令超时已保存。'),
+                onSave: () => saveTune({ cmdTimeoutSec: Number(cmdTmo) }, '命令超时已保存。', '命令超时'),
                 onRestore: () => saveTune({ cmdTimeoutSec: null }, '命令超时已恢复默认（180 秒）。'),
                 def: '180 秒',
                 range: `${tuneMeta?.ranges?.cmdTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.cmdTimeoutSec?.[1] ?? 900} 秒`,
@@ -575,7 +681,7 @@ window.__ModuleLoader__.load({
                 value: advVals[x.key] ?? x.def,
                 unit: x.unit,
                 onChange: (v) => { markDirty(); setAdvVals((s) => ({ ...s, [x.key]: v })) },
-                onSave: () => saveTune({ [x.key]: Number(advVals[x.key] ?? x.def) }, `${x.label}已保存。`),
+                onSave: () => saveTune({ [x.key]: Number(advVals[x.key] ?? x.def) }, `${x.label}已保存。`, x.label),
                 onRestore: () => saveTune({ [x.key]: null }, `${x.label}已恢复默认（${x.def} ${x.unit}）。`),
                 def: `${x.def} ${x.unit}`,
                 range: (() => {

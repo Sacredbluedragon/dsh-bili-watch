@@ -1,89 +1,89 @@
 {
-  "name": "dsh-bili-watch",
-  "version": "0.3.3",
-  "private": false,
-  "description": "把 B 站视频读成文本给 DSH agent 用：元数据、评论、弹幕、字幕、本地转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。只读命令零依赖。",
-  "type": "module",
-  "main": "index.js",
-  "scripts": {
-    "verify": "node tools/verify.mjs",
-    "smoke": "node tools/verify.mjs"
-  },
-  "bin": {
-    "bili-watch": "tools/look.mjs"
-  },
-  "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
-    "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
-  },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-settings"
-      ]
-    }
-  },
-  "files": [
-    "index.js",
-    "client.js",
-    "cordis.patch.yml",
-    "tools/look.mjs",
-    "tools/ocr.py",
-    "scripts/fetch-deps.ps1",
-    "scripts/fetch-deps.sh",
-    "deps/_bili-asr.py",
-    "auto-trigger.js",
-    "LICENSE",
-    "README.md",
-    "THIRD_PARTY_NOTICES.md"
-  ],
-  "keywords": [
-    "bilibili",
-    "video",
-    "asr",
-    "ocr",
-    "danmaku",
-    "dsh",
-    "deepseek",
-    "subtitles"
-  ],
-  "author": "Sacredbluedragon",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Sacredbluedragon/dsh-bili-watch.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Sacredbluedragon/dsh-bili-watch/issues"
-  },
-  "homepage": "https://github.com/Sacredbluedragon/dsh-bili-watch#readme",
-  "engines": {
-    "node": ">=22"
-  },
-  "dependencies": {
-    "qrcode": "^1.5.4"
-  },
-  "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.3.0-0",
-    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0-0",
-    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.3.0-0"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-tools": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-llm": {
-      "optional": true
-    }
-  }
+    "name":  "dsh-bili-watch",
+    "version":  "0.3.4",
+    "private":  false,
+    "description":  "把 B 站视频读成文本给 AI 用：元数据、评论、弹幕、字幕、本地 ASR 转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。本地跑不上传、内容一致性检查、二次读瞬时、为 AI 设计落盘+摘要。",
+    "type":  "module",
+    "main":  "index.js",
+    "scripts":  {
+                    "verify":  "node tools/verify.mjs",
+                    "smoke":  "node tools/verify.mjs"
+                },
+    "bin":  {
+                "bili-watch":  "tools/look.mjs"
+            },
+    "exports":  {
+                    ".":  "./index.js",
+                    "./client":  "./client.js",
+                    "./cordis.patch.yml":  "./cordis.patch.yml",
+                    "./package.json":  "./package.json"
+                },
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "platform":  "web",
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-runtime",
+                                              "@deepseek-ai/dsh-client-ui-settings"
+                                          ]
+                           }
+            },
+    "files":  [
+                  "index.js",
+                  "client.js",
+                  "cordis.patch.yml",
+                  "tools/look.mjs",
+                  "tools/ocr.py",
+                  "scripts/fetch-deps.ps1",
+                  "scripts/fetch-deps.sh",
+                  "deps/_bili-asr.py",
+                  "auto-trigger.js",
+                  "LICENSE",
+                  "README.md",
+                  "THIRD_PARTY_NOTICES.md"
+              ],
+    "keywords":  [
+                     "bilibili",
+                     "video",
+                     "asr",
+                     "ocr",
+                     "danmaku",
+                     "dsh",
+                     "deepseek",
+                     "subtitles"
+                 ],
+    "author":  "Sacredbluedragon",
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/Sacredbluedragon/dsh-bili-watch.git"
+                   },
+    "bugs":  {
+                 "url":  "https://github.com/Sacredbluedragon/dsh-bili-watch/issues"
+             },
+    "homepage":  "https://github.com/Sacredbluedragon/dsh-bili-watch#readme",
+    "engines":  {
+                    "node":  "\u003e=22"
+                },
+    "dependencies":  {
+                         "qrcode":  "^1.5.4"
+                     },
+    "peerDependencies":  {
+                             "@deepseek-ai/dsh":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0",
+                             "@deepseek-ai/dsh-tools":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0",
+                             "@deepseek-ai/dsh-llm":  "\u003e=0.2.0-rc.2 \u003c0.3.0-0"
+                         },
+    "peerDependenciesMeta":  {
+                                 "@deepseek-ai/dsh":  {
+                                                          "optional":  true
+                                                      },
+                                 "@deepseek-ai/dsh-tools":  {
+                                                                "optional":  true
+                                                            },
+                                 "@deepseek-ai/dsh-llm":  {
+                                                              "optional":  true
+                                                          }
+                             }
 }

@@ -24,6 +24,49 @@ import json
 import os
 import sys
 
+
+class _FlushStderr:
+    """写一次就 flush 一次的 stderr 包装器。
+
+    为什么需要（N-03）：ASR 依赖（ctranslate2 / cuBLAS / cuDNN）在 Windows 上会以
+    0xC0000005 访问违例**直接杀掉进程**，Python 层缓冲区里没 flush 的内容一个字节都留不下。
+    本脚本的诊断全走 stderr，调用方（tools/look.mjs）靠它说清「为什么零字 / 为什么失败」；
+    缓冲区一丢，用户就只看到「转写失败（exit -1073741819）：」后面一片空白。
+    包一层、每次 write 后立刻 flush，进程被打死时调用方至少能拿到崩之前最后那几行。
+
+    注：实测 CPython 3.9+ 的 sys.stderr 即使重定向到管道也是**行缓冲**，print 自带换行
+    本身就会落盘；这一层是为「将来换成 block-buffered 的 stdout 口径 / 被包装成别的流」
+    兜底，成本是每行一次 write syscall，对本脚本几十行的量级可忽略。
+    """
+
+    __slots__ = ("_w",)
+
+    def __init__(self, w):
+        self._w = w
+
+    def write(self, s):
+        n = self._w.write(s)
+        try:
+            self._w.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        return n
+
+    def flush(self):
+        try:
+            self._w.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __getattr__(self, name):
+        # encoding / errors / fileno / isatty / buffer 等一律透传，别让 argparse、
+        # traceback、faulthandler 这些按属性探测的调用方踩空
+        return getattr(self._w, name)
+
+
+if not isinstance(sys.stderr, _FlushStderr):
+    sys.stderr = _FlushStderr(sys.stderr)
+
 # ⭐ 必须在 import faster_whisper 之前设好，否则它会先按默认去连 HuggingFace
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-home"))
@@ -82,6 +125,15 @@ def main() -> int:
     if not os.path.isfile(args.src):
         print("[asr] 找不到文件：" + args.src, file=sys.stderr)
         return 2
+
+    # N-03：崩溃面包屑，必须在下面这个 import **之前**。
+    #   导入 faster_whisper 会连带加载 ctranslate2 与 cuDNN/cuBLAS 的 DLL，这是
+    #   0xC0000005 访问违例的最高发点——DLL 版本不匹配、缺 VC++ 运行库、显卡驱动
+    #   与 cuDNN 对不上，进程都会被系统直接打死，Python 连 traceback 都来不及打。
+    #   先喊一声再进去：stderr 里只剩这一行，就说明崩在导入/加载 DLL 这一步，
+    #   而不是崩在转写本身——调用方和用户都能据此定位，不用对着空白 stderr 猜。
+    print("[asr] 正在导入 faster_whisper（会连带加载 ctranslate2 与 cuDNN/cuBLAS 的 DLL；"
+          "若 stderr 到此为止，说明崩在这一步）…", file=sys.stderr)
 
     try:
         from faster_whisper import WhisperModel

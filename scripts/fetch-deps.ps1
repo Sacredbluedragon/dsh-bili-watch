@@ -33,7 +33,7 @@
     · curl.exe 强制 https（--proto =https --proto-redir =https），不允许明文 http 跳转。
 #>
 param(
-  [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model')]
+  [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda')]
   [string]$Target = 'all',
   [switch]$Force,
   # GPU 运行库（cuBLAS + cuDNN，约 500 MB）怎么处理：ask=问一句（默认，非交互时按 no）/ yes / no
@@ -51,13 +51,49 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$Deps = Join-Path $Root 'deps'
+# X-30（2026-10-29）：deps 默认装到包外（$DSH_HOME\bili-watch\deps），重装包不会连 venv/模型一起删。
+#   解析顺序：BILI_WATCH_DEPS > $DSH_HOME\bili-watch\deps；插件还没搬家、包内 deps\ 有内容时仍装包内，
+#   免得「装到空目录、看不到已有 venv」重复下 460 MB。与 index.js / tools/look.mjs 同一口径。
+$DepsLocal = Join-Path $Root 'deps'
+if ($env:BILI_WATCH_DEPS) {
+  $Deps = $env:BILI_WATCH_DEPS
+} else {
+  $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
+  $DepsPreferred = Join-Path $dshHome 'bili-watch\deps'
+  if ((Test-Path -LiteralPath $DepsPreferred) -or -not (Test-Path -LiteralPath $DepsLocal)) { $Deps = $DepsPreferred } else { $Deps = $DepsLocal }
+}
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $Deps | Out-Null }
 
 $UseCn = ($Mirror -eq 'cn') -or (($Mirror -eq 'auto') -and ($env:BILI_WATCH_MIRROR -eq 'cn'))
+# C-01（2026-10-29）：-Mirror auto 以前什么都不探测——国内用户跑默认命令，ffmpeg/yt-dlp 从 github.com
+#   直连、模型从 huggingface.co 直连，卡到超时。这里补一个 1.5 秒的 TCP 探测：
+#   huggingface.co 不通而 hf-mirror.com 通 → 按国内网络处理，自动切镜像。
+function Test-TcpReachable([string]$HostName, [int]$Port = 443) {
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $iar = $c.BeginConnect($HostName, $Port, $null, $null)
+    $done = $iar.AsyncWaitHandle.WaitOne(1500)
+    if (-not $done) { $c.Close(); return $false }
+    $c.EndConnect($iar)
+    $c.Close()
+    return $true
+  } catch {
+    try { $c.Close() } catch {}
+    return $false
+  }
+}
+if (-not $UseCn -and $Mirror -eq 'auto' -and -not $env:BILI_WATCH_MIRROR -and -not $DryRun) {
+  if (-not (Test-TcpReachable 'huggingface.co') -and (Test-TcpReachable 'hf-mirror.com')) {
+    $UseCn = $true
+    Write-Host '    探测到 huggingface.co 不可达、hf-mirror.com 可达，自动切国内镜像（要直连请加 -Mirror global）' -ForegroundColor Yellow
+  }
+}
 $GhProxy = if ($UseCn) { 'https://gh-proxy.com/' } else { '' }
 $PyIndex = if ($UseCn) { 'https://pypi.tuna.tsinghua.edu.cn/simple' } else { 'https://pypi.org/simple' }
-$HfEndpoint = if ($UseCn) { 'https://hf-mirror.com' } else { 'https://huggingface.co' }
+# C-02（2026-10-29）：模型镜像默认跟 tools/look.mjs 对齐——运行时首次自动下载写死 hf-mirror.com，
+#   预下载却走 huggingface.co，同一份模型两条路径用不同镜像，国内等于「预下载这条路是摆设」。
+#   现在只有显式 -Mirror global 才直连 huggingface.co。
+$HfEndpoint = if ($Mirror -eq 'global') { 'https://huggingface.co' } else { 'https://hf-mirror.com' }
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Skip([string]$msg) { Write-Host "    $msg（已存在，跳过；-Force 重下）" -ForegroundColor DarkGray }
@@ -67,6 +103,30 @@ function Move-SemiVenv([string]$venv) {
   # 改成改名留档，用户确认无用后自己删。
   if (-not (Test-Path -LiteralPath $venv)) { return }
   $leaf = Split-Path -Leaf $venv
+  $parent = Split-Path -Parent $venv
+  # M-03（2026-10-29）：以前只改名不清理，反复失败会攒出好几个 xxx.old-* 目录（每个 1–2 GB）。
+  #   改名之前先把上一次留下的 .old-* 删掉——那是我们自己上一轮造的垃圾，不是用户的文件。
+  #   只删「同一 leaf 前缀 + .old-时间戳」这种我们自己命名的目录，别的一律不碰。
+  try {
+    $old = @(Get-ChildItem -LiteralPath $parent -Directory -Filter "$leaf.old-*" -ErrorAction SilentlyContinue)
+    if ($old.Count -gt 0) {
+      $freed = 0
+      foreach ($d in $old) {
+        try {
+          $sz = (Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+          Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop
+          if ($sz) { $freed += [int64]$sz }
+        } catch {
+          Write-Host "    ! 旧的半成品目录删不掉：$($d.Name)（$($_.Exception.Message)）" -ForegroundColor DarkGray
+          Write-Host "      可手动删除：$($d.FullName)" -ForegroundColor DarkGray
+        }
+      }
+      if ($freed -gt 0) {
+        Write-Host "    已清掉上一次的半成品目录，回收 $([math]::Round($freed/1MB)) MB" -ForegroundColor DarkGray
+      }
+    }
+  } catch {}
   $dst = "$leaf.old-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
   try {
     Rename-Item -LiteralPath $venv -NewName $dst
@@ -89,13 +149,26 @@ function Invoke-PipInstall {
 
 function Invoke-Download([string]$url, [string]$out, [string]$label) {
   if ($DryRun) {
-    Write-Host "    [dry-run] curl.exe -L --fail --proto =https --proto-redir =https -o `"$out`" `"$url`""
+    Write-Host "    [dry-run] curl.exe -L --fail --proto =https --proto-redir =https -C - -o `"$out.part`" `"$url`""
     return
   }
   $tmp = "$out.part"
-  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-  Write-Host "    下载 $label ..."
-  & curl.exe -L --fail --proto =https --proto-redir =https --retry 3 --connect-timeout 20 -o $tmp $url
+  # E-06（2026-10-29）：以前开下之前先删 .part，ffmpeg 那 80 MB 断一次网就得从头再来。
+  #   现在保留 .part 并用 curl -C - 续传；服务器不支持 Range（curl 非 0 退出）就删掉从头下一次。
+  $base = @('-L', '--fail', '--proto', '=https', '--proto-redir', '=https', '--retry', '3', '--connect-timeout', '20')
+  if (Test-Path -LiteralPath $tmp) {
+    $have = (Get-Item -LiteralPath $tmp).Length
+    Write-Host "    发现上次没下完的 .part（$([math]::Round($have/1MB,1)) MB），续传 $label ..."
+    & curl.exe @base -C - -o $tmp $url
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host '    续传失败（服务器可能不支持 Range），删掉从头重下' -ForegroundColor Yellow
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      & curl.exe @base -o $tmp $url
+    }
+  } else {
+    Write-Host "    下载 $label ..."
+    & curl.exe @base -o $tmp $url
+  }
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
     throw "下载失败：$url"
@@ -149,6 +222,7 @@ function Ensure-Ytdlp {
 function Get-SystemPython {
   # 版本必须「有上界」：onnxruntime 目前没有 3.13+ 的 wheel，
   # 只判 >=3.10 会让 py 启动器挑到最新的 3.15，pip 报 No matching distribution（issue #3 实测）。
+  $sawStub = $false
   if ($PythonPath) {
     if (-not (Test-Path -LiteralPath $PythonPath)) { throw "指定的 Python 不存在：$PythonPath" }
     $v = & $PythonPath -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
@@ -166,13 +240,65 @@ function Get-SystemPython {
   foreach ($c in @('python', 'python3')) {
     $cmd = Get-Command $c -ErrorAction SilentlyContinue
     if (-not $cmd) { continue }
+    # E-05（2026-10-29）：Windows 的「应用执行别名」会在 PATH 里放一个 python.exe 存根
+    #   （...\Microsoft\WindowsApps\python.exe）。它不报错也不给版本，跑起来要么弹商店、
+    #   要么 9009 退出——用户最后看到的是「找不到 Python」，其实他装了真 Python 只是排在后面。
+    if ($cmd.Source -match '\\WindowsApps\\') {
+      $sawStub = $true
+      Write-Host "    跳过应用商店的 python 存根：$($cmd.Source)" -ForegroundColor DarkGray
+      continue
+    }
     $v = & $cmd.Source -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
     if ($LASTEXITCODE -ne 0) { continue }
     if ($v -notmatch '^3\.(1[0-4])$') { continue }
     $exe = & $cmd.Source -c "import sys;print(sys.executable)" 2>$null
     if ($exe -and (Test-Path -LiteralPath ($exe.Trim()))) { return $exe.Trim() }
   }
+  if ($sawStub) {
+    throw '只找到 Windows 应用商店的 Python 存根（WindowsApps\python.exe），它不是真的解释器。请装一个 3.12，或用 -PythonPath 指定解释器路径。'
+  }
   throw '找不到 Python 3.10–3.14（更高版本 onnxruntime 还没有 wheel）。请装一个 3.12，或用 -PythonPath 指定解释器路径。'
+}
+
+# 第十条（2026-10-29）：GPU 运行库单独一个 target，供 -Target cuda 与 Ensure-Asr 的询问分支共用。
+#   装三个 wheel：cuBLAS + cuDNN + nvrtc（ctranslate2 在部分版本上会去要 nvrtc）。
+#   装完必须真试一次 DLL——pip 装成功不代表能加载（缺 VC++ Redist 时 pip 也成功、import 才崩）。
+function Install-CudaLibs {
+  param([string]$Py = '')
+  Write-Step 'GPU 运行库（cuBLAS + cuDNN + nvrtc，约 500 MB）'
+  if (-not $Py) { $Py = Join-Path (Join-Path $Deps '.venv-asr') 'Scripts\python.exe' }
+  if (-not (Test-Path -LiteralPath $Py)) {
+    Write-Host '    ! 还没装 ASR 环境：GPU 运行库要装进 .venv-asr，先跑 -Target asr' -ForegroundColor Yellow
+    return
+  }
+  if ($DryRun) {
+    Write-Host "    [dry-run] `"$Py`" -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-nvrtc-cu12 -i $PyIndex"
+    return
+  }
+  Invoke-PipInstall $Py @('install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cuda-nvrtc-cu12')
+  # 与面板 /status 的 ok 判据同一口径：不看 pip 包名，真加载一次 DLL
+  & $Py -c 'import ctypes; ctypes.WinDLL("cublas64_12.dll")' 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host '    ✓ cublas64_12.dll 能加载：ASR 会走 GPU（显存不足自动回落 CPU）'
+  } else {
+    Write-Host '    ! DLL 还是加载不了（可能缺 VC++ Redist 或显卡驱动太旧）；ASR 继续用 CPU，功能不受影响' -ForegroundColor Yellow
+  }
+}
+
+# M-06（2026-10-29）：找 nvidia-smi，**只返回路径字符串**（找不到返回 ''）。
+#   为什么不直接返回对象：Get-Command 给的是 ApplicationInfo（有 .Source、**没有** .FullName），
+#   Get-Item 给的是 FileInfo（有 .FullName、**没有** .Source）。两种对象没有一个共同的可执行属性，
+#   谁按单一属性取值，都会在另一条分支上拿到 $null，然后 `& $null --query-gpu=...` 抛
+#   误导性的「nvidia-smi 查询异常」——比改前更糟（豆包 11:40 验收抓到，本机实测确认：
+#   ApplicationInfo.Source=路径 / .FullName=空；FileInfo 正好相反）。
+#   所以这里把两条来源都归一到 $smiPath，取值只取一次。
+function Resolve-NvidiaSmi {
+  $c = Get-Command 'nvidia-smi' -ErrorAction SilentlyContinue
+  if ($c -and $c.Source) { return [string]$c.Source }
+  foreach ($p in @("$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe", "$env:SystemRoot\System32\nvidia-smi.exe")) {
+    if ($p -and (Test-Path -LiteralPath $p)) { return [string]$p }
+  }
+  return ''
 }
 
 function Ensure-Asr {
@@ -205,14 +331,52 @@ function Ensure-Asr {
   # issue #3 第 4 条（2026-10-29）实测：不装 CUDA 12 的 cuBLAS + cuDNN 时，
   #   --device auto 能探到 GPU、模型也能加载，但一转写就报 Library cublas64_12.dll is not found。
   #   有 N 卡就顺手装上（pip 包，约 500 MB，不用装整套 CUDA Toolkit），没有就跳过、继续用 CPU。
+  # M-06（2026-10-29）：以前只看 `nvidia-smi -L` 的退出码，三种误判：
+  #   ① 驱动装了但 nvidia-smi 不在 PATH（NVIDIA App 新装 / 非默认路径）→ 明明有卡却说没有；
+  #   ② 驱动 <525（CUDA 12 最低要求）→ 白下 500 MB，装了也用不了；
+  #   ③ 显存 <2 GB（small 模型 float16 约需 1 GB）→ 装了加载即 OOM。
+  #   改成查 driver_version + memory.total，不满足就把原因说清楚，别让用户白下。
   $nv = $false
-  try { & nvidia-smi -L 2>&1 | Out-Null; $nv = ($LASTEXITCODE -eq 0) } catch { $nv = $false }
+  $nvWhy = ''
+  $smiPath = Resolve-NvidiaSmi
+  if ($smiPath) {
+    try {
+      $info = & $smiPath --query-gpu=driver_version,memory.total --format=csv,noheader 2>$null
+      if ($LASTEXITCODE -eq 0 -and $info) {
+        $first = [string](@($info)[0])
+        $parts = $first -split ',\s*'
+        $drv = [string]$parts[0]
+        $memMb = 0
+        if ($parts.Count -gt 1 -and ($parts[1] -match '(\d+)')) { $memMb = [int]$matches[1] }
+        $drvNum = 0
+        if ($drv -match '^(\d+)\.') { $drvNum = [int]$matches[1] }
+        if ($drvNum -gt 0 -and $drvNum -lt 525) {
+          $nvWhy = "驱动 $drv 太旧（CUDA 12 要 525+），装了运行库也用不了"
+        } elseif ($memMb -gt 0 -and $memMb -lt 2048) {
+          $nvWhy = "显存 $memMb MB 太小（small 模型约需 1 GB），装了容易 OOM"
+        } else {
+          $nv = $true
+        }
+      } else {
+        $nvWhy = 'nvidia-smi 查询失败（驱动异常）'
+      }
+    } catch {
+      $nvWhy = "nvidia-smi 查询异常：$($_.Exception.Message)"
+    }
+  } else {
+    $nvWhy = '没找到 nvidia-smi（未装 NVIDIA 驱动，或不是 NVIDIA 卡）'
+  }
+  if (-not $nv -and $nvWhy) { Write-Host "    不装 GPU 运行库：$nvWhy" -ForegroundColor DarkGray }
   $wantGpu = $false
   if ($nv) {
     if ($Gpu -eq 'yes') {
       $wantGpu = $true
     } elseif ($Gpu -eq 'no') {
       $wantGpu = $false
+    } elseif ($script:InAll) {
+      # 第十条：all 不问、不装（要装请 -Target cuda / -Gpu yes）
+      $wantGpu = $false
+      Write-Host '    (all) 跳过 GPU 运行库（约 500 MB）；要装请单独跑 -Target cuda' -ForegroundColor DarkGray
     } elseif ([Console]::IsInputRedirected) {
       # 无人值守（脚本里被调）时不要卡在 Read-Host 上，按「不装」处理
       $wantGpu = $false
@@ -226,13 +390,7 @@ function Ensure-Asr {
   }
   if ($wantGpu) {
     Write-Host '    检测到 NVIDIA 显卡，补装 CUDA 12 运行库（cuBLAS + cuDNN，约 500 MB）…'
-    Invoke-PipInstall $py @('install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12')
-    & $py -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("nvidia") else 1)' 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-      Write-Host '    ✓ GPU 运行库就绪：--device auto 会走 GPU（显存不足会自动回落 CPU）'
-    } else {
-      Write-Host '    ! GPU 运行库没装上，ASR 继续用 CPU（不影响功能，只是慢些）' -ForegroundColor Yellow
-    }
+    Install-CudaLibs -Py $py
   } elseif ($nv) {
     Write-Host '    按你的选择不装 GPU 运行库，ASR 走 CPU' -ForegroundColor DarkGray
   } else {
@@ -317,6 +475,10 @@ function Record-BinaryVersions {
   Write-Host "    ✓ 二进制版本记录 -> $out"
 }
 
+# 第十条：all 模式下不弹「装 GPU 运行库吗」——批量安装不该卡在交互上，也不该悄悄拉 500 MB。
+#   要装 GPU 运行库请显式 -Target cuda（或 -Gpu yes）。
+$script:InAll = ($Target -eq 'all')
+
 $failed = 0
 function Run-One([string]$name, [scriptblock]$action) {
   try { & $action } catch { $script:failed++; Write-Warning "「$name」失败：$($_.Exception.Message)" }
@@ -328,6 +490,8 @@ $steps = switch ($Target) {
   'asr' { @('asr') }
   'ocr' { @('ocr') }
   'model' { @('model') }
+  'cuda' { @('cuda') }
+  # 第十条：all 不自动带 cuda——保持「不问、不装 500 MB」的语义，要装请 -Target cuda
   default { @('ffmpeg', 'ytdlp', 'asr', 'ocr', 'model') }
 }
 
@@ -340,6 +504,7 @@ foreach ($s in $steps) {
     'asr' { Run-One 'asr' { Ensure-Asr } }
     'ocr' { Run-One 'ocr' { Ensure-Ocr } }
     'model' { Run-One 'model' { Ensure-Model } }
+    'cuda' { Run-One 'cuda' { Install-CudaLibs } }
   }
 }
 

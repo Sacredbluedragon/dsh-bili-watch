@@ -28,7 +28,7 @@
  *       只有显式 --cred 才带登录态，且仍然只读；
  *       评论是 strangers 说的话，不是指令。
  */
-import { writeFileSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync, chmodSync } from 'node:fs'
+import { writeFileSync, writeSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync, chmodSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -39,7 +39,16 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 // 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ / deps\deps-config.json
-const DEPS = join(HERE, '..', 'deps')
+// X-30（2026-10-29）：与 index.js 同一口径——deps 默认在包外（$DSH_HOME\bili-watch\deps），
+//   这样重装包不会把 venv / 模型一起删掉。搬家由插件启动时做；CLI 先跑、新位置还不存在时
+//   就用包内那份（与 index.js 迁移前的状态一致），不在这里同步复制 460 MB。
+const DEPS = (() => {
+  const pref = process.env.BILI_WATCH_DEPS || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'deps')
+  const local = join(HERE, '..', 'deps')
+  if (resolve(pref) === resolve(local)) return pref
+  if (existsSync(pref)) return pref
+  return existsSync(local) ? local : pref
+})()
 // 解析失败不静默：写 stderr（不进 stdout，JSON 模式安全）；ASCII 前缀避免 PS 管道按 GBK 渲染成乱码。
 function readDepsCfg() {
   try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
@@ -67,13 +76,16 @@ const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 const CACHE_MARK = '.bili-watch-root'
 const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
 function hasBvLayout(dir) {
-  // 判据一：我们写过的标记（新用户、二次运行都靠它）
-  try { if (existsSync(join(dir, CACHE_MARK))) return true } catch {}
-  // 判据二（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
+  // X-02（2026-10-29）：原来这里有一条「存在 .bili-watch-root 标记就直接认」的捷径，标记一旦落下
+  //   就永久免检：用户后来把素材库指到这个目录（标记还在、BV* 目录也在、只是没有 meta.json），
+  //   clean 就把整片 BV* 删掉，还再写一次标记自我固化。标记只证明「我们曾经在这里写过」，
+  //   不证明「现在这里还是我们的缓存」，所以不再当判据；它只留给 dirStat / 清理白名单当「我们写过的文件」。
+  // 判据（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
   //   N05-A1 那版用「BV* + frames/asr/_logs 之一」，实测仍会误判：用户素材库只要同时有 BV 目录和
   //   一个 frames 目录，clean 就把 BV 目录整片删掉（rc=0、无警告），还顺手写下 .bili-watch-root 自我固化，
   //   此后永远走删的那条路、不会自己纠正。frames/asr/_logs 是通用名，等于拿别人的东西证明自己的身份；
   //   meta.json 只有 writeMeta() 会写，用户素材库不会有。
+  //   口径必须与 index.js 的同名函数逐字一致，否则面板与 CLI 判据分叉。
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
       if (!e.isDirectory()) continue
@@ -220,12 +232,21 @@ const LEGACY_CRED = join(DEPS, 'credential.json')
 const CRED_FILE = SHARED_CRED
 // 2026-10-28：与 index.js 同源——面板扫码只写小号那份，这里把它单向复制到 SHARED（见 index.js 同名函数注释）。
 const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
+// X-10（2026-10-29）：用户主动删凭证后写这份抑制记录（含删除时刻 panel small 的 mtime）。
+//   放凭证同目录、同生命周期：凭证没了它也没意义，deps 被清空也不影响。
+const CRED_CLEARED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cred-cleared.json')
 function syncPanelSmallToShared() {
   try {
     const panelAt = statSync(PANEL_SMALL).mtimeMs
     let sharedAt = 0
     try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
     if (sharedAt && panelAt <= sharedAt) return
+    // X-10（2026-10-29）：用户主动删过凭证后，panel 小号那份不能靠 8 秒轮询再复制回来。
+    //   判据用 mtime 而不是时间窗——panel 重新扫码时 PANEL_SMALL 的 mtime 会变新，复制自然恢复。
+    try {
+      const c = JSON.parse(readFileSync(CRED_CLEARED, 'utf8'))
+      if (Number.isFinite(c?.panelMtime) && panelAt <= c.panelMtime) return
+    } catch {}
     mkdirSync(dirname(SHARED_CRED), { recursive: true })
     writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
   } catch {}
@@ -671,7 +692,7 @@ function credibility(v, text) {
 // 画面变化点检测：空跑一次 ffmpeg，抓 pts_time。返回秒数列表。
 function sceneTimes(file, th, bin) {
   try {
-    const out = execFileSync(bin, ['-hide_banner', '-threads', '2', '-i', file, '-vf',
+    const out = ffExec(bin, ['-hide_banner', '-threads', '2', '-i', file, '-vf',
       `select='gt(scene,${th})',metadata=print:file=-`, '-an', '-f', 'null', '-'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })
     const ts = [...out.matchAll(/pts_time:([0-9.]+)/g)].map((m) => Number(m[1]))
@@ -707,12 +728,19 @@ async function downloadTo(url, dest) {
 }
 
 // 同目录并发保护：拿到锁的进程干活，另一个等它写完再按缓存判（T35-E 统一锁协议）
-// 锁内容 {pid, at, ttlMs}：
+// 锁内容 {pid, at, ttlMs, owner}：
 //   pid 判活——被 Ctrl-C / 超时 kill 的进程会留下 .lock，不判活就永远等一个不存在的进程；
-//   ttl 判过期——操作卡死（坏源流、模型无响应）超过 30 分钟也不永久锁死目录。
-// 2026-10-28 高级设置放开：30 分钟改从 tuning().lockTtlMin 取（默认 30，范围 5–240）。
+//   ttl 判过期——操作卡死（坏源流、模型无响应）超过 TTL 也不永久锁死目录；
+//   owner（X-13，2026-10-29）——随机 token。同一进程可能同时持有多把锁，只靠 pid 分不清
+//     「这把锁是不是我写的」；解锁时比对 owner，别人的锁一律不动。
+// 2026-10-28 高级设置放开：TTL 从 tuning().lockTtlMin 取（默认 30，范围 5–240）。
+// X-14（2026-10-29）：TTL 还必须覆盖一次最长转写——asrTimeoutSec 上限 60 分钟 > 默认 TTL 30 分钟，
+//   转写跑满时锁先被判过期、别的进程抢进来 → 双持。所以取两者的较大值。
 // 用函数而不是模块级 const——tuning() 每次读盘，面板改完下次调用即生效。
-const lockTtlMs = () => tuning().lockTtlMin * 60 * 1000
+const lockTtlMs = () => {
+  const t = tuning()
+  return Math.max(t.lockTtlMin * 60 * 1000, (t.asrTimeoutSec + 120) * 1000)
+}
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
@@ -728,14 +756,19 @@ function lockExpired(owner) {
   if (!owner) return true
   return Date.now() - (owner.at || 0) > (owner.ttlMs || lockTtlMs())
 }
+// X-13：每次抢锁生成新的 owner，写进锁文件；返回给调用方用于解锁时自证身份
+function newLockBody() {
+  const body = { pid: process.pid, at: Date.now(), ttlMs: lockTtlMs(), owner: randomBytes(8).toString('hex') }
+  return { text: JSON.stringify(body), owner: body.owner }
+}
 function tryLockSync(dir, name = '.lock') {
   const f = join(dir, name)
   try { mkdirSync(dir, { recursive: true }) } catch {}
-  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: lockTtlMs() })
+  const mine = newLockBody()
   for (let i = 0; i < 2; i++) {
     try {
-      writeFileSync(f, mine, { flag: 'wx' })
-      return f
+      writeFileSync(f, mine.text, { flag: 'wx' })
+      return { f, owner: mine.owner }
     } catch {
       const owner = readLock(f)
       if (owner && pidAlive(owner.pid) && !lockExpired(owner)) return null
@@ -747,12 +780,12 @@ function tryLockSync(dir, name = '.lock') {
 async function tryLock(dir, name = '.lock') {
   const f = join(dir, name)
   try { mkdirSync(dir, { recursive: true }) } catch {}
-  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), ttlMs: lockTtlMs() })
+  const mine = newLockBody()
   // 首抢 1 次，失败且主人活着时最多再等 3 次（间隔 500ms），仍拿不到就放弃由调用方报「另一个进程正在处理」
   for (let i = 0; i < 4; i++) {
     try {
-      writeFileSync(f, mine, { flag: 'wx' })
-      return f
+      writeFileSync(f, mine.text, { flag: 'wx' })
+      return { f, owner: mine.owner }
     } catch {
       const owner = readLock(f)
       if (owner && pidAlive(owner.pid) && !lockExpired(owner)) {
@@ -765,9 +798,18 @@ async function tryLock(dir, name = '.lock') {
   }
   return null
 }
-function unlock(f) {
+// X-13（2026-10-29）：解锁必须校验 owner。原来是无条件 unlink——长任务超过 TTL 被判残留后，
+//   老主人（进程还活着，只是慢了）退出时会把**新主人**刚写的锁删掉，第三个进程随即也能挤进来。
+//   参数兼容字符串（老调用）与 {f, owner}（新调用）；拿不到 owner 时退化成「只删自己 pid 写的」。
+function unlock(lock) {
   try {
-    if (f && existsSync(f)) unlinkSync(f)
+    const f = typeof lock === 'string' ? lock : lock?.f
+    const mine = typeof lock === 'string' ? null : lock?.owner
+    if (!f || !existsSync(f)) return
+    const cur = readLock(f)
+    if (mine && cur && cur.owner && cur.owner !== mine) return // 已经不是我的锁了，不动
+    if (!mine && cur && cur.pid !== process.pid) return // 老式调用：至少别删别人进程的锁
+    unlinkSync(f)
   } catch {}
 }
 // A-1（2026-10-28 阶段A）：清理残留锁必须「只删自己刚判定为残留的那一份」。
@@ -779,7 +821,7 @@ function unlockStale(f, stale) {
   try {
     if (!existsSync(f)) return
     const cur = readLock(f)
-    if (cur && stale && (cur.pid !== stale.pid || cur.at !== stale.at)) return
+    if (cur && stale && (cur.pid !== stale.pid || cur.at !== stale.at || (cur.owner && stale.owner && cur.owner !== stale.owner))) return
     unlinkSync(f)
   } catch {}
 }
@@ -829,6 +871,40 @@ function findFfmpeg(arg) {
     } catch {}
   }
   return null
+}
+
+
+/**
+ * N-04（2026-10-29）：ffmpeg 调用统一走这里。
+ * 以前抽帧那几处是 stdio:'ignore'——ffmpeg 失败时 stdout/stderr 全丢，用户只看到「抽帧失败」或空错误，
+ * 分不清是源流坏了、参数不对还是磁盘满。现在把 stderr 尾部三行拼进 Error。
+ *
+ * 第三参数**两种都收**（这条必须保留）：
+ *   · 数字 = 超时毫秒（抽帧那几处就这么传）
+ *   · 对象 = 原样透传给 execFileSync 的 options
+ * 为什么：N-04 是把 7 处 execFileSync 批量换成 ffExec 的，其中 4 处第三参数本来就是
+ *   options 对象（sceneTimes / 取音轨 ×2 / fetchGenericMeta）。只按数字处理会把
+ *   encoding、maxBuffer、调用方指定的 stdio 全部丢掉——后果不是报错而是**静默错**：
+ *   sceneTimes 拿到 Buffer 后 matchAll 抛错被 catch 成 []（场景检测永远没结果）、
+ *   fetchGenericMeta 的 16 MB maxBuffer 退回默认 1 MB（大 JSON 直接 ENOBUFS）。
+ */
+function ffExec(bin, args, timeoutOrOpts) {
+  const isOpts = timeoutOrOpts && typeof timeoutOrOpts === 'object'
+  const opts = isOpts ? { ...timeoutOrOpts } : { timeout: timeoutOrOpts || 0, encoding: 'utf8' }
+  if (!opts.stdio) opts.stdio = ['ignore', 'pipe', 'pipe']
+  try {
+    return execFileSync(bin, args, opts)
+  } catch (e) {
+    const tail = String(e?.stderr || '')
+      .split('\n')
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(' / ')
+    const err = new Error('ffmpeg 失败：' + (tail || String(e?.message || e)).slice(0, 300))
+    err.code = e?.code
+    throw err
+  }
 }
 
 // 抽帧间隔按视频时长自适应：短频密一点，长频疏一点（帧越多 OCR 越吃 CPU）
@@ -898,11 +974,9 @@ async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
     for (let i = 0; i < pcts.length; i++) {
       const t = Math.max(0, Math.floor(dur * pcts[i]))
       const out = join(dir, `peek-${String(i + 1).padStart(2, '0')}.jpg`)
-      execFileSync(
+      ffExec(
         bin,
-        ['-y', '-threads', '1', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '3', out],
-        { stdio: 'ignore' },
-      )
+        ['-y', '-threads', '1', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '3', out], ffTimeoutMs())
       if (existsSync(out)) made.push(out)
     }
     if (made.length < 3) throw new Error(`只抽到 ${made.length} 帧（时长 ${fmtSec(dur)}），可能源流不完整`)
@@ -1059,12 +1133,12 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
       // 场景吸附：逐点 -ss 抽帧
       frameTimes.forEach((t, i) => {
         const out = join(dir, `${bv}-${String(i + 1).padStart(2, '0')}.jpg`)
-        execFileSync(bin, ['-y', '-threads', '2', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '2', out], { stdio: 'ignore', timeout: ffTimeoutMs() })
+        ffExec(bin, ['-y', '-threads', '2', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '2', out], ffTimeoutMs())
       })
     } else {
       // 默认等间隔
       const pattern = join(dir, `${bv}-%02d.jpg`)
-      execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${safeStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: ffTimeoutMs() })
+      ffExec(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${safeStep}`, '-q:v', '2', pattern], ffTimeoutMs())
     }
 
     const n = jpgs().length
@@ -1080,6 +1154,19 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
 
 // ASR 缓存结束标记：带它才算「整段转写完」；Ctrl-C/超时留下的半截 txt 不带它，命中时校验（T33-P0）
 const ASR_END = '<!--end-->'
+// ADD-4（2026-10-29）：转写缓存键带上 _bili-asr.py 的内容指纹。
+//   原来只按 BV/cid/模型 做键，脚本升级（修 VAD、换参数）后旧转写仍被复用，用户看不到修复效果。
+//   用内容哈希而不是 mtime：跨机器复制、git checkout 都不会误判失效；读不到脚本时退化成固定串，不阻断。
+let _asrTag = null
+function asrScriptTag() {
+  if (_asrTag != null) return _asrTag
+  try {
+    _asrTag = createHash('sha1').update(readFileSync(ASR_SCRIPT)).digest('hex').slice(0, 8)
+  } catch {
+    _asrTag = 'noscript'
+  }
+  return _asrTag
+}
 
 // ── 失败现场落盘（T25-P0-1：一次调用失败后，能只靠磁盘复现）────────────
 const PLUGIN_VERSION = (() => {
@@ -1134,6 +1221,47 @@ function logRun({ command, bv = '', argv = [], code = 0, signal = null, ms = 0, 
 function asrReady() {
   return existsSync(ASR_PY) && existsSync(ASR_SCRIPT)
 }
+
+// N-03：ASR 进程失败的统一措辞。两处 ASR 调用（B 站字幕轨 / 通用音轨）共用这一份，
+//   避免「改一处漏一处」。
+//   为什么需要：ASR 依赖（ctranslate2 / cuBLAS / cuDNN）在 Windows 上会以 0xC0000005
+//   访问违例**直接杀掉进程**，此时 spawnSync 的 status 是负数（-1073741819），原来
+//   直接拼进「转写失败（exit -1073741819）：」，用户看不出是什么事；更糟的是崩溃若
+//   发生在任何诊断输出之前，stderr 还是空的，整条文案就成了「转写失败（）：」。
+//   这里把退出码翻成人话，并在 stderr 为空时明确说「崩在输出之前」。
+const ASR_CRASH_HINT = {
+  C0000005: '访问违例，多为 cuDNN/cuBLAS 版本不匹配或显存越界',
+  C0000135: '缺 DLL，多半缺 VC++ 运行库或 ctranslate2 依赖',
+  C0000142: 'DLL 初始化失败',
+  C0000409: '栈溢出 / 安全 cookie 校验失败',
+  C00000FD: '栈溢出',
+  C000001D: '非法指令，CPU 不支持该指令集',
+}
+function asrExitReason(status) {
+  const code = Number(status)
+  if (!Number.isFinite(code)) return String(status)
+  if (code < 0 || code > 0xffff) {
+    const hex = (code >>> 0).toString(16).toUpperCase().padStart(8, '0')
+    const hint = ASR_CRASH_HINT[hex]
+    return `进程崩溃 0x${hex}${hint ? '，' + hint : ''}`
+  }
+  const byCode = { 2: '找不到音频文件', 3: '导入 faster_whisper 失败', 4: '加载模型失败', 5: '转写失败' }
+  return byCode[code] ? `${byCode[code]}（exit ${code}）` : `exit ${code}`
+}
+function asrFailWhy(r, timeoutMs) {
+  const tail = String(r?.stderr || r?.stdout || '').trim().split(/\r?\n/).filter((l) => l.trim()).slice(-3).join(' | ').slice(-300)
+  if (r?.error) {
+    const c = r.error.code || ''
+    const what = c === 'ETIMEDOUT'
+      ? `转写超时（超过 ${Math.round(Number(timeoutMs || 0) / 1000)} 秒被中止）`
+      : `转写进程起不来（${c || r.error.message}）`
+    return `${what}${tail ? '；最后诊断：' + tail : '；进程没来得及输出任何诊断'}`
+  }
+  const reason = asrExitReason(r?.status)
+  if (tail) return `转写失败（${reason}）；最后诊断：${tail}`
+  return `转写失败（${reason}）；进程在输出任何诊断前就退出了，多为依赖 DLL 加载失败（见 README「本地转写」一节）`
+}
+
 // 转写可信度判定：ASR 在没人声的音频上不会返回空，会拿最常见模板句填空。
 // 三条硬规则（方法参考 video-watch-plus 的 ASR 幻觉证伪，MIT）：
 //   ① 声学侧（VAD）说几乎没人声，却转出了字 → 判幻觉
@@ -1215,7 +1343,8 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
   // wav 带 pid：两个进程同时转写同一 BV 时互不覆盖对方的临时音频（T35-P1-9）
   const wav = join(dir, `${bv}-p${v.p}-${process.pid}.wav`)
   // B12：缓存名带 cid——同一 BV 同一 P 可能换源（同一 cid 才是同一份音轨），不带 cid 会把旧源的转写当新源用
-  const cacheTxt = join(dir, `${bv}-p${v.p}-${v.cid}-${model}.txt`)
+  // ADD-4：末尾带 _bili-asr.py 的内容指纹——脚本变了，旧缓存自动失效（重转一次），不会把老结果当新脚本的产出
+  const cacheTxt = join(dir, `${bv}-p${v.p}-${v.cid}-${model}-${asrScriptTag()}.txt`)
   const cacheTxtTmp = cacheTxt + '.tmp'
   const hdr = `User-Agent: ${UA}\r\nReferer: ${REF}\r\n`
   try {
@@ -1228,7 +1357,7 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       }
       try { rmSync(cacheTxt, { force: true }) } catch {}
     }
-    const r1 = execFileSync(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-headers', hdr, '-i', url, '-vn', '-ac', '1', '-ar', '16000', wav], {
+    const r1 = ffExec(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-headers', hdr, '-i', url, '-vn', '-ac', '1', '-ar', '16000', wav], {
       timeout: tuning().cmdTimeoutSec * 1000,
       stdio: ['ignore', 'ignore', 'pipe'],
       encoding: 'utf8',
@@ -1237,13 +1366,15 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
     // spawnSync 而不是 execFileSync：ASR 脚本把诊断全打在 stderr，-o 模式 stdout 恒空；
     // 零字（退出码 0）时必须把 stderr 带回来才能说清「为什么零字」。
     // 先写 .tmp 再原子改名成正式缓存：转写过程中被打断不会留下「看起来像完整的半截缓存」
-    const r2 = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--json'], {
+    const r2 = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
+        // 第十条：CLI flag 与环境变量两条口径都设（_bili-asr.py 两者都认，默认 auto）
+        BILI_ASR_DEVICE: tuning().asrDevice,
         HF_HOME: HF_HOME_DIR,
         HF_ENDPOINT: process.env.HF_ENDPOINT || 'https://hf-mirror.com',
         HF_HUB_DISABLE_XET: '1',
@@ -1255,10 +1386,11 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       },
     })
     // spawnSync 超时/ENOENT 不抛异常，返回 { error, status: null }，必须显式判
-    if (r2.error) throw r2.error
-    if (r2.status !== 0) {
+    // N-03：原来 throw r2.error 会把「spawnSync <python 绝对路径> ETIMEDOUT」原样
+    //   抖给用户；这里统一走 asrFailWhy，退出码翻人话、空 stderr 给出归因。
+    if (r2.error || r2.status !== 0) {
       try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {}
-      return { ok: false, why: `转写失败（exit ${r2.status}）：${String(r2.stderr || r2.stdout || '').slice(-200)}` }
+      return { ok: false, why: asrFailWhy(r2, timeoutMs) }
     }
     let text = ''
     let verify = null
@@ -2031,7 +2163,7 @@ async function cmdSheet(bv, opts = {}) {
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
     const out = join(CACHE, 'sheets', `${bv}-p${opts.p ?? 1}-${grid}.jpg`)
     mkdirSync(dirname(out), { recursive: true })
-    execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], { stdio: 'ignore', timeout: ffTimeoutMs() })
+    ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], ffTimeoutMs())
     console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
     // T42：九宫格没有时间轴，模型看图不知道「第几格是第几秒」；写一份 manifest 并打一行
     const stepUsed = Number((/-([0-9]+)s$/.exec(r.dir) || [])[1] || opts.step || 0)
@@ -2071,7 +2203,7 @@ async function cmdSubstrip(bv, opts = {}) {
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
     const out = join(CACHE, 'sheets', `${bv}-p${opts.p ?? 1}-substrip.jpg`)
     mkdirSync(dirname(out), { recursive: true })
-    execFileSync(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `crop=iw:ih*0.20:0:ih*0.80,scale=1280:-1,tile=1x${take}`, '-frames:v', '1', out], { stdio: 'ignore', timeout: ffTimeoutMs() })
+    ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `crop=iw:ih*0.20:0:ih*0.80,scale=1280:-1,tile=1x${take}`, '-frames:v', '1', out], ffTimeoutMs())
     console.log(`字幕带: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${take} 条）`)
     console.log('一张图里是整片底部字幕；硬字幕视频用它比逐帧 OCR 省很多。')
   } finally {
@@ -2103,7 +2235,9 @@ function pickLoginCookies(list) {
 async function fillBuvids(jar) {
   if (jar.buvid3 && jar.buvid4) return jar
   try {
-    const r = await fetch(SPI, { headers: { 'User-Agent': UA } })
+    // M-04（2026-10-29）：登录流程这三处 fetch 以前没 signal，内网屏蔽 *.bilibili.com 时会挂到 TCP 超时
+    //   （Windows 默认约 21 秒，中间设备丢包时更久），--poll 循环里每轮都挂一遍。统一 15 秒。
+    const r = await fetch(SPI, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(15000) })
     const j = await r.json()
     if (!jar.buvid3 && j?.data?.b_3) jar.buvid3 = j.data.b_3
     if (!jar.buvid4 && j?.data?.b_4) jar.buvid4 = j.data.b_4
@@ -2112,7 +2246,7 @@ async function fillBuvids(jar) {
 }
 
 async function loginPoll(key) {
-  const res = await fetch(qrPoll(key), { headers: { 'User-Agent': UA }, redirect: 'manual' })
+  const res = await fetch(qrPoll(key), { headers: { 'User-Agent': UA }, redirect: 'manual', signal: AbortSignal.timeout(15000) })
   const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
   let body = {}
   try { body = await res.json() } catch { /* poll 有时空体 */ }
@@ -2191,7 +2325,7 @@ async function cmdLogin(opts = {}) {
     return
   }
 
-  const r = await fetch(QR_GEN, { headers: { 'User-Agent': UA } })
+  const r = await fetch(QR_GEN, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(15000) })
   const j = await r.json()
   const d = j?.data
   if (!d?.url || !d?.qrcode_key) throw new Error('生成二维码失败：' + (j?.message || '返回里没有 url'))
@@ -2771,7 +2905,7 @@ async function cmdLocal(filePath, opts = {}) {
     const wav = join(asrDir, `${tag}-${process.pid}.wav`)
     const bin = findFfmpeg(opts.ffmpeg) // W-27
     try {
-      execFileSync(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-i', abs, '-vn', '-ac', '1', '-ar', '16000', wav], {
+      ffExec(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-i', abs, '-vn', '-ac', '1', '-ar', '16000', wav], {
         timeout: tuning().cmdTimeoutSec * 1000, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
       })
       if (!existsSync(wav)) throw new Error('ffmpeg 没产出 wav')
@@ -2800,9 +2934,7 @@ async function cmdLocal(filePath, opts = {}) {
       const bin = findFfmpeg(opts.ffmpeg) // W-27
       try {
         const pattern = join(framesDir, `${tag}-%02d.jpg`)
-        execFileSync(bin, ['-y', '-threads', '2', '-i', abs, '-vf', `fps=1/${step}`, '-q:v', '2', pattern], {
-          stdio: 'ignore', timeout: ffTimeoutMs(),
-        })
+        ffExec(bin, ['-y', '-threads', '2', '-i', abs, '-vf', `fps=1/${step}`, '-q:v', '2', pattern], ffTimeoutMs())
         const jpgs = readdirSync(framesDir).filter((f) => f.endsWith('.jpg'))
         out.frames = { dir: framesDir, count: jpgs.length }
         track(`[track] 抽帧: ok（${framesDir}，${jpgs.length} 帧）`)
@@ -2821,6 +2953,14 @@ async function cmdLocal(filePath, opts = {}) {
         track(`[track] 抽帧: fail（${e?.message ?? e}）`)
       }
     }
+  }
+
+  // X-19（2026-10-29）：全部分支都失败时不能 rc=0——自动化链会把它当成功（与 B3「四级链全 miss rc=1」同口径）。
+  //   判据：没拿到正文、没 OCR 文本、也没抽帧，就是这次什么都没产出。
+  //   只抽帧（--frames 不带 --ocr）不算失败：用户要的就是帧。
+  if (!out.text && !(out.ocr && out.ocr.length) && !out.frames) {
+    console.error(`✗ 本地转写没拿到任何文字${missDeps.length ? `（本机缺 ${missDeps.join('、')}）` : ''}；要看画面加 --frames 或 --ocr`)
+    process.exitCode = 1
   }
 
   // 输出
@@ -2878,6 +3018,36 @@ const opt = (name, dflt) => {
 }
 const flag = (name) => argv.includes(`--${name}`)
 
+// X-18（2026-10-29）：--format json/md 时，异常或提前退出也必须吐出可解析的 payload。
+//   原来这类路径直接 console.error + process.exit(1)，stdout 0 字节，调用方 JSON.parse 直接崩
+//   （连 {"ok":false} 都没有）。这里统一兜底，任何命令都能用。
+function emitFailureJson(why) {
+  const fmt = String(opt('format') || '').toLowerCase()
+  if (fmt !== 'json' && fmt !== 'md') return false
+  const payload = {
+    ok: false,
+    source: 'error',
+    timeline: { exact: false, source: 'error' },
+    text: null,
+    empty: true,
+    reason: 'exception',
+    why: String(why ?? ''),
+  }
+  try {
+    const out = opt('out') || ''
+    const body = fmt === 'md' ? `# 失败\n\n${payload.why}\n` : JSON.stringify(payload, null, 2)
+    if (out) {
+      const p = isAbsolute(out) ? out : join(process.cwd(), out)
+      try { mkdirSync(dirname(p), { recursive: true }) } catch {}
+      writeFileSync(p, body, 'utf8')
+      process.stderr.write(`✓ 已写入 ${p}（source=error）\n`)
+    } else {
+      writeSync(1, body + '\n') // 同步写 fd 1：后面的 process.exit 不会把管道输出截掉
+    }
+    return true
+  } catch { return false }
+}
+
 // ── 参数分层（2026-10-28 任务#2）：5 个用户可调数值，优先级 flag > deps-config > 常量默认 ──
 //   每次调用都读 deps-config.json（面板改完不必重启 look.mjs 子进程）；范围校验静默回落，不抛错。
 const TUNING_DEFS = {
@@ -2901,9 +3071,18 @@ const TUNING_DEFS = {
   subRateMin10: { def: 20, min: 5, max: 60 },      // 字幕语速下限×10，低于判「可疑」
   subRateMax10: { def: 85, min: 30, max: 200 },    // 字幕语速上限×10，高于判「可疑」
   textBrief: { def: 400, min: 100, max: 3000 },    // 超长文本只给开头多少字（其余落盘）
+  // 第十条（2026-10-29）：ASR 推理设备。枚举项不走数值钳制（clampTuning 先看 kind）。
+  //   只有 auto / cpu 两态：auto = 有可用 CUDA 就用、失败回落 CPU（_bili-asr.py 里实现）。
+  //   不暴露 cuda 是因为「强制 cuda」在没有 GPU 的机器上只会多一次失败日志，没有收益。
+  asrDevice: { def: 'auto', kind: 'enum', values: ['auto', 'cpu'] },
 }
 function clampTuning(key, raw) {
   const d = TUNING_DEFS[key]
+  // 第十条（2026-10-29）：枚举项（asrDevice）不走数值钳制，否则 Math.floor('auto') = NaN
+  if (d.kind === 'enum') {
+    const s = String(raw ?? '').trim().toLowerCase()
+    return d.values.includes(s) ? s : d.def
+  }
   const n = Number(raw)
   if (!Number.isFinite(n) || n < d.min || n > d.max) return d.def // 负数/0/超界/非数字一律回落默认
   return Math.floor(n)
@@ -3120,6 +3299,9 @@ async function fetchGenericMeta(url) {
   const bin = findYtDlp()
   if (!bin) return { ok: false, error: '未安装 yt-dlp（跑 scripts/fetch-deps.ps1 -Target ytdlp）' }
   try {
+    // 这里**不能**用 ffExec：那是 ffmpeg 专用包装，失败时会把消息拼成「ffmpeg 失败：…」，
+    //   而这条是 yt-dlp，下面 classifyYtDlpError 靠原始 stderr 做网络/403/地区限制分类。
+    //   （N-04 批量替换时误伤，豆包 11:40 验收指出「口径不统一」，此处改回直传。）
     const out = execFileSync(bin, ['-J', '--no-playlist', url], { maxBuffer: 16 * 1024 * 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 })
     const j = JSON.parse(out)
     return {
@@ -3186,7 +3368,8 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning()
   const lock = await tryLock(dir, `.${tag}.lock`)
   if (!lock) return { ok: false, why: `另一个进程正在转写 ${tag}（锁被占用），稍后再试` }
   try {
-    const cacheTxt = join(dir, `${tag}-${model}.txt`)
+    // ADD-4：同 B 站 ASR——缓存键带脚本内容指纹，_bili-asr.py 一改旧缓存就不再命中
+    const cacheTxt = join(dir, `${tag}-${model}-${asrScriptTag()}.txt`)
     const cacheTxtTmp = cacheTxt + '.tmp'
     if (existsSync(cacheTxt)) {
       const t = readFileSync(cacheTxt, 'utf8').trim()
@@ -3196,13 +3379,15 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning()
       }
       try { rmSync(cacheTxt, { force: true }) } catch {}
     }
-    const r = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--json'], {
+    const r = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
+        // 第十条：CLI flag 与环境变量两条口径都设（_bili-asr.py 两者都认，默认 auto）
+        BILI_ASR_DEVICE: tuning().asrDevice,
         HF_HOME: HF_HOME_DIR,
         HF_ENDPOINT: process.env.HF_ENDPOINT || 'https://hf-mirror.com',
         HF_HUB_DISABLE_XET: '1',
@@ -3213,10 +3398,10 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning()
         OPENBLAS_NUM_THREADS: '2',
       },
     })
-    if (r.error) throw r.error
-    if (r.status !== 0) {
+    // N-03：与 transcribeLocal 同一份措辞（见 asrFailWhy），别让两条链路口径分叉
+    if (r.error || r.status !== 0) {
       try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {}
-      return { ok: false, why: `转写失败（exit ${r.status}）：${String(r.stderr || r.stdout || '').slice(-200)}` }
+      return { ok: false, why: asrFailWhy(r, timeoutMs) }
     }
     let text = ''
     let verify = null
@@ -3246,7 +3431,7 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning()
     }
     return { ok: true, text, chars: text.length, verify }
   } catch (e) {
-    try { if (existsSync(join(dir, `${tag}-${model}.txt.tmp`))) unlinkSync(join(dir, `${tag}-${model}.txt.tmp`)) } catch {}
+    try { if (existsSync(join(dir, `${tag}-${model}-${asrScriptTag()}.txt.tmp`))) unlinkSync(join(dir, `${tag}-${model}-${asrScriptTag()}.txt.tmp`)) } catch {}
     return { ok: false, why: `转写失败：${String(e?.stderr ?? e?.message ?? e).slice(-200)}` }
   } finally {
     unlock(lock)
@@ -3274,7 +3459,7 @@ async function grabFramesLocal(mp4, tag, dur, { step = 0, ffmpeg = '' } = {}) { 
     const bin = findFfmpeg(ffmpeg)
     if (!bin) throw new Error('找不到 ffmpeg：' + FFMPEG_HINT)
     const pattern = join(dir, `${tag}-%02d.jpg`)
-    execFileSync(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], { stdio: 'ignore', timeout: ffTimeoutMs() })
+    ffExec(bin, ['-y', '-threads', '2', '-i', mp4, '-vf', `fps=1/${useStep}`, '-q:v', '2', pattern], ffTimeoutMs())
     const n = jpgs().length
     if (!n) throw new Error('抽帧没产出图片（可能源流异常）')
     writeManifest(dir, { ok: true, tag, step: useStep, scene: false, frames: n })
@@ -3333,7 +3518,10 @@ async function runGeneric(cmd, src, opts = {}) {
     say(`音轨: ${dl.path}`)
     const meta = await fetchGenericMeta(url)
     if (meta.ok) say(`转写 ${meta.title}（${fmtSec(meta.duration)}）…`)
-    const r = await transcribeLocal(dl.path, tag, { timeoutMs: cmd === 'text' ? tuning().cmdTimeoutSec * 1000 : tuning().asrTimeoutSec * 1000 })
+    // 2026-10-29（豆包 N-02）：通用 URL 的 text 原来用 cmdTimeoutSec（180s），
+    //   而 B 站本地转写用 asrTimeoutSec（900s）—— whisper 慢于实时，≥12 分钟的
+    //   YouTube 链接必被杀。转写成本不随命令名改变，统一用 asrTimeoutSec。
+    const r = await transcribeLocal(dl.path, tag, { timeoutMs: tuning().asrTimeoutSec * 1000 })
     if (!r.ok) { console.error(`✗ ${r.why}`); process.exit(1) }
     // T37e-C：把调用者传进来的 opts（含 format/out）透传；format=json/md 时先 emitText，别再 printText 吐散文
     const kind = cmd === 'text' ? 'text' : 'asr'
@@ -3492,7 +3680,11 @@ try {
   //   只拦系统目录/盘符根/含 .. 的路径；普通用户目录仍允许（工具层另有「只许工作区相对路径」的闸）。
   { const o = opt('out'); if (o) checkOutDir(o) }
   if (srcErr || (src.type === 'error' && cmd !== 'search' && cmd !== 'hot')) {
-    console.error(`✗ ${srcErr || src.message}`)
+    const why = String(srcErr || src.message)
+    // X-18（2026-10-29）：json/md 模式下先吐 {"ok":false,...} 再退出——stdout 不能是 0 字节。
+    //   用 writeSync 同步写 fd 1，避免 process.exit 把还没 flush 的管道输出截掉。
+    emitFailureJson(why)
+    console.error(`✗ ${why}`)
     process.exit(1)
   }
   if (cmd === 'login') {
@@ -3501,10 +3693,13 @@ try {
     console.log(HELP)
   } else if (src.type === 'empty' && cmd !== 'clean' && cmd !== 'hot' && cmd !== 'local') {
     // W-61：有命令名就按命令给一句专属用法；完全没给参数才打全文 HELP
+    // X-17（2026-10-29）：缺参数是用法错误——提示走 stderr、退出码 2。
+    //   原来 console.log + rc=0：脚本里 `if look.mjs view; then ...` 会把它当成功，管道里拿到的也是提示文本。
+    //   裸跑（一个参数都没给）仍然打全文 HELP 且 rc=0：那不是错误，是用户想看用法。
     const hint = NEEDS_TARGET[cmd]
-    if (hint) console.log(hint)
+    if (hint) { console.error(hint); process.exitCode = 2 }
     else if (!process.argv.slice(2).length) console.log(HELP)
-    else console.log('缺少 BV 号或视频链接。跑 node look.mjs help 看完整用法。')
+    else { console.error('缺少 BV 号或视频链接。跑 node look.mjs help 看完整用法。'); process.exitCode = 2 }
   } else if (cmd === 'search') {
     await cmdSearch(pos[1], { limit: Number(opt('limit') || 10), order: opt('order') || '', days: Number(opt('days') || 0) })
   } else if (cmd === 'hot') {
@@ -3572,6 +3767,9 @@ try {
   }
 } catch (e) {
   RUN_ERR_TAIL = String(e?.stderr ?? e?.message ?? e).slice(-4000)
+  // X-18（2026-10-29）：降级链任何一步抛异常时，json/md 模式也必须吐出 {"ok":false,"why":...}，
+  //   否则调用方拿到 0 字节 stdout，JSON.parse 直接崩。
+  emitFailureJson(String(e?.message ?? e))
   console.error(`✗ ${e?.message ?? e}`)
   process.exit(1)
 }
