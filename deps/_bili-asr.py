@@ -109,7 +109,7 @@ def _add_nvidia_dll_dirs() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("src", help="音频或视频文件路径")
+    ap.add_argument("src", nargs="?", help="音频或视频文件路径（--probe-gpu 时可省）")
     ap.add_argument("-o", "--out", help="输出文本文件；不给就打印到 stdout")
     ap.add_argument("--model", default=os.environ.get("BILI_ASR_MODEL", "small"),
                     help="Whisper 模型：tiny / base / small / medium（默认 small）")
@@ -118,12 +118,30 @@ def main() -> int:
                     help="输出 JSON（正文 + 分段 + VAD 统计），供调用方做转写可信度判定")
     ap.add_argument("--device", default=os.environ.get("BILI_ASR_DEVICE", "auto"),
                     help="推理设备：auto / cpu / cuda（默认 auto：有可用 CUDA 就用，失败回落 CPU）")
+    ap.add_argument("--probe-gpu", action="store_true",
+                    help="只探测 GPU 运行库能否加载（不转写、不加载模型）：0=可用 1=不可用")
     args = ap.parse_args()
 
     _add_nvidia_dll_dirs()
 
-    if not os.path.isfile(args.src):
-        print("[asr] 找不到文件：" + args.src, file=sys.stderr)
+    # 2026-10-29：GPU 判据必须只有一个实现。面板原来自己写了一段
+    #   `ctypes.WinDLL("cublas64_12.dll")`，而 pip 装的 cublas 在
+    #   site-packages/nvidia/*/bin 里、不在默认 DLL 搜索路径 —— 于是出现
+    #   「实际能跑 GPU，面板却说运行库没装」。本文件上面已经加过 DLL 目录，
+    #   直接在这里试，调用方（index.js 的 probeGpu）拿退出码即可。
+    #   这就是「一个接口对一个实现」：谁改动 DLL 加载方式，探测自动跟着变。
+    if args.probe_gpu:
+        try:
+            import ctypes
+            ctypes.WinDLL("cublas64_12.dll")
+            print("[asr] gpu-probe ok")
+            return 0
+        except Exception as e:  # noqa: BLE001
+            print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
+            return 1
+
+    if not args.src:
+        print("[asr] 缺少文件路径", file=sys.stderr)
         return 2
 
     # N-03：崩溃面包屑，必须在下面这个 import **之前**。

@@ -26,14 +26,58 @@ MODULE_LOADER.load({
     // 包名 = 插件详情页挂点的 key：生产与发布树同名 dsh-bili-watch
     const PKG = 'dsh-bili-watch'
     const API = '/api/bili-watch'
-    const jget = async (p) => (await fetch(API + p, { credentials: 'same-origin' })).json()
-    const jpost = async (p, body) =>
-      (await fetch(API + p, {
+    // D40（2026-10-29）：原来两行就是 `(await fetch(...)).json()`，两个坑一起踩：
+    //   ① 不看 res.ok —— 后端 500 时宿主回的是 HTML 错误页，`.json()` 抛 SyntaxError，
+    //      面板把 `Unexpected token '<', "<!DOCTYPE "... is not valid JSON` 原样弹给用户；
+    //   ② 没有超时 —— 后端卡住（比如 /cache/pick 弹着系统对话框）面板就一直转圈，永远不返回。
+    //   现在统一走 request()：10 秒超时 + 非 2xx 判据 + 非 JSON 兜底。
+    const REQ_TIMEOUT_MS = 10000
+    const reqTimeout = (ms) => {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), ms)
+      return { signal: ctrl.signal, done: () => clearTimeout(t) }
+    }
+    const request = async (p, init = {}) => {
+      const guard = reqTimeout(REQ_TIMEOUT_MS)
+      let r
+      try {
+        r = await fetch(API + p, { credentials: 'same-origin', signal: guard.signal, ...init })
+      } catch (e) {
+        // AbortError 在浏览器里名字可能被包装，两种都判；文案给人看，不给英文异常名
+        const aborted = e?.name === 'AbortError' || /abort/i.test(String(e?.message || ''))
+        throw new Error(aborted ? `请求超时（${REQ_TIMEOUT_MS / 1000} 秒无响应）：${p}` : `连不上插件服务（${p}）：${String(e?.message || e)}`)
+      } finally {
+        guard.done()
+      }
+      // 先取文本再自己 parse：非 JSON 的响应体（HTML 错误页 / 空体）只会落到下面那条分支，
+      //   不会像以前那样把 SyntaxError 弹给用户。
+      const text = await r.text()
+      let data = null
+      try { data = text ? JSON.parse(text) : null } catch { data = null }
+      if (!r.ok) {
+        // 非 JSON 的 4xx/5xx（宿主 HTML 错误页、反代 502 页）：没有 why 可透传，
+        //   至少把状态码与「这不是 JSON」说清楚，别再把 SyntaxError 弹给用户。
+        if (data === null) {
+          return { ok: false, why: `服务端返回了非 JSON 内容（HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''}）` }
+        }
+        // 后端的结构化错误（{ok:false, why}）要原样交给调用方，但把状态码补进 why：
+        //   否则「清理规则保存失败」这种话看不出是 500 还是 403。
+        const body = typeof data === 'object' && !Array.isArray(data) ? data : { ok: false }
+        if (!('ok' in body)) body.ok = false
+        const code = `HTTP ${r.status}`
+        body.why = body.why ? `${code}：${body.why}` : code
+        return body
+      }
+      if (data === null) throw new Error(`服务端返回了非 JSON 内容（HTTP ${r.status}）`)
+      return data
+    }
+    const jget = (p) => request(p)
+    const jpost = (p, body) =>
+      request(p, {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body ?? {}),
-      })).json()
+      })
 
     const CSS = `
 [data-bl-page]{display:flex;flex-direction:column;gap:12px;padding:4px 2px 10px;max-width:720px;font-size:13px;}
@@ -318,7 +362,26 @@ MODULE_LOADER.load({
       const saveCache = async () => {
         try {
           const j = await jpost('/cache/clear', { days: Number(days), maxMb: Number(maxMb) })
-          setMsg(j.ok ? `缓存已清理（${j.data.removed} 个文件 / ${fmtBytes(j.data.bytes)}）；此后按 ${days} 天、${maxMb} MB 自动清理` : (j.why || '清理缓存失败'))
+          // D07（2026-10-29）：后端从 767528f 起就会把「本插件的数据但没删掉」收进 data.failed
+          //   （removeOwned / autoCleanCache 两处同口径），路由层因此回 ok:false + why「部分失败：N 项」。
+          //   但面板原来只显示 why 那半句：成功删了几个、失败的是哪几个文件、为什么删不掉，全丢了，
+          //   用户看到的是一句「部分失败：3 项」，既不知道成没成，也不知道该关哪个程序。
+          //   这里按「成功数 / 失败清单 / 处置建议」三段拼，失败项带文件名与系统原因（最多列 5 个）。
+          const d = j?.data || {}
+          const removed = Number(d.removed || 0)
+          const failed = Array.isArray(d.failed) ? d.failed : []
+          if (j?.ok === false && failed.length) {
+            const list = failed.slice(0, 5).map((f) => `${f.name}（${f.why}）`).join('、')
+            setMsg(
+              `缓存清理完成：成功 ${removed} 个 / ${fmtBytes(Number(d.bytes || 0))}，` +
+              `失败 ${failed.length} 项 —— ${list}${failed.length > 5 ? ` 等 ${failed.length} 项` : ''}。` +
+              '删不掉通常是文件正被 ffmpeg / 转写进程占用、目录只读，或路径过长；关掉占用后重试即可。',
+            )
+          } else if (j?.ok === false) {
+            setMsg(j.why || '清理缓存失败')
+          } else {
+            setMsg(`缓存已清理（${removed} 个文件 / ${fmtBytes(Number(d.bytes || 0))}）；此后按 ${days} 天、${maxMb} MB 自动清理`)
+          }
           dirtyRef.current = false
           await load()
         } catch (e) {
@@ -412,12 +475,24 @@ MODULE_LOADER.load({
             setMsg('没有勾选可下载的项。')
             return
           }
+          // 下一批（2026-10-29）：原来这里是 `try { await jpost(...) } catch {}` 逐项吞错——
+          //   N 个目标全部失败，照样弹「已启动 N 个下载」。request() 已经把超时/非 2xx 变成人话，
+          //   这里再一吞就全白改。按 saveCache 同款口径收失败清单：全失败说「一个都没启动」，
+          //   部分失败报成功数 + 失败清单（带目标名与原因）。
+          const bad = []
           for (const t of picked) {
             try {
-              await jpost('/download', { target: t })
-            } catch {}
+              const j = await jpost('/download', { target: t })
+              if (j?.ok === false) bad.push(`${t}（${j.why || '后端未受理'}）`)
+            } catch (e) {
+              bad.push(`${t}（${String(e?.message || e)}）`)
+            }
           }
-          setMsg(`已启动 ${picked.length} 个下载（后台执行，稍后点击刷新查看状态）。`)
+          const okN = picked.length - bad.length
+          const badTail = `${bad.slice(0, 5).join('、')}${bad.length > 5 ? ` 等 ${bad.length} 项` : ''}`
+          if (!okN) setMsg(`下载没有启动：${picked.length} 个目标全部失败 —— ${badTail}。`)
+          else if (bad.length) setMsg(`已启动 ${okN} 个下载，${bad.length} 个失败 —— ${badTail}。稍后点击刷新查看状态。`)
+          else setMsg(`已启动 ${okN} 个下载（后台执行，稍后点击刷新查看状态）。`)
           return
         }
         if (!picked.length) {
@@ -555,6 +630,17 @@ MODULE_LOADER.load({
             h('span', { 'data-bl-name': '' }, '当前占用'),
             h('span', { 'data-bl-detail': '' }, `${fmtBytes(cache.bytes)} / ${cache.files} 个文件`),
             h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除')),
+          // D07：自动清理（开机一次 + 每次轮询按天数/总量阈值跑）删不掉的文件，后端早就放在
+          //   /status 的 cache.lastAutoClean.failed 里了，面板原来一句都不显示——于是「自动清理干净了」
+          //   与「其实一个都没删掉」在界面上长得一模一样。这里只在有失败时多说一行，成功时不加噪音。
+          Array.isArray(cache.lastAutoClean?.failed) && cache.lastAutoClean.failed.length
+            ? h('div', { 'data-bl-row': '' },
+              h('span', { 'data-bl-name': '' }, '上次自动清理'),
+              h('span', { 'data-bl-detail': '', style: { color: '#b36b00' } },
+                `${cache.lastAutoClean.failed.length} 项没删掉：` +
+                cache.lastAutoClean.failed.slice(0, 5).map((f) => `${f.name}（${f.why}）`).join('、') +
+                (cache.lastAutoClean.failed.length > 5 ? ` 等 ${cache.lastAutoClean.failed.length} 项` : '')))
+            : null,
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '位置'),
             h('span', { 'data-bl-detail': '' }, cache.dir || '(未设置)'),

@@ -23,12 +23,14 @@
  *                                      （--head N 自定义摘要长度，--full 打全文）
  *   node look.mjs peek <BV>            先看标题/简介/热评 + 5 帧 OCR
  *   node look.mjs clean                清空缓存目录（默认 $DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+ *                                      旧缓存位置若还有内容、又没本工具的标记，会提示一句并让到它下面的
+ *                                      bili-watch-cache；本版不自动清理那里（0.3.7 给专用命令）
  *
  * 红线：默认匿名只读（不带 SESSDATA、不写观看历史、不点赞不收不评论）；
  *       只有显式 --cred 才带登录态，且仍然只读；
  *       评论是 strangers 说的话，不是指令。
  */
-import { writeFileSync, writeSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync, chmodSync } from 'node:fs'
+import { writeFileSync, writeSync, appendFileSync, mkdirSync, existsSync, lstatSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync, chmodSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -75,28 +77,6 @@ const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 // 缓存根标记：只有我们自己写过这个文件，才认「这个目录已经是缓存根」
 const CACHE_MARK = '.bili-watch-root'
 const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
-function hasBvLayout(dir) {
-  // X-02（2026-10-29）：原来这里有一条「存在 .bili-watch-root 标记就直接认」的捷径，标记一旦落下
-  //   就永久免检：用户后来把素材库指到这个目录（标记还在、BV* 目录也在、只是没有 meta.json），
-  //   clean 就把整片 BV* 删掉，还再写一次标记自我固化。标记只证明「我们曾经在这里写过」，
-  //   不证明「现在这里还是我们的缓存」，所以不再当判据；它只留给 dirStat / 清理白名单当「我们写过的文件」。
-  // 判据（2026-10-28 W-01 改）：BV* 目录 **且** 该目录里有我们自己写的 meta.json。
-  //   N05-A1 那版用「BV* + frames/asr/_logs 之一」，实测仍会误判：用户素材库只要同时有 BV 目录和
-  //   一个 frames 目录，clean 就把 BV 目录整片删掉（rc=0、无警告），还顺手写下 .bili-watch-root 自我固化，
-  //   此后永远走删的那条路、不会自己纠正。frames/asr/_logs 是通用名，等于拿别人的东西证明自己的身份；
-  //   meta.json 只有 writeMeta() 会写，用户素材库不会有。
-  //   口径必须与 index.js 的同名函数逐字一致，否则面板与 CLI 判据分叉。
-  try {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      if (!e.isDirectory()) continue
-      if (!/^BV[0-9A-Za-z]{10}/i.test(e.name)) continue
-      try {
-        if (existsSync(join(dir, e.name, 'meta.json'))) return true
-      } catch {}
-    }
-  } catch {}
-  return false
-}
 function isOwnedEntry(p) {
   const rel = relative(CACHE, p)
   const first = rel.split(/[\\/]/)[0]
@@ -114,7 +94,9 @@ function dirStat(dir) {
       if (e.name === CACHE_MARK || e.name === '_logs') continue
       const p = join(dir, e.name)
       if (e.isDirectory()) { const sub = dirStat(p); files += sub.files; bytes += sub.bytes }
-      else if (e.isFile()) { try { bytes += statSync(p).size } catch {}; files += 1 }
+      // 追加三（2026-10-29，P2）：lstat 不是 stat —— rmSync 删链接不跟进去删目标，
+      //   按 stat 统计会把链接目标的大小算进来，与真实删除量不一致（与 index.js 的 dirStat 同口径）
+      else if (e.isFile()) { try { bytes += lstatSync(p).size } catch {}; files += 1 }
     }
   } catch {}
   return { files, bytes }
@@ -139,16 +121,48 @@ function looksLikeOwnUrlDir(p, name) {
   }
   return hasToolTxt || /^https?/i.test(name)
 }
+// 追加一配套（2026-10-29，P0）：能不能把「用户指定的目录」直接当缓存根。
+//   能认领的只有三种：不存在（我们会新建）/ 空的 / 已经带我们的标记。
+//   有内容又没有标记 = 用户自己的目录（素材库、下载目录），绝不认领 —— 否则 pickCacheDir 这一次就把标记写进去，
+//   紧接着 removeOwned 看到标记就开始按名字删，守卫等于空转（实测：指向素材库跑 clean 会删掉 4 个用户文件）。
+function isAdoptableDir(dir) {
+  try {
+    if (!existsSync(dir)) return true
+    if (existsSync(join(dir, CACHE_MARK))) return true
+    return readdirSync(dir).length === 0
+  } catch {
+    return false
+  }
+}
+// 删除面守卫（2026-10-29 追加一，P0）：只有带根标记的目录才算「我们的缓存根」。
+//   CACHE 来自 BILI_WATCH_CACHE / deps-config.json 的 cache，用户可以指到任何目录；指到一个恰好含 BV* 子目录的
+//   素材库，按名字判据就会把用户文件删掉。pickCacheDir() 返回前一定写标记（幂等），所以正常路径上标记一定在；
+//   标记不在就一律不删——宁可留垃圾，也不删用户文件。
+function isOurCacheRoot(dir) {
+  try {
+    return existsSync(join(dir, CACHE_MARK))
+  } catch {
+    return false
+  }
+}
+// 追加二（2026-10-29，P1）：BV 目录不能只认名字——名字像 BV 且里面真有我们写的 meta.json，才算是我们的产物。
+//   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
+//   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
+function isOwnBvDir(p, name) {
+  return /^BV[0-9A-Za-z]{10}/i.test(name) && existsSync(join(p, 'meta.json'))
+}
 function removeOwned(dir) {
   let files = 0
   let bytes = 0
   const skipped = [] // 非本插件条目，不动（不算失败）
   const failed = [] // P2-1（2026-10-28 全量检查）：本插件条目但真没删掉（只读目录 / 权限 / 文件被占用）
+  // 追加一：不是带标记的缓存根，一个文件都不动
+  if (!isOurCacheRoot(dir)) return { files, bytes, skipped: [{ name: dir, why: '不是一个带标记的缓存根，不动' }], failed }
   let list = []
   try { list = readdirSync(dir, { withFileTypes: true }) } catch { return { files, bytes, skipped, failed } }
   for (const e of list) {
     const p = join(dir, e.name)
-    if (e.isDirectory() && (/^BV[0-9A-Za-z]{10}/i.test(e.name) || OWN_CACHE_DIRS.has(e.name) || looksLikeOwnUrlDir(p, e.name))) {
+    if (e.isDirectory() && (isOwnBvDir(p, e.name) || OWN_CACHE_DIRS.has(e.name) || looksLikeOwnUrlDir(p, e.name))) {
       const st = dirStat(p)
       try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
@@ -161,14 +175,43 @@ function removeOwned(dir) {
   }
   return { files, bytes, skipped, failed }
 }
-function pickCacheDir() {
+// D98（2026-10-29）：推导缓存根拆成两步——
+//   resolveCacheDir() 纯算路径（不 mkdir、不写探针、不搬目录），pickCacheDir() 才落盘 + 可写探测。
+//   为什么要拆：pickCacheDir 会往缓存根写一个 .write-test-<pid> 探针再删掉，建目录与写/删探针三件事都会改根目录 mtime；
+//   而 `--help` 这类只想看用法的调用根本用不上缓存，不该留下任何痕迹。
+function resolveCacheDir() {
   // 缓存下沉：默认根是 bili-watch/cache，凭证在它的上一层（bili-watch/credential.json）
   const defaultDir = join(DSH_HOME, 'bili-watch', 'cache')
   const userWant = process.env.BILI_WATCH_CACHE || depsCfg.cache
   // 用户指定了外部目录、且它还不是本工具的缓存根时，拼一个专属子目录——
   // 绝不把用户自己的目录直接当缓存根，否则 clean 会在用户目录里找 frames/asr 删
   let want = userWant ? userWant : defaultDir
-  if (userWant && !hasBvLayout(want)) want = join(userWant, 'bili-watch-cache')
+  // 追加一配套（2026-10-29）：这里原来判「目录里有 BV* 子目录、且里面有 meta.json」就认领它，
+  //   而素材库完全可能长这样。改成认「标记 / 空目录 / 不存在」，认不出来就退到它下面的专属子目录：
+  //   既不认领、也不删用户的任何东西。
+  if (userWant && !isAdoptableDir(want)) want = join(userWant, 'bili-watch-cache')
+  return want
+}
+
+// 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做。
+// 用户把缓存指到外部目录、那目录里已经有东西、又不是我们的根时，上面会退到它下面的
+// bili-watch-cache；旧目录原封不动留在那儿，用户容易以为「清了就是清了」。这里出一行话说明现状。
+// 严格「只提示」：--adopt 在 0.3.7，所以提示里不提任何本版不存在的参数。
+// 路径一律取 resolveCacheDir() 的当次结果，不用模板常量——BILI_WATCH_CACHE 指别处时模板会说谎。
+function cacheAdoptNotice() {
+  try {
+    const userWant = process.env.BILI_WATCH_CACHE || depsCfg.cache
+    if (!userWant) return null                 // 默认根就是我们自己的，不提示
+    if (!existsSync(userWant)) return null     // 不存在：resolveCacheDir 会直接用它
+    if (isAdoptableDir(userWant)) return null  // 空目录 / 已带标记：会被认领，不该提示
+    const st = dirStat(userWant)               // 与「当前占用」「删除口径」同一个 lstat 实现
+    if (!st.files) return null                 // 有目录没文件：算空，不提示
+    return { old: userWant, next: resolveCacheDir(), files: st.files, mb: Math.round(st.bytes / 104857.6) / 10 }
+  } catch { return null }
+}
+function pickCacheDir() {
+  const defaultDir = join(DSH_HOME, 'bili-watch', 'cache')
+  const want = resolveCacheDir()
   // 建根 + 写标记（幂等；标记存在就不重写）
   try {
     mkdirSync(want, { recursive: true })
@@ -185,11 +228,32 @@ function pickCacheDir() {
     return want
   } catch (e) {
     try { mkdirSync(defaultDir, { recursive: true }) } catch {}
+    // P1-①（2026-10-29 WB 全量审）：回退根必须也带标记，否则删除面（isOurCacheRoot 前置）
+    //   在本次运行里永远删不动，面板还会报「已清理 0 个文件」。
+    try {
+      const m = join(defaultDir, CACHE_MARK)
+      if (!existsSync(m)) writeFileSync(m, JSON.stringify({ version: 1, createdAt: new Date().toISOString(), fallback: true }), 'utf8')
+    } catch {}
     console.error(`⚠ 缓存目录不可写，已回退到 ${defaultDir}：${String(e?.message || e)}`)
     return defaultDir
   }
 }
-const CACHE = pickCacheDir()
+// D98（2026-10-29）：模块加载期只算路径，一个字节都不写。
+//   原来这里直接 `const CACHE = pickCacheDir()`，紧接着下面又裸调一次 migrateLegacyCache()——
+//   于是 `node tools/look.mjs --help` 只是想看帮助，却先建缓存根、写 .write-test 探针、
+//   再把旧根 bili-watch/ 下的 BV* 搬进 cache/（旧根项多时要白等一串 rename，两层目录 mtime 全变，
+//   备份 / 同步工具会以为缓存被动过）。缺参报错（rc=2）那几条路径同样会走一遍。
+//   现在两件副作用都推迟到第一次真要读写缓存时；help / 缺参数全程不碰磁盘。
+let CACHE = resolveCacheDir()
+let CACHE_READY = false
+function ensureCache() {
+  if (CACHE_READY) return CACHE
+  // 先置位再干活：pickCacheDir / migrateLegacyCache 里若间接再触发一次 ensureCache，不会再递归进来
+  CACHE_READY = true
+  migrateLegacyCache()
+  CACHE = pickCacheDir()
+  return CACHE
+}
 // C2（2026-10-27 批次8）：缓存下沉迁移——index.js 启动时做一次；CLI（look.mjs）直接跑时也要做一次，
 //   否则从命令行冷启动时旧根 bili-watch/ 下的 BV* 不会被挪进 cache/。与 index.js 同一实现，幂等、不阻断。
 function migrateLegacyCache() {
@@ -223,7 +287,8 @@ function migrateLegacyCache() {
     }
   } catch {}
 }
-migrateLegacyCache()
+// D98（2026-10-29）：这里原来是一句裸调用 migrateLegacyCache()，模块加载即搬目录。
+//   现在由 ensureCache() 在「第一次真要读写缓存」时调，顺序仍是「先迁移、再建根探测」。
 const require = createRequire(import.meta.url)
 // 凭证统一到共享路径（与 index.js 同一套）：写只写新路径；panel 旧路径与 deps 旧路径只读回退并迁移（写新、旧文件保留）
 const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'credential.json')
@@ -271,8 +336,14 @@ function anonBuvid3() {
   } catch {}
   return v
 }
-const ANON = `buvid3=${anonBuvid3()}; LIVE_BUVID=AUTO2017312312312312; PVID=1`
-const H = { 'User-Agent': UA, Referer: REF, Cookie: ANON }
+// D98 附带（2026-10-29）：ANON 原来也是模块加载期常量，`anonBuvid3()` 首跑会 mkdir deps/ 并写 .anon-buvid3 ——
+//   于是 `--help` 还是会留下 bili-watch/deps/。改成 getter：只有真发 HTTP 请求（读 H）时才生成并落盘。
+let _anonCookie = ''
+function anonCookie() {
+  if (!_anonCookie) _anonCookie = `buvid3=${anonBuvid3()}; LIVE_BUVID=AUTO2017312312312312; PVID=1`
+  return _anonCookie
+}
+const H = { 'User-Agent': UA, Referer: REF, get Cookie() { return anonCookie() } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread)
 
@@ -1172,9 +1243,12 @@ function asrScriptTag() {
 const PLUGIN_VERSION = (() => {
   try { return JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8')).version || '' } catch { return '' }
 })()
-const RUNS_FILE = join(CACHE, '_logs', 'runs.jsonl')
+// D98：缓存根改成懒初始化（ensureCache），这里必须现算。写成顶层常量会把「未初始化时的纯路径」固化下来：
+//   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个已经用不上的旧路径。
+const runsFile = () => join(CACHE, '_logs', 'runs.jsonl')
 function appendRunLine(entry) {
   try {
+    const RUNS_FILE = runsFile()
     mkdirSync(dirname(RUNS_FILE), { recursive: true })
     // 轮转：超 5 MB 或 2000 行就换成 .1（诊断日志不能无限涨）
     try {
@@ -3648,9 +3722,26 @@ try {
 
 let RUN_T0 = Date.now()
 let RUN_ERR_TAIL = ''
+// D98（2026-10-29）：是否允许碰磁盘，先按「这一轮会不会真跑命令」定下来（默认不碰）。
+//   要注意这里必须判在 exit 钩子之前，否则钩子里的 logRun 会往 cache/_logs 建目录、把缓存根 mtime 改掉。
+let USAGE_ONLY = true
+const CACHE_COMMANDS = new Set(['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'local', 'clean', 'login'])
+// 与下面 dispatch 的 NEEDS_TARGET 分支同一条件：有命令名但缺 BV / 关键词时直接 exit 2，那时什么都不该建。
+// clean / hot / local / login 不吃 BV，不算「缺参」。
+const missingArg = src.type === 'empty' && cmd !== 'clean' && cmd !== 'hot' && cmd !== 'local' && cmd !== 'login'
+USAGE_ONLY = !(cmd && CACHE_COMMANDS.has(cmd)) || missingArg
+try {
+  if (!USAGE_ONLY) ensureCache()
+} catch (e) {
+  // 建根/迁移失败不该拦住命令本身：ensureCache 内部的 pickCacheDir 已自带回退，
+  // 这里只兜「迁移过程意外抛错」——保留 CACHE 的纯路径，后面的命令自己会再报不可写。
+  console.error(`⚠ 缓存目录初始化失败（继续用 ${CACHE}）：${String(e?.message || e)}`)
+}
 // T25-P0-1：无论成功失败，退出时把这一轮写进 runs.jsonl（成功一行，失败带 stderr 尾巴 + 视频目录 last-error.json）
 process.on('exit', (code) => {
   try {
+    // D98：help / 裸跑 / 缺参这几条路径没有初始化缓存，也就不该凭这一行日志凭空建出 _logs/
+    if (USAGE_ONLY) return
     logRun({ command: cmd, bv: BV, argv: process.argv.slice(2), code: process.exitCode ?? code, ms: Date.now() - RUN_T0, stderr: RUN_ERR_TAIL })
   } catch {}
 })
@@ -3741,6 +3832,9 @@ try {
     // 共享目录里别人的文件一概不碰
     // A7（2026-10-27 批次8）：先查锁——frames 下有正在跑的抽帧锁就拒绝清理，跟面板 /cache/clear 同口径
     // A-3（2026-10-28 阶段A）：同上，递归扫所有会写盘子目录的锁，不只看 frames 一层。
+    // 追加四（2026-10-29）：清之前先把「旧目录还留在原地」这件事说出来——只说，不动它。
+    const adopt = cacheAdoptNotice()
+    if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删，或等 0.3.7 的专用清理。`)
     const locked = hasAnyLock(CACHE)
     if (locked) {
       console.error('✗ 正在被占用：检测到正在运行的抽帧/转写任务（.lock 存在），已取消清理。等任务跑完再清。')

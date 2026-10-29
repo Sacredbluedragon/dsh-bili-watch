@@ -138,7 +138,7 @@ function Move-SemiVenv([string]$venv) {
 }
 
 function Invoke-PipInstall {
-  # 镜像失败自动回退官方 PyPI（issue #3：清华未同步 faster-whisper==1.2.1）
+  # 镜像失败自动回退官方 PyPI（issue #3 报过 mirror 晚于 PyPI 同步；2026-10-29 复核清华已有 1.2.1）
   param([string]$Py, [string[]]$PipArgs)
   & $Py -m pip @PipArgs -i $PyIndex
   if ($LASTEXITCODE -eq 0) { return }
@@ -276,12 +276,21 @@ function Install-CudaLibs {
     return
   }
   Invoke-PipInstall $Py @('install', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cuda-nvrtc-cu12')
-  # 与面板 /status 的 ok 判据同一口径：不看 pip 包名，真加载一次 DLL
-  & $Py -c 'import ctypes; ctypes.WinDLL("cublas64_12.dll")' 2>&1 | Out-Null
-  if ($LASTEXITCODE -eq 0) {
+  # 与面板 /status 的 ok 判据同一口径：不看 pip 包名，真加载一次 DLL。
+  # 2026-10-29 修两处：① 原来用裸 ctypes.WinDLL("cublas64_12.dll") 判可用，但 pip 装的 cublas 在
+  #   site-packages/nvidia/*/bin、不在默认 DLL 搜索路径，装好了也报「加载不了」；
+  #   ② $ErrorActionPreference='Stop' 下原生命令写 stderr 会抛 NativeCommandError（日志里只剩空 Traceback）。
+  #   统一走 _bili-asr.py --probe-gpu（它内部先加 DLL 目录），并临时放宽错误策略。
+  $probe = Join-Path $Deps '_bili-asr.py'
+  $eap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  & $Py $probe '--probe-gpu' 2>$null | Out-Null
+  $probeRc = $LASTEXITCODE
+  $ErrorActionPreference = $eap
+  if ($probeRc -eq 0) {
     Write-Host '    ✓ cublas64_12.dll 能加载：ASR 会走 GPU（显存不足自动回落 CPU）'
   } else {
-    Write-Host '    ! DLL 还是加载不了（可能缺 VC++ Redist 或显卡驱动太旧）；ASR 继续用 CPU，功能不受影响' -ForegroundColor Yellow
+    Write-Host '    ! DLL 加载不了（可能缺 VC++ Redist 或显卡驱动太旧）；ASR 继续用 CPU，功能不受影响' -ForegroundColor Yellow
   }
 }
 
