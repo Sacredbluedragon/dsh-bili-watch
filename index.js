@@ -1534,38 +1534,61 @@ function runDownload(target) {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
   } catch {}
   const win = process.platform === 'win32'
-  const cmd = win ? 'powershell.exe' : 'bash'
+  // G-04（2026-10-29）：powershell 用绝对路径。以前是裸名 'powershell.exe' 交给 PATH 解析，
+  //   宿主被以受限 PATH 拉起时可能解析不到；用绝对路径后日志里也能直接看出到底调了哪个 exe。
+  const cmd = win
+    ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : 'bash'
   const args = win
     ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Target', target]
     : [script.replace(/\.ps1$/i, '.sh'), target]
+  // G-04（2026-10-29，致命根因）：Windows 上 detached:true 会被 libuv 映射成 DETACHED_PROCESS，
+  //   powershell.exe 启动后约 0.5 秒内以 exit code 0 退出，但 -File 脚本一行都不执行——
+  //   stdout/stderr 全空，连脚本第一行该写的落盘标记都不出现。本机控制变量实测：同样的参数、
+  //   stdio（ignore/inherit/pipe）与是否绝对路径都不影响结论，只把 detached 切成 false 就正常执行。
+  //   Windows 本来就不会因为父进程退出而杀子进程，所以 win32 不用 detached 也能「关掉宿主继续下」。
+  const detached = process.platform !== 'win32'
+  // A-下载黑洞（2026-10-29 二次修正）：子进程输出不再 stdio:'ignore'，也不再和宿主事件挤同一个文件——
+  //   脚本自己的逐行输出写 deps\download.out.log；deps\download.log 只留宿主侧结构化事件
+  //   （开始 / pid / detached / 退出码）。fetch-deps.ps1 自己也会往 download.log 写关键节点和失败原因，
+  //   两个文件合起来看：宿主确实拉起了进程 + 脚本到底跑到哪一步。
+  const outLog = join(DEPS, 'download.out.log')
+  let outFd = null
+  try { outFd = openSync(outLog, 'a') } catch {}
   let child = null
-  // A-下载黑洞：以前是 stdio:'ignore'——脚本 throw 的文本（比如 fetch-deps.ps1 里
-  //   「找不到 Python 3.10–3.14」）全被丢掉，download.log 里只有「开始下载」一行，
-  //   用户等 5 分钟看到 ASR 还是红的，不知道是 Python 没装还是版本不对。
-  //   这里把子进程 stdout/stderr 直接重定向到 download.log 的文件描述符（不是 pipe）：
-  //   · 不占事件循环，detached + unref 的「关掉宿主也能继续下」语义不变；
-  //   · 脚本输出逐行落盘，失败时能看到真正的 throw 文本。
-  let logFd = null
-  try {
-    logFd = openSync(DOWNLOAD_LOG, 'a')
-  } catch {}
   try {
     child = spawn(cmd, args, {
       windowsHide: true,
-      stdio: logFd === null ? 'ignore' : ['ignore', logFd, logFd],
-      detached: true,
+      stdio: outFd === null ? 'ignore' : ['ignore', outFd, outFd],
+      detached,
+      // G-04：显式透传环境变量——DSH 的 .env 代理机制（HTTP_PROXY/HTTPS_PROXY）靠子进程继承，
+      //   不能指望 spawn 默认行为在以后被改掉。
+      env: { ...process.env },
     })
   } catch (e) {
-    if (logFd !== null) try { closeSync(logFd) } catch {}
+    if (outFd !== null) try { closeSync(outFd) } catch {}
     return { started: false, why: String(e?.message ?? e) }
   }
-  // 父进程这侧的句柄用完就关；子进程继承的那一份仍然有效（Windows 句柄继承 / POSIX fork 语义）
-  if (logFd !== null) try { closeSync(logFd) } catch {}
-  // detached 子进程不会把 spawn 失败同步抛给我们，必须自己接 error，否则 ENOENT 会带崩宿主
+  try {
+    appendFileSync(
+      DOWNLOAD_LOG,
+      `[${new Date().toISOString()}] ${target} 进程已拉起：pid=${child.pid ?? '?'} detached=${detached} shell=${cmd}\n`,
+      'utf8',
+    )
+  } catch {}
+  // 子进程拿的是自己那份句柄（Windows 继承 / POSIX fork），父进程这份等它退出/报错后再关
+  let outClosed = false
+  const closeOut = () => {
+    if (outClosed) return
+    outClosed = true
+    if (outFd !== null) { try { closeSync(outFd) } catch {} outFd = null }
+  }
+  // 非 detached 的子进程同样会异步报 spawn 失败（ENOENT/EACCES），必须接 error，否则带崩宿主
   child.on('error', (e) => {
     try {
       appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 启动失败 ${target}：${e?.message ?? e}\n`, 'utf8')
     } catch {}
+    closeOut()
   })
   // A-下载黑洞（后半）：记退出码。以前脚本崩在 pip install / 模型下载中途，
   //   日志里既没有 stdout 也没有退出码，排障无路。
@@ -1573,11 +1596,16 @@ function runDownload(target) {
     try {
       const tail = signal ? `信号 ${signal}` : `退出码 ${code ?? 'null'}`
       const bad = (code ?? 0) !== 0 || Boolean(signal)
-      appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] ${target} 结束，${tail}${bad ? '（失败）' : '（成功）'}\n`, 'utf8')
+      appendFileSync(
+        DOWNLOAD_LOG,
+        `[${new Date().toISOString()}] ${target} 结束，${tail}${bad ? '（失败）' : '（成功）'}（详细输出见 deps\\download.out.log）\n`,
+        'utf8',
+      )
     } catch {}
+    closeOut()
   })
   child.unref()
-  return { started: true, log: DOWNLOAD_LOG }
+  return { started: true, log: DOWNLOAD_LOG, outLog }
 }
 
 /**

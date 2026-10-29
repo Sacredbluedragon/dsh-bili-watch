@@ -6,6 +6,8 @@
     powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target ytdlp -Force
     powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all -DryRun
     powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all -Mirror cn
+    powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all -ProxyUrl http://127.0.0.1:7890
+    powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all -NoProxy
     pwsh scripts/fetch-deps.ps1 -Target all
 
   目标（可单独装，也可 all 全装）：
@@ -31,6 +33,15 @@
     · -VerifyHash：可选开关。不传则跳过哈希校验；传了则在下载完成后打印每个二进制
       的 SHA256 摘要（仓库暂不内置期望摘要，仅打印供人工比对，不据此失败）。
     · curl.exe 强制 https（--proto =https --proto-redir =https），不允许明文 http 跳转。
+    · 代理（G-01，2026-10-29）：curl.exe / pip / huggingface_hub 都不读 Windows「Internet 选项 → 代理」，
+      所以脚本自己探测代理：-ProxyUrl > 环境变量 BILI_WATCH_PROXY > HTTP(S)_PROXY > 注册表 WinINet，
+      探测到就写进进程级 HTTP_PROXY/HTTPS_PROXY（huggingface_hub 靠这个）并给 curl / pip 显式带
+      --proxy。-NoProxy 强制直连；探测不到就按原来的直连行为跑，不影响没开代理的机器。
+    · Python（G-02，2026-10-29）：优先用已安装的 uv（uv venv --python 3.12/3.13，uv 自己管的解释器
+      可离线用），其次 py 启动器的 3.13/3.12/3.11/3.10，最后 PATH 上的 python；跳过 WindowsApps 的
+      应用商店存根。3.14 不行——onnxruntime（OCR）还没有 cp314 的 wheel。
+    · 日志（G-03，2026-10-29）：每一步进度和失败原因都会 append 到 deps\download.log，面板「一键下载」
+      的日志就是这个文件（index.js 也把子进程输出重定向进来）。
 #>
 param(
   [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda')]
@@ -43,6 +54,9 @@ param(
   [switch]$VerifyHash,
   [ValidateSet('auto', 'cn', 'global')]
   [string]$Mirror = 'auto',
+  # 代理：''=自动探测；-ProxyUrl http://127.0.0.1:7890 显式指定；-NoProxy 强制直连（忽略系统代理）
+  [string]$ProxyUrl = '',
+  [switch]$NoProxy,
   [string]$PythonPath = ''
 )
 
@@ -64,10 +78,96 @@ if ($env:BILI_WATCH_DEPS) {
 }
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $Deps | Out-Null }
 
+# G-03（2026-10-29）：下载/安装的每一步都 append 到 deps\download.log。
+#   以前失败只留在进程输出里：面板的「一键下载」看不到（0.3.3 的 index.js 是 stdio:ignore），
+#   用户只看到「开始下载 ytdlp」然后没下文。现在脚本自己写，手动跑和面板跑都能翻到原因。
+$script:LogFile = Join-Path $Deps 'download.log'
+function Write-Log([string]$msg) {
+  if ($DryRun) { return }
+  try {
+    $line = '[' + (Get-Date).ToString('o') + '] ' + $msg
+    [IO.File]::AppendAllText($script:LogFile, $line + "`r`n", (New-Object Text.UTF8Encoding($false)))
+  } catch {}
+}
+
+# G-01（2026-10-29）：代理探测。curl.exe 不读 WinINet 的系统代理，pip / huggingface_hub 只认环境变量，
+#   于是「开了系统代理但 GitHub 直连超时」的机器上，一键下载必然静默失败（本机实测：
+#   注册表 ProxyEnable=1 + ProxyServer=127.0.0.1:27398，curl 直连 github.com 超时，走代理 200）。
+#   优先级：-ProxyUrl > BILI_WATCH_PROXY > HTTP(S)_PROXY > 注册表 WinINet。
+function Format-ProxyUrl([string]$raw) {
+  # 归一成 curl / pip 都认的 http://host:port（注册表可能是按协议的列表：http=...;https=...）
+  $s = ([string]$raw).Trim()
+  if (-not $s) { return '' }
+  if ($s -match '(?:^|;)\s*https?\s*=') {
+    $map = @{}
+    foreach ($part in ($s -split ';')) {
+      if ($part -match '^\s*(https?)\s*=\s*(\S+)\s*$') { $map[$matches[1].ToLower()] = $matches[2] }
+    }
+    if ($map.ContainsKey('https')) { $s = $map['https'] } elseif ($map.ContainsKey('http')) { $s = $map['http'] } else { return '' }
+  }
+  if ($s -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $s = "http://$s" }
+  return $s.TrimEnd('/')
+}
+
+function Resolve-Proxy {
+  if ($NoProxy) { return '' }
+  if ($ProxyUrl) {
+    $p = Format-ProxyUrl $ProxyUrl
+    if (-not $p) { throw "代理地址看不懂：$ProxyUrl（示例：-ProxyUrl http://127.0.0.1:7890）" }
+    return $p
+  }
+  if ($env:BILI_WATCH_PROXY) {
+    $p = Format-ProxyUrl $env:BILI_WATCH_PROXY
+    if ($p) { return $p }
+  }
+  foreach ($n in @('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy')) {
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($v) {
+      $p = Format-ProxyUrl $v
+      if ($p) { return $p }
+    }
+  }
+  # Windows「Internet 选项 → 局域网设置」的系统代理（WinINet）
+  try {
+    $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+    if ($ie -and [int]$ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+      $p = Format-ProxyUrl ([string]$ie.ProxyServer)
+      if ($p) { return $p }
+    }
+  } catch {}
+  return ''
+}
+
+$script:Proxy = Resolve-Proxy
+function Set-ProxyEnv {
+  # pip / huggingface_hub / uv 只认这些环境变量；curl 认 http_proxy，但我们另外显式传 --proxy，双保险
+  if (-not $script:Proxy) { return }
+  foreach ($n in @('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')) {
+    [Environment]::SetEnvironmentVariable($n, $script:Proxy, 'Process')
+    Set-Item -Path "env:$n" -Value $script:Proxy
+  }
+  if (-not $env:NO_PROXY -and -not $env:no_proxy) {
+    [Environment]::SetEnvironmentVariable('NO_PROXY', 'localhost,127.0.0.1,::1', 'Process')
+    [Environment]::SetEnvironmentVariable('no_proxy', 'localhost,127.0.0.1,::1', 'Process')
+  }
+}
+Set-ProxyEnv
+if ($script:Proxy) {
+  Write-Host "    代理：$($script:Proxy)（curl/pip 显式 --proxy；huggingface_hub 走 HTTP(S)_PROXY）" -ForegroundColor DarkGray
+} elseif ($NoProxy) {
+  Write-Host '    代理：-NoProxy，强制直连' -ForegroundColor DarkGray
+} else {
+  Write-Host '    代理：未探测到（直连）' -ForegroundColor DarkGray
+}
+Write-Log "==== fetch-deps 开始：Target=$Target Mirror=$Mirror DryRun=$DryRun"
+Write-Log "依赖目录：$Deps"
+Write-Log $(if ($script:Proxy) { "代理：$($script:Proxy)" } else { '代理：未配置（直连）' })
+
 $UseCn = ($Mirror -eq 'cn') -or (($Mirror -eq 'auto') -and ($env:BILI_WATCH_MIRROR -eq 'cn'))
 # C-01（2026-10-29）：-Mirror auto 以前什么都不探测——国内用户跑默认命令，ffmpeg/yt-dlp 从 github.com
 #   直连、模型从 huggingface.co 直连，卡到超时。这里补一个 1.5 秒的 TCP 探测：
 #   huggingface.co 不通而 hf-mirror.com 通 → 按国内网络处理，自动切镜像。
+#   注意：这个探测是裸 TCP，不走代理；有代理就别猜——代理能出去就是 global，误切镜像反而慢。
 function Test-TcpReachable([string]$HostName, [int]$Port = 443) {
   try {
     $c = New-Object System.Net.Sockets.TcpClient
@@ -82,7 +182,7 @@ function Test-TcpReachable([string]$HostName, [int]$Port = 443) {
     return $false
   }
 }
-if (-not $UseCn -and $Mirror -eq 'auto' -and -not $env:BILI_WATCH_MIRROR -and -not $DryRun) {
+if (-not $UseCn -and $Mirror -eq 'auto' -and -not $env:BILI_WATCH_MIRROR -and -not $DryRun -and -not $script:Proxy) {
   if (-not (Test-TcpReachable 'huggingface.co') -and (Test-TcpReachable 'hf-mirror.com')) {
     $UseCn = $true
     Write-Host '    探测到 huggingface.co 不可达、hf-mirror.com 可达，自动切国内镜像（要直连请加 -Mirror global）' -ForegroundColor Yellow
@@ -95,8 +195,8 @@ $PyIndex = if ($UseCn) { 'https://pypi.tuna.tsinghua.edu.cn/simple' } else { 'ht
 #   现在只有显式 -Mirror global 才直连 huggingface.co。
 $HfEndpoint = if ($Mirror -eq 'global') { 'https://huggingface.co' } else { 'https://hf-mirror.com' }
 
-function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
-function Write-Skip([string]$msg) { Write-Host "    $msg（已存在，跳过；-Force 重下）" -ForegroundColor DarkGray }
+function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan; Write-Log "==> $msg" }
+function Write-Skip([string]$msg) { Write-Host "    $msg（已存在，跳过；-Force 重下）" -ForegroundColor DarkGray; Write-Log "跳过：$msg（已存在）" }
 
 function Move-SemiVenv([string]$venv) {
   # 半成品 venv 不用递归批量删——会撞上用户的删除守卫（issue #3 实测）。
@@ -139,41 +239,78 @@ function Move-SemiVenv([string]$venv) {
 
 function Invoke-PipInstall {
   # 镜像失败自动回退官方 PyPI（issue #3 报过 mirror 晚于 PyPI 同步；2026-10-29 复核清华已有 1.2.1）
+  # G-01/G-02（2026-10-29）：pip 不读 Windows 系统代理，必须显式 --proxy；装了 uv 就走 uv pip
+  #   （同一个 venv，装包快很多；uv 没有 --proxy 参数，靠 HTTP_PROXY/HTTPS_PROXY 环境变量）。
   param([string]$Py, [string[]]$PipArgs)
-  & $Py -m pip @PipArgs -i $PyIndex
+  $proxyArgs = @()
+  if ($script:Proxy) { $proxyArgs = @('--proxy', $script:Proxy) }
+  if ((Get-PythonPlan).Mode -eq 'uv') {
+    # uv 没有 --proxy 参数（只认 HTTP_PROXY/HTTPS_PROXY 环境变量，启动时已设好）；
+    # 而且 uv pip install 自带子命令，要把调用方传的 'install' 去掉，否则 uv 会把 install 当包名解析
+    # （本机实测：uv pip install install rapidocr-onnxruntime==1.2.3 → No solution found）。
+    $uv = (Get-PythonPlan).Uv
+    $uvArgs = @($PipArgs | Select-Object -Skip 1)
+    Write-Log "uv pip install $($uvArgs -join ' ')（--python $Py）"
+    & $uv pip install --python $Py @uvArgs --index-url $PyIndex
+    if ($LASTEXITCODE -eq 0) { return }
+    if ($PyIndex -eq 'https://pypi.org/simple') { return }
+    Write-Host "    ! 镜像装不上（$PyIndex），改走官方 PyPI 重试" -ForegroundColor Yellow
+    Write-Log "uv pip 镜像失败（$PyIndex），改走官方 PyPI"
+    & $uv pip install --python $Py @uvArgs --index-url 'https://pypi.org/simple'
+    return
+  }
+  Write-Log "pip install $($PipArgs -join ' ')（$Py）"
+  & $Py -m pip @PipArgs @proxyArgs -i $PyIndex
   if ($LASTEXITCODE -eq 0) { return }
   if ($PyIndex -eq 'https://pypi.org/simple') { return }
   Write-Host "    ! 镜像装不上（$PyIndex），改走官方 PyPI 重试" -ForegroundColor Yellow
-  & $Py -m pip @PipArgs -i 'https://pypi.org/simple'
+  Write-Log "pip 镜像失败（$PyIndex），改走官方 PyPI"
+  & $Py -m pip @PipArgs @proxyArgs -i 'https://pypi.org/simple'
 }
 
 function Invoke-Download([string]$url, [string]$out, [string]$label) {
+  $tmp = "$out.part"
   if ($DryRun) {
-    Write-Host "    [dry-run] curl.exe -L --fail --proto =https --proto-redir =https -C - -o `"$out.part`" `"$url`""
+    $px = ''
+    if ($script:Proxy) { $px = " --proxy `"$($script:Proxy)`"" }
+    Write-Host "    [dry-run] curl.exe -L --fail --proto =https --proto-redir =https$px -C - -o `"$tmp`" `"$url`""
     return
   }
-  $tmp = "$out.part"
+  $proxyArgs = @()
+  if ($script:Proxy) { $proxyArgs = @('--proxy', $script:Proxy) }
+  $via = '直连'
+  if ($script:Proxy) { $via = "代理 $($script:Proxy)" }
   # E-06（2026-10-29）：以前开下之前先删 .part，ffmpeg 那 80 MB 断一次网就得从头再来。
   #   现在保留 .part 并用 curl -C - 续传；服务器不支持 Range（curl 非 0 退出）就删掉从头下一次。
-  $base = @('-L', '--fail', '--proto', '=https', '--proto-redir', '=https', '--retry', '3', '--connect-timeout', '20')
+  $base = @('-L', '--fail', '--proto', '=https', '--proto-redir', '=https', '--retry', '3', '--connect-timeout', '20') + $proxyArgs
+  Write-Log "下载 $label（$via）：$url"
   if (Test-Path -LiteralPath $tmp) {
     $have = (Get-Item -LiteralPath $tmp).Length
     Write-Host "    发现上次没下完的 .part（$([math]::Round($have/1MB,1)) MB），续传 $label ..."
     & curl.exe @base -C - -o $tmp $url
-    if ($LASTEXITCODE -ne 0) {
+    $curlCode = $LASTEXITCODE
+    if ($curlCode -ne 0) {
       Write-Host '    续传失败（服务器可能不支持 Range），删掉从头重下' -ForegroundColor Yellow
+      Write-Log "续传失败（curl 退出码 $curlCode），删掉 .part 从头重下 $label"
       Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
       & curl.exe @base -o $tmp $url
+      $curlCode = $LASTEXITCODE
     }
   } else {
     Write-Host "    下载 $label ..."
     & curl.exe @base -o $tmp $url
+    $curlCode = $LASTEXITCODE
   }
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) {
+  if ($curlCode -ne 0 -or -not (Test-Path -LiteralPath $tmp)) {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-    throw "下载失败：$url"
+    $hint = 'curl 退出码 ' + $curlCode
+    if (-not $script:Proxy) { $hint = $hint + '；如果这台机器要走代理，试 -ProxyUrl 或 -NoProxy 检查一下' }
+    Write-Log "下载失败 $label（$hint）：$url"
+    throw "下载失败：$url（$hint）"
   }
+  $size = (Get-Item -LiteralPath $tmp).Length
   Move-Item -LiteralPath $tmp -Destination $out -Force
+  Write-Log "下载完成 $label（$([math]::Round($size/1MB,1)) MB）-> $out"
   if ($VerifyHash) {
     $h = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash
     Write-Host "    SHA256($label) = $h"
@@ -219,22 +356,33 @@ function Ensure-Ytdlp {
   if (-not $DryRun) { Write-Host "    ✓ $exe" }
 }
 
+# G-02（2026-10-29）：Python 选择。原逻辑先试 py -3.14，但 3.14 没有 onnxruntime 的 cp314 wheel，
+#   本机（PATH 上只有 py 3.14、py -3.10 还指向不存在的用户目录）就是「ASR 也许能装、OCR 必挂」。
+#   现在的顺序：-PythonPath（显式）> uv 管的 3.12/3.13（uv venv 可离线，本机已装 3.12.13）
+#   > py 启动器 3.13/3.12/3.11/3.10 > PATH 上的 python。WindowsApps 存根一律跳过。
+function Test-PyVersion([string]$v) {
+  # 3.10–3.13 才进：3.14 没有 onnxruntime 的 wheel，<3.10 faster-whisper 装不上
+  return ($v -match '^3\.(1[0-3])$')
+}
+
+function Get-UvPath {
+  $cmd = Get-Command 'uv' -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath ([string]$cmd.Source))) { return [string]$cmd.Source }
+  $cands = @()
+  if ($env:USERPROFILE) { $cands += (Join-Path $env:USERPROFILE '.local\bin\uv.exe') }
+  if ($env:LOCALAPPDATA) { $cands += (Join-Path $env:LOCALAPPDATA 'Programs\uv\uv.exe') }
+  foreach ($p in $cands) { if (Test-Path -LiteralPath $p) { return $p } }
+  return ''
+}
+
 function Get-SystemPython {
-  # 版本必须「有上界」：onnxruntime 目前没有 3.13+ 的 wheel，
-  # 只判 >=3.10 会让 py 启动器挑到最新的 3.15，pip 报 No matching distribution（issue #3 实测）。
+  # 兜底层（没有 uv / uv 建 venv 失败时用）：py 启动器 3.13 往下 → PATH 上的 python。
   $sawStub = $false
-  if ($PythonPath) {
-    if (-not (Test-Path -LiteralPath $PythonPath)) { throw "指定的 Python 不存在：$PythonPath" }
-    $v = & $PythonPath -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "指定的 Python 跑不起来：$PythonPath" }
-    if ($v -notmatch '^3\.(1[0-4])$') { throw "指定的 Python 是 $v，需要 3.10–3.14（onnxruntime 尚无更高版本的 wheel）" }
-    return $PythonPath
-  }
   $pyLauncher = Get-Command 'py' -ErrorAction SilentlyContinue
-  if ($pyLauncher) {
-    foreach ($v in @('3.14', '3.13', '3.12', '3.11', '3.10')) {
+  if ($pyLauncher -and $pyLauncher.Source) {
+    foreach ($v in @('3.13', '3.12', '3.11', '3.10')) {
       $exe = & $pyLauncher.Source "-$v" -c "import sys;print(sys.executable)" 2>$null
-      if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ($exe.Trim()))) { return $exe.Trim() }
+      if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ([string]$exe).Trim())) { return ([string]$exe).Trim() }
     }
   }
   foreach ($c in @('python', 'python3')) {
@@ -250,14 +398,67 @@ function Get-SystemPython {
     }
     $v = & $cmd.Source -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
     if ($LASTEXITCODE -ne 0) { continue }
-    if ($v -notmatch '^3\.(1[0-4])$') { continue }
+    if (-not (Test-PyVersion ([string]$v).Trim())) { continue }
     $exe = & $cmd.Source -c "import sys;print(sys.executable)" 2>$null
-    if ($exe -and (Test-Path -LiteralPath ($exe.Trim()))) { return $exe.Trim() }
+    if ($exe -and (Test-Path -LiteralPath ([string]$exe).Trim())) { return ([string]$exe).Trim() }
   }
   if ($sawStub) {
-    throw '只找到 Windows 应用商店的 Python 存根（WindowsApps\python.exe），它不是真的解释器。请装一个 3.12，或用 -PythonPath 指定解释器路径。'
+    throw '只找到 Windows 应用商店的 Python 存根（WindowsApps\python.exe），它不是真的解释器。请装 uv 或 Python 3.12，或用 -PythonPath 指定解释器路径。'
   }
-  throw '找不到 Python 3.10–3.14（更高版本 onnxruntime 还没有 wheel）。请装一个 3.12，或用 -PythonPath 指定解释器路径。'
+  throw '找不到 Python 3.10–3.13（3.14 还没有 onnxruntime 的 wheel）。请装 uv 或 Python 3.12，或用 -PythonPath 指定解释器路径。'
+}
+
+# 返回 @{ Mode='uv'|'python'; Version; Uv; Exe; Desc }，整个脚本只判一次
+$script:PyPlan = $null
+function Get-PythonPlan {
+  if ($script:PyPlan) { return $script:PyPlan }
+  if ($PythonPath) {
+    if (-not (Test-Path -LiteralPath $PythonPath)) { throw "指定的 Python 不存在：$PythonPath" }
+    $v = & $PythonPath -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "指定的 Python 跑不起来：$PythonPath" }
+    $v = ([string]$v).Trim()
+    if (-not (Test-PyVersion $v)) { throw "指定的 Python 是 $v，需要 3.10–3.13（3.14 还没有 onnxruntime 的 wheel）" }
+    $script:PyPlan = @{ Mode = 'python'; Version = $v; Uv = ''; Exe = $PythonPath; Desc = "-PythonPath 指定的 Python $v" }
+    return $script:PyPlan
+  }
+  $uv = Get-UvPath
+  if ($uv) {
+    foreach ($v in @('3.12', '3.13')) {
+      & $uv python find $v 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        $script:PyPlan = @{ Mode = 'uv'; Version = $v; Uv = $uv; Exe = ''; Desc = "uv 的 Python $v（$uv）" }
+        return $script:PyPlan
+      }
+    }
+    $script:PyPlan = @{ Mode = 'uv'; Version = '3.12'; Uv = $uv; Exe = ''; Desc = "uv（Python 3.12，本机没有时按需下载）" }
+    return $script:PyPlan
+  }
+  $exe = Get-SystemPython
+  $script:PyPlan = @{ Mode = 'python'; Version = ''; Uv = ''; Exe = $exe; Desc = "系统 Python（$exe）" }
+  return $script:PyPlan
+}
+
+# 建 venv 并返回里面的 python.exe；uv 失败自动回退系统 Python。venv 一律建在 deps\ 下。
+function New-DepVenv([string]$venv) {
+  $plan = Get-PythonPlan
+  if ($plan.Mode -eq 'uv') {
+    Write-Host "    建 venv：uv venv --python $($plan.Version) `"$venv`""
+    Write-Log "uv venv --python $($plan.Version) $venv"
+    & $plan.Uv venv --python $plan.Version $venv
+    $py = Join-Path $venv 'Scripts\python.exe'
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $py)) { return $py }
+    Write-Host "    ! uv 建 venv 失败（退出码 $LASTEXITCODE），回退系统 Python" -ForegroundColor Yellow
+    Write-Log "uv venv 失败（退出码 $LASTEXITCODE），回退系统 Python"
+    if (Test-Path -LiteralPath $venv) { Move-SemiVenv $venv }
+  }
+  $sysPy = Get-SystemPython
+  Write-Host "    建 venv：`"$sysPy`" -m venv `"$venv`""
+  Write-Log "python -m venv $venv（$sysPy）"
+  & $sysPy -m venv $venv
+  if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
+  $py = Join-Path $venv 'Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $py)) { throw '创建 venv 失败（找不到 venv 里的 python.exe）' }
+  return $py
 }
 
 # 第十条（2026-10-29）：GPU 运行库单独一个 target，供 -Target cuda 与 Ensure-Asr 的询问分支共用。
@@ -322,15 +523,23 @@ function Ensure-Asr {
   }
   Write-Step 'ASR 环境（deps\.venv-asr + faster-whisper==1.2.1）'
   if ($DryRun) {
-    Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
-    Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
+    $plan = Get-PythonPlan
+    Write-Host "    [dry-run] Python：$($plan.Desc)"
+    if ($plan.Mode -eq 'uv') {
+      Write-Host "    [dry-run] `"$($plan.Uv)`" venv --python $($plan.Version) `"$venv`""
+      Write-Host "    [dry-run] `"$($plan.Uv)`" pip install --python `"$py`" `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" --index-url $PyIndex"
+    } else {
+      Write-Host "    [dry-run] `"$($plan.Exe)`" -m venv `"$venv`""
+      Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
+    }
     Write-Host '    [dry-run] 检测到 NVIDIA 显卡时会问一句「装 GPU 运行库吗（约 500 MB）」，选是才装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（非交互或 -Gpu no 则跳过）'
     return
   }
-  $sysPy = Get-SystemPython
-  & $sysPy -m venv $venv
-  if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
-  Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  $py = New-DepVenv $venv
+  if ((Get-PythonPlan).Mode -ne 'uv') {
+    # uv 建的 venv 里没有 pip（也不需要），非 uv 路径照旧先升 pip
+    Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  }
   Invoke-PipInstall $py @('install', 'faster-whisper==1.2.1', 'av==15.1.0', 'ctranslate2==4.8.3')
   if ($LASTEXITCODE -ne 0) {
     # 本次失败把半成品改名留档（不递归删，避免撞用户的删除守卫）
@@ -419,14 +628,21 @@ function Ensure-Ocr {
   }
   Write-Step 'OCR 环境（deps\.venv-ocr + rapidocr-onnxruntime==1.2.3）'
   if ($DryRun) {
-    Write-Host "    [dry-run] <系统 Python> -m venv `"$venv`""
-    Write-Host "    [dry-run] `"$py`" -m pip install `"rapidocr-onnxruntime==1.2.3`" -i $PyIndex"
+    $plan = Get-PythonPlan
+    Write-Host "    [dry-run] Python：$($plan.Desc)"
+    if ($plan.Mode -eq 'uv') {
+      Write-Host "    [dry-run] `"$($plan.Uv)`" venv --python $($plan.Version) `"$venv`""
+      Write-Host "    [dry-run] `"$($plan.Uv)`" pip install --python `"$py`" `"rapidocr-onnxruntime==1.2.3`" --index-url $PyIndex"
+    } else {
+      Write-Host "    [dry-run] `"$($plan.Exe)`" -m venv `"$venv`""
+      Write-Host "    [dry-run] `"$py`" -m pip install `"rapidocr-onnxruntime==1.2.3`" -i $PyIndex"
+    }
     return
   }
-  $sysPy = Get-SystemPython
-  & $sysPy -m venv $venv
-  if ($LASTEXITCODE -ne 0) { throw '创建 venv 失败' }
-  Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  $py = New-DepVenv $venv
+  if ((Get-PythonPlan).Mode -ne 'uv') {
+    Invoke-PipInstall $py @('install', '--upgrade', 'pip')
+  }
   Invoke-PipInstall $py @('install', 'rapidocr-onnxruntime==1.2.3')
   if ($LASTEXITCODE -ne 0) {
     Move-SemiVenv $venv
@@ -450,8 +666,15 @@ function Ensure-Model {
   $env:HF_HOME = $hfHome
   if (-not $env:HF_ENDPOINT) { $env:HF_ENDPOINT = $HfEndpoint }
   $env:HF_HUB_DISABLE_XET = '1'
+  # G-03：huggingface_hub 只认 HTTP_PROXY/HTTPS_PROXY（启动时已按系统代理设好），这里把用的代理写进日志
+  $via = '直连'
+  if ($script:Proxy) { $via = "代理 $($script:Proxy)" }
+  Write-Log "下载模型 Systran/faster-whisper-small（$via，HF_ENDPOINT=$($env:HF_ENDPOINT)，HF_HOME=$hfHome）"
   & $asrPy -c "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"
-  if ($LASTEXITCODE -ne 0) { throw '模型下载失败' }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Log "模型下载失败（退出码 $LASTEXITCODE）：$($env:HF_ENDPOINT)"
+    throw '模型下载失败'
+  }
   Write-Host "    ✓ $hfHome"
 }
 
@@ -490,7 +713,15 @@ $script:InAll = ($Target -eq 'all')
 
 $failed = 0
 function Run-One([string]$name, [scriptblock]$action) {
-  try { & $action } catch { $script:failed++; Write-Warning "「$name」失败：$($_.Exception.Message)" }
+  Write-Log "开始：$name"
+  try {
+    & $action
+    Write-Log "完成：$name"
+  } catch {
+    $script:failed++
+    Write-Log "失败：$name —— $($_.Exception.Message)"
+    Write-Warning "「$name」失败：$($_.Exception.Message)"
+  }
 }
 
 $steps = switch ($Target) {
@@ -504,7 +735,11 @@ $steps = switch ($Target) {
   default { @('ffmpeg', 'ytdlp', 'asr', 'ocr', 'model') }
 }
 
-if ($DryRun) { Write-Host '[DryRun] 只打印命令，不下载、不写盘。' -ForegroundColor Yellow }
+if ($DryRun) {
+  Write-Host '[DryRun] 只打印命令，不下载、不写盘。' -ForegroundColor Yellow
+  # 验收要求 -DryRun 能看到代理与 Python 的选择（-Target ytdlp 这类不建 venv 的目标也要打出来）
+  try { Write-Host "    [dry-run] Python：$((Get-PythonPlan).Desc)" } catch { Write-Host "    [dry-run] Python：$($_.Exception.Message)" -ForegroundColor Yellow }
+}
 
 foreach ($s in $steps) {
   switch ($s) {
@@ -520,7 +755,9 @@ foreach ($s in $steps) {
 Write-Host ''
 if ($failed -gt 0) {
   Write-Warning "有 $failed 项失败，看上面每项的原因；已完成的项不受影响。"
+  Write-Log "==== 结束：$failed 项失败（Target=$Target）"
   exit 1
 }
 Record-BinaryVersions
 Write-Host '完成。验证：node --check tools/look.mjs 与 node tools/look.mjs view <BV号>' -ForegroundColor Green
+Write-Log "==== 结束：全部完成（Target=$Target）"
