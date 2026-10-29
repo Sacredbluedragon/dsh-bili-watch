@@ -4,7 +4,14 @@
 [![node](https://img.shields.io/node/v/dsh-bili-watch?label=node)](https://www.npmjs.com/package/dsh-bili-watch)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
 
-DSH 插件 / CLI 工具：将 B 站视频解析为模型可消费的结构化内容（元数据、评论、弹幕、AI 字幕、本地 ASR 转写、抽帧 OCR）。
+DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内容（元数据、评论、弹幕、AI 字幕、本地 ASR 转写、抽帧 OCR）。
+
+## 为什么用它
+
+- **本地跑不上传**：ASR 转写 + OCR 抽帧全在本机，不依赖云 API、不花钱
+- **防字幕诱饵**：语速异常或字幕自称「实验/钓鱼」即判可疑；关键词命中率只在语速也异常时才作补充；可疑时抽 5 帧 OCR 比对画面
+- **二次读瞬时**：缓存目录 + 文件锁，同一视频二次读取秒出
+- **为 AI 设计**：manifest 落盘 + 摘要输出，agent 直接消费不用再解析
 
 ## 特性
 
@@ -148,6 +155,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `asrTimeoutSec` | number (sec) | 900 | ASR 进程超时 |
 | `ffmpegTimeoutSec` | number (sec) | 300 | ffmpeg 进程超时 |
 | `cmdTimeoutSec` | number (sec) | 180 | 通用命令超时 |
+| `asrDevice` | enum | `auto` | ASR 推理设备：`auto`（有 CUDA 就用，失败回落 CPU）/ `cpu`（强制 CPU）。面板上是「转写时用 GPU」开关 |
 
 ## 缓存路径
 
@@ -211,6 +219,34 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target ytdlp
 bash scripts/fetch-deps.sh all
 BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all
 ```
+
+> **依赖装在哪**（0.3.4 起）：默认放 `$DSH_HOME/bili-watch/deps`（`DSH_HOME` 默认 `~/.dsh`），**不在插件包目录里**——这样 `npm uninstall` / 重装插件不会把两个 venv 和 460 MB 模型一起删掉。
+> 从旧版升级时，首次启动会自动把包内 `deps/` 搬过去（复制完成后才切换，中途失败继续用包内那份，面板会给出提示）；包内旧的 `deps/` 不再使用，确认新位置正常后可以手动删除。
+> 想放到别的盘：设环境变量 `BILI_WATCH_DEPS` 指向目标目录即可（CLI、面板、一键脚本三处同源）。
+
+## GPU 加速（可选）
+
+只有**本地 ASR 转写**用得上 GPU，OCR 走 onnxruntime 的 CPU 推理，与显卡无关。
+
+| 你的机器 | 面板「GPU 运行库」一行 | 转写 |
+|---|---|---|
+| 有 NVIDIA 卡 + 已装运行库 | 绿点，显示 `cublas64_12.dll` | 走 GPU，比 CPU 快 2–8 倍 |
+| 有 NVIDIA 卡 + 没装运行库 | 灰点，提示「装上快 2-8 倍」 | 走 CPU（功能一样，只是慢些） |
+| 没有 NVIDIA 卡 | 灰点，说明没有 `nvidia-smi` | 走 CPU |
+
+**怎么装**：面板上点那一行的「下载」，或命令行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
+```
+
+装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 500 MB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会用 `ctypes.WinDLL("cublas64_12.dll")` 真加载一次——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
+
+**为什么第一次慢**：`-Target all` 不会自动装它（不问、不装 500 MB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
+
+**怎么关**：面板「转写与抽帧」里的「转写时用 GPU」取消勾选（存的是 `asrDevice: cpu`），或命令行 `set BILI_ASR_DEVICE=cpu`。删掉运行库也能自动退回 CPU，不会报错。
+
+**没有卡能不能开**：能，但开了也走 CPU——`auto` 的语义是「有可用 CUDA 就用，没有或显存不足就回落 CPU」。
 
 ## 故障排查
 
