@@ -47,11 +47,16 @@ function cleanKey(s) {
   return k
 }
 
+/** T34-P0-1 / E6-02（2026-10-30）：模型可能把整条链接当 key 传进来，先取 BV 再建目录。
+ *  两处必须逐字一致（面板与 CLI 不许各算一个目录名）；CLI 的 positional 是原样接的，
+ *  比插件侧更容易收到整条链接，漏了这一侧会造出 http 开头的目录名。 */
+function bvOf(s) {
+  const m = /(BV[0-9A-Za-z]{10})/.exec(String(s || ''))
+  return m ? m[1] : s
+}
 /** 按视频分目录：CACHE/<BV>/<cmd>.txt —— 同一个视频各命令的输出收在一处 */
 function videoDir(key) {
-  // T34-P0-1：模型可能把整条链接当 key 传进来，先取 BV 再建目录，别在缓存根下建乱码目录
-  const bvHit = /(BV[0-9A-Za-z]{10})/.exec(String(key || ''))
-  const base = cleanKey(bvHit ? bvHit[1] : key)
+  const base = cleanKey(bvOf(key))
   mkdirSync(CACHE, { recursive: true })
   // 同一个 BV 已经有目录（可能被 CLI 改成「BV_标题」）就用它，别建第二个兄弟目录（2026-10-26 审查 T01/T02）
   try {
@@ -516,7 +521,16 @@ function isOurCacheRoot(dir) {
 //   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
 //   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
 function isOwnBvDir(p, name) {
-  return /^BV[0-9A-Za-z]{10}/i.test(name) && existsSync(join(p, 'meta.json'))
+  if (!/^BV[0-9A-Za-z]{10}/i.test(name)) return false
+  if (existsSync(join(p, 'meta.json'))) return true
+  // E7 顺带（2026-10-30）：名字是 BV 但目录是空的——那只能是我们建的。
+  //   videoDir() 先 mkdir 再校验 BV 有效性，所以 `view BV0000000000` 这类请求失败后会留下一个空壳，
+  //   而原判据要求 meta.json，于是这个空壳既清不掉、也永远不消失（用户看到缓存里有个不认识的目录）。
+  //   用户自己不会在缓存根里放一个恰好叫 BV+10 位字符的空目录，放宽到「空」是安全的。
+  try {
+    if (readdirSync(p).length === 0) return true
+  } catch {}
+  return false
 }
 function removeOwned(dir) {
   let files = 0
@@ -533,6 +547,11 @@ function removeOwned(dir) {
       const st = dirStat(p)
       try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
+      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+    } else if (e.isFile() && e.name === 'login-qr.png') {
+      // E7 顺带（2026-10-30）：登录二维码写在缓存根，而原判据只认 BV 目录与 10 个固定子目录，
+      //   于是 clean 每次都把它当「不是 bili-watch 的数据」跳过——迁移函数（migrateLegacyCache）却专门保留它，
+      //   两处口径互相矛盾，结果是这张图永远留在缓存根。它确实是我们写的，该清。
       try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === CACHE_MARK) {
       // 缓存根标记：静默保留，不进 skip 清单
@@ -913,7 +932,10 @@ function pickLoginCookies(list) {
 async function fillBuvids(jar) {
   if (jar.buvid3 && jar.buvid4) return jar
   try {
-    const r = await fetch(SPI, { headers: { 'User-Agent': UA } })
+    // E6（2026-10-30）：M-04 给 CLI 侧三处补了超时，插件侧这一处漏了——
+    //   内网屏蔽 *.bilibili.com 时这里会挂到 TCP 超时（Windows 约 21 秒），面板登录跟着卡。
+    //   取值与同文件 QR_GEN / QR_POLL 一致。
+    const r = await fetch(SPI, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) })
     const j = await r.json()
     if (!jar.buvid3 && j?.data?.b_3) jar.buvid3 = j.data.b_3
     if (!jar.buvid4 && j?.data?.b_4) jar.buvid4 = j.data.b_4
@@ -2186,7 +2208,7 @@ function apply(ctx) {
                       ...(() => {
                         const a = cacheAdoptNotice()
                         if (!a) return []
-                        return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删，0.3.7 给专用命令）。`]
+                        return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删）。`]
                       })(),
                     ].filter(Boolean),
                   },

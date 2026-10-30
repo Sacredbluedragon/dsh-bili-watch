@@ -149,7 +149,16 @@ function isOurCacheRoot(dir) {
 //   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
 //   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
 function isOwnBvDir(p, name) {
-  return /^BV[0-9A-Za-z]{10}/i.test(name) && existsSync(join(p, 'meta.json'))
+  if (!/^BV[0-9A-Za-z]{10}/i.test(name)) return false
+  if (existsSync(join(p, 'meta.json'))) return true
+  // E7 顺带（2026-10-30）：名字是 BV 但目录是空的——那只能是我们建的。
+  //   videoDir() 先 mkdir 再校验 BV 有效性，所以 `view BV0000000000` 这类请求失败后会留下一个空壳，
+  //   而原判据要求 meta.json，于是这个空壳既清不掉、也永远不消失（用户看到缓存里有个不认识的目录）。
+  //   用户自己不会在缓存根里放一个恰好叫 BV+10 位字符的空目录，放宽到「空」是安全的。
+  try {
+    if (readdirSync(p).length === 0) return true
+  } catch {}
+  return false
 }
 function removeOwned(dir) {
   let files = 0
@@ -166,6 +175,11 @@ function removeOwned(dir) {
       const st = dirStat(p)
       try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
+      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+    } else if (e.isFile() && e.name === 'login-qr.png') {
+      // E7 顺带（2026-10-30）：登录二维码写在缓存根，而原判据只认 BV 目录与 10 个固定子目录，
+      //   于是 clean 每次都把它当「不是 bili-watch 的数据」跳过——迁移函数（migrateLegacyCache）却专门保留它，
+      //   两处口径互相矛盾，结果是这张图永远留在缓存根。它确实是我们写的，该清。
       try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === CACHE_MARK) {
       // 缓存根标记：静默保留，不进 skip 清单（这是我们自己写的，不是别人的东西）
@@ -497,9 +511,15 @@ function loadCred(path) {
 function credFor(explicit) {
   if (explicit) return loadCred(explicit)
   syncPanelSmallToShared()
-  // 2026-10-27 批次9：与 index.js resolveCredPath() 同口径——panel 写 bili-duty\bili_credential.json、
+  // 2026-10-27 批次9：panel 侧 mtime 仲裁与 index.js resolveCredPath() 一致——panel 写 bili-duty\bili_credential.json、
   // 插件面板扫码写 bili-watch\credential.json，两处独立写入口，谁 mtime 新用谁。
   // 原来「SHARED 存在即返回」会让 panel 侧重登大号后这里永远读旧快照（AI 字幕静默失效）。
+  // E6-01（2026-10-30 复核）：与 index.js resolveCredPath() 有三处**有意不同**，不是分叉——
+  //   ① 本函数返回凭证对象（或 null 当未登录），那边返回路径：调用方要的东西不同；
+  //   ② 那边有一步「本次进程刚扫码写的那份优先」（模块级 sharedWrittenAt），本侧走不到——
+  //      CLI 不扫码，扫码只发生在面板进程；且真扫完 SHARED 的 mtime 必然最新，mtime 仲裁已能选它；
+  //   ③ 残缺凭证：那边返回 LEGACY_CRED 交下游 loadCred 再校验，本侧这里直接判 null 并打警告，
+  //      最终行为一致（都当未登录），差别只是谁说那句警告。
   const mtimeOf = (p) => { try { return statSync(p).mtimeMs } catch { return 0 } }
   const sharedAt = mtimeOf(SHARED_CRED)
   const panelAt = mtimeOf(PANEL_CRED)
@@ -509,6 +529,14 @@ function credFor(explicit) {
   if (existsSync(LEGACY_CRED)) {
     const cred = loadCred(LEGACY_CRED)
     if (cred) {
+      // E7-03（2026-10-30）：这条迁移是静默的，于是出现两种误判——
+      //   ① 用户换了 DSH_HOME（换机 / 换盘 / 隔离测试）后仍能登录，以为是新位置的凭证；
+      //   ② 做「隔离环境」验证的人（包括对着这份代码做审查的）以为 DSH_HOME 空就等于未登录，
+      //      实际上读到的是包内 deps/credential.json 里那份真凭证，测出来的全部是真实身份。
+      //   打一行到 stderr（不污染 stdout 的机器可读格式），只在真正迁移时打一次：
+      //   SHARED / PANEL 任一存在时上面的 mtime 分支早就 return 了，走不到这里。
+      process.stderr.write(`[cred] 没有新位置的凭证，改从旧位置 ${LEGACY_CRED} 读，已复制到 ${SHARED_CRED}
+`)
       try {
         mkdirSync(dirname(SHARED_CRED), { recursive: true })
         writeFileSync(SHARED_CRED, JSON.stringify(cred, null, 2), 'utf8')
@@ -1296,6 +1324,28 @@ function asrReady() {
   return existsSync(ASR_PY) && existsSync(ASR_SCRIPT)
 }
 
+// E7-01（2026-10-30，P0）：这道闸门原先只写在 cmdText 的降级分支里（asrMemOk），
+//   cmdAsr 这条路完全没有——直接 transcribe() 一路跑到
+//   「[asr] GPU 转写失败，回落 CPU：bad allocation / CPU 回落也失败：mkl_malloc」。
+//   更糟的是崩之前 cmdAsr 还打了一行「3 分钟片约 30–45 秒」，等于承诺做不到的事。
+//   现在抽成一个判断，两条路都先问；真正的调用点在 transcribe 里（见下面的 Gate），
+//   这样 cmdText / cmdAsr / 以后任何新入口都覆盖，不用每个调用方各记一遍。
+//   短片（≤180s）不受内存判据约束——whisper 崩的是长片（issue #2 P2-1）。
+function canRunAsr(dur) {
+  if (!asrReady()) {
+    return { ok: false, why: '本地转写环境不可用（缺 ' + ASR_PY + ' 或 ' + ASR_SCRIPT + '；跑 scripts/fetch-deps.ps1 -Target asr）' }
+  }
+  const t = tuning()
+  if (dur > t.asrMaxSec) {
+    return { ok: false, why: `时长 ${fmtSec(dur)} 超过转写闸门 ${Math.round(t.asrMaxSec / 60)} 分钟——超长片只出画面描述、不出字幕，要改去面板「转写闸门」调` }
+  }
+  const freeMB = freemem() / 1024 / 1024
+  if (dur > 180 && freeMB < t.asrMemMB) {
+    return { ok: false, why: `可用内存 ${(freeMB / 1024).toFixed(1)} GB，低于 ${(t.asrMemMB / 1024).toFixed(1)} GB 的门槛——whisper 跑 ${Math.round(dur / 60)} 分钟的片子会 mkl_malloc 崩。改用抽帧 + ocr，或先关掉别的程序` }
+  }
+  return { ok: true }
+}
+
 // N-03：ASR 进程失败的统一措辞。两处 ASR 调用（B 站字幕轨 / 通用音轨）共用这一份，
 //   避免「改一处漏一处」。
 //   为什么需要：ASR 依赖（ctranslate2 / cuBLAS / cuDNN）在 Windows 上会以 0xC0000005
@@ -1431,6 +1481,10 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       }
       try { rmSync(cacheTxt, { force: true }) } catch {}
     }
+    // E7-01 Gate：放在缓存命中之后是刻意的——转过的直接给结果，不该因为此刻内存紧就拒绝；
+    //   放在抽音轨之前，才不会白下一个音轨再报错。
+    const gate = canRunAsr(v.dur)
+    if (!gate.ok) return { ok: false, why: gate.why }
     const r1 = ffExec(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-headers', hdr, '-i', url, '-vn', '-ac', '1', '-ar', '16000', wav], {
       timeout: tuning().cmdTimeoutSec * 1000,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -2100,7 +2154,9 @@ async function cmdAsr(bv, p = 1, ffmpeg = '') {
     console.log('  跑 scripts/fetch-deps.ps1 -Target asr（macOS/Linux：bash scripts/fetch-deps.sh asr）装环境，或用 text 走字幕/OCR 降级')
     return
   }
-  console.log(`本地转写 ${bv}${p > 1 ? ` P${p}` : ''}（faster-whisper CPU，3 分钟片约 30–45 秒）`)
+  // E7-01：原来这行写死「3 分钟片约 30–45 秒」——可这时还不知道时长、也不知道内存够不够，
+  //   崩了的人看到的是「承诺了 30 秒，结果 mkl_malloc」。预估改到 transcribe 里闸门通过之后再打。
+  console.log(`本地转写 ${bv}${p > 1 ? ` P${p}` : ''}（faster-whisper，先算时长再决定要不要跑）`)
   const r = await transcribe(bv, { p, ffmpeg })
   if (!r.ok) {
     console.log(`\n✗ ${r.why}`)
@@ -2343,7 +2399,11 @@ async function cmdLogin(opts = {}) {
     }
     const j = await jget(NAV, headersFor(cred))
     if (j?.code === 0 && j?.data?.isLogin) {
-      console.log(`✓ 凭证有效：${j.data.uname}（mid=${j.data.mid}，Lv${j.data.level}）`)
+      // E7 顺带（2026-10-30）：原来直接读 j.data.level，而 x/web-interface/nav 的等级在
+      //   data.level_info.current_level（老版本才平铺成 data.level），于是每次登录检查都打出
+      //   「Lvundefined」——用户看到的是账号信息缺一块，实际是取错字段。
+      const lv = j.data?.level_info?.current_level ?? j.data?.level ?? null
+      console.log(`✓ 凭证有效：${j.data.uname}（mid=${j.data.mid}${lv === null ? '' : `，Lv${lv}`}）`)
     } else {
       process.exitCode = 1; console.error(`✗ 凭证已失效：code=${j?.code} ${j?.message ?? ''}（重新跑 node look.mjs login）`)
     }
@@ -2382,7 +2442,9 @@ async function cmdLogin(opts = {}) {
       if (r.state === 'expired') {
         // 15-6：二维码过期后清理 login-key.json，不留残留
         try { if (existsSync(LOGIN_KEY_FILE)) rmSync(LOGIN_KEY_FILE, { force: true }) } catch {}
-        console.log('\n✗ 二维码已过期，重新跑 node look.mjs login')
+        // E7 顺带（2026-10-30）：错误原本走 console.log（stdout）——rc=1 但 stderr 0 字节，
+        //   脚本 2>/dev/null 收集报错时拿不到一个字。与 C1 修过的是同一个坑，这次在 login --poll 上。
+        console.error('\n✗ 二维码已过期，重新跑 node look.mjs login')
         process.exitCode = 1
         return
       }
@@ -2392,7 +2454,7 @@ async function cmdLogin(opts = {}) {
       }
       await sleep(3000)
     }
-    console.log('\n✗ 超时（5 分钟），重新跑 node look.mjs login')
+    console.error('\n✗ 超时（5 分钟），重新跑 node look.mjs login')
     // 15-6：扫码超时后清理 login-key.json，不留残留
     try { if (existsSync(LOGIN_KEY_FILE)) rmSync(LOGIN_KEY_FILE, { force: true }) } catch {}
     process.exitCode = 1
@@ -2412,7 +2474,7 @@ async function cmdLogin(opts = {}) {
       await qrcode.toFile(qrPng, d.url)
       console.log(`二维码 PNG: ${qrPng}`)
     } catch (e) {
-      console.log(`⚠ 二维码 PNG 保存失败：${e?.message ?? e}`)
+      console.error(`⚠ 二维码 PNG 保存失败：${e?.message ?? e}`)
     }
   }
   console.log(`链接: ${d.url}`)
@@ -2463,9 +2525,16 @@ function cleanKey(s) {
   return k
 }
 
+/** T34-P0-1 / E6-02（2026-10-30）：模型可能把整条链接当 key 传进来，先取 BV 再建目录。
+ *  两处必须逐字一致（面板与 CLI 不许各算一个目录名）；CLI 的 positional 是原样接的，
+ *  比插件侧更容易收到整条链接，漏了这一侧会造出 http 开头的目录名。 */
+function bvOf(s) {
+  const m = /(BV[0-9A-Za-z]{10})/.exec(String(s || ''))
+  return m ? m[1] : s
+}
 /** 按视频分目录：CACHE/<BV>/<kind>.txt —— 同一个视频识别到的各层都收在同一个文件夹里 */
 function videoDir(bv) {
-  const base = cleanKey(bv)
+  const base = cleanKey(bvOf(bv))
   mkdirSync(CACHE, { recursive: true })
   // 同一个 BV 已经有目录（可能带标题后缀）就用它，别建第二个
   try {
@@ -3108,13 +3177,27 @@ function emitFailureJson(why) {
     why: String(why ?? ''),
   }
   try {
-    const out = opt('out') || ''
-    const body = fmt === 'md' ? `# 失败\n\n${payload.why}\n` : JSON.stringify(payload, null, 2)
+    const body = fmt === 'md' ? ['# 失败', '', payload.why, ''].join('\n'): JSON.stringify(payload, null, 2)
+    // E7-02（2026-10-30，P0）：这里原先只做 isAbsolute/join 就写盘，完全没过 checkOutDir。
+    //   于是 `--out C:/Windows/Temp/x.json` 的实际行为是：
+    //     抛「不能指向系统目录」→ 外层 catch 调本函数 → 本函数读同一个 opt('out') 把拒绝原因写进去
+    //     → 同一条 stderr 里「✓ 已写入 C:/Windows/Temp/x.json」和「✗ 不能指向系统目录」并存，
+    //       而文件真的落在系统目录里（241 B，内容就是那条拒绝原因）。
+    //   失败出口必须过同一道闸；被拒就退回 stdout——数据不能丢（X-18 要求 json 模式必须有输出），
+    //   但绝不能因为「反正是报错内容」就把它写进被拒绝的位置。
+    const rawOut = opt('out') || ''
+    let out = rawOut
+    if (rawOut) {
+      try { checkOutDir(rawOut) } catch { out = '' }
+    }
     if (out) {
       const p = isAbsolute(out) ? out : join(process.cwd(), out)
       try { mkdirSync(dirname(p), { recursive: true }) } catch {}
       writeFileSync(p, body, 'utf8')
-      process.stderr.write(`✓ 已写入 ${p}（source=error）\n`)
+      process.stderr.write(`✓ 已写入 ${p}（source=error）
+`)
+      if (out !== rawOut) process.stderr.write(`  （--out ${rawOut} 被拒，正文改投 stdout）
+`)
     } else {
       writeSync(1, body + '\n') // 同步写 fd 1：后面的 process.exit 不会把管道输出截掉
     }
@@ -3552,7 +3635,7 @@ async function runGeneric(cmd, src, opts = {}) {
   }
   const yt = findYtDlp()
   if (!yt) {
-    process.exitCode = 1; console.error('✗ 未安装 yt-dlp，通用入口不可用。跑 scripts/fetch-deps.ps1 -Target ytdlp（macOS/Linux：bash scripts/fetch-deps.sh ytdlp）')
+    console.error('✗ 未安装 yt-dlp，通用入口不可用。跑 scripts/fetch-deps.ps1 -Target ytdlp（macOS/Linux：bash scripts/fetch-deps.sh ytdlp）')
     process.exit(1)
   }
   if (cmd === 'view') {
@@ -3834,7 +3917,7 @@ try {
     // A-3（2026-10-28 阶段A）：同上，递归扫所有会写盘子目录的锁，不只看 frames 一层。
     // 追加四（2026-10-29）：清之前先把「旧目录还留在原地」这件事说出来——只说，不动它。
     const adopt = cacheAdoptNotice()
-    if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删，或等 0.3.7 的专用清理。`)
+    if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删。`)
     const locked = hasAnyLock(CACHE)
     if (locked) {
       console.error('✗ 正在被占用：检测到正在运行的抽帧/转写任务（.lock 存在），已取消清理。等任务跑完再清。')
