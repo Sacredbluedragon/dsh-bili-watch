@@ -1098,22 +1098,28 @@ async function peekViaVideoShot(bv, v, dir, bin) {
   if (!d?.image?.length || !d?.index?.length) throw new Error('videoshot 没给 image/index')
   const { image, index, img_x_len, img_y_len, img_x_size, img_y_size } = d
   // 在 index 时间点里均匀挑 5 个
-  const n = Math.min(5, index.length)
+  // P1（2026-10-31，灰度指纹对拍实测）：**格 k 存的是 index[k+1]，不是 index[k]**。
+  //   videoshot 的 index[0] 是哨兵值，格 0 是一张纯黑占位图；可用格数 = index.length - 1。
+  //   原来按 index[k] 取，五个点全部错位一格，最后一帧越界落进黑色格 —— peek-05 恒为
+  //   986 字节纯黑（与 peek-01 同 md5），OCR 只出 4 帧。时间对、图不对，正是 A2 修过的那件事。
+  const usable = index.length - 1
+  const n = Math.min(5, usable)
   if (n < 3) throw new Error(`index 只有 ${index.length} 个时间点，太少`)
   const picks = []
   for (let i = 0; i < n; i++) {
-    const at = Math.floor((index.length - 1) * i / (n - 1))
-    picks.push({ t: index[at], idx: at })
+    const k = Math.floor((usable - 1) * i / (n - 1)) // 0..usable-1，合法格号
+    picks.push({ t: index[k + 1], idx: k }) // 格 k ↔ index[k+1]
   }
   // 对每个 pick，算出它在第几张图、第几行第几列
-  // 一张图是 img_x_len × img_y_len 格（10×10）
-  const cols = img_y_len || 10
+  // 一张图是 img_x_len 列 × img_y_len 行（这台机器上实测 10×10）
+  // 顺带修：原来列数取的是 img_y_len（行数），非方阵拼版图会把行列算错
+  const cols = img_x_len || 10
+  const rows = img_y_len || 10
   for (let i = 0; i < picks.length; i++) {
     const pick = picks[i]
     // 这个时间点在第几张拼版图里？image 数组每张对应一段 index
-    // 简化处理：假设所有 index 都在第一张图里（大部分视频是这样）
-    // 如果 index 总数 > cols * img_x_len，就需要算第几张图
-    const perSheet = cols * (img_x_len || 10)
+    // 一张拼版图 = cols × rows 格；超过就要换下一张（长视频的 index 会跨多张）
+    const perSheet = cols * rows
     const sheetIdx = Math.floor(pick.idx / perSheet)
     const inSheet = pick.idx % perSheet
     const row = Math.floor(inSheet / cols)
@@ -4062,7 +4068,12 @@ process.on('uncaughtException', (e) => {
 })
 
 // 8-15：未知 flag 给拼写提示（--headd → 你是想用 --head 吗）
-const KNOWN_FLAGS = new Set(['quiet', 'cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head', 'fast', 'full', 'fresh', 'mark-seen', 'ocr', 'poll', 'check', 'scene', 'verify', 'asr-max', 'no-time', 'at'])
+const KNOWN_FLAGS = new Set(['quiet', 'cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head', 'fast', 'full', 'fresh', 'mark-seen', 'ocr', 'poll', 'check', 'scene', 'verify', 'asr-max', 'no-time', 'at', 'help', 'frames'])
+// ↑ 2026-10-30：补 help 与 frames。两者都在实现里真生效（`cmd === 'help' || cmd === '--help'`
+//   在 :4155、`opts.ocr || opts.frames` 在 :3357），却不在这张表里——于是 `look --help`
+//   第一句就打「未知参数 --help，你是想用 --head 吗？（已按忽略处理）」，`look local --frames`
+//   打「未知参数 --frames（已忽略）」。两个判断都错：不是未知参数，也没被忽略。
+//   这张表只用来「别乱报警」，漏项的代价是给用户假信息，所以宁可多收。
 // ↑ P2（2026-10-28 全量检查）：补 asr-max。它在 VALUE_OPTS（:2769）与实现（:2813）里早就生效，
 //   却不在这张表里——`look.mjs help --asr-max 30000` 会打印「⚠ 未知参数 --asr-max（已忽略）」，
 //   然后真的生效。index.js 的 KNOWN_FLAGS 同款漏项，两处一起补。
@@ -4150,7 +4161,15 @@ try {
     console.error(`✗ ${why}`)
     process.exit(1)
   }
-  if (cmd === 'login') {
+  // P1（2026-10-31，实测踩到）：`<任意命令> --help` 原来**不拦**——`node look.mjs clean --help`
+  //   会真的执行 clean。本次实测因此删掉 158 个文件 / 18.1 MB 真实缓存。根因：help 只按位置参数判
+  //   （cmd === 'help'），--help 落在 opts 里没人读；而 60e0c86 把它补进 KNOWN_FLAGS 之后，
+  //   连「未知参数 --help（已忽略）」这句唯一像是提醒的话也没了。
+  //   现在统一在分派前拦：带 --help 就只打全文，任何命令都不执行。
+  if (flag('help') && cmd !== 'help' && cmd !== '--help') {
+    console.log(HELP)
+    console.error(`（--help 打印全文；暂无 ${cmd} 的子命令帮助。本次没有执行 ${cmd}）`)
+  } else if (cmd === 'login') {
     await cmdLogin({ check: flag('check'), poll: flag('poll'), key: opt('key') })
   } else if (cmd === 'help' || cmd === '--help') {
     console.log(HELP)

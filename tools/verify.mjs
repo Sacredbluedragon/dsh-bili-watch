@@ -1604,7 +1604,9 @@ try {
   const f = new Function('jget', 'downloadTo', 'ffExec', 'ffTimeoutMs', 'existsSync', 'join', 'readdirSync', 'unlinkSync',
     body + '\\nreturn peekViaVideoShot')(jget, downloadTo, ffExec, ffTimeoutMs, existsSync, join, readdirSync, unlinkSync)
   const r = await f('BV1test', { dur: 936 }, dir, 'ffmpeg')
-  const want = [0, 46, 93, 140, 187].map((k) => INDEX[k])
+  // 2026-10-31：期望值从 index[0/46/93/140/187] 改为 index[1/47/94/140/187]。
+  //   不是放宽——格 k 存的是 index[k+1]（灰度指纹对拍实测，见 C52），所以 t 必须整体右移一格。
+  const want = [1, 47, 94, 140, 187].map((k) => INDEX[k])
   console.log(JSON.stringify({ got: r && r.times, want }))
 } finally { rmSync(dir, { recursive: true, force: true }) }
 `
@@ -1615,8 +1617,123 @@ try {
     const out = execFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
     const { got, want } = JSON.parse(out.trim().split('\n').pop())
     must(Array.isArray(got), `peekViaVideoShot 没返回 times（返回的是 ${JSON.stringify(got)}）——一进门就短路了？`)
-    must(JSON.stringify(got) === JSON.stringify(want), `times 对不上：拿到 ${JSON.stringify(got)}，应该是 index[0/46/93/140/187]=${JSON.stringify(want)}`)
-    return `真跑：index 188 点 → times=${JSON.stringify(got)}，与 index[0/46/93/140/187] 逐个相等`
+    must(JSON.stringify(got) === JSON.stringify(want), `times 对不上：拿到 ${JSON.stringify(got)}，应该是 index[1/47/94/140/187]=${JSON.stringify(want)}`)
+    return `真跑：index 188 点 → times=${JSON.stringify(got)}，与 index[1/47/94/140/187] 逐个相等`
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+check('C52 peek 取格不许错位（P1：格 k 存 index[k+1]，按 index[k] 取会整排错一格、末帧落黑格）', () => {
+  // 真跑 peekViaVideoShot，把每帧的 crop 参数与「格号」一起记下来，三条一起断：
+  //   ① times 必须是 index[k+1]（不是 index[k]）
+  //   ② 末帧不许落到「格数」以外（usable = index.length - 1，末格号 usable-1）
+  //   ③ crop 的 x/y 必须由格号算出（idx→row/col→像素），三方对齐才算「像素就是那个时刻」
+  const script = `
+import { readFileSync, mkdtempSync, writeFileSync, existsSync, readdirSync, unlinkSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+const SRC = ${JSON.stringify(join(HERE, 'look.mjs'))}
+const src = readFileSync(SRC, 'utf8')
+const i = src.indexOf('async function peekViaVideoShot(')
+if (i < 0) throw new Error('找不到 peekViaVideoShot')
+const j = src.slice(i).search(/\\n\\}/)
+const body = src.slice(i, i + j + 2)
+const dir = mkdtempSync(join(tmpdir(), 'bw-c52-'))
+// 188 个时间点 = 187 格（0..186）：最后一点是哨兵，不能当格用
+// 非方阵 8×5（不是 10×10）：这样「列数取 x_len 还是 y_len」也会被这条钉住
+const INDEX = Array.from({ length: 188 }, (_, k) => 100 + k * 5)
+const jget = async () => ({ code: 0, data: { image: ['//a.jpg', '//b.jpg', '//c.jpg', '//d.jpg', '//e.jpg'], index: INDEX, img_x_len: 8, img_y_len: 5, img_x_size: 480, img_y_size: 270 } })
+const downloadTo = async (url, dest) => { writeFileSync(dest, 'x') }
+const crops = []
+const ffExec = (bin, args) => {
+  const k = args.indexOf('-vf')
+  crops.push(k >= 0 ? args[k + 1] : null)
+  writeFileSync(args[args.length - 1], 'x')
+}
+const ffTimeoutMs = () => 1000
+try {
+  const f = new Function('jget', 'downloadTo', 'ffExec', 'ffTimeoutMs', 'existsSync', 'join', 'readdirSync', 'unlinkSync',
+    body + '\\nreturn peekViaVideoShot')(jget, downloadTo, ffExec, ffTimeoutMs, existsSync, join, readdirSync, unlinkSync)
+  const r = await f('BV1test', { dur: 936 }, dir, 'ffmpeg')
+  console.log(JSON.stringify({ times: r && r.times, crops, len: INDEX.length }))
+} finally { rmSync(dir, { recursive: true, force: true }) }
+`
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c52p-'))
+  try {
+    const f = join(tmp, 'c52.mjs')
+    writeFileSync(f, script)
+    const out = execFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
+    const { times, crops } = JSON.parse(out.trim().split('\n').pop())
+    const INDEX = Array.from({ length: 188 }, (_, k) => 100 + k * 5)
+    const usable = INDEX.length - 1 // 187 格：0..186
+    // 均匀覆盖 0..usable-1 的 5 个格号
+    const wantIdx = [0, 1, 2, 3, 4].map((i) => Math.floor((usable - 1) * i / 4))
+    const wantTimes = wantIdx.map((k) => INDEX[k + 1])
+    must(JSON.stringify(times) === JSON.stringify(wantTimes),
+      `times 不是 index[格号+1]：拿到 ${JSON.stringify(times)}，应为 ${JSON.stringify(wantTimes)}（格号 ${JSON.stringify(wantIdx)}）`)
+    must(wantIdx[wantIdx.length - 1] <= usable - 1, `末格号越界：${wantIdx[wantIdx.length - 1]} > ${usable - 1}`)
+    // 格号 → 行列 → 像素，必须与 crop 一致（列数取 img_x_len：非方阵拼版图按 y_len 算会整排错）
+    const cols = 8, rows = 5
+    const wantCrops = wantIdx.map((k) => {
+      const inSheet = k % (cols * rows)
+      return `crop=480:270:${(inSheet % cols) * 480}:${Math.floor(inSheet / cols) * 270}`
+    })
+    must(JSON.stringify(crops) === JSON.stringify(wantCrops),
+      `crop 与格号对不上：拿到 ${JSON.stringify(crops)}，应为 ${JSON.stringify(wantCrops)}`)
+    return `真跑：格号 ${JSON.stringify(wantIdx)}（末格 ${usable - 1} 未越界）→ times=${JSON.stringify(times)}、crop 逐个对齐`
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+check('C51 /bili 层「收不收」与「提示表」不许分叉（P1：parseCommandLine 才是判据，漏词=拒执行且自指报错）', () => {
+  const src = read('index.js')
+  const listLit = src.match(/const KNOWN_FLAGS = (\[[^\]]*\])/)
+  must(listLit, '找不到 index.js 的 KNOWN_FLAGS')
+  const flags = new Function(`return ${listLit[1]}`)()
+  const { parseCommandLine } = compile(src, ['parseCommandLine'])
+  // 三个例外：写了理由才能进这张清单；清单里的词必须真的在 KNOWN_FLAGS 里（下面会查），
+  //   这样「表改了、例外说明过期」也会红。
+  const EXEMPT = {
+    '--quiet': '/bili 层自己有渲染，用不上 CLI 的 QUIET 抑制',
+    '--help': '/bili 没有 help 命令（look.mjs 那边才有）',
+    '--frames': '/bili 没有 local 命令；它是 --ocr 的别名，斜杠层传 --ocr',
+  }
+  const WITH_VALUE = new Set(['--step', '--p', '--cred', '--days', '--limit', '--order', '--grid',
+    '--out', '--ffmpeg', '--head', '--format', '--at', '--asr-max', '--key'])
+  const missed = []
+  for (const f of flags) {
+    if (EXEMPT[f]) continue
+    const line = WITH_VALUE.has(f) ? `text BV1xx411c7mD ${f} tmp` : `text BV1xx411c7mD ${f}`
+    const r = parseCommandLine(line)
+    if (r.unknownFlags.includes(f)) missed.push(`${f}（${line} → 未知参数）`)
+    else if (!r.extra.includes(f)) missed.push(`${f}（${line} → 被静默吞掉，没进 extra）`)
+  }
+  must(missed.length === 0, `parseCommandLine 不收这些白名单词，斜杠层会拒执行：${missed.join('、')}`)
+  // 反向：实现了分支却没进提示表 → 用户看到「未知参数 X，你是想用 X 吗」（60e0c86 就是这么坏的）
+  const implemented = [...new Set([...src.matchAll(/t === '(--[a-z-]+)'/g)].map((m) => m[1]))]
+  must(implemented.length >= 15, `只从 parseCommandLine 里认出 ${implemented.length} 个分支，正则失效了？`)
+  const unlisted = implemented.filter((f) => !flags.includes(f) && !EXEMPT[f])
+  must(unlisted.length === 0, `parseCommandLine 收这些词但提示表里没有：${unlisted.join('、')}`)
+  for (const k of Object.keys(EXEMPT)) must(flags.includes(k), `例外 ${k} 不在 KNOWN_FLAGS 里——例外清单过期了`)
+  return `${flags.length} 个词逐个真跑 parseCommandLine 全部收下；${implemented.length} 个分支全部在提示表里；例外 ${Object.keys(EXEMPT).length} 个`
+})
+
+check('C53 `<命令> --help` 只打帮助、不许执行（P1：clean --help 真删了 158 个文件 / 18.1 MB）', () => {
+  // 实测踩到的：help 只按位置参数判（cmd === 'help'），--help 落在 opts 里没人读，
+  //   于是 `node look.mjs clean --help` = 真清缓存。这条用隔离缓存真跑一次，钉住「不许有副作用」。
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c53-'))
+  try {
+    const cache = join(tmp, 'cache')
+    const bvDir = join(cache, 'frames', 'BV1aaaaaaaaa')
+    mkdirSync(bvDir, { recursive: true })
+    writeFileSync(join(cache, '.bili-watch-root'), '{}')
+    writeFileSync(join(bvDir, 'meta.json'), '{"bv":"BV1aaaaaaaaa"}')
+    const r = spawnSync(process.execPath, [join(HERE, 'look.mjs'), 'clean', '--help'], {
+      encoding: 'utf8', timeout: 120000,
+      env: { ...process.env, DSH_HOME: tmp, BILI_WATCH_CACHE: cache },
+    })
+    const out = String(r.stdout || '')
+    must(existsSync(join(bvDir, 'meta.json')), '`clean --help` 真的执行了 clean（隔离缓存里的目录被删）——help 必须只打帮助')
+    must(/用法:/.test(out), `\`clean --help\` 没打帮助（stdout 前 120 字：${out.slice(0, 120)}）`)
+    return '真跑：隔离缓存里 clean --help 未删任何文件，且打印了用法'
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 

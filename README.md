@@ -167,6 +167,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 - 自定义缓存位置：设置 `BILI_WATCH_CACHE` 环境变量，或在 `deps/deps-config.json` 写入 `"cache": "<dir>"`。指向外部目录时插件自动创建 `bili-watch-cache/` 子目录作为缓存根
 - 修改后需重启 DSH 生效
 - 自动清理规则（保留天数 / 总量上限）存于 `deps/cache-config.json`，默认保留 7 天 / 上限 2048 MB，启动时与打开面板时各检查一次
+- **缓存根归插件专用**：`clean` 与面板「立即清除」按名字整棵删这 10 个子目录 —— `_logs` `frames` `sheets` `sheet-tmp` `substrip-tmp` `_misc` `asr` `frames-dl` `audio-dl` `_hot`，里面的东西一律不保留。别把自己的文件放进这些名字的目录；放在缓存根**根目录下**、名字不在上表的文件不会被删（`clean` 会跳过并列进「不是 bili-watch 的缓存条目」）
 
 ## 卸载
 

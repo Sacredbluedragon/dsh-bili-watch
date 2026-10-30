@@ -136,9 +136,19 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const LOOK = join(HERE, 'tools', 'look.mjs')
 const COMMANDS = ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'login', 'clean']
 // 斜杠入口认识的 flag（与 tools/look.mjs CLI 对齐；未知 --xxx 给拼写提示而非静默吞）
-const KNOWN_FLAGS = ['--step', '--p', '--cred', '--days', '--limit', '--order', '--grid', '--out', '--ffmpeg', '--head', '--full', '--verify', '--format', '--fresh', '--ocr', '--poll', '--check', '--fast', '--scene', '--mark-seen', '--asr-max']
+const KNOWN_FLAGS = ['--step', '--p', '--cred', '--days', '--limit', '--order', '--grid', '--out', '--ffmpeg', '--head', '--full', '--verify', '--format', '--fresh', '--ocr', '--poll', '--check', '--fast', '--scene', '--mark-seen', '--asr-max', '--quiet', '--no-time', '--at', '--help', '--frames', '--key']
+// ↑ 2026-10-31：补 --key。login --poll --key <code> 要用它，表里漏了 → 提示「未知参数」并拒执行。
+// ↑ 这张表只影响**提示文案**，真正决定收不收的是 parseCommandLine 的 if-else 链。两张表必须
+//   保持一致，例外只有三个（C51 断言里钉住）：
+//     --quiet  /bili 层有自己的渲染，用不上 CLI 的 QUIET 抑制
+//     --help   /bili 没有 help 命令（look.mjs 那边才有）
+//     --frames /bili 没有 local 命令；它是 --ocr 的别名，斜杠层传 --ocr 即可
 // ↑ P2（2026-10-28 全量检查）：补 --asr-max。它早在 tools/look.mjs:2769 的 VALUE_OPTS 与 :2813 实现里
 //   生效，却不在这张表里——斜杠命令传 `--asr-max 60000` 会同时「报未知参数」并「真的生效」，自相矛盾。
+// ↑ 2026-10-30：再补 --quiet / --no-time / --at / --help / --frames。前两个是 0.3.9 新增的
+//   （--no-time 在 cuesToTxt、--at 在 cmdFrames），后三个是一直漏的：--help 是真命令
+//   （tools/look.mjs:4155 有 `cmd === 'help' || cmd === '--help'`）、--frames 是 local 的开关
+//   （:3357 的 `opts.ocr || opts.frames`）。漏项的直接后果是给用户一句假提示「已忽略」。
 
 // 设置页端点读的落点，与 tools/look.mjs 同源（DEPS / CACHE / pickCacheDir / depsCfg 等常量定义处）
 // X-30（2026-10-29）：deps 默认放到包目录之外。npm uninstall / 重装包会把包目录整个删掉，
@@ -1917,6 +1927,18 @@ function parseCommandLine(raw) {
       extra.push('--ffmpeg', tokens.shift())
     } else if (t === '--head' && tokens.length) {
       extra.push('--head', tokens.shift())
+    } else if (t === '--at' && tokens.length) {
+      // 2026-10-31 P1：这张 if-else 链才是「收不收」的唯一判据（KNOWN_FLAGS 只喂提示）。
+      //   --at 是 0.3.9 新增（frames 精确定点），漏在这儿 → /bili frames --at 750 直接被拒执行。
+      extra.push('--at', tokens.shift())
+    } else if (t === '--asr-max' && tokens.length) {
+      // 老洞：10-28 补进了 KNOWN_FLAGS，提示不报了，但这里仍然拒执行（当时注释写反了）
+      extra.push('--asr-max', tokens.shift())
+    } else if (t === '--key' && tokens.length) {
+      // login --poll --key <code> 扫码轮询要用；表里有、这里没有 → 扫码登录在斜杠层走不通
+      extra.push('--key', tokens.shift())
+    } else if (t === '--no-time') {
+      extra.push(t)
     } else if (t === '--full' || t === '--verify') {
       extra.push(t)
     } else if (t === '--format' && tokens.length) {
@@ -2037,7 +2059,7 @@ function apply(ctx) {
     name: 'bili',
     description: '看 B 站视频内容：字幕 → 本地转写 → 抽帧 OCR，输出最可信的一份文本',
     input: {
-      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--format srt|json|md|txt] [--out 文件（需配合 --format）] [--limit N] [--head N] [--full] [--verify] [--ffmpeg 路径] [--fresh] [--ocr] [--poll] [--check] [--mark-seen]',
+      hint: '<search 关键词|hot|peek|view|sub|comments|danmaku|asr|frames|sheet|substrip|ocr|text|login|clean> [BV] [--p N] [--step 2] [--days 3] [--order pubdate|click] [--cred 凭证路径] [--fast] [--scene] [--grid 3x3] [--at 12:30] [--format srt|json|md|txt] [--out 文件（需配合 --format）] [--limit N] [--head N] [--full] [--verify] [--ffmpeg 路径] [--fresh] [--ocr] [--poll] [--check] [--mark-seen] [--no-time] [--asr-max 60000] [--key 轮询码]',
     },
     handler: async (invocation) => {
       const { command, bv, positionals, extra, badOut } = parseCommandLine(invocation?.rawInput)
