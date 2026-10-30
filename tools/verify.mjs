@@ -820,14 +820,12 @@ check('C25 videoDir 抽 BV 两处一致：整条链接不能变成 http 开头�
 
 // #1（2026-10-30 E8 总表）：删除面有两个入口——用户点清理走 removeOwned，自动清理走 autoCleanCache → walkEntries
 //   → isOwnedEntry。removeOwned 早就改成「名字 + meta.json」，isOwnedEntry 却还按 /^BV…/ 名字直接认领，
-//   于是用户在缓存根放一个自己的 BV1234567890/ 会被自动清理连文件一起删。这条钉两件事：
-//   ① 两处 isOwnedEntry 逐字一致且都问 isOwnBvDir；② 真造目录树，用户的 BV 目录必须不被认领。
+//   于是用户在缓存根放一个自己的 BV1234567890/ 会被自动清理连文件一起删。这条钉：
+//   ① index.js 侧的 isOwnedEntry 必须走 isOwnBvDir；② 真造目录树，用户的 BV 目录必须不被认领。
+//   （原来还钉「两处字符串一致」——look.mjs 里那份是死代码，删了，守卫不该盯「另一个文件里有没有这行字」。）
 check('C26 自动清理与手点清理同一认领判据：BV 目录必须有 meta.json 或为空（#1，P0：别按名字删）', () => {
   const a = read('index.js')
-  const b = read('tools/look.mjs')
   const ea = fnBody(a, 'isOwnedEntry')
-  const eb = fnBody(b, 'isOwnedEntry')
-  must(ea === eb, 'isOwnedEntry 两处函数体不一致：len ' + ea.length + ' vs ' + eb.length)
   must(/return isOwnBvDir\(/.test(ea), 'isOwnedEntry 没走 isOwnBvDir（还在按名字认领）')
   must(!/\^BV\[0-9A-Za-z\]\{10\}\/i\.test\(first\)\)\s*return true/.test(ea), 'isOwnedEntry 里仍有「按名字直接 return true」')
   // 真跑（不只看字符串）
@@ -840,6 +838,9 @@ check('C26 自动清理与手点清理同一认领判据：BV 目录必须有 me
     writeFileSync(join(dir, 'BV9999999999', 'mine.mp4'), 'x')
     mkdirSync(join(dir, 'BV1234567890extra'))
     writeFileSync(join(dir, 'BV1234567890extra', 'mine.mp4'), 'x')
+    // videoDir 的真实命名是「BV_标题」，右边界 (_|$) 就是为它留的
+    mkdirSync(join(dir, 'BV1bbbbbbbbb_标题'))
+    writeFileSync(join(dir, 'BV1bbbbbbbbb_标题', 'meta.json'), '{}')
     const { isOwnedEntry } = compile(a, ['isOwnBvDir', 'isOwnedEntry'], {
       prelude: 'const CACHE = ' + JSON.stringify(dir) + "\nconst OWN_CACHE_DIRS = new Set(['_logs','frames','sheets','sheet-tmp','substrip-tmp','_misc','asr','frames-dl','audio-dl','_hot'])",
       params: ['relative', 'join', 'existsSync', 'readdirSync'],
@@ -848,7 +849,28 @@ check('C26 自动清理与手点清理同一认领判据：BV 目录必须有 me
     must(isOwnedEntry(join(dir, 'BV1aaaaaaaaa')) === true, '有 meta.json 的 BV 目录没被认领（会漏删自己的）')
     must(isOwnedEntry(join(dir, 'BV9999999999')) === false, '用户自己的 BV 目录被认领了（自动清理会删里面的文件）')
     must(isOwnedEntry(join(dir, 'BV1234567890extra')) === false, 'BV 前缀陷阱被认领了（正则缺右边界）')
-    return '两处一致且都问 isOwnBvDir；用户 BV 目录与前缀陷阱都不认领'
+    // 右边界 (_|$)：videoDir 的命名是「BV_标题」，少了它自己的缓存目录不被认领，自动清理永远漏删这一批
+    must(isOwnedEntry(join(dir, 'BV1bbbbbbbbb_标题')) === true, 'BV_标题 自建目录没被认领（正则右边界 (_|$) 掉了）')
+
+    // ③ 补 look.mjs 侧的 isOwnBvDir（B1 删了「两处一致」那半之后，look.mjs 这份没人盯了）
+    const b = read('tools/look.mjs')
+    const { isOwnBvDir } = compile(b, ['isOwnBvDir'], {
+      prelude: 'const CACHE = ' + JSON.stringify(dir),
+      params: ['existsSync', 'join', 'readdirSync'],
+      args: [existsSync, join, readdirSync],
+    })
+    must(isOwnBvDir(join(dir, 'BV1aaaaaaaaa'), 'BV1aaaaaaaaa') === true, 'look.mjs 侧：有 meta.json 的 BV 目录没被认领')
+    must(isOwnBvDir(join(dir, 'BV9999999999'), 'BV9999999999') === false, 'look.mjs 侧：用户自己的 BV 目录被认领了')
+    // 右边界（WB-CN 2026-10-30 扰动实测补的）：三条用例原来全是「恰好 BV+10 位」，$ 和 (_|$) 都能过，
+    //   把 `(_|$)` 改回 `$` 时 C26 照样全绿。右边界真正管的是「BV_标题」这种自建目录——
+    //   少了它，自己建过的缓存目录不被认领，clean 永远清不掉（漏删比误删难发现）。
+    must(isOwnBvDir(join(dir, 'BV1bbbbbbbbb_标题'), 'BV1bbbbbbbbb_标题') === true, 'look.mjs 侧：BV_标题 自建目录没被认领（正则右边界 (_|$) 掉了，clean 清不掉自己的缓存）')
+    must(isOwnBvDir(join(dir, 'BV1234567890extra'), 'BV1234567890extra') === false, 'look.mjs 侧：BV 前缀陷阱被认领了（正则右边界松了）')
+    // 空目录也要认领（E7 那条放宽：空目录说明是我们建过又清空的）
+    mkdirSync(join(dir, 'BVcccccccccc'))
+    must(isOwnBvDir(join(dir, 'BVcccccccccc'), 'BVcccccccccc') === true, 'look.mjs 侧：空 BV 目录没被认领（清不掉会留垃圾）')
+
+    return 'index.js 侧的 isOwnedEntry 走 isOwnBvDir；look.mjs 侧 isOwnBvDir 也钉了三条；用户 BV 目录与前缀陷阱都不认领'
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -1215,7 +1237,7 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
   try {
     const p = join(dir, 'deps-config.json')
     writeFileSync(p, '{ 坏掉的 json', 'utf8')
-    const { readDepsCfgFile } = compile(src, ['readDepsCfgFile'], {
+    const { readDepsCfgFile } = compile(src, ['readDepsCfgFile', 'readJsonOrBackup'], {
       prelude: 'let cfgWarning = null',
       params: ['readFileSync', 'renameSync', 'basename'],
       args: [readFileSync, renameSync, basename],
@@ -1330,6 +1352,272 @@ check('C40 双变量隔离下必须「还没登录」：只设 DSH_HOME 会回�
   } finally {
     rmSync(box, { recursive: true, force: true })
   }
+})
+
+// C41（2026-10-30，严重漏洞）：泄漏闸门的扫描面必须覆盖「只进仓库」的文件，且闸门自己不许写死本机身份。
+//   成因：sync-release.ps1 的 $scanList 由 package.json 的 files 展开，而 tools/verify*.mjs 走的是
+//   $repoOnly 通路（只进仓库、不进包），从来没进过扫描清单——于是写在 verify.mjs 规则里的本机用户名
+//   跟着 sync 进了发布树，闸门还照打「零本机字面量」。判据：扫描面集合 == 实际会进仓库的集合。
+//   这条只证明接线对；「注入身份后闸门真能红」是手工验过的，不在这里重复跑（要起 PowerShell）。
+check('C41 泄漏闸门的扫描面必须覆盖只进仓库的文件（且闸门自己不含本机身份）', () => {
+  const sp = join(ROOT, 'scripts/sync-release.ps1')
+  if (!existsSync(sp)) {
+    skip('C41 泄漏闸门的扫描面', '发布树不含 scripts/sync-release.ps1（含本机路径，只留开发态）')
+    return 'ok'
+  }
+  const s = readFileSync(sp, 'utf8')
+  const atRepo = s.indexOf('$repoOnly = @(')
+  const atScan = s.indexOf('AssertNoPaths $Source')
+  must(atRepo > 0, 'sync-release.ps1 里找不到 $repoOnly 定义')
+  must(atScan > atRepo, '$repoOnly 定义在泄漏扫描之后——扫描时它还不存在，等于白扫')
+  // 两处 AssertNoPaths（开发态 + 发布树）都必须检查 $repoOnly；少一处就等于那侧白扫。
+  const nRepo = (s.match(/\$repoOnly \$hardRules/g) || []).length
+  must(nRepo === 2, 'AssertNoPaths 只在 ' + nRepo + ' 处检查了 $repoOnly（应 2 处：开发态 + 发布树）——「只进仓库」的文件等于不被检查')
+  must(!/\$scanList \$hardRules/.test(s), 'AssertNoPaths 把 $scanList 和 $hardRules 配在一起了：进包那侧必须用 $allRules，否则软规则整档失效')
+  const uid = (process.env.USERNAME || process.env.USER || '').trim()
+  if (uid && uid.length >= 3) must(!s.includes(uid), 'sync-release.ps1 里硬编码了本机用户名')
+  const idsFile = join(ROOT, '.leak-ids')
+  let nIds = 0
+  if (existsSync(idsFile)) {
+    const ids = readFileSync(idsFile, 'utf8').split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'))
+    nIds = ids.length
+    for (const id of ids) must(!s.includes(id), 'sync-release.ps1 里硬编码了 .leak-ids 的条目')
+  }
+  return `扫描面含 repoOnly；闸门自身不含本机身份（用户名${uid ? '已查' : '不可用'}、.leak-ids ${nIds} 条已查）`
+})
+
+// A1：text/sub 默认格式带时间码，--no-time 退回纯文本
+check('C42 cuesToTxt 带 withTime 时每行 [mm:ss] 前缀（A1：模型要能定位到第几分钟那句）', () => {
+  const b = read('tools/look.mjs')
+  const { cuesToTxt } = compile(b, ['cuesToTxt'])
+  // 真跑：withTime=true 时必须带 [mm:ss] 前缀
+  const cues = [{ from: 65.5, content: '测试句1' }, { from: 125.2, content: '测试句2' }]
+  const outT = cuesToTxt(cues, { withTime: true })
+  must(outT.text.includes('[01:05] 测试句1'), 'withTime=true 时第 1 行没有 [mm:ss] 前缀')
+  must(outT.text.includes('[02:05] 测试句2'), 'withTime=true 时第 2 行没有 [mm:ss] 前缀')
+  // 真跑：withTime=false 时必须不带前缀
+  const outF = cuesToTxt(cues, { withTime: false })
+  must(!outF.text.includes('[01:05]'), 'withTime=false 时不该有 [mm:ss] 前缀')
+  must(outF.text.includes('测试句1'), 'withTime=false 时丢了内容')
+  // 调用点：cmdSub/cmdText 默认都接了 withTime（字符串断言保留，因为调用点不好真跑）
+  const src = b
+  const cmdSubBlock = src.slice(src.indexOf('async function cmdSub('), src.indexOf('async function cmdSubstrip('))
+  must(cmdSubBlock.includes('withTime: true'), 'cmdSub 默认 text 格式没用带时间码的 cuesToTxt')
+  must(cmdSubBlock.includes('noTime'), 'cmdSub 没接 --no-time 开关')
+  const cmdTextBlock = src.slice(src.indexOf('async function cmdText('), src.indexOf('async function cmdLocal('))
+  must(cmdTextBlock.includes('withTime: true'), 'cmdText 没用带时间码的 cuesToTxt')
+  must(cmdTextBlock.includes('noTime'), 'cmdText 没接 --no-time 开关')
+  // KNOWN_FLAGS 加了 no-time
+  const flagsLine = src.match(/const KNOWN_FLAGS = new Set\(\[([^\]]+)\]\)/)
+  must(flagsLine && flagsLine[1].includes("'no-time'"), 'KNOWN_FLAGS 里没有 no-time')
+  return 'cuesToTxt 真跑：withTime=true 带 [mm:ss] 前缀、withTime=false 不带；cmdSub/cmdText 调用点已接'
+})
+
+check('C43 peek 先走 videoshot，失败回落抽帧（A2：省流量，别只写顺路径）', () => {
+  const b = read('tools/look.mjs')
+  // 验证 peekViaVideoShot 函数体不是一进门就 return false
+  const peekVsBody = fnBody(b, 'peekViaVideoShot')
+  must(peekVsBody.length > 50, 'peekViaVideoShot 函数体太短——是不是一进门就 return false？')
+  must(peekVsBody.includes('await jget('), 'peekViaVideoShot 没调 jget——是不是一进门就 return false？')
+  must(peekVsBody.includes('return { times:'), 'peekViaVideoShot 没返回 times——是不是一进门就 return false？')
+  // 验证 peekFrames 里先调 videoshot，失败时回落
+  const peekBlock = b.slice(b.indexOf('async function peekFrames('), b.indexOf('async function peekOcrLines('))
+  must(peekBlock.includes('peekViaVideoShot(bv, v, dir, bin)'), 'peekFrames 里没调 peekViaVideoShot')
+  must(peekBlock.includes('track(`[track] videoshot 失败，回落抽帧：'), 'peekFrames 里 videoshot 失败时没打 track（静默吞了）')
+  must(peekBlock.includes('let mp4 = fresh ? null : cachedMp4'), 'peekFrames 里 videoshot 失败后没回落原来的抽帧逻辑（cachedMp4 那段）')
+  // 协议相对 URL 补 https:
+  must(b.includes("startsWith('//') ? 'https:' + sheetUrl"), 'peekViaVideoShot 没给协议相对 URL 补 https:')
+  return 'peekViaVideoShot 函数体有 await jget 和 return times（不是一进门就 return false）；peekFrames 先试 videoshot，失败打 track 后回落抽帧；协议相对 URL 补了 https:'
+})
+
+check('C44 --at 时间解析容错（A3：12:30 / 12:3 都当 12 分 30 秒；abc 报错）', () => {
+  const b = read('tools/look.mjs')
+  const { parseAtTimes } = compile(b, ['parseAtTimes'])
+  // 真跑：三种格式都对
+  must(JSON.stringify(parseAtTimes('750', 936, 2)) === '[750]', '750（秒）解析错了')
+  must(JSON.stringify(parseAtTimes('12:30', 936, 2)) === '[750]', '12:30（分:秒）解析错了')
+  must(JSON.stringify(parseAtTimes('12:30-12:35', 936, 5)) === '[750,755]', '12:30-12:35（区间）解析错了')
+  // 真跑：abc 报错
+  let threw = false
+  try { parseAtTimes('abc', 936, 2) } catch { threw = true }
+  must(threw, 'abc 这种格式不该不报错')
+  // 调用点：grabFrames 接了 at 参数
+  const src = b
+  const grabBlock = src.slice(src.indexOf('async function grabFrames('), src.indexOf('async function transcribe('))
+  must(grabBlock.includes('parseAtTimes(at'), 'grabFrames 里没调 parseAtTimes')
+  // KNOWN_FLAGS 加了 at
+  const flagsLine = src.match(/const KNOWN_FLAGS = new Set\(\[([^\]]+)\]\)/)
+  must(flagsLine && flagsLine[1].includes("'at'"), 'KNOWN_FLAGS 里没有 at')
+  return 'parseAtTimes 真跑：750/12:30/12:30-13:10 三种格式都对，abc 报错；grabFrames 接了 at，KNOWN_FLAGS 有 at'
+})
+
+check('C45 时间索引固定格式 r1c1 00:00-00:05 @00:02（A4：三处出索引）', () => {
+  const b = read('tools/look.mjs')
+  const { fmtIdxLine } = compile(b, ['fmtIdxLine'])
+  // 真跑：格式是 rXcY mm:ss-mm:ss @mm:ss
+  must(fmtIdxLine(1, 1, 0, 5) === 'r1c1 00:00-00:05 @00:02', `fmtIdxLine(1,1,0,5) 输出错了：${fmtIdxLine(1,1,0,5)}`)
+  must(fmtIdxLine(1, 2, 45, 50) === 'r1c2 00:45-00:50 @00:47', `fmtIdxLine(1,2,45,50) 输出错了：${fmtIdxLine(1,2,45,50)}`)
+  // 调用点：三处都出索引
+  const src = b
+  const peekBlock = src.slice(src.indexOf('async function cmdPeek('), src.indexOf('async function grabFrames('))
+  must(peekBlock.includes('fmtIdxLine(1, i + 1'), 'peek 没出索引')
+  const sheetBlock = src.slice(src.indexOf('async function cmdSheet('), src.indexOf('async function cmdSubstrip('))
+  must(sheetBlock.includes('fmtIdxLine(row, col'), 'sheet 没出索引')
+  const framesBlock = src.slice(src.indexOf('async function cmdFrames('), src.indexOf('async function cmdOcr('))
+  must(framesBlock.includes('fmtIdxLine(1, names.length'), 'frames --at 没出索引')
+  return 'fmtIdxLine 真跑：格式 rXcY mm:ss-mm:ss @mm:ss；peek/sheet/frames --at 三处都出索引'
+})
+
+check('C46 peek 索引时刻透传全链路：videoshot 返回 times、peekFrames 三个分支都带 times、manifest 写 times、cmdPeek 不自己重算 pcts', () => {
+  const b = read('tools/look.mjs')
+  // 1. peekViaVideoShot 返回 times
+  const peekVsBody = fnBody(b, 'peekViaVideoShot')
+  must(peekVsBody.includes('return { times:'), 'peekViaVideoShot 没返回 times——索引时刻对不上')
+  // 2. peekFrames 三个 return 分支都透传 times
+  const peekFramesBody = fnBody(b, 'peekFrames')
+  // 缓存命中分支：return { dir, cached: true, times: m0.times ?? null }
+  must(peekFramesBody.includes('times: m0.times ?? null'), 'peekFrames 缓存命中分支没透传 times')
+  // videoshot 成功分支：return { dir, cached: false, source: 'videoshot', times: vs.times }
+  must(peekFramesBody.includes('times: vs.times'), 'peekFrames videoshot 成功分支没透传 times')
+  // mp4 抽帧分支：return { dir, cached: false, times }
+  must(peekFramesBody.match(/return \{ dir, cached: false, times \}/), 'peekFrames mp4 抽帧分支没透传 times')
+  // 3. manifest 写 times
+  must(peekFramesBody.includes('writeManifest(dir, { ok: true, bv, p: v.p ?? 1, frames: 5, source: \'videoshot\', times: vs.times })'), 'peekFrames videoshot 成功时 manifest 没写 times')
+  // 4. cmdPeek 不自己重算 pcts（验证没有 const pcts = 这样的变量声明，注释不算）
+  const cmdPeekBody = fnBody(b, 'cmdPeek')
+  must(!cmdPeekBody.match(/const pcts\s*=/), 'cmdPeek 还在声明 pcts 变量重算时刻——videosort 路径下索引时刻对不上')
+  must(cmdPeekBody.includes('r.times'), 'cmdPeek 没遍历 r.times——是不是自己重算了？')
+  return 'peekViaVideoShot 返回 times；peekFrames 三个分支都透传 times；manifest 写 times；cmdPeek 遍历 r.times 不自己重算'
+})
+
+// C47–C49（2026-10-30，WB-CN）：0.3.9 挡发的两条。①②能溜进「60 条全绿」，根因是 C42–C45 全是
+//   字符串断言——这次一律真跑：把判定逻辑抽成顶层纯函数（atDirTag / framesCacheHit / nextGpuCache），
+//   喂真输入看真输出，不是 grep 源码里有没有某段字。
+check('C47 frames --at 换时刻不许撞缓存（P0：--at 460 与 --at 750 都叫 at-1p，第二次 rc=0 返回 07:40）', () => {
+  const b = read('tools/look.mjs')
+  const { atDirTag, framesCacheHit } = compile(b, ['atDirTag', 'framesCacheHit'], { params: ['createHash'], args: [createHash] })
+  // 1. 目录名必须带上时刻指纹
+  const d460 = atDirTag([460])
+  const d750 = atDirTag([750])
+  must(d460 && d750 && d460 !== d750, `不同时刻撞同一目录：${d460} vs ${d750}`)
+  must(atDirTag([460]) === d460, '同一组时刻算出来的目录名不稳定（会每次新目录、缓存永远命中不了）')
+  must(atDirTag(null) === null, '非 at 模式不该有 at 前缀')
+  const many = atDirTag(Array.from({ length: 50 }, (_, i) => i * 10))
+  must(many.length <= 20, `50 个点的目录名太长（${many.length} 字符），会炸 Windows 路径长度`)
+  // 2. 缓存判据必须比对 times（--out 指向同一目录、目录名没法隔离时就靠这条）
+  const m460 = { ok: true, step: 20, scene: false, times: [460] }
+  must(framesCacheHit(m460, 20, false, [750], 1) === false, 'manifest.times=[460] 却把 --at 750 判成命中——又是 rc=0 给旧帧')
+  must(framesCacheHit(m460, 20, false, [460], 1) === true, '同一组时刻没判成命中——每次都重抽，缓存白做')
+  must(framesCacheHit({ ok: true, step: 20, scene: false }, 20, false, null, 1) === true, '非 at 模式的老 manifest（无 times）没命中——升级后所有老缓存白抽')
+  must(framesCacheHit({ ok: true, step: 20, scene: false }, 20, false, [460], 1) === false, '老 manifest 没有 times 却命中了 at 请求')
+  must(framesCacheHit(m460, 20, false, [460], 0) === false, '零张 jpg 也判成命中——残帧被当完整结果')
+  // 3. manifest 往返：times 真的写进去、真读回来
+  const { writeManifest, readManifest } = compile(b, ['writeManifest', 'readManifest'], {
+    params: ['writeFileSync', 'readFileSync', 'join'], args: [writeFileSync, readFileSync, join],
+  })
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c47-'))
+  let backTimes
+  try {
+    writeManifest(tmp, { ok: true, times: [460, 750] })
+    backTimes = readManifest(tmp)?.times
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+  must(JSON.stringify(backTimes) === '[460,750]', `manifest 里的 times 读回来是 ${JSON.stringify(backTimes)}`)
+  // 4. 调用点：grabFrames 不许退回「只带点数」的写法（剥注释再判——注释里会引用旧写法作对照）
+  const grabBody = stripComments(fnBody(b, 'grabFrames'))
+  must(!grabBody.includes('at-${atTimes.length}p`'), 'grabFrames 里还是 `at-${atTimes.length}p` 只带点数')
+  must(grabBody.includes('atDirTag(atTimes)'), 'grabFrames 没调 atDirTag')
+  must((grabBody.match(/framesCacheHit\(/g) || []).length >= 2, 'grabFrames 的缓存判据没走 framesCacheHit（主判据 + 等锁后那处，两处都要）')
+  // 5. cmdFrames 只列本次时刻（--out 同一个目录里还留着上一轮的帧时，别把旧帧算进本次索引）
+  const { framesToShow } = compile(b, ['framesToShow'])
+  const mixed = ['f_12m30s.jpg', 'f_7m40s.jpg']
+  must(JSON.stringify(framesToShow([460], mixed)) === '["f_7m40s.jpg"]', `--at 460 时列成了 ${JSON.stringify(framesToShow([460], mixed))}——旧帧混进来了`)
+  must(JSON.stringify(framesToShow([750, 460], mixed)) === '["f_12m30s.jpg","f_7m40s.jpg"]', '多个时刻时没按请求顺序列')
+  must(JSON.stringify(framesToShow(null, mixed)) === '["f_12m30s.jpg","f_7m40s.jpg"]', 'r.times 缺失（老缓存）时没退回目录扫描排序')
+  must(stripComments(fnBody(b, 'cmdFrames')).includes('framesToShow(r.times'), 'cmdFrames 没走 framesToShow')
+  // 6. --fresh 删得掉 at 产物（files 里只认 <bv>-NN.jpg 时，f_7m40s.jpg 永远删不掉）
+  const producedLine = fnBody(b, 'grabFrames').split('\n').find((l) => l.includes('const produced'))
+  must(producedLine && producedLine.includes('f_'), 'manifest.files 没把 at 产物（f_12m30s.jpg）算进去——--fresh 删不掉旧时刻帧')
+  return `atDirTag([460])=${d460} ≠ ${d750}；times 不等不命中、零帧不命中、无 times 的老 manifest 非 at 仍命中；manifest 往返 times=${JSON.stringify(backTimes)}`
+})
+
+check('C48 GPU：不确定的结论不许写缓存（P1：一次超时锁死 5 分钟，用户盯着假状态）', () => {
+  const src = read('index.js')
+  const { nextGpuCache } = compile(src, ['nextGpuCache'], { prelude: 'const GPU_CACHE_MS = 5 * 60 * 1000', params: [], args: [] })
+  const old = { at: 100, val: { deviceCount: 1, dllReady: true, cudaLibs: true, note: '' } }
+  const sure = nextGpuCache(old, { confident: true, val: { deviceCount: 1, dllReady: false, cudaLibs: true, note: 'x' } }, 999)
+  must(sure.at === 999 && sure.val.dllReady === false, '确定的结论没写进缓存（那面板会每 8 秒重探）')
+  must(nextGpuCache(old, { confident: false, val: { deviceCount: 0, dllReady: false } }, 999) === old, '不确定的结论也写进了缓存——一次超时锁死 5 分钟')
+  must(nextGpuCache(old, null, 999) === old, '探测异常（res=null）也把假状态写进缓存')
+  must(nextGpuCache(old, { val: { dllReady: true } }, 999) === old, '没带 confident 的旧形状被当成确定（默认信它就会锁死）')
+  // 调用点：gpuStatus 走 nextGpuCache，catch 里不许再写 _gpuCache
+  const g = fnBody(src, 'gpuStatus')
+  must(g.includes('nextGpuCache('), 'gpuStatus 没走 nextGpuCache')
+  must(!/\.catch\([\s\S]{0,400}?_gpuCache\s*=/.test(g), 'gpuStatus 的 catch 里还在写 _gpuCache')
+  // ④ reset 之后旧探测不许落地（WB-CN 2026-10-30 lifecycle 复核：原来 reset 只置空 _probePromise，
+  //   在飞那次完成时照样写缓存——用户刚装完运行库点「重置」，旧结论会把新的盖掉，还再锁 5 分钟）
+  must(g.includes('mySeq === _gpuSeq'), 'gpuStatus 没有序号判据——resetGpuCache() 之后在飞的旧探测会把新结论盖掉')
+  must(fnBody(src, 'resetGpuCache').includes('_gpuSeq++'), 'resetGpuCache 没推进 _gpuSeq，序号判据永远成立')
+  return 'nextGpuCache 真跑：确定才写、不确定/异常/无 confident 都不动缓存；gpuStatus catch 不再写缓存；reset 后旧探测不落地'
+})
+
+check('C49 GPU 探测失败必须说真因（P1：stdio:ignore 让面板只剩一句「加载失败」，看不见超时还是缺 DLL）', () => {
+  const src = read('index.js')
+  const body = fnBody(src, 'probeGpu')
+  must(!/stdio:\s*'ignore'/.test(body), "probeGpu 里还有 stdio:'ignore'——子进程输出全丢，失败只剩笼统文案")
+  const utf8 = (body.match(/encoding:\s*'utf8'/g) || []).length
+  must(utf8 >= 3, `probeGpu 只有 ${utf8} 处收输出，nvidia-smi / spec / --probe-gpu 三处都要（否则看不出真因）`)
+  must(body.includes('probeWhy('), 'probeGpu 失败时没调 probeWhy——真因（超时/退出码/stderr）没进 note')
+  must(!body.includes('cublas64_12.dll 加载失败（GPU 运行库未装'), '旧的笼统文案还在')
+  must(/const GPU_PROBE_TIMEOUT_MS = 10000/.test(src), 'GPU_PROBE_TIMEOUT_MS 不是 10000（3 秒偏紧，机器忙时被当成「没装」）')
+  // probeWhy 真跑：超时要说 killed，非零退出要带 code 与 stderr 末段
+  const { probeWhy } = compile(src, ['probeWhy'], { prelude: 'const GPU_PROBE_TIMEOUT_MS = 10000', params: [], args: [] })
+  const killed = probeWhy({ ok: false, stdout: '', err: { killed: true, code: null, signal: 'SIGTERM' } })
+  must(/超时/.test(killed) && /killed=true/.test(killed), `超时的真因写错了：${killed}`)
+  const bad = probeWhy({ ok: false, stdout: '', err: { code: 1, stderr: 'ImportError: DLL load failed while importing cublas: 找不到指定的模块。' } })
+  must(/code=1/.test(bad) && /DLL load failed/.test(bad), `stderr 没带到 note 里：${bad}`)
+  return `10 秒超时；三处都收 utf8；probeWhy 真跑：超时→「${killed}」、失败→「${bad.slice(0, 60)}…」`
+})
+
+// C50（2026-10-30，WB-CN）：C43 只查函数体字符串——把 peekViaVideoShot 开头插一句
+//   `if (true) return { times: [] }`（后面死代码留着），C43 照样绿，而 peek 永远回落抽帧。
+//   这里真跑：桩掉网络(jget/downloadTo)与 ffmpeg(ffExec)，离线喂一份 index，看 times 到底等于什么。
+//   为什么用子进程：check 回调是同步的，等不了 Promise；子进程里可以 await，execFileSync 天然同步等待。
+check('C50 peek videoshot 真跑到 times（桩掉网络与 ffmpeg）：不许一进门就短路', () => {
+  const script = `
+import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+const SRC = ${JSON.stringify(join(HERE, 'look.mjs'))}
+const src = readFileSync(SRC, 'utf8')
+const i = src.indexOf('async function peekViaVideoShot(')
+if (i < 0) throw new Error('找不到 peekViaVideoShot')
+const j = src.slice(i).search(/\\n\\}/)
+if (j <= 0) throw new Error('peekViaVideoShot 没有行首闭合括号')
+const body = src.slice(i, i + j + 2)
+const dir = mkdtempSync(join(tmpdir(), 'bw-c50-'))
+const INDEX = Array.from({ length: 188 }, (_, k) => k * 5)
+const jget = async () => ({ code: 0, data: { image: ['//i0.hdslb.com/bfs/x.jpg'], index: INDEX, img_x_len: 10, img_y_len: 10, img_x_size: 480, img_y_size: 270 } })
+const downloadTo = async (url, dest) => { writeFileSync(dest, 'x') }
+const ffExec = (bin, args) => { writeFileSync(args[args.length - 1], 'x') }
+const ffTimeoutMs = () => 1000
+try {
+  const f = new Function('jget', 'downloadTo', 'ffExec', 'ffTimeoutMs', 'existsSync', 'join', 'readdirSync', 'unlinkSync',
+    body + '\\nreturn peekViaVideoShot')(jget, downloadTo, ffExec, ffTimeoutMs, existsSync, join, readdirSync, unlinkSync)
+  const r = await f('BV1test', { dur: 936 }, dir, 'ffmpeg')
+  const want = [0, 46, 93, 140, 187].map((k) => INDEX[k])
+  console.log(JSON.stringify({ got: r && r.times, want }))
+} finally { rmSync(dir, { recursive: true, force: true }) }
+`
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c50p-'))
+  try {
+    const f = join(tmp, 'c50.mjs')
+    writeFileSync(f, script)
+    const out = execFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
+    const { got, want } = JSON.parse(out.trim().split('\n').pop())
+    must(Array.isArray(got), `peekViaVideoShot 没返回 times（返回的是 ${JSON.stringify(got)}）——一进门就短路了？`)
+    must(JSON.stringify(got) === JSON.stringify(want), `times 对不上：拿到 ${JSON.stringify(got)}，应该是 index[0/46/93/140/187]=${JSON.stringify(want)}`)
+    return `真跑：index 188 点 → times=${JSON.stringify(got)}，与 index[0/46/93/140/187] 逐个相等`
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

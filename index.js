@@ -283,24 +283,37 @@ function readTuning() {
  * 现在：文件不存在 → 默认值（正常）；存在但坏了 → 改名成 `.broken-<ts>` 留档 + 默认值 + 一次告警。
  * 留档而不是直接拒绝写，是因为拒绝写会让面板「保存」一直失败、用户也不知道该改哪个文件。
  */
-function readDepsCfgFile(p) {
+/**
+ * B2：坏 JSON 三入口统一。三处原来各写一遍「读不到 → 返回默认值；解析失败 → 改名留档 + 返回默认值」，
+ *   现在抽成一个函数。行为以已经改对的那两处为准（uiCfg / cacheCfg）。
+ * 留档而不是直接拒绝写，是因为拒绝写会让面板「保存」一直失败、用户也不知道该改哪个文件。
+ */
+function readJsonOrBackup(p, fallback) {
   let raw
   try {
     raw = readFileSync(p, 'utf8')
   } catch (e) {
     if (e?.code !== 'ENOENT') cfgWarning = `${basename(p)} 读取失败：${String(e?.message || e)}`
-    return {}
+    return fallback
   }
-  if (!raw.trim()) return {}
+  if (!raw.trim()) return fallback
   try {
-    const j = JSON.parse(raw)
-    return (j && typeof j === 'object' && !Array.isArray(j)) ? j : {}
+    return JSON.parse(raw)
   } catch (e) {
     const bak = `${p}.broken-${Date.now()}`
-    try { renameSync(p, bak) } catch {}
-    cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
-    return {}
+    try {
+      renameSync(p, bak)
+      cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
+    } catch (e2) {
+      cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
+    }
+    return fallback
   }
+}
+
+function readDepsCfgFile(p) {
+  const j = readJsonOrBackup(p, {})
+  return (j && typeof j === 'object' && !Array.isArray(j)) ? j : {}
 }
 /**
  * 参数分层专用写入口：一次读盘 → 按白名单改/删 → 整份写回。
@@ -547,7 +560,8 @@ function resolveCacheDir() {
 // 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做。与 tools/look.mjs 的 cacheAdoptNotice 同源。
 // 用户把缓存指到外部目录、那目录里已经有东西、又不是我们的根时，resolveCacheDir 会退到它下面的
 // bili-watch-cache；旧目录原封不动留着，用户容易以为「清了就是清了」。这里只生成一句话，不清理。
-// --adopt 在 0.3.7，提示里不提任何本版不存在的参数；路径取 resolveCacheDir() 当次结果。
+// 严格「只提示」：认领旧目录的开关（--adopt）还没做，所以提示里不提任何当前版本不存在的参数。
+// 路径取 resolveCacheDir() 当次结果。
 // P1-②（2026-10-29 WB 全量审）：/status 是 8 秒轮询，dirStat 会递归 walk 用户目录
 //   （实测 2.8 万文件 664 ms 中位、首跑 2 秒），同步 walk 会顶到面板 10 秒超时并卡别的路由。
 //   所以这里按 10 分钟节流——配置变了最多晚 10 分钟反映，换掉的是每 8 秒一次的全盘扫描。
@@ -695,23 +709,8 @@ const UI_CFG = join(DEPS, 'ui-config.json')
 const DEFAULT_UI_CFG = { hintDismissed: false, activationSeen: false, showInSettings: true, autoHint: true }
 
 function uiCfg() {
-  try {
-    const raw = JSON.parse(readFileSync(UI_CFG, 'utf8'))
-    return { ...DEFAULT_UI_CFG, ...raw }
-  } catch (e) {
-    // X-16a 同族（2026-10-28）：原来坏文件静默回默认值，紧接着 writeUiCfg 就把坏文件覆盖掉——
-    // 用户手改坏的 4 个开关再也找不回来。这里先改名留档（rename 后文件就不存在了，不会重复备份）。
-    if (e?.code !== 'ENOENT') {
-      const bak = `${UI_CFG}.broken-${Date.now()}`
-      try {
-        renameSync(UI_CFG, bak)
-        cfgWarning = `ui-config.json 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
-      } catch (e2) {
-        cfgWarning = `ui-config.json 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
-      }
-    }
-    return { ...DEFAULT_UI_CFG }
-  }
+  const raw = readJsonOrBackup(UI_CFG, DEFAULT_UI_CFG)
+  return { ...DEFAULT_UI_CFG, ...raw }
 }
 function writeUiCfg(patch) {
   const cur = uiCfg()
@@ -1100,30 +1099,10 @@ function walkEntries(dir) {
 }
 
 function cacheCfg() {
-  let raw
-  try {
-    raw = readFileSync(CACHE_CFG, 'utf8')
-  } catch (e) {
-    if (e?.code !== 'ENOENT') cfgWarning = `cache-config.json 读取失败：${String(e?.message || e)}`
-    return { days: DEFAULT_CACHE_DAYS, maxMb: DEFAULT_CACHE_MAX_MB }
-  }
-  try {
-    const j = JSON.parse(raw)
-    return {
-      days: Number.isFinite(j?.days) ? Math.max(1, j.days) : DEFAULT_CACHE_DAYS,
-      maxMb: Number.isFinite(j?.maxMb) ? Math.max(100, j.maxMb) : DEFAULT_CACHE_MAX_MB,
-    }
-  } catch (e) {
-    // #17 同族（2026-10-30）：坏文件原来静默回默认值，紧接着 writeCacheCfg 就把它覆盖掉——
-    //   用户手改坏的两个数值再也找不回来。与 uiCfg / readDepsCfgFile 同口径：先改名留档。
-    const bak = `${CACHE_CFG}.broken-${Date.now()}`
-    try {
-      renameSync(CACHE_CFG, bak)
-      cfgWarning = `cache-config.json 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
-    } catch (e2) {
-      cfgWarning = `cache-config.json 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
-    }
-    return { days: DEFAULT_CACHE_DAYS, maxMb: DEFAULT_CACHE_MAX_MB }
+  const j = readJsonOrBackup(CACHE_CFG, {})
+  return {
+    days: Number.isFinite(j?.days) ? Math.max(1, j.days) : DEFAULT_CACHE_DAYS,
+    maxMb: Number.isFinite(j?.maxMb) ? Math.max(100, j.maxMb) : DEFAULT_CACHE_MAX_MB,
   }
 }
 
@@ -1316,26 +1295,48 @@ function ytdlpVersion() {
 // 探测要跑两个子进程，/status 每 8 秒轮询一次，所以缓存 5 分钟；删完 GPU 运行库后 resetGpuCache() 立刻作废。
 // GPU 第二轮（2026-10-29）：原来 probeGpu 是同步 execFileSync，缓存失效那一次会堵住事件循环，
 //   而面板 8 秒轮询 + 用户手点刷新很容易同时来两个 /status。改成异步 + 模块级 in-flight Promise：
-//   在飞期间所有调用复用同一个 Promise，探测完清空，缓存照旧 5 分钟。超时从 5 秒砍到 3 秒。
-const GPU_PROBE_TIMEOUT_MS = 3000
+//   在飞期间所有调用复用同一个 Promise，探测完清空，缓存照旧 5 分钟。
+// GPU 第三轮（2026-10-30，老大报「面板说运行库未装、手动跑同一个探测却 rc=0」）：
+//   ① 3 秒超时 → 10 秒。探测有 5 分钟缓存，单次慢点没代价；机器忙时 3 秒偏紧，一超时就被当成「没装」。
+//   ② 原来 stdio:'ignore' 把子进程输出全丢了，失败时只剩一句笼统的「加载失败」——真因（超时被 kill /
+//      退出码 / stderr）看不到。现在统一 encoding:'utf8' 收输出，失败时把真因拼进 note。
+//   ③ 只有「结论确定」才写缓存：一次抖动现在会锁死 5 分钟假状态，改成异常/超时只本次返回、下次重探。
+const GPU_PROBE_TIMEOUT_MS = 10000
 const GPU_CACHE_MS = 5 * 60 * 1000
 let _gpuCache = { at: 0, val: null }
 let _probePromise = null
+// ④（2026-10-30，WB-CN 按 lifecycle 复核补的）：reset 之后，在飞那次探测的结果必须作废。
+//   原来 resetGpuCache() 只把 _probePromise 置 null，旧 Promise 完成时照样 .then 写 _gpuCache——
+//   用户在面板点了「重置」（比如刚装完 GPU 运行库），旧探测（基于旧环境）落地会把新结论盖掉，
+//   而且盖完又有 5 分钟缓存。序号就是「这次结果还算不算数」的凭据。
+let _gpuSeq = 0
 function resetGpuCache() {
   _gpuCache = { at: 0, val: null }
   _probePromise = null
+  _gpuSeq++
+}
+/**
+ * ③ 只有「结论确定」才进缓存：一次抖动/超时就把假状态锁死 5 分钟，用户会盯着面板上的错结论。
+ *   抽成纯函数是为了能被 verify.mjs 真跑（喂「确定 / 不确定 / 异常」三种结果，看缓存到底变不变）。
+ *   res 形状：{ val, confident }；confident!==true 或异常(null) → 原样返回旧缓存，本次结论只用不记。
+ */
+function nextGpuCache(cache, res, now = Date.now()) {
+  if (!res || res.confident !== true || !res.val) return cache
+  return { at: now, val: res.val }
 }
 function gpuStatus() {
   // 没有 force 形参：强刷统一走 resetGpuCache()。留一个没人传的 force 会让下一个人
   //   以为「传 true 能强刷」，而实际刷新路径已经改成 resetGpuCache()，两套机制并存会分叉。
   if (_gpuCache.val && Date.now() - _gpuCache.at < GPU_CACHE_MS) return Promise.resolve(_gpuCache.val)
   if (_probePromise) return _probePromise // 在飞就复用，并发 5 次也只起一套 nvidia-smi
+  const mySeq = ++_gpuSeq
   _probePromise = probeGpu()
-    .then((val) => { _gpuCache = { at: Date.now(), val }; return val })
-    .catch(() => {
-      const val = { deviceCount: 0, dllReady: false, cudaLibs: false, note: 'GPU 探测异常，按无卡处理' }
-      _gpuCache = { at: Date.now(), val }
-      return val
+    // ③ 只有「结论确定」才进缓存；不确定（超时/异常）只本次返回，下次重探
+    // ④ 期间被 resetGpuCache() 作废过（序号变了）→ 这是过期观察，不写缓存
+    .then((res) => { if (mySeq === _gpuSeq) _gpuCache = nextGpuCache(_gpuCache, res); return res.val })
+    .catch((e) => {
+      // 探测本身抛异常 → 同样不写缓存（否则一次崩溃锁死 5 分钟假状态）
+      return { deviceCount: 0, dllReady: false, cudaLibs: false, note: `GPU 探测异常，按无卡处理（${String(e?.message ?? e).slice(0, 120)}）` }
     })
     .finally(() => { _probePromise = null })
   return _probePromise
@@ -1350,39 +1351,69 @@ function execFileP(file, args, opts) {
     }
   })
 }
+/** ② 把子进程失败的真因说清楚：超时被 kill / 退出码 / stderr 末段。别只剩一句「加载失败」。 */
+function probeWhy(r) {
+  const e = r?.err
+  if (!e) return '没有返回'
+  if (e.killed) return `超时 ${GPU_PROBE_TIMEOUT_MS}ms 被中止（killed=true）`
+  const out = []
+  if (e.code != null) out.push(`code=${e.code}`)
+  if (e.signal) out.push(`signal=${e.signal}`)
+  const se = String(e.stderr ?? '').replace(/\s+/g, ' ').trim()
+  const so = String(r.stdout ?? '').replace(/\s+/g, ' ').trim()
+  const tail = (se || so).slice(-120)
+  if (tail) out.push(tail)
+  return out.length ? out.join(' ') : String(e.message ?? e).slice(0, 120)
+}
 async function probeGpu() {
   const notes = []
+  let confident = true // 探测过程没被超时/异常打断，结论可信 → 才允许写缓存
   let deviceCount = 0
   const smi = await execFileP('nvidia-smi', ['-L'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
   if (smi.ok) {
     deviceCount = smi.stdout.split('\n').filter((l) => /^\s*GPU\s+\d+:/.test(l)).length
-  } else {
+  } else if (smi.err?.code === 'ENOENT') {
     notes.push('没有 nvidia-smi（未装 NVIDIA 驱动，或不是 NVIDIA 卡）')
+  } else {
+    confident = false
+    notes.push(`nvidia-smi 探测失败：${probeWhy(smi)}`)
   }
   const py = venvAsr().find((p) => existsSync(p)) || ''
   let dllReady = false
   let cudaLibs = false
   if (py) {
-    const spec = await execFileP(py, ['-c', 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("nvidia") else 1)'], { timeout: GPU_PROBE_TIMEOUT_MS, stdio: 'ignore' })
+    const spec = await execFileP(py, ['-c', 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("nvidia") else 1)'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8' })
     cudaLibs = spec.ok
+    if (!spec.ok && spec.err?.killed) {
+      confident = false
+      notes.push(`venv 里查 nvidia 包超时：${probeWhy(spec)}`)
+    }
     if (process.platform === 'win32') {
       // 2026-10-29 修：原来在这里直接 `ctypes.WinDLL("cublas64_12.dll")`，但 pip 装的
       //   cublas 在 site-packages/nvidia/*/bin 里、不在默认 DLL 搜索路径 —— 结果是
       //   「_bili-asr.py 能跑 GPU，面板却说运行库没装」。判据现在改由 ASR 脚本自己答
       //   （它本来就先跑 _add_nvidia_dll_dirs()），一个实现，两处不会分叉。
       const asrPy = join(DEPS, '_bili-asr.py')
-      const dll = existsSync(asrPy)
-        ? await execFileP(py, [asrPy, '--probe-gpu'], { timeout: GPU_PROBE_TIMEOUT_MS, stdio: 'ignore' })
-        : { ok: false }
-      dllReady = dll.ok
-      if (!dllReady) notes.push('cublas64_12.dll 加载失败（GPU 运行库未装，或装了但不在 DLL 搜索路径里）')
+      if (!existsSync(asrPy)) {
+        // 脚本确实不在 = 确定的结论（明确没环境），照常可缓存；不确定的只有「超时/异常」
+        notes.push(`ASR 脚本不存在（${asrPy}），无法探测 DLL`)
+      } else {
+        const dll = await execFileP(py, [asrPy, '--probe-gpu'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8' })
+        dllReady = dll.ok
+        if (!dllReady) {
+          // 超时 = 不知道结果（不确定，不写缓存）；正常非 0 退出 = 确定没装/不在搜索路径
+          if (dll.err?.killed) confident = false
+          notes.push(`cublas64_12.dll 加载失败：${probeWhy(dll)}`)
+        }
+      }
     } else {
       notes.push('非 Windows：GPU 运行库走系统 CUDA，不做 DLL 探测')
     }
   } else {
+    // venv 确实不存在 = 确定的「明确没环境」，可缓存（不必每 8 秒重探）
     notes.push('ASR 环境还没装，装完才能判断 GPU 运行库')
   }
-  return { deviceCount, dllReady, cudaLibs, note: notes.join('；') }
+  return { val: { deviceCount, dllReady, cudaLibs, note: notes.join('；') }, confident }
 }
 
 // C-04（2026-10-29）：面板以前只看 venv 里的 python.exe 在不在就标绿。缺 VC++ Redist 时

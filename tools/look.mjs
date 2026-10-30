@@ -24,7 +24,7 @@
  *   node look.mjs peek <BV>            先看标题/简介/热评 + 5 帧 OCR
  *   node look.mjs clean                清空缓存目录（默认 $DSH_HOME/bili-watch/cache；凭证在上一层，不动）
  *                                      旧缓存位置若还有内容、又没本工具的标记，会提示一句并让到它下面的
- *                                      bili-watch-cache；本版不自动清理那里（0.3.7 给专用命令）
+ *                                      bili-watch-cache；本版不自动清理那里（要清理请手动删旧目录）
  *
  * 红线：默认匿名只读（不带 SESSDATA、不写观看历史、不点赞不收不评论）；
  *       只有显式 --cred 才带登录态，且仍然只读；
@@ -95,18 +95,6 @@ const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 // 缓存根标记：只有我们自己写过这个文件，才认「这个目录已经是缓存根」
 const CACHE_MARK = '.bili-watch-root'
 const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
-function isOwnedEntry(p) {
-  const rel = relative(CACHE, p)
-  const first = rel.split(/[\\/]/)[0]
-  if (OWN_CACHE_DIRS.has(first)) return true
-  if (/^\.(meta-|write-test-)/.test(first)) return true
-  // #1（2026-10-30 E8 总表 58 条里唯一会删用户文件的那条）：BV 目录不能只认名字。
-  //   原来的 /^BV…/ 直接 return true，于是自动清理（autoCleanCache → walkEntries）与 pruneEmptyDirs
-  //   会把用户在缓存根放的一个恰好叫 BV1234567890/ 的目录当成我们的，连里面用户自己的文件一起删。
-  //   改成与 removeOwned（用户点清理）同一判据 isOwnBvDir：名字像 BV 且（有 meta.json 或目录为空）。
-  //   同一个删除面两个入口判据必须相同，否则只修了一边（E8 根因 D：归属判据宽于实际所有权）。
-  return isOwnBvDir(join(CACHE, first), first)
-}
 function dirStat(dir) {
   let files = 0
   let bytes = 0
@@ -237,7 +225,7 @@ function resolveCacheDir() {
 // 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做。
 // 用户把缓存指到外部目录、那目录里已经有东西、又不是我们的根时，上面会退到它下面的
 // bili-watch-cache；旧目录原封不动留在那儿，用户容易以为「清了就是清了」。这里出一行话说明现状。
-// 严格「只提示」：--adopt 在 0.3.7，所以提示里不提任何本版不存在的参数。
+// 严格「只提示」：认领旧目录的开关（--adopt）还没做，所以提示里不提任何当前版本不存在的参数。
 // 路径一律取 resolveCacheDir() 的当次结果，不用模板常量——BILI_WATCH_CACHE 指别处时模板会说谎。
 function cacheAdoptNotice() {
   try {
@@ -946,6 +934,25 @@ function hasAnyLock(root) {
   return walk(root, 0)
 }
 
+// P0（2026-10-30）：--at 模式的目录名。原来只带「点数」（at-1p），--at 460 与 --at 750 撞同一目录，
+//   第二次直接复用第一次的帧且 rc=0（用户要 12:30，给的是 07:40）。
+//   现在带时刻集合的 sha1 前 8 位：目录名长度可控（50 个点也不会炸 Windows 路径长度），不同时刻必然不同目录。
+function atDirTag(atTimes) {
+  if (!atTimes) return null
+  return `at-${atTimes.length}p-${createHash('sha1').update(atTimes.join(',')).digest('hex').slice(0, 8)}`
+}
+
+// P0（2026-10-30）：帧缓存是否可复用。抽成顶层函数是为了能被 verify.mjs 真跑（造 manifest 喂进去看结果），
+//   而不是 grep 字符串——①② 能在 60 条全绿下溜进来，根因就是断言没牙。
+//   at 模式下 step/scene 恒定，唯一能区分两次请求的就是 times；非 at 模式 atTimes=null，
+//   老 manifest（没 times 字段）也要照样命中，不然升级后所有老缓存都白抽。
+function framesCacheHit(m0, safeStep, scene, atTimes, nJpg) {
+  if (!m0?.ok) return false
+  if (m0.step !== safeStep || m0.scene !== scene) return false
+  if (JSON.stringify(m0.times ?? null) !== JSON.stringify(atTimes ?? null)) return false
+  return nJpg > 0
+}
+
 // manifest 记录「这批帧确实抽完了」，防止把残帧当完整结果复用
 function writeManifest(dir, info) {
   try {
@@ -1006,6 +1013,57 @@ function ffExec(bin, args, timeoutOrOpts) {
   }
 }
 
+// A3：--at 参数解析。支持两种形状：
+//   750,760,830   多个时间点（秒，逗号分隔）
+//   12:30-13:10   区间（端点都含，按 step 密度走）
+// 时间格式容错：12:30 / 12:3 都当 12 分 30 秒；abc 直接报错
+function parseAtTimes(atStr, dur, step) {
+  if (!atStr) return null
+  const result = []
+  const parts = String(atStr).split(',')
+  for (const part of parts) {
+    const s = part.trim()
+    if (!s) continue
+    // 区间：12:30-13:10
+    const rangeMatch = s.match(/^(\d+):(\d+(?:\.\d+)?)-(\d+):(\d+(?:\.\d+)?)$/)
+      || s.match(/^(\d+)-(\d+)$/)
+    if (rangeMatch) {
+      let startSec, endSec
+      if (rangeMatch[3] !== undefined) {
+        // mm:ss-mm:ss
+        startSec = parseInt(rangeMatch[1]) * 60 + parseFloat(rangeMatch[2])
+        endSec = parseInt(rangeMatch[3]) * 60 + parseFloat(rangeMatch[4])
+      } else {
+        // sec-sec
+        startSec = parseFloat(rangeMatch[1])
+        endSec = parseFloat(rangeMatch[2])
+      }
+      if (startSec > endSec) throw new Error(`--at 区间起点大于终点：${s}`)
+      if (startSec < 0) startSec = 0
+      if (endSec > dur) endSec = dur
+      // 按 step 密度走
+      const useStep = step > 0 ? step : 5
+      for (let t = startSec; t <= endSec + 0.001; t += useStep) {
+        result.push(Math.round(t))
+      }
+      continue
+    }
+    // 单时间点：12:30 或 750
+    const timeMatch = s.match(/^(\d+):(\d+(?:\.\d+)?)$/)
+    const secMatch = s.match(/^(\d+(?:\.\d+)?)$/)
+    if (timeMatch) {
+      result.push(Math.round(parseInt(timeMatch[1]) * 60 + parseFloat(timeMatch[2])))
+    } else if (secMatch) {
+      result.push(Math.round(parseFloat(secMatch[1])))
+    } else {
+      throw new Error(`--at 时间格式错：${s}（支持 750 / 12:30 / 12:30-13:10）`)
+    }
+  }
+  // 去重 + 排序
+  const uniq = [...new Set(result)].sort((a, b) => a - b)
+  return uniq.length ? uniq : null
+}
+
 // 抽帧间隔按视频时长自适应：短频密一点，长频疏一点（帧越多 OCR 越吃 CPU）
 function autoStep(dur) {
   if (!dur || dur <= 0) return 2
@@ -1028,6 +1086,66 @@ function cachedMp4(bv, page = 1) {
   return null
 }
 
+/**
+ * A2：peek 先走 B 站 videoshot 接口，不用下视频就能看到画面。
+ * 成功返回 true（5 帧已写到 dir），失败返回 false（调用方回落原来的抽帧逻辑）。
+ */
+async function peekViaVideoShot(bv, v, dir, bin) {
+  // 调 videoshot 接口
+  const p = await jget(`https://api.bilibili.com/x/player/videoshot?bvid=${bv}&index=1`)
+  if (p?.code !== 0) throw new Error(`videoshot code=${p?.code}`)
+  const d = p.data
+  if (!d?.image?.length || !d?.index?.length) throw new Error('videoshot 没给 image/index')
+  const { image, index, img_x_len, img_y_len, img_x_size, img_y_size } = d
+  // 在 index 时间点里均匀挑 5 个
+  const n = Math.min(5, index.length)
+  if (n < 3) throw new Error(`index 只有 ${index.length} 个时间点，太少`)
+  const picks = []
+  for (let i = 0; i < n; i++) {
+    const at = Math.floor((index.length - 1) * i / (n - 1))
+    picks.push({ t: index[at], idx: at })
+  }
+  // 对每个 pick，算出它在第几张图、第几行第几列
+  // 一张图是 img_x_len × img_y_len 格（10×10）
+  const cols = img_y_len || 10
+  for (let i = 0; i < picks.length; i++) {
+    const pick = picks[i]
+    // 这个时间点在第几张拼版图里？image 数组每张对应一段 index
+    // 简化处理：假设所有 index 都在第一张图里（大部分视频是这样）
+    // 如果 index 总数 > cols * img_x_len，就需要算第几张图
+    const perSheet = cols * (img_x_len || 10)
+    const sheetIdx = Math.floor(pick.idx / perSheet)
+    const inSheet = pick.idx % perSheet
+    const row = Math.floor(inSheet / cols)
+    const col = inSheet % cols
+    // 下载拼版图（如果还没下过）
+    const sheetUrl = image[Math.min(sheetIdx, image.length - 1)]
+    const sheetFile = join(dir, `_sheet-${sheetIdx}.jpg`)
+    if (!existsSync(sheetFile)) {
+      // B站返回的是协议相对 URL（//i0.hdslb.com/...），要补 https:
+      const absUrl = sheetUrl.startsWith('//') ? 'https:' + sheetUrl : sheetUrl
+      await downloadTo(absUrl, sheetFile)
+    }
+    // 裁出那一格
+    const out = join(dir, `peek-${String(i + 1).padStart(2, '0')}.jpg`)
+    const x = col * (img_x_size || 480)
+    const y = row * (img_y_size || 270)
+    ffExec(bin, [
+      '-y', '-threads', '1', '-i', sheetFile,
+      '-vf', `crop=${img_x_size || 480}:${img_y_size || 270}:${x}:${y}`,
+      '-frames:v', '1', '-q:v', '3', out,
+    ], ffTimeoutMs())
+    if (!existsSync(out)) throw new Error(`裁帧失败：peek-${i + 1}`)
+  }
+  // 清掉中间文件（拼版图）
+  try {
+    for (const f of readdirSync(dir)) {
+      if (f.startsWith('_sheet-')) try { unlinkSync(join(dir, f)) } catch {}
+    }
+  } catch {}
+  return { times: picks.map((p) => p.t) }
+}
+
 async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
   // B16：目录改 `${bv}-p${v.p}-shots`，能被 cachedMp4 的 `${bv}-p${page}-` 前缀命中。
   //       复用方向（DSH 2026-10-26 实跑修正）：先跑 frames 时会命中 peek 留下的 mp4；peek 先跑时抽完帧自删 mp4（B17），
@@ -1037,7 +1155,7 @@ async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
   const jpgs = () => readdirSync(dir).filter((f) => f.endsWith('.jpg'))
   const m0 = readManifest(dir)
   // N05-A3（2026-10-27）：--fresh 要真的重下重抽，别在缓存判定这里就被挡回去
-  if (!fresh && m0?.ok && jpgs().length >= 5) return { dir, cached: true }
+  if (!fresh && m0?.ok && jpgs().length >= 5) return { dir, cached: true, times: m0.times ?? null }
   const lock = await tryLock(dir)
   if (!lock) {
     for (let i = 0; i < 30; i++) {
@@ -1054,6 +1172,17 @@ async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
     //          旧帧也先清掉，免得「新抽」里混着上一轮的残留。
     if (fresh) {
       for (const f of jpgs()) { try { unlinkSync(join(dir, f)) } catch {} }
+    }
+    // A2：先试 B 站 videoshot（不用下视频，省流量和时间）；失败再回落原来的抽帧
+    try {
+      const vs = await peekViaVideoShot(bv, v, dir, bin)
+      if (vs?.times?.length) {
+        writeManifest(dir, { ok: true, bv, p: v.p ?? 1, frames: 5, source: 'videoshot', times: vs.times })
+        return { dir, cached: false, source: 'videoshot', times: vs.times }
+      }
+    } catch (e) {
+      // videoshot 失败不报错，回落原来的抽帧逻辑
+      track(`[track] videoshot 失败，回落抽帧：${e?.message ?? e}`)
     }
     let mp4 = fresh ? null : cachedMp4(bv, v.p ?? 1)
     let ownMp4 = false // B17：只有 peek 自己下的 mp4 才用完删；复用自 cachedMp4 的不能动
@@ -1079,10 +1208,11 @@ async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
       if (existsSync(out)) made.push(out)
     }
     if (made.length < 3) throw new Error(`只抽到 ${made.length} 帧（时长 ${fmtSec(dur)}），可能源流不完整`)
-    writeManifest(dir, { ok: true, bv, p: v.p ?? 1, frames: made.length, pcts })
+    const times = pcts.map((pct) => Math.max(0, Math.floor(dur * pct)))
+    writeManifest(dir, { ok: true, bv, p: v.p ?? 1, frames: made.length, pcts, times })
     // B17：peek 只抽 5 帧，mp4 使命完成——自己下的那份删掉，不占磁盘
     if (ownMp4) { try { unlinkSync(mp4) } catch {} }
-    return { dir, cached: false }
+    return { dir, cached: false, times }
   } finally {
     unlock(lock)
   }
@@ -1122,7 +1252,17 @@ async function cmdPeek(bv, opts = {}) {
   }
   try {
     const r = await peekFrames(bv, v, { ffmpeg: opts.ffmpeg, fresh: !!opts.fresh })
-    console.log(`\n5 帧（${r.cached ? '复用' : '新抽'}）: ${r.dir}`)
+    const srcLabel = r.source === 'videoshot' ? 'videoshot' : 'mp4 抽帧'
+    console.log(`\n5 帧（${r.cached ? '复用' : '新抽 · ' + srcLabel}）: ${r.dir}`)
+    // A4：时间索引固定格式 r1c1 00:00-00:05 @00:02
+    // ① 修复：时间从 r.times 来（videoshot 路径是 index[at]，mp4 路径是 dur*pct），不再用 pcts 重算
+    const times = r.times || []
+    if (times.length) {
+      console.log('索引：')
+      times.forEach((t, i) => {
+        console.log('  ' + fmtIdxLine(1, i + 1, t, t))
+      })
+    }
     const ocrLines = await peekOcrLines(r.dir)
     if (ocrLines) {
       console.log('画面文字（OCR）：')
@@ -1149,14 +1289,25 @@ async function cmdPeek(bv, opts = {}) {
 
 // B39：抽帧数硬上限——模型传极小 --step 会把磁盘抽爆；预计帧数超此值就直接中止
 //   （2026-10-28 任务#2 参数分层：改成从 tuning() 读 maxFrames，用户可在面板调 100–1000，默认 500）
-async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page = 1, scene = false } = {}) {
+async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page = 1, scene = false, at = '' } = {}) {
   const maxFrames = tuning().maxFrames
   const v = await viewOf(bv, page)
+  // A3：--at 优先；同时给 --at 和 --step 时以 --at 为准，并在 stderr 说一句
+  let atTimes = null
+  if (at) {
+    atTimes = parseAtTimes(at, v.dur || 0, step)
+    if (atTimes && step > 0) {
+      console.error('（--at 已指定，忽略 --step）')
+    }
+  }
   const useStep = step > 0 ? step : autoStep(v.dur)
   // T34-P0-2：时长拿不到（0/异常）时别用 2 秒间隔——3 小时视频会抽几千帧
   // （2026-10-26 批次2 修复：原写法 `? safeStep : Math.max(safeStep,10)` 在 const 初始化里自引用，TDZ 必抛 ReferenceError）
   const safeStep = (v.dur > 0) ? useStep : Math.max(useStep, 10)
-  const dirTag = scene ? `scene-${safeStep}s` : `${safeStep}s`
+  // A3：--at 模式下目录名带 at 标记，不按 step
+  // P0（2026-10-30）：原来是 `at-${atTimes.length}p`，只带点数 —— --at 460 与 --at 750 都是 at-1p，
+  //   第二次直接命中第一次的缓存，rc=0 返回旧帧。现在由 atDirTag() 带上时刻指纹。
+  const dirTag = atDirTag(atTimes) || (scene ? `scene-${safeStep}s` : `${safeStep}s`)
   const dir = outDir || join(CACHE, 'frames', `${bv}-p${v.p}-${dirTag}`)
   // --out 指向用户目录时绝不整目录递归删：只覆盖本工具产物（下面会重下 mp4、清 jpg）
   // --fresh 的清理**必须等拿到锁之后**：锁外删会把别人刚写的 .lock 一起删掉，两个进程都以为持锁（2026-10-26 审查 T24）
@@ -1164,8 +1315,9 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   const mp4 = join(dir, `${bv}.mp4`)
   const jpgs = () => readdirSync(dir).filter((f) => f.endsWith('.jpg'))
   // 只有 manifest 说这批帧抽完了才算缓存有效；残帧（中途被打断）会重抽
+  // P0（2026-10-30）：判据必须比对「时刻集合」——at 模式下 step/scene 恒定，光换目录名不够。
   const m0 = readManifest(dir)
-  if (!fresh && m0?.ok && m0.step === safeStep && m0.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
+  if (!fresh && framesCacheHit(m0, safeStep, scene, atTimes, jpgs().length)) return { dir, mp4, cached: true, frames: jpgs().length, times: m0?.times ?? null }
   // B39：先按 时长/step 估一下要抽多少帧，超 maxFrames 就别下载/解码了
   const estFrames = v.dur > 0 ? Math.ceil(v.dur / safeStep) : 0
   if (estFrames > maxFrames) throw new Error(`抽帧数超上限（预计 ${estFrames} 帧，上限 ${maxFrames}）：请改大 --step`)
@@ -1174,7 +1326,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     for (let i = 0; i < 60; i++) {
       await sleep(1000)
       const m = readManifest(dir)
-      if (m?.ok && m.step === safeStep && m.scene === scene && jpgs().length > 0) return { dir, mp4, cached: true, frames: jpgs().length }
+      if (framesCacheHit(m, safeStep, scene, atTimes, jpgs().length)) return { dir, mp4, cached: true, frames: jpgs().length, times: m?.times ?? null }
     }
     throw new Error('同目录有另一个实例在抽帧，等不到结果')
   }
@@ -1216,7 +1368,10 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
 
     let frameTimes = []
     let sceneTh = 0
-    if (scene) {
+    if (atTimes) {
+      // A3：--at 模式，按指定时间点抽
+      frameTimes = atTimes
+    } else if (scene) {
       // 等间隔模式会抽多少帧，scene 模式就挑多少个变化点
       const targetN = Math.max(3, Math.ceil(v.dur / safeStep))
       for (const th of [0.3, 0.15, 0.08]) {
@@ -1228,7 +1383,16 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
       if (!frameTimes.length) throw new Error('scene 检测没找到任何变化点（试试去掉 --scene 走等间隔）')
     }
 
-    if (scene && frameTimes.length) {
+    if (atTimes && frameTimes.length) {
+      // A3：--at 模式，逐点 -ss 抽帧，文件名带时间戳
+      frameTimes.forEach((t) => {
+        const mm = Math.floor(t / 60)
+        const ss = t % 60
+        const tag = `${mm}m${String(ss).padStart(2, '0')}s`
+        const out = join(dir, `f_${tag}.jpg`)
+        ffExec(bin, ['-y', '-threads', '2', '-ss', String(t), '-i', mp4, '-frames:v', '1', '-q:v', '2', out], ffTimeoutMs())
+      })
+    } else if (scene && frameTimes.length) {
       // 场景吸附：逐点 -ss 抽帧
       frameTimes.forEach((t, i) => {
         const out = join(dir, `${bv}-${String(i + 1).padStart(2, '0')}.jpg`)
@@ -1243,9 +1407,11 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     const n = jpgs().length
     if (!n) throw new Error('抽帧没产出图片（可能源流异常）')
     // V1：本次产物的文件名写进 manifest.files，下一轮 --fresh 只按这份清单删
-    const produced = jpgs().filter((f) => new RegExp(`^${bv}-\\d+\\.jpg$`).test(f))
-    writeManifest(dir, { ok: true, bv, p: v.p, step: safeStep, scene, sceneTh: scene ? sceneTh : 0, frames: n, files: produced })
-    return { dir, mp4, frames: n, sceneTh: scene ? sceneTh : 0 }
+    // P1（2026-10-30）：at 模式的产物是 f_7m40s.jpg，原来只认 `<bv>-NN.jpg`，于是 files 恒为空数组，
+    //   下次 --fresh 走「manifest 没有 files 清单 → 一律不碰」，同一个 --out 目录里的旧时刻帧永远删不掉。
+    const produced = jpgs().filter((f) => new RegExp(`^${bv}-\\d+\\.jpg$`).test(f) || /^f_\d+m\d+s\.jpg$/.test(f))
+    writeManifest(dir, { ok: true, bv, p: v.p, step: safeStep, scene, sceneTh: scene ? sceneTh : 0, frames: n, files: produced, times: atTimes })
+    return { dir, mp4, frames: n, sceneTh: scene ? sceneTh : 0, times: atTimes }
   } finally {
     unlock(lock)
   }
@@ -1496,7 +1662,15 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       const t = readFileSync(cacheTxt, 'utf8').trim()
       if (t && t.endsWith(ASR_END)) {
         const clean = t.replace(/\n?<!--end-->\s*$/, '').trim()
-        return { ok: true, text: clean, chars: clean.length, cached: true }
+        // A1 补充：老缓存没有 .cues.json，缓存命中时读一下，有就带上
+        let cues
+        try {
+          const cuesFile = cacheTxt + '.cues.json'
+          if (existsSync(cuesFile)) {
+            cues = JSON.parse(readFileSync(cuesFile, 'utf8'))
+          }
+        } catch {}
+        return { ok: true, text: clean, chars: clean.length, cached: true, cues: cues || undefined, noCues: !cues }
       }
       try { rmSync(cacheTxt, { force: true }) } catch {}
     }
@@ -1541,12 +1715,23 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
     }
     let text = ''
     let verify = null
+    let cues = null
     try {
       const line = String(r2.stdout || '').trim().split('\n').pop()
       if (line && line.startsWith('{')) {
         const js = JSON.parse(line)
         text = String(js.text || '').trim()
         verify = verifyAsr(js)
+        // A1：从 segments 提取 cues（带时间码），缓存命中时没有 cues 就降级成纯文本
+        if (Array.isArray(js.segments) && js.segments.length) {
+          cues = js.segments
+            .filter((s) => String(s?.text ?? '').trim())
+            .map((s) => ({
+              from: Number(s?.start ?? 0),
+              to: Number(s?.end ?? 0),
+              content: String(s?.text ?? '').trim(),
+            }))
+        }
         // 只有整段转写完才落缓存（带结束标记）；失败/零字不留半截
         // T37c-D：首跑被判疑似幻觉（verify.suspect）的结果不落缓存——否则二次跑静默当好文本；
         //   写缓存时已把关，命中返回时无需再跑 verify。
@@ -1554,6 +1739,10 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
           try {
             writeFileSync(cacheTxtTmp, text + '\n' + ASR_END + '\n', 'utf8')
             renameSync(cacheTxtTmp, cacheTxt)
+            // A1：cues 另外存一个 .cues.json，老缓存不受影响（新转写的才有）
+            if (cues && cues.length) {
+              try { writeFileSync(cacheTxt + '.cues.json', JSON.stringify(cues), 'utf8') } catch {}
+            }
           } catch (e2) { try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {} }
         }
       }
@@ -1571,7 +1760,7 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       const diag = String(r2.stderr || '').split(String.fromCharCode(10)).filter((l) => /vad|speech|chars|语种/i.test(l)).join(' | ').slice(0, 400)
       return { ok: false, why: `转写零字${kept ? `（音频已留在 ${kept}）` : ''}${diag ? '；诊断：' + diag : ''}` }
     }
-    return { ok: true, text, chars: text.length, verify }
+    return { ok: true, text, chars: text.length, verify, cues: cues || undefined }
   } catch (e) {
     try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {}
     return { ok: false, why: `转写失败：${String(e?.stderr ?? e?.message ?? e).slice(-200)}` }
@@ -1613,6 +1802,15 @@ async function runOcr(dir, { json = false } = {}) {
 }
 
 // ── 输出 ───────────────────────────────────────────────────────────────
+// A4：时间索引固定格式。只在三处出：peek 索引、sheet 索引、frames --at 索引
+// 格式：r1c1 00:00-00:05 @00:02
+function fmtIdxLine(row, col, startSec, endSec) {
+  const mm = (s) => String(Math.floor(s / 60)).padStart(2, '0')
+  const ss = (s) => String(Math.floor(s % 60)).padStart(2, '0')
+  const mid = (startSec + endSec) / 2
+  return `r${row}c${col} ${mm(startSec)}:${ss(startSec)}-${mm(endSec)}:${ss(endSec)} @${mm(mid)}:${ss(mid)}`
+}
+
 function fmtSec(s) {
   const m = Math.floor(s / 60)
   return m ? `${m}m${String(s % 60).padStart(2, '0')}s` : `${s}s`
@@ -1666,14 +1864,21 @@ function cuesToSrt(cues) {
 }
 
 // 纯文本（2026-10-22 加）：一行一句，去掉时间轴与链接，喂给摘要/翻译最省
-function cuesToTxt(cues) {
+function cuesToTxt(cues, { withTime = false } = {}) {
   const rows = []
   let n = 0
   for (const c of cues || []) {
-    const text = String(c?.content ?? '').trim()
+    const text = String(c?.content ?? c?.text ?? '').trim()
     if (!text) continue
     n++
-    rows.push(text)
+    if (withTime && c?.from != null) {
+      const sec = Math.max(0, Math.floor(Number(c.from)))
+      const mm = String(Math.floor(sec / 60)).padStart(2, '0')
+      const ss = String(sec % 60).padStart(2, '0')
+      rows.push(`[${mm}:${ss}] ${text}`)
+    } else {
+      rows.push(text)
+    }
   }
   return { text: rows.join('\n') + '\n', count: n }
 }
@@ -1866,7 +2071,14 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
   say(
     `  提示 · 关键词重合 ${c.ks.hit}/${c.ks.total}${c.ks.hits.length ? `（${c.ks.hits.join('、')}）` : ''}${c.ks.hit === 0 ? '（零命中，可能标题与主题词不同）' : ''}`,
   )
-  printText(s.text, opts, bv, 'sub')
+  // A1：默认 text 格式带时间码，--no-time 退回纯文本
+  const _noTime = !!(opts && opts.noTime)
+  if (!_noTime && Array.isArray(s.cues) && s.cues.length) {
+    const r = cuesToTxt(s.cues, { withTime: true })
+    printText(r.text, opts, bv, 'sub')
+  } else {
+    printText(s.text, opts, bv, 'sub')
+  }
 }
 
 // T37-P0（注入文本 source tag）：字幕/转写/OCR/评论/弹幕全是陌生人的话，进上下文前必须标来源 + 代码围栏，
@@ -2229,6 +2441,16 @@ function checkOutDir(out) {
   }
 }
 
+// P1（2026-10-30）：--at 模式下该列哪些帧。只列「本次请求的时刻」，别扫整个目录——
+//   `--out` 指向同一个用户目录、上一轮不同时刻的帧还留在那儿时，扫目录会把旧帧一并列出
+//   （用户要 07:40，第一行却是 12:30，rc=0）。抽成顶层函数是为了能被 verify 真跑。
+function framesToShow(times, dirFiles) {
+  if (Array.isArray(times) && times.length) {
+    return times.map((t) => `f_${Math.floor(t / 60)}m${String(t % 60).padStart(2, '0')}s.jpg`)
+  }
+  return dirFiles.filter((f) => f.startsWith('f_') && f.endsWith('.jpg')).sort()
+}
+
 async function cmdFrames(bv, opts = {}) {
   if (opts.outDir) checkOutDir(opts.outDir) // W-32：先过 --out 黑名单，再下载/抽帧
   const sceneTag = opts.scene ? '（场景吸附）' : ''
@@ -2239,10 +2461,27 @@ async function cmdFrames(bv, opts = {}) {
   if (opts.scene && r.sceneTh) console.log(`  场景吸附 · 阈值 ${r.sceneTh} · ${r.frames} 个变化点`)
   console.log(`视频: ${r.mp4}`)
   const names = []
-  for (let i = 1; i < 100; i++) {
-    const n = join(r.dir, `${bv}-${String(i).padStart(2, '0')}.jpg`)
-    if (!existsSync(n)) break
-    names.push(n)
+  if (opts.at) {
+    // A3/A4：--at 模式下文件名是 f_12m30s.jpg，打印索引
+    // P1（2026-10-30）：只列「本次请求的时刻」，别 readdir 整个目录——`--out` 指向同一个用户目录、
+    //   上一轮不同时刻的帧还留在那儿时，原来会把旧帧一并列出（用户要 07:40，第一行却是 12:30，rc=0）。
+    const want = framesToShow(r.times, readdirSync(r.dir))
+    for (const f of want) {
+      if (!existsSync(join(r.dir, f))) continue
+      names.push(join(r.dir, f))
+      // 从文件名解析时间：f_12m30s.jpg → 12*60+30=750 秒
+      const m = /f_(\d+)m(\d+)s\.jpg$/.exec(f)
+      if (m) {
+        const sec = parseInt(m[1]) * 60 + parseInt(m[2])
+        console.log(`  ${fmtIdxLine(1, names.length, sec, sec)}  ${f}`)
+      }
+    }
+  } else {
+    for (let i = 1; i < 100; i++) {
+      const n = join(r.dir, `${bv}-${String(i).padStart(2, '0')}.jpg`)
+      if (!existsSync(n)) break
+      names.push(n)
+    }
   }
   console.log(`帧: ${names.length} 张 → ${names.map((p) => basename(p)).join(', ')}`)
   if (opts.ocr) {
@@ -2325,7 +2564,16 @@ async function cmdSheet(bv, opts = {}) {
     try {
       writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
     } catch {}
-    console.log('每格时间：' + cells.map((x) => `#${x.cell}=${x.mmss}`).join('  '))
+    // A4：时间索引固定格式 r1c1 00:00-00:05 @00:02
+    console.log('索引：')
+    cells.forEach((x, i) => {
+      if (x.sec == null) return
+      const row = Math.floor(i / cols) + 1
+      const col = (i % cols) + 1
+      const startSec = x.sec
+      const endSec = stepUsed > 0 ? startSec + stepUsed : startSec
+      console.log('  ' + fmtIdxLine(row, col, startSec, endSec))
+    })
     console.log('读这张图就能过一遍画面；要精确读字用 ocr <BV>。')
   } finally {
     unlock(lock)
@@ -2881,7 +3129,14 @@ async function cmdText(bv, credPath, opts = {}) {
       return
     }
     track(`[track] ${via}: ok ${s.text.length} 字（语速 ${c.sp.rate ?? '?'} 字/秒，关键词 ${c.ks.hit}/${c.ks.total}）`)
-    printText(s.text, { ...opts, _noFrameCheck: !bait.suspect }, bv)
+    // A1：默认 text 格式带时间码，--no-time 退回纯文本
+    const _noTime = !!(opts && opts.noTime)
+    if (!_noTime && Array.isArray(s.cues) && s.cues.length) {
+      const r = cuesToTxt(s.cues, { withTime: true })
+      printText(r.text, { ...opts, _noFrameCheck: !bait.suspect }, bv)
+    } else {
+      printText(s.text, { ...opts, _noFrameCheck: !bait.suspect }, bv)
+    }
     done()
     return
   }
@@ -2929,7 +3184,18 @@ async function cmdText(bv, credPath, opts = {}) {
           return
         }
         track(`[track] 转写: ok ${a.chars} 字（${rate.toFixed(1)} 字/秒${a.cached ? '，缓存命中' : ''}；机器转写，专有名词可能有错）`)
-        printText(a.text, { ...opts, _noFrameCheck: true }, bv, 'asr')
+        // A1 补充：老缓存（没有 .cues.json）时在 stderr 说一句，别在正文里吵
+        if (a.cached && a.noCues && !opts?.dataOnly) {
+          console.error('（本份无时间码：缓存是旧版本生成的；加 --fresh 重取可带）')
+        }
+        // A1：默认 text 格式带时间码，--no-time 退回纯文本；缓存命中时可能没有 cues
+        const _noTime = !!(opts && opts.noTime)
+        if (!_noTime && Array.isArray(a.cues) && a.cues.length) {
+          const r = cuesToTxt(a.cues, { withTime: true })
+          printText(r.text, { ...opts, _noFrameCheck: true }, bv, 'asr')
+        } else {
+          printText(a.text, { ...opts, _noFrameCheck: true }, bv, 'asr')
+        }
         done()
         return
       } else if (a.verify && a.verify.suspect) {
@@ -3765,6 +4031,8 @@ const HELP = `用法:
   参数分层：转写闸门 asrMaxSec(秒,默认1800)/抽帧上限 maxFrames(默认500)/ASR超时 asrTimeoutSec(秒,默认900)/
             ffmpeg超时 ffmpegTimeoutSec(秒,默认300)/命令超时 cmdTimeoutSec(秒,默认180)，写 deps/deps-config.json
             或面板「常规」「高级设置」；--asr-max <毫秒> 只覆盖转写闸门（flag > config > 默认）。
+  --no-time：text/sub 默认输出带 [mm:ss] 逐句时间码，加这个退回纯文本（不带时间戳）。
+  --at <时刻>：frames/sheet 精看某一刻，支持三种写法——750（秒）、12:30（分:秒）、12:30-13:10（区间）。
 `
 // 6-15：unhandledRejection / uncaughtException 兜底——落 last-error.json 并 exit 1，别让进程直接崩无记录
 function crashDump(err, kind) {
@@ -3794,7 +4062,7 @@ process.on('uncaughtException', (e) => {
 })
 
 // 8-15：未知 flag 给拼写提示（--headd → 你是想用 --head 吗）
-const KNOWN_FLAGS = new Set(['quiet', 'cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head', 'fast', 'full', 'fresh', 'mark-seen', 'ocr', 'poll', 'check', 'scene', 'verify', 'asr-max'])
+const KNOWN_FLAGS = new Set(['quiet', 'cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head', 'fast', 'full', 'fresh', 'mark-seen', 'ocr', 'poll', 'check', 'scene', 'verify', 'asr-max', 'no-time', 'at'])
 // ↑ P2（2026-10-28 全量检查）：补 asr-max。它在 VALUE_OPTS（:2769）与实现（:2813）里早就生效，
 //   却不在这张表里——`look.mjs help --asr-max 30000` 会打印「⚠ 未知参数 --asr-max（已忽略）」，
 //   然后真的生效。index.js 的 KNOWN_FLAGS 同款漏项，两处一起补。
@@ -3907,7 +4175,7 @@ try {
   } else if (cmd === 'view') {
     await cmdView(BV, P)
   } else if (cmd === 'sub') {
-    await cmdSub(BV, CRED, P, { format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full') })
+    await cmdSub(BV, CRED, P, { format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full'), noTime: flag('no-time') })
   } else if (cmd === 'comments') {
     await cmdComments(BV, Number(pos[2] || 10), { format: opt('format') || 'text', out: opt('out') || '' })
   } else if (cmd === 'danmaku') {
@@ -3915,7 +4183,7 @@ try {
   } else if (cmd === 'asr') {
     await cmdAsr(BV, P, opt('ffmpeg'))
   } else if (cmd === 'frames') {
-    await cmdFrames(BV, { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene') })
+    await cmdFrames(BV, { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene'), at: opt('at') })
   } else if (cmd === 'sheet') {
     await cmdSheet(BV, { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh') })
   } else if (cmd === 'substrip') {
@@ -3926,7 +4194,7 @@ try {
     //   注意：verify.mjs 的「全文件禁止无参 findFfmpeg()」抓不到这条——cmdOcr 根本不直接调 findFfmpeg。
     await cmdOcr(BV, { step: STEP, p: P, ffmpeg: opt('ffmpeg') })
   } else if (cmd === 'text') {
-    await cmdText(BV, CRED, { step: STEP, p: P, fast: flag('fast'), mark: flag('mark-seen'), verify: flag('verify'), format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full'), ffmpeg: opt('ffmpeg') })
+    await cmdText(BV, CRED, { step: STEP, p: P, fast: flag('fast'), mark: flag('mark-seen'), verify: flag('verify'), format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full'), ffmpeg: opt('ffmpeg'), noTime: flag('no-time') })
   } else if (cmd === 'local') {
     // W-27（2026-10-28 阶段B-②）：--ffmpeg 在 text/local 这两条链路上是断的——值到了 main 就丢了，
     //   底下 transcribe / grabFrames / probeDur 全用默认候选，自装 ffmpeg 的用户一直走不到自己那份。

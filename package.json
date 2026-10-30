@@ -1,6 +1,6 @@
 {
     "name":  "dsh-bili-watch",
-    "version":  "0.3.8",
+    "version":  "0.3.9",
     "private":  false,
     "description":  "把 B 站视频读成文本给 AI 用：元数据、评论、弹幕、字幕、本地 ASR 转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。本地跑不上传、内容一致性检查、二次读瞬时、为 AI 设计落盘+摘要。",
     "type":  "module",

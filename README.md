@@ -95,6 +95,8 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `--verify` | flag | — | 字幕可疑时抽 5 帧 OCR 交叉校验。字幕正常时不触发 |
 | `--fresh` | flag | — | 忽略缓存强制重跑 |
 | `--mark-seen` | flag | — | 标记为已读 |
+| `--no-time` | flag | — | text/sub 默认输出带 `[mm:ss]` 逐句时间码，加这个退回纯文本（不带时间戳） |
+| `--at <时刻>` | string | — | frames/sheet 精看某一刻，支持三种写法：`750`（秒）、`12:30`（分:秒）、`12:30-13:10`（区间） |
 
 完整参数列表见 `bili-watch help`。
 
