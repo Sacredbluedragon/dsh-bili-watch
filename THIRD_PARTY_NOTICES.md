@@ -3,8 +3,8 @@
 本插件随 npm 包分发的内容，以及由 `scripts/fetch-deps.ps1` 在本机按需安装、**不随本包分发**的第三方组件，其版本与许可如下。
 
 版本号均在本机实测对过：随包依赖来自 `node_modules/qrcode/package.json`；本机 venv 依赖来自
-`<本机工作区>\项目\刷B站助手\.venv-asr\Lib\site-packages\*.dist-info\METADATA` 与
-`.venv-ocr\Lib\site-packages\*.dist-info\METADATA` 的 `Name`/`Version`/`License` 字段；
+`deps/.venv-asr/Lib/site-packages/*.dist-info/METADATA` 与
+`deps/.venv-ocr/Lib/site-packages/*.dist-info/METADATA` 的 `Name`/`Version`/`License` 字段；
 二进制来自 `ffmpeg -version` 与 `yt-dlp --version`。
 
 ---

@@ -210,13 +210,12 @@ let cfgWarning = null
 // issue #2 P3-3（2026-10-28）：bili_watch 工具没注册成功时原来只 console.warn，桌面端看不到控制台，
 // 用户会以为「工具坏了」。改成同时记一条，由 /status 的 warnings 带到面板。
 let toolsWarning = null
+// #17（2026-10-30，P1）：原来这里是裸 JSON.parse——坏文件只记一条 warning 就返回 {}，
+//   下一次任何写入口整份写回，就把用户手改坏的配置永久覆盖掉（正是 X-16a 修过的那个坑，
+//   当时只修了 readDepsCfgFile / uiCfg，漏了读得最多的这一处）。
+//   现在统一走 readDepsCfgFile：坏文件先改名留档，三个读入口只剩一种行为。
 function depsCfg() {
-  try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
-    if (e?.code !== 'ENOENT') {
-      cfgWarning = `deps-config.json 解析失败，已改用 deps 目录：${String(e?.message || e)}`
-    }
-    return {}
-  }
+  return readDepsCfgFile(join(DEPS, 'deps-config.json'))
 }
 /**
  * 参数分层（2026-10-28 阶段B）：面板可调的五个数值，全部并进 deps\deps-config.json，
@@ -345,71 +344,32 @@ function writeTuning(body) {
   }
 }
 function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
-// 凭证路径（2026-10-27 批次9）：两处写入口——panel 的大号凭证
-// $DSH_HOME/bili-duty/bili_credential.json（面板/手工登录写）与 watch 自己的
-// $DSH_HOME/bili-watch/credential.json（插件面板扫码写）。两者并存时**谁新用谁**，
-// 不再「SHARED 存在即返回」——那样 panel 侧重登大号后 watch 永远读旧快照。
-// deps/credential.json 为更旧的 legacy，只在两者都缺时迁移。所有读/写/面板展示都走 resolveCredPath()。
+// 凭证路径（2026-10-30 B 方案）：watch 只认自己这一份。
+//   以前这里是「两处写入口谁新用谁」的 mtime 仲裁——跟随同机另一个 B 站工具写下的凭证。
+//   用户拍板把这套功能整套拿掉，两个理由：
+//     ① 它把一个不属于本插件的本机目录概念写进了公开源码（那个目录只在特定机器上存在，
+//        于是相关分支在用户侧是死代码，却把本机信息泄露给了所有读源码的人）；
+//     ② 「跟随别人写的凭证」本身就不该是 watch 的职责——读谁的号应该由用户在本插件里扫。
+//   现在规则只有一条：$DSH_HOME/bili-watch/credential.json；没有就从 deps/credential.json
+//   （更旧的 legacy）迁移一次；都没有就是未登录（匿名请求）。
 const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'credential.json')
-const PANEL_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.json')
 const LEGACY_CRED = join(DEPS, 'credential.json')
-// 2026-10-28：面板扫码写的是 bili-duty\bili_credential.small.json（小号），watch 这份不会跟着变。
-// 老大的口径是「两个地方用同一份，复制一下即可」——所以这里把它做成一次自动复制，
-// 不引入新的读取优先级：复制后 SHARED 的 mtime 就是现在，后面那段 mtime 仲裁照旧。
-// 单向（panel small → SHARED），不反向写，避免把 watch 扫的号盖掉面板那份。
-const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
-// X-10（2026-10-29）：用户主动删凭证后写这份抑制记录（含删除时刻 panel small 的 mtime）。
-//   放凭证同目录、同生命周期：凭证没了它也没意义，deps 被清空也不影响。
-const CRED_CLEARED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cred-cleared.json')
-// B-10（2026-10-29）：本进程刚扫码写进 SHARED_CRED 的那一次，记下写入后的 mtime。
-//   resolveCredPath 的仲裁是「panelAt >= sharedAt 就用 PANEL_CRED」——刚扫完码时 panel 那份
-//   恰好也被触碰（或同毫秒）就会把新号判给旧号，用户以为登了新号、实际 watch 还在用旧号。
-//   只要磁盘上还是我们自己写的那一份，就优先 SHARED，不参与 mtime 仲裁。
-let sharedWrittenAt = 0
-function syncPanelSmallToShared() {
-  try {
-    const panelAt = statSync(PANEL_SMALL).mtimeMs
-    let sharedAt = 0
-    try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
-    if (sharedAt && panelAt <= sharedAt) return
-    // X-10（2026-10-29）：用户主动删过凭证后，panel 小号那份不能靠 8 秒轮询再复制回来。
-    //   判据用 mtime 而不是时间窗——panel 重新扫码时 PANEL_SMALL 的 mtime 会变新，复制自然恢复。
-    try {
-      const c = JSON.parse(readFileSync(CRED_CLEARED, 'utf8'))
-      if (Number.isFinite(c?.panelMtime) && panelAt <= c.panelMtime) return
-    } catch {}
-    mkdirSync(dirname(SHARED_CRED), { recursive: true })
-    writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
-  } catch {}
-}
 function resolveCredPath() {
-  syncPanelSmallToShared()
-  try {
-    // mtime 比较：panel 侧重登大号（更常见）后 PANEL_CRED 更新，watch 立刻跟上；
-    // watch 自己扫码登了新号则 SHARED 更新，用 SHARED。同 mtime 时偏好 panel（权威源）。
-    const mtimeOf = (p) => { try { return statSync(p).mtimeMs } catch { return 0 } }
-    const sharedAt = mtimeOf(SHARED_CRED)
-    const panelAt = mtimeOf(PANEL_CRED)
-    // B-10（2026-10-29）：刚扫码写的那份优先。磁盘上还是它（mtime 没被别人改写）就直接用它，
-    //   不让 panelAt >= sharedAt 把刚登的新号盖成 panel 侧的旧号。
-    if (sharedWrittenAt && sharedAt === sharedWrittenAt) return SHARED_CRED
-    if (panelAt && panelAt >= sharedAt) return PANEL_CRED
-    if (sharedAt) return SHARED_CRED
-    if (existsSync(LEGACY_CRED)) {
-      try {
-        // 2026-10-26 收口（DSH 拍板）：迁移走 loadCred 同一路径——先解析 JSON 并校验必填字段，
-        // 残缺该拒就拒（继续用旧路径），不把坏凭证原样搬到新路径。
-        const j = JSON.parse(readFileSync(LEGACY_CRED, 'utf8'))
-        const missing = ['sessdata', 'bili_jct', 'buvid3', 'buvid4'].filter((k) => !j[k])
-        if (missing.length) return LEGACY_CRED
-        mkdirSync(dirname(SHARED_CRED), { recursive: true })
-        writeFileSync(SHARED_CRED, JSON.stringify(j, null, 2), { encoding: 'utf8', mode: 0o600 })
-        return SHARED_CRED  // 2026-10-26 批次5：只在真写成功后才返回新路径
-      } catch {
-        return LEGACY_CRED  // JSON 解析失败或写 SHARED 抛错：继续用旧凭证，不返回没写成功的新路径
-      }
+  if (existsSync(SHARED_CRED)) return SHARED_CRED
+  if (existsSync(LEGACY_CRED)) {
+    try {
+      // 2026-10-26 收口（DSH 拍板）：迁移走 loadCred 同一路径——先解析 JSON 并校验必填字段，
+      // 残缺该拒就拒（继续用旧路径），不把坏凭证原样搬到新路径。
+      const j = JSON.parse(readFileSync(LEGACY_CRED, 'utf8'))
+      const missing = ['sessdata', 'bili_jct', 'buvid3', 'buvid4'].filter((k) => !j[k])
+      if (missing.length) return LEGACY_CRED
+      mkdirSync(dirname(SHARED_CRED), { recursive: true })
+      writeFileSync(SHARED_CRED, JSON.stringify(j, null, 2), { encoding: 'utf8', mode: 0o600 })
+      return SHARED_CRED // 2026-10-26 批次5：只在真写成功后才返回新路径
+    } catch {
+      return LEGACY_CRED // JSON 解析失败或写 SHARED 抛错：继续用旧凭证，不返回没写成功的新路径
     }
-  } catch {}
+  }
   return SHARED_CRED
 }
 const LAST_RUN = join(DEPS, 'last-run.json')
@@ -421,10 +381,14 @@ const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'subst
 function isOwnedEntry(p) {
   const rel = relative(CACHE, p)
   const first = rel.split(/[\\/]/)[0]
-  if (/^BV[0-9A-Za-z]{10}/i.test(first)) return true
   if (OWN_CACHE_DIRS.has(first)) return true
   if (/^\.(meta-|write-test-)/.test(first)) return true
-  return false
+  // #1（2026-10-30 E8 总表 58 条里唯一会删用户文件的那条）：BV 目录不能只认名字。
+  //   原来的 /^BV…/ 直接 return true，于是自动清理（autoCleanCache → walkEntries）与 pruneEmptyDirs
+  //   会把用户在缓存根放的一个恰好叫 BV1234567890/ 的目录当成我们的，连里面用户自己的文件一起删。
+  //   改成与 removeOwned（用户点清理）同一判据 isOwnBvDir：名字像 BV 且（有 meta.json 或目录为空）。
+  //   同一个删除面两个入口判据必须相同，否则只修了一边（E8 根因 D：归属判据宽于实际所有权）。
+  return isOwnBvDir(join(CACHE, first), first)
 }
 // A-3（2026-10-28 阶段A）：清理前确认「没有任何会写盘的子目录在被占用」。
 //   原实现只查 frames/.lock 与 frames/<子>/.lock，漏掉 sheet-tmp / substrip-tmp / CACHE 根的 .meta-*.lock / asr。
@@ -521,7 +485,7 @@ function isOurCacheRoot(dir) {
 //   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
 //   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
 function isOwnBvDir(p, name) {
-  if (!/^BV[0-9A-Za-z]{10}/i.test(name)) return false
+  if (!/^BV[0-9A-Za-z]{10}(_|$)/i.test(name)) return false
   if (existsSync(join(p, 'meta.json'))) return true
   // E7 顺带（2026-10-30）：名字是 BV 但目录是空的——那只能是我们建的。
   //   videoDir() 先 mkdir 再校验 BV 有效性，所以 `view BV0000000000` 这类请求失败后会留下一个空壳，
@@ -533,6 +497,8 @@ function isOwnBvDir(p, name) {
   return false
 }
 function removeOwned(dir) {
+  // E6-07（2026-10-30，P1）：下面统计体积一律用 lstat。rmSync 删符号链接只删链接本身，
+  //   按 stat 取的是目标大小——「已清理 X MB」会虚高，而真正腾出的空间是链接那几十字节。
   let files = 0
   let bytes = 0
   const skipped = [] // 非本插件条目，不动（不算失败）
@@ -547,12 +513,12 @@ function removeOwned(dir) {
       const st = dirStat(p)
       try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
-      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === 'login-qr.png') {
       // E7 顺带（2026-10-30）：登录二维码写在缓存根，而原判据只认 BV 目录与 10 个固定子目录，
       //   于是 clean 每次都把它当「不是 bili-watch 的数据」跳过——迁移函数（migrateLegacyCache）却专门保留它，
       //   两处口径互相矛盾，结果是这张图永远留在缓存根。它确实是我们写的，该清。
-      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === CACHE_MARK) {
       // 缓存根标记：静默保留，不进 skip 清单
     } else {
@@ -831,7 +797,19 @@ function runLogRecord(args, code, err, ms) {
   logRun({ command, bv, argv: args || [], code, ms, stderr: err })
 }
 
-function runLook(args, { timeoutMs = 1_200_000, signal = null } = {}) {
+// #12（2026-10-30，P1）：外层硬顶原来写死 20 分钟，而面板能调的内层 ASR 超时上限是 60 分钟。
+//   用户把 asrTimeoutSec 调到 3600，长视频转写会在第 20 分钟被外层杀掉，报的是「超时」，
+//   分不清是哪一层杀的——调大内层等于没调。
+//   现在外层 = max(20 分钟, 内层上限 + 3 分钟余量)：保证内层（更具体的判据）先触发、报得出原因。
+function outerBudgetMs() {
+  try {
+    return Math.max(1_200_000, (readTuning().asrTimeoutSec + 180) * 1000)
+  } catch {
+    return 1_200_000
+  }
+}
+function runLook(args, { timeoutMs = 0, signal = null } = {}) {
+  const limitMs = timeoutMs > 0 ? timeoutMs : outerBudgetMs()
   return new Promise((resolve) => {
     const t0 = Date.now()
     // C组（T42）：Buffer 分块各自 toString 会把跨 UTF-8 边界的汉字切成 ��；先攒 chunk，finish 时统一 concat 再 toString
@@ -887,8 +865,11 @@ function runLook(args, { timeoutMs = 1_200_000, signal = null } = {}) {
     }
     timer = setTimeout(() => {
       killTree(child)
-      finish({ code: -2, out: getOut().trim(), err: (getErr() + '\n[超时]').trim() })
-    }, timeoutMs)
+      // #12：把「哪一层、多少预算」写进错误里。外层预算 = 内层 ASR 超时 + 3 分钟，
+      //   所以内层会先触发；真看到这句就说明是外层兜底，不是转写自己超时。
+      const mins = Math.round(limitMs / 60000)
+      finish({ code: -2, out: getOut().trim(), err: (getErr() + `\n[超时] 整条命令超过 ${mins} 分钟，被插件外层强制结束（不是转写自己报的超时）`).trim() })
+    }, limitMs)
     if (signal) {
       if (signal.aborted) {
         killTree(child)
@@ -999,9 +980,6 @@ async function loginPollOnce(key) {
     } catch (e) {
       return { ok: false, state: 'error', why: `凭证写入失败：${e?.message ?? e}` }
     }
-    // B-10（2026-10-29）：记下这次写的 mtime，resolveCredPath 见到它就优先用这份，
-    //   不让 panel 侧的旧号靠 mtime 仲裁把刚扫的号盖掉。
-    try { sharedWrittenAt = statSync(SHARED_CRED).mtimeMs } catch { sharedWrittenAt = 0 }
     return { ok: true, state: 'ok', data: { mid: jar.dedeuserid || '' } }
   }
   const map = { 86101: 'waiting', 86090: 'scanned', 86038: 'expired' }
@@ -1069,6 +1047,24 @@ function dirStat(dir) {
   return { bytes, files }
 }
 
+// #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就按 10 分钟节流了，
+//   但 cache 那块占用每次都重新 dirStat(CACHE) 全盘递归 walk（3 万文件实测中位 219 ms，
+//   首跑更慢）。面板一开着就是「每 8 秒白扫一遍」。
+//   现在 30 秒节流；清理/清除之后调 invalidateCacheStat() 立刻失效，面板看到的是清完的真实值。
+const CACHE_STAT_TTL_MS = 30 * 1000
+let cacheStatAt = 0
+let cacheStatVal = null
+function cacheStat() {
+  if (cacheStatVal && Date.now() - cacheStatAt < CACHE_STAT_TTL_MS) return cacheStatVal
+  cacheStatVal = dirStat(CACHE)
+  cacheStatAt = Date.now()
+  return cacheStatVal
+}
+function invalidateCacheStat() {
+  cacheStatVal = null
+  cacheStatAt = 0
+}
+
 /**
  * 缓存目录里每个文件的 { path, size, mtime }，用于按天数/总量清理。
  * T35/T40-A1：只遍历插件自己的条目（BV_* / _logs / frames 等白名单）；
@@ -1090,7 +1086,10 @@ function walkEntries(dir) {
       } else {
         if (!isOwnedEntry(p)) continue
         try {
-          const st = statSync(p)
+          // E6-07（2026-10-30，P1）：lstat 不是 stat。rmSync 删符号链接只删链接本身，
+          //   按 stat 取的是目标大小——「按总量清理」会拿一个虚高的体积去凑阈值，
+          //   实际删掉几百字节却以为腾出了几 MB。与 dirStat 同口径。
+          const st = lstatSync(p)
           out.push({ path: p, size: st.size, mtime: st.mtimeMs })
         } catch {}
       }
@@ -1101,13 +1100,29 @@ function walkEntries(dir) {
 }
 
 function cacheCfg() {
+  let raw
   try {
-    const j = JSON.parse(readFileSync(CACHE_CFG, 'utf8'))
+    raw = readFileSync(CACHE_CFG, 'utf8')
+  } catch (e) {
+    if (e?.code !== 'ENOENT') cfgWarning = `cache-config.json 读取失败：${String(e?.message || e)}`
+    return { days: DEFAULT_CACHE_DAYS, maxMb: DEFAULT_CACHE_MAX_MB }
+  }
+  try {
+    const j = JSON.parse(raw)
     return {
-      days: Number.isFinite(j.days) ? Math.max(1, j.days) : DEFAULT_CACHE_DAYS,
-      maxMb: Number.isFinite(j.maxMb) ? Math.max(100, j.maxMb) : DEFAULT_CACHE_MAX_MB,
+      days: Number.isFinite(j?.days) ? Math.max(1, j.days) : DEFAULT_CACHE_DAYS,
+      maxMb: Number.isFinite(j?.maxMb) ? Math.max(100, j.maxMb) : DEFAULT_CACHE_MAX_MB,
     }
-  } catch {
+  } catch (e) {
+    // #17 同族（2026-10-30）：坏文件原来静默回默认值，紧接着 writeCacheCfg 就把它覆盖掉——
+    //   用户手改坏的两个数值再也找不回来。与 uiCfg / readDepsCfgFile 同口径：先改名留档。
+    const bak = `${CACHE_CFG}.broken-${Date.now()}`
+    try {
+      renameSync(CACHE_CFG, bak)
+      cfgWarning = `cache-config.json 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
+    } catch (e2) {
+      cfgWarning = `cache-config.json 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
+    }
     return { days: DEFAULT_CACHE_DAYS, maxMb: DEFAULT_CACHE_MAX_MB }
   }
 }
@@ -1227,6 +1242,8 @@ function autoCleanCache(opts = {}) {
   // 清单 1-7：只删文件会留一堆空目录（跑 100 个视频留 100 个空目录）；删完后自底向上清白名单内空目录
   pruneEmptyDirs(CACHE)
   lastCleanAt = Date.now()
+  // #11：清了东西就让占用缓存失效，否则面板最多 30 秒还在显示清理前的体积
+  if (removed) invalidateCacheStat()
   return { removed, bytes, failed }
 }
 
@@ -1546,7 +1563,47 @@ async function depRows(gpuVal) {
   return rows
 }
 
-/** 一键下载：跑插件自带的 fetch-deps 脚本，后台执行，返回日志路径。 */
+// E1-01（2026-10-30，P0）：「成功」不能由退出码推导，只能由产物推导。
+//   现象：日志写「结束，退出码 0（成功）」，而实际什么都没装。
+//   根因：Windows 上 DSH 跑在带 KILL_ON_JOB_CLOSE 的 Job Object 里（_dsh-supervise.ps1 的
+//   LimitFlags=0x2800），宿主一停，内核回收整棵树；Node 的 spawn 不论 detached 真假都不请求
+//   CREATE_BREAKAWAY_FROM_JOB，所以「关掉宿主继续下」在 win32 上从来就没成立过。
+//   PR#4 修的是同一个功能的另一面（detached:true 让脚本一行都不执行），两个方向都没对——
+//   因为真正的错在于「用退出码当成功判据」，而不是 detached 该怎么设。
+//   现在：退出码 0 之后回查 depRows()（真跑 resolveFfmpeg、venv 里真 import），那一行 ok 才算成功。
+const DOWNLOAD_TARGET_DEPS = {
+  ytdlp: ['ytdlp'],
+  ffmpeg: ['ffmpeg'],
+  asr: ['asr'],
+  ocr: ['ocr'],
+  model: ['model'],
+  cuda: ['cuda'],
+  // all 不含 cuda（C20 的约定），装的是这五项
+  all: ['ytdlp', 'ffmpeg', 'asr', 'ocr', 'model'],
+}
+
+/**
+ * 判断一次下载的最终结论。纯函数，便于真跑断言（C32）。
+ * @param {string} target 下载目标
+ * @param {number|null} code 退出码
+ * @param {string|null} signal 终止信号
+ * @param {Array<{id:string, ok:boolean}>} rows depRows() 的结果；没查成就传 null
+ * @returns {{ok:boolean, note:string}}
+ */
+function downloadVerdict(target, code, signal, rows) {
+  if (signal) return { ok: false, note: `信号 ${signal}` }
+  if ((code ?? 0) !== 0) return { ok: false, note: `退出码 ${code ?? 'null'}` }
+  const ids = DOWNLOAD_TARGET_DEPS[target] || []
+  // 查不到就退一步说「退出码 0」，不谎称成功也不谎称失败——但要把原因写清楚
+  if (!Array.isArray(rows)) return { ok: false, note: `退出码 0，但没能复查产物（depRows 失败）` }
+  const miss = ids.filter((id) => !((rows.find((r) => r && r.id === id) || {}).ok))
+  if (miss.length) {
+    return { ok: false, note: `退出码 0，但 ${miss.join('、')} 仍不可用（宿主被关掉时下载进程会被连带杀掉）` }
+  }
+  return { ok: true, note: `退出码 0，产物已复查` }
+}
+
+/** 一键下载：异步拉起插件自带的 fetch-deps 脚本，立刻返回日志路径（不等下载结束）。 */
 function runDownload(target) {
   const script = join(SCRIPTS, 'fetch-deps.ps1')
   if (!existsSync(script)) return { started: false, why: '插件目录里没有 scripts/fetch-deps.ps1' }
@@ -1568,7 +1625,9 @@ function runDownload(target) {
   //   powershell.exe 启动后约 0.5 秒内以 exit code 0 退出，但 -File 脚本一行都不执行——
   //   stdout/stderr 全空，连脚本第一行该写的落盘标记都不出现。本机控制变量实测：同样的参数、
   //   stdio（ignore/inherit/pipe）与是否绝对路径都不影响结论，只把 detached 切成 false 就正常执行。
-  //   Windows 本来就不会因为父进程退出而杀子进程，所以 win32 不用 detached 也能「关掉宿主继续下」。
+  //   注意：win32 用 detached:false 只是为了让它真的执行，**不是**为了「关掉宿主继续下」——
+  //   宿主在带 KILL_ON_JOB_CLOSE 的 Job Object 里（见上方 downloadVerdict 那段），宿主一退出，
+  //   内核会把下载进程一起回收。所以面板文案只说「已开始」，不许承诺能跨宿主存活。
   const detached = process.platform !== 'win32'
   // A-下载黑洞（2026-10-29 二次修正）：子进程输出不再 stdio:'ignore'，也不再和宿主事件挤同一个文件——
   //   脚本自己的逐行输出写 deps\download.out.log；deps\download.log 只留宿主侧结构化事件
@@ -1614,17 +1673,23 @@ function runDownload(target) {
   })
   // A-下载黑洞（后半）：记退出码。以前脚本崩在 pip install / 模型下载中途，
   //   日志里既没有 stdout 也没有退出码，排障无路。
+  // E1-01（2026-10-30，P0）：退出码 0 不再直接写「成功」——先回查产物（depRows 会真跑
+  //   resolveFfmpeg、在 venv 里真 import 一次）。异步，所以写完日志再 closeOut。
+  //   失败路径不复查（省几秒），只有退出码 0 才值得问一句「东西真装上了吗」。
   child.on('exit', (code, signal) => {
-    try {
-      const tail = signal ? `信号 ${signal}` : `退出码 ${code ?? 'null'}`
-      const bad = (code ?? 0) !== 0 || Boolean(signal)
-      appendFileSync(
-        DOWNLOAD_LOG,
-        `[${new Date().toISOString()}] ${target} 结束，${tail}${bad ? '（失败）' : '（成功）'}（详细输出见 deps\\download.out.log）\n`,
-        'utf8',
-      )
-    } catch {}
-    closeOut()
+    const finish = (rows) => {
+      try {
+        const v = downloadVerdict(target, code, signal, rows)
+        appendFileSync(
+          DOWNLOAD_LOG,
+          `[${new Date().toISOString()}] ${target} 结束，${v.note}${v.ok ? '（成功）' : '（失败）'}（详细输出见 deps\\download.out.log）\n`,
+          'utf8',
+        )
+      } catch {}
+      closeOut()
+    }
+    if ((code ?? 0) !== 0 || signal) { finish(null); return }
+    depRows().then(finish).catch(() => finish(null))
   })
   child.unref()
   return { started: true, log: DOWNLOAD_LOG, outLog }
@@ -1656,21 +1721,6 @@ function deleteDeps(targets) {
       }
       if (anyDeleted) deleted.push(t)
       else skipped.push({ id: t, why: '本来就不存在' })
-      // X-10（2026-10-29）：删完记下「此刻 panel 小号那份的 mtime」。syncPanelSmallToShared 会跳过
-      //   不晚于它的复制，否则 8 秒轮询又把 panel small 复制回来，用户看到凭证「自己长回来」。
-      //   panel 重新扫码后 PANEL_SMALL 的 mtime 会变新 → 自动恢复复制，不需要用户手动解禁。
-      try {
-        let panelMtime = 0
-        try { panelMtime = statSync(PANEL_SMALL).mtimeMs } catch {}
-        mkdirSync(dirname(CRED_CLEARED), { recursive: true })
-        writeFileSync(CRED_CLEARED, JSON.stringify({ at: Date.now(), panelMtime }), 'utf8')
-      } catch {}
-      // 2026-10-27 批次9：resolveCredPath() 现在是「两处写入口谁新用谁」，所以删掉 watch 自己的
-      // 两份不等于「未登录」——panel 的大号凭证还在就会继续用它。这里如实说明，不删 PANEL
-      // （那是业务侧只读身份，归 panel/业务管，watch 删它会毁掉大号）。
-      if (existsSync(PANEL_CRED)) {
-        skipped.push({ id: t, why: 'panel 大号凭证仍在（bili-duty/bili_credential.json），watch 会继续用它；要彻底未登录请到业务侧处理' })
-      }
       continue
     }
     if (t === 'cuda') {
@@ -2197,7 +2247,7 @@ function apply(ctx) {
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
-                    cache: { ...dirStat(CACHE), ...cacheCfg(), dir: maskAbs(CACHE), lastAutoClean: cleaned },
+                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(CACHE), lastAutoClean: cleaned },
                     tuning: readTuning(),
                     tuningDefaults: tuningDefaults(),
                     tuningRanges: tuningRanges(),
@@ -2259,6 +2309,8 @@ function apply(ctx) {
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
                 const cleared = removeOwned(CACHE)
+                // #11：清完立刻让占用缓存失效——面板紧接着那次 /status 要看到清完的真实体积
+                invalidateCacheStat()
                 // 9-8：有权限问题删不掉时不报成功，且 removed 只数真删掉的；面板按 ok/why 显示「部分失败：N 项」
                 const partial = cleared.failed.length > 0
                 return sendJson(res, 200, {
@@ -2286,7 +2338,15 @@ function apply(ctx) {
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/login/poll') {
                 const body = await readJsonBody(req)
-                const r = await loginPollOnce(String(body?.key ?? ''))
+                // E4-03（2026-10-30，P1）：轮询里 fetch 抛错（断网 / 8 秒超时）原来直接冒到最外层 catch，
+                //   回 { ok:false, why }——没有 state。前端拿 state 分分支，认不出就按「等待中」无限重试。
+                //   轮询接口的返回形状必须永远带 state，异常也在这里就地收口。
+                let r
+                try {
+                  r = await loginPollOnce(String(body?.key ?? ''))
+                } catch (e) {
+                  r = { ok: false, state: 'error', why: `轮询失败：${String(e?.message || e)}` }
+                }
                 if (r.state === 'ok') writeLastRun('login', 0)
                 return sendJson(res, 200, r)
               }

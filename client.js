@@ -3,7 +3,7 @@
  *
  * 面板回答三件事（不碰业务流程）：
  *   ① 这个插件依赖的 ffmpeg / yt-dlp / ASR / OCR / 模型 / 登录凭证，现在配好了没有；
- *   ② 缺的可以一键下载（后台跑插件自带的 fetch-deps 脚本，带预估体积）；
+ *   ② 缺的可以一键下载（异步跑插件自带的 fetch-deps 脚本，带预估体积）；
  *   ③ 抽帧缓存占了多少、可以一键清，平时按「天数 + 总量阈值」自动清。
  *
  * 后端只走 host 的 /api/bili-watch（读盘 + 清缓存 + 起下载），面板不存任何凭证。
@@ -16,6 +16,51 @@ const MODULE_LOADER =
   typeof window !== 'undefined' && window.__ModuleLoader__ && typeof window.__ModuleLoader__.load === 'function'
     ? window.__ModuleLoader__
     : { load() { console.warn('[dsh-bili-watch] 需要 DSH ≥ 0.2.0-rc.2（当前宿主缺 window.__ModuleLoader__），插件面板不会显示。请升级 DSH 后重试。') } }
+
+// E4-02（2026-10-30，P0）：删除结果的消息拼装抽成一处，两处调用点共用。
+//   原来单条删除（delOne）写的是 `d.deleted?.length ? 已删除 : 未删除`，而后端删 credential 时
+//   两份凭证文件可能一份删掉、一份 rm 失败——deleted 与 skipped 同时非空，
+//   于是界面只报「已删除 credential」，skipped 里的原因被整条丢掉，用户以为退出干净了。
+//   批量删除那条早就是对的（deleted 与 skipped 都报），这里统一成同一口径，别让两条路各说各话。
+function fmtDelMsg(d) {
+  const deleted = ((d && d.deleted) || []).join('、')
+  const skipped = ((d && d.skipped) || [])
+    .map((s) => (s && s.id && s.why ? `${s.id}（${s.why}）` : (s && s.why) || String(s)))
+    .join('、')
+  if (deleted && skipped) return `已删除：${deleted}；跳过：${skipped}`
+  if (deleted) return `已删除：${deleted}`
+  return `未删除：${skipped || '未知原因'}`
+}
+
+// #10（2026-10-30，P1）：轮询回包 → 下一步动作。抽成纯函数，便于真跑断言（C36）。
+//   原来这段判断写在 tick 里，且无条件 `fails = 0` 之后再 `setQrState(j.state)`：
+//   request() 对非 2xx 是「返回结构化错误」而不是抛异常，所以后端 500 时 j.state 是 undefined，
+//   既不是 ok 也不是 expired/error，于是落到「等待中」分支每 2.5 秒再问一次——5 次兜底永远不触发，
+//   界面永远「等待中」。现在认不出的状态一律算失败，攒够 5 次就停。
+function pollStep(j) {
+  const known = ['ok', 'expired', 'error', 'waiting', 'scanned'].includes(j && j.state)
+  if (j && j.state === 'ok') return { act: 'ok', state: 'ok', why: '' }
+  if (j && (j.state === 'expired' || j.state === 'error')) {
+    return { act: 'stop', state: j.state, why: (j && j.why) || '' }
+  }
+  if (!known) return { act: 'retry', state: 'unknown', why: (j && j.why) || '后端没有返回状态' }
+  return { act: 'wait', state: j.state, why: '' }
+}
+
+// #9（2026-10-30，P1）：/download 的回包是 { ok, data: { results: [{started, log} | {started:false, why}], started } }。
+//   单条路径 2026-10-29 已经改成按 results 读，批量路径还在读扁平的 j.why——后端 ok:true 但目标没启动时，
+//   批量会把「没启动」算成成功，报的原因还是 request() 补的「HTTP 400」，与真实原因完全无关（E4-01）。
+//   两处共用这一份解读，别再各读各的。
+function readDownloadResp(j) {
+  const results = Array.isArray(j?.data?.results) ? j.data.results : []
+  const good = results.filter((r) => r && r.started)
+  const bad = results.filter((r) => r && !r.started)
+  const log = good[0]?.log || j?.data?.log || ''
+  const why = bad.map((r) => r.why).filter(Boolean).join('；') || j?.data?.why || j?.why || ''
+  // results 为空（老宿主 / 只回 started 的形状）时退回整体 ok 判，别把成功退化成「启动失败」
+  const allStarted = results.length ? good.length === results.length : !!(j?.ok || log)
+  return { results, good, bad, log, why, allStarted }
+}
 
 MODULE_LOADER.load({
   id: 'dsh-bili-watch',
@@ -272,8 +317,10 @@ MODULE_LOADER.load({
           try {
             const j = await jpost('/login/poll', { key: qr.key })
             if (stop) return
-            fails = 0
-            if (j.state === 'ok') {
+            // E4-03 / #10（2026-10-30，P1）：状态判断统一走 pollStep，认不出的状态不算「等待中」。
+            const step = pollStep(j)
+            if (step.act !== 'retry') fails = 0
+            if (step.act === 'ok') {
               stop = true
               setQr(null)
               setQrState('ok')
@@ -281,13 +328,22 @@ MODULE_LOADER.load({
               await load()
               return
             }
-            if (j.state === 'expired' || j.state === 'error') {
+            if (step.act === 'stop') {
               stop = true
-              setQrState(j.state)
-              setMsg(j.why || (j.state === 'expired' ? '二维码已过期，请点击「重新扫码」重试。' : '轮询失败'))
+              setQrState(step.state)
+              setMsg(step.why || (step.state === 'expired' ? '二维码已过期，请点击「重新扫码」重试。' : '轮询失败'))
               return
             }
-            setQrState(j.state)
+            if (step.act === 'retry') {
+              fails += 1
+              if (fails >= 5) {
+                stopWith('error', `登录轮询失败：${step.why}。请重新扫码。`)
+                return
+              }
+              setTimeout(tick, 4000)
+              return
+            }
+            setQrState(step.state)
             setTimeout(tick, 2500)
           } catch (e) {
             if (stop) return
@@ -334,23 +390,16 @@ MODULE_LOADER.load({
         setMsg('')
         try {
           const j = await jpost('/download', { target })
-          // 后端回的是 { ok, data: { results: [{started, log} | {started:false, why}], started } }，
-          // 扁平读 j.data.log / j.data.why 永远是 undefined——成功时显示「日志 undefined」，
-          // 失败时把后端写明的具体原因全丢掉，只剩兜底的「启动失败」。
-          const results = Array.isArray(j?.data?.results) ? j.data.results : []
-          const good = results.filter((r) => r && r.started)
-          const bad = results.filter((r) => r && !r.started)
-          const log = good[0]?.log || j?.data?.log || ''
-          const why = bad.map((r) => r.why).filter(Boolean).join('；') || j?.data?.why || j?.why || ''
-          if (good.length && !bad.length) {
-            setMsg(`已开始下载（后台执行，日志 ${log || 'deps/download.log'}）。下载完成后点击刷新查看状态。`)
-          } else if (good.length && bad.length) {
-            setMsg(`部分已开始（${good.length} 项）；失败 ${bad.length} 项：${why || '原因未知'}`)
-          } else if (!results.length && (j?.ok || log)) {
+          const r = readDownloadResp(j)
+          if (r.good.length && !r.bad.length) {
+            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。下载期间请保持面板打开——宿主退出会中断下载，重进面板可重新下；完成后点击刷新查看状态。`)
+          } else if (r.good.length && r.bad.length) {
+            setMsg(`部分已开始（${r.good.length} 项）；失败 ${r.bad.length} 项：${r.why || '原因未知'}`)
+          } else if (!r.results.length && (j?.ok || r.log)) {
             // 老形状 / 空 results 但整体成功：别退化成「启动失败」
-            setMsg(`已开始下载（后台执行，日志 ${log || 'deps/download.log'}）。下载完成后点击刷新查看状态。`)
+            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。下载期间请保持面板打开——宿主退出会中断下载，重进面板可重新下；完成后点击刷新查看状态。`)
           } else {
-            setMsg(why || '启动失败')
+            setMsg(r.why || '启动失败')
           }
         } catch (e) {
           setMsg(String(e?.message || e))
@@ -483,7 +532,10 @@ MODULE_LOADER.load({
           for (const t of picked) {
             try {
               const j = await jpost('/download', { target: t })
-              if (j?.ok === false) bad.push(`${t}（${j.why || '后端未受理'}）`)
+              // #9（2026-10-30，P1）：原来这里只看 j.ok / j.why——后端 ok:true 但这一项没启动时
+              //   （宿主 Job Object 被杀、脚本不存在、目标名不认识），批量会把失败算成成功。
+              const r = readDownloadResp(j)
+              if (!r.allStarted) bad.push(`${t}（${r.why || '后端未受理'}）`)
             } catch (e) {
               bad.push(`${t}（${String(e?.message || e)}）`)
             }
@@ -492,7 +544,7 @@ MODULE_LOADER.load({
           const badTail = `${bad.slice(0, 5).join('、')}${bad.length > 5 ? ` 等 ${bad.length} 项` : ''}`
           if (!okN) setMsg(`下载没有启动：${picked.length} 个目标全部失败 —— ${badTail}。`)
           else if (bad.length) setMsg(`已启动 ${okN} 个下载，${bad.length} 个失败 —— ${badTail}。稍后点击刷新查看状态。`)
-          else setMsg(`已启动 ${okN} 个下载（后台执行，稍后点击刷新查看状态）。`)
+          else setMsg(`已启动 ${okN} 个下载（下载期间请保持面板打开，宿主退出会中断）。`)
           return
         }
         if (!picked.length) {
@@ -502,8 +554,7 @@ MODULE_LOADER.load({
         try {
           const j = await jpost('/delete', { targets: picked })
           const d = j.data || {}
-          const skipped = (d.skipped || []).map((s) => `${s.id}（${s.why}）`).join('、')
-          setMsg(`已删除：${(d.deleted || []).join('、') || '无'}` + (skipped ? `；跳过：${skipped}` : ''))
+          setMsg(fmtDelMsg(d))
           await load()
         } catch (e) {
           setMsg('删除失败：' + String(e?.message || e))
@@ -519,8 +570,8 @@ MODULE_LOADER.load({
         try {
           const j = await jpost('/delete', { targets: [target] })
           const d = j.data || {}
-          const skipped = (d.skipped || []).map((s) => s.why).join('、')
-          setMsg(d.deleted?.length ? `已删除 ${target}` : `未删除：${skipped || '未知原因'}`)
+          // E4-02：不能只看 deleted 非空就报成功——credential 会同时出现在 deleted 与 skipped 里
+          setMsg(fmtDelMsg(d))
           await load()
         } catch (e) {
           setMsg('删除失败：' + String(e?.message || e))
@@ -575,7 +626,7 @@ MODULE_LOADER.load({
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
           ...deps.map((d) => h(DepRow, { key: d.id, d, busy: busy === d.id, onDownload: download, onDelete: delOne })),
           h('div', { 'data-bl-note': '' },
-            '下载在后台执行，使用内置 fetch-deps 脚本；体积为预估值，实际以完成后为准。')),
+            '下载由内置 fetch-deps 脚本执行，需保持面板打开（宿主退出会中断）；体积为预估值，实际以完成后为准。')),
         dlg
           ? h('div', { 'data-bl-sec': '', 'data-bl-dlg': '' },
               h('span', { 'data-bl-sec-title': '' }, dlg === 'download' ? '批量下载（默认全勾选，可取消）' : '批量清理（默认全勾选，可取消）'),

@@ -7,9 +7,10 @@
 
 // 完整视频页：允许 ?p=2&t=30 与尾斜杠
 const RE_FULL = /https?:\/\/(?:www\.|m\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{10})(?:[/?#][^\s<>"'）)]*)?/gi
-// 短链：能识别，但 look.mjs 不能展开（tools/look.mjs:1249-1251），调用方要单独处理
+// 短链：能识别，但本模块只判定、不做 IO，拿不到短码背后的 BV（命中时返回 kind='short', bv=''）；
+// 真正展开成 BV 由下游 look.mjs 的 resolveSource() → expandB23() 完成
 const RE_SHORT = /https?:\/\/b23\.tv\/[0-9A-Za-z]{5,12}(?:[/?#][^\s<>"'）)]*)?/gi
-// ?bvid=BV… 形态（tools/look.mjs:1254 支持）；必须挂在 bilibili.com 域名下，避免任意站点的同名参数被当成视频
+// ?bvid=BV… 形态（由 look.mjs resolveSource() 提取）；必须挂在 bilibili.com 域名下，避免任意站点的同名参数被当成视频
 const RE_BVID_Q = /https?:\/\/(?:www\.|m\.)?bilibili\.com\/video\/[^\s<>"'）)]*?[?&]bvid=(BV[0-9A-Za-z]{10})[^\s<>"'）)]*/gi
 // 裸 BV 号：前后不许粘字母数字
 const RE_BARE = /(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g

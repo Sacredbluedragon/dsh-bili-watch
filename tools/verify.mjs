@@ -8,11 +8,11 @@
  * 用法：node tools/verify.mjs
  * 不进 npm 包（files 里只留 tools/look.mjs，见 package.json）。
  */
-import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readdirSync, renameSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, relative, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -21,9 +21,14 @@ const read = (rel) => readFileSync(join(ROOT, rel), 'utf8')
 
 const results = []
 const check = (name, fn) => {
+  const before = results.length
   try {
     const detail = fn()
-    results.push({ name, ok: true, detail: detail ?? '' })
+    // 2026-10-30（WB-CN）：断言内部调了 skip() 再 return 时，这里不能再补一条 PASS——
+    //   skip() 已经自己 push 过一笔，补进去就成了「同一条断言 SKIP + PASS 各一行」，
+    //   通过数虚高 1（发布树的 C11 一直是这样：53 通过/3 跳过，真实是 52/3）。
+    //   判据用「这一趟有没有新结果」，不猜名字——skip() 传的是短名，与 check 的全名对不上。
+    if (results.length === before) results.push({ name, ok: true, detail: detail ?? '' })
   } catch (e) {
     results.push({ name, ok: false, detail: e?.message ?? String(e) })
   }
@@ -92,6 +97,18 @@ const fnBody = (src, name) => {
   must(j > 0, `${name} 的函数体没有行首闭合括号`)
   return src.slice(i, i + j + 2)
 }
+
+// #20（2026-10-30，P1）：守卫自己的口径必须统一。原来 C6/C7 比「函数体原文」——只改一行注释
+//   就假红，逼得人把注释删掉才能过；而 C17 早就剥注释再比。同一套守卫里两种尺子，
+//   结果就是「无害改注释会假红，真分叉不会红」。
+//   现在统一走这一个 normalize：去行注释 + 压空白。
+//   只认「行首或空白后」的 `//`——`'https://x'`、`/^https?:\/\//` 里的不会被误当注释切掉。
+const stripComments = (s) =>
+  s
+    .split('\n')
+    .map((l) => l.replace(/(^|\s)\/\/.*$/, ''))
+    .join('\n')
+    .replace(/\s+/g, '')
 
 // DB 10-28 独立审核抓到的真问题：只查字符串的断言没有牙——把守卫条件拆成 `if (false && ...)`，
 //   C5 照样 PASS。所以这里把源码里的顶层函数**取出来真跑**：塞进隔离的 Function，喂参数、看返回值。
@@ -382,18 +399,19 @@ check('C14 /status 也过同源闸，所以路径遮罩退化成直通是安全�
   return `guard@${iGuard} < status@${iStatus}`
 })
 
-check('C6 hasAnyLock 判活判过期，且 4 个锁函数两处逐字一致（P1：残留 .lock 会让 clean 永久拒绝）', () => {
+check('C6 hasAnyLock 判活判过期，且 4 个锁函数两处一致（剥注释后比；P1：残留 .lock 会让 clean 永久拒绝）', () => {
   const a = read('index.js')
   const b = read('tools/look.mjs')
   const h = (s) => createHash('md5').update(s).digest('hex').slice(0, 12)
   // 回归复核（2026-10-28）：原来只比 hasAnyLock 自己。但它的判据不是自己写死的，
   //   而是 pidAlive / readLock / lockExpired 三个辅助函数 + LOCK_TTL_MS —— 只比 hasAnyLock 会漏：
   //   有人只改 index.js 的 lockExpired，这条照样绿，面板与 CLI 就悄悄分叉了。
+  // #20（2026-10-30）：比之前先剥注释——改一行注释不算分叉，改一个字符算。
   const names = ['pidAlive', 'readLock', 'lockExpired', 'hasAnyLock']
   for (const n of names) {
-    const fa = fnBody(a, n)
-    const fb = fnBody(b, n)
-    must(fa === fb, `${n} 在两处不一致（index=${h(fa)} look=${h(fb)}）`)
+    const fa = stripComments(fnBody(a, n))
+    const fb = stripComments(fnBody(b, n))
+    must(fa === fb, `${n} 在两处不一致（剥注释后 index=${h(fa)} look=${h(fb)}）`)
   }
   const body = fnBody(a, 'hasAnyLock')
   must(body.includes('pidAlive') && body.includes('lockExpired'), 'hasAnyLock 没判活/判过期')
@@ -419,22 +437,57 @@ check('C6 hasAnyLock 判活判过期，且 4 个锁函数两处逐字一致（P1
   return `4 函数同 md5 ${h(fnBody(a, 'hasAnyLock'))} + TTL 覆盖 asrTimeoutSec`
 })
 
-check('C7 cleanKey 两处逐字一致并剥尾部点号（P2：Windows 会吃掉目录名尾部的点）', () => {
-  const a = fnBody(read('index.js'), 'cleanKey')
-  const b = fnBody(read('tools/look.mjs'), 'cleanKey')
+check('C7 cleanKey 两处一致并剥尾部点号（剥注释后比；P2：Windows 会吃掉目录名尾部的点）', () => {
+  const a = stripComments(fnBody(read('index.js'), 'cleanKey'))
+  const b = stripComments(fnBody(read('tools/look.mjs'), 'cleanKey'))
   must(/\[\\s\.\]\+\$/.test(a), 'index.js 的 cleanKey 没剥尾部点/空格')
   const h = (s) => createHash('md5').update(s).digest('hex').slice(0, 12)
-  must(h(a) === h(b), `两处函数体不一致：index=${h(a)} look=${h(b)}`)
+  must(h(a) === h(b), `两处函数体不一致（剥注释后）：index=${h(a)} look=${h(b)}`)
   return `md5 ${h(a)}`
 })
 
-check('C8 pickCacheDir 两层都做可写探测（P2：只读目录会让两层算出两个不同 CACHE）', () => {
-  const a = fnBody(read('index.js'), 'pickCacheDir')
-  const b = fnBody(read('tools/look.mjs'), 'pickCacheDir')
+check('C8 pickCacheDir 两层都做可写探测，且两处返回同一形状（#18，P1：形状不同会让 CACHE 变成 [object Object]）', () => {
+  const idx = read('index.js')
+  const look = read('tools/look.mjs')
+  const a = fnBody(idx, 'pickCacheDir')
+  const b = fnBody(look, 'pickCacheDir')
   must(a.includes('.write-test-'), 'index.js 没有写探针')
   must(b.includes('.write-test-'), 'look.mjs 没有写探针')
-  must(/return defaultDir/.test(b), 'look.mjs 探测失败后没回退默认目录')
-  return 'ok'
+  // #18（2026-10-30）：原来这条只查「有没有写探针」。可 pickCacheDir 在 index.js 返回
+  //   { dir, fallback }、在 tools/look.mjs 返回字符串——改一侧另一侧就拿到 [object Object]，
+  //   而断言照样绿。现在真跑两个分支，两边都必须返回同一个形状。
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c8-'))
+  try {
+    // 「父级是文件」的路径逼出 catch 分支：mkdir 必失败，与平台无关，也不用改权限
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'x')
+    const bad = join(blocker, 'cache')
+    const good = join(dir, 'cache-ok')
+    const mkIdx = (want) =>
+      compile(idx, ['pickCacheDir'], {
+        prelude: `const CACHE_MARK = '.bili-watch-root'\nfunction resolveCacheDir() { return ${JSON.stringify(want)} }`,
+        params: ['join', 'process', 'homedir', 'mkdirSync', 'existsSync', 'writeFileSync', 'rmSync'],
+        args: [join, { env: { DSH_HOME: join(dir, 'home') }, pid: 1 }, () => dir, mkdirSync, existsSync, writeFileSync, rmSync],
+      }).pickCacheDir
+    const mkLook = (want) =>
+      compile(look, ['pickCacheDir'], {
+        prelude: `const DSH_HOME = ${JSON.stringify(join(dir, 'home'))}\nconst CACHE_MARK = '.bili-watch-root'\nfunction resolveCacheDir() { return ${JSON.stringify(want)} }`,
+        params: ['join', 'mkdirSync', 'existsSync', 'writeFileSync', 'rmSync', 'console', 'process'],
+        args: [join, mkdirSync, existsSync, writeFileSync, rmSync, { error() {} }, { pid: 1 }],
+      }).pickCacheDir
+    for (const [label, mk] of [['index.js', mkIdx], ['tools/look.mjs', mkLook]]) {
+      const ok = mk(good)()
+      must(ok && typeof ok === 'object' && typeof ok.dir === 'string', `${label} 正常路径没返回 { dir }（拿到 ${JSON.stringify(ok)}）`)
+      must(ok.fallback === null, `${label} 正常路径的 fallback 应为 null，实际 ${JSON.stringify(ok.fallback)}`)
+      must(ok.dir === good, `${label} 正常路径返回的 dir 不对：${ok.dir}`)
+      const fb = mk(bad)()
+      must(fb && typeof fb === 'object' && typeof fb.dir === 'string', `${label} 回退分支没返回 { dir }（拿到 ${JSON.stringify(fb)}）`)
+      must(fb.dir !== bad && Boolean(fb.fallback), `${label} 回退分支应换到默认根并给出 fallback 原因，实际 ${JSON.stringify(fb)}`)
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  return '两层都写探针；正常/回退两个分支都返回 { dir, fallback }'
 })
 
 check('C9 KNOWN_FLAGS 两处都认识 --asr-max（P2：真生效却被报「未知参数已忽略」）', () => {
@@ -490,27 +543,68 @@ check('C13 package.json 的 files 是显式列表，且不含内部脚本（P1�
   return `${f.length} 项`
 })
 
-check('C16 凭证同步（panel small → SHARED）两处都要在且函数体一致（漏一处就是「扫码后 watch 还用旧号」）', () => {
-  const grab = (src, name) => {
-    const m = src.match(new RegExp(`function\\s+${name}\\s*\\([^)]*\\)\\s*\\{`))
-    must(m, `找不到 ${name} 定义`)
-    const from = src.indexOf('{', m.index)
-    let d = 0
-    let i = from
-    for (; i < src.length; i++) {
-      if (src[i] === '{') d++
-      else if (src[i] === '}') { d--; if (d === 0) break }
-    }
-    return src.slice(from, i + 1).replace(/\/\/[^\n]*/g, '').replace(/\s+/g, '')
+// 2026-10-30 B 方案：原来 C16 守的是「syncPanelSmallToShared 两处函数体逐字一致」。
+//   用户拍板把「跟随同机其它工具」整套功能拿掉，那个函数已经不存在了——这条断言必须跟着改，
+//   否则它会变成指着已删代码的空转断言（E6-08 说的正是这个毛病）。
+//   新判据改成「终态」：两处都只认自己那份凭证，且全仓不许再出现同机其它工具的痕迹。
+check('C16 凭证只认自己那份：不再跟随同机其它工具（B 方案终态）', () => {
+  const idx = read('index.js')
+  const look = read('tools/look.mjs')
+  for (const [name, src] of [['index.js', idx], ['tools/look.mjs', look]]) {
+    must(!/syncPanelSmallToShared/.test(src), `${name} 里还有 syncPanelSmallToShared（B 方案应已删）`)
+    must(!/PANEL_CRED|PANEL_SMALL|CRED_CLEARED/.test(src), `${name} 里还有同机其它工具的凭证常量`)
   }
-  const a = grab(read('index.js'), 'syncPanelSmallToShared')
-  const b = grab(read('tools/look.mjs'), 'syncPanelSmallToShared')
-  must(a === b, '两处 syncPanelSmallToShared 函数体不一致')
-  for (const [f, caller] of [['index.js', 'resolveCredPath'], ['tools/look.mjs', 'credFor']]) {
-    const re = new RegExp(`function\\s+${caller}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]{0,240}syncPanelSmallToShared\\(\\)`)
-    must(re.test(read(f)), `${f} 的 ${caller}() 里没有调 syncPanelSmallToShared()`)
+  // 两处的凭证解析都只能出现 SHARED / LEGACY 两个路径
+  const body = (src, name) => {
+    const i = src.indexOf(`function ${name}(`)
+    must(i >= 0, `找不到 ${name}`)
+    return src.slice(i, src.indexOf('\n}', i) + 2)
   }
-  return `${a.length} 字符一致，两处已接`
+  const r1 = body(idx, 'resolveCredPath')
+  const r2 = body(look, 'credFor')
+  for (const [n, b] of [['resolveCredPath', r1], ['credFor', r2]]) {
+    must(/SHARED_CRED/.test(b), `${n} 没有用 SHARED_CRED`)
+    must(!/PANEL_/.test(b), `${n} 还在引用同机其它工具的凭证`)
+  }
+  // 删掉仲裁之后，「谁新用谁」的 mtime 比较不该再出现
+  must(!/mtimeOf\(/.test(r2), 'credFor 里还留着 mtime 仲裁')
+  must(/LEGACY_CRED/.test(r1) && /LEGACY_CRED/.test(r2), '两处都应保留 deps 旧路径的一次性迁移')
+
+  // 真跑（不是查字符串）：造四种现场看 resolveCredPath 到底返回哪条、有没有把坏凭证搬过去。
+  //   只查源码里有没有 SHARED_CRED 是纸老虎——把 if 改成恒假照样绿。
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c16-'))
+  try {
+    const shared = join(dir, 'bili-watch', 'credential.json')
+    const legacy = join(dir, 'deps', 'credential.json')
+    const { resolveCredPath } = compile(idx, ['resolveCredPath'], {
+      prelude: `const SHARED_CRED = ${JSON.stringify(shared)}\nconst LEGACY_CRED = ${JSON.stringify(legacy)}`,
+      params: ['existsSync', 'readFileSync', 'writeFileSync', 'mkdirSync', 'dirname'],
+      args: [existsSync, readFileSync, writeFileSync, mkdirSync, dirname],
+    })
+    // ① 两处都没有：只返回 SHARED 路径，不凭空造文件
+    must(resolveCredPath() === shared, '① 两处都没有时应返回 SHARED 路径')
+    must(!existsSync(shared), '① 只是算路径就创建了文件')
+    // ② 旧位置凭证齐全：迁到 SHARED 并返回 SHARED，字段不能丢
+    mkdirSync(dirname(legacy), { recursive: true })
+    writeFileSync(legacy, JSON.stringify({ sessdata: 's', bili_jct: 'j', buvid3: '3', buvid4: '4' }))
+    must(resolveCredPath() === shared, '② 旧凭证齐全时没迁到 SHARED')
+    must(existsSync(shared), '② 旧凭证齐全时没真的写 SHARED')
+    const mig = JSON.parse(readFileSync(shared, 'utf8'))
+    must(mig.sessdata === 's' && mig.buvid4 === '4', '② 迁移把字段弄丢了')
+    // ③ 旧位置凭证残缺：继续用 LEGACY，不迁（半个凭证搬过去等于把登录态弄坏）
+    rmSync(shared, { force: true })
+    writeFileSync(legacy, JSON.stringify({ sessdata: 's' }))
+    must(resolveCredPath() === legacy, '③ 旧凭证缺字段时应继续用 LEGACY，不迁')
+    must(!existsSync(shared), '③ 旧凭证缺字段却还是写了 SHARED')
+    // ④ SHARED 在就永远优先，哪怕 LEGACY 更新——这正是 B 方案要拿掉的「谁新用谁」
+    writeFileSync(shared, JSON.stringify({ sessdata: 'new' }))
+    writeFileSync(legacy, JSON.stringify({ sessdata: 'old', bili_jct: 'j', buvid3: '3', buvid4: '4' }))
+    must(resolveCredPath() === shared, '④ SHARED 存在时不该回读 LEGACY（谁新用谁已拿掉）')
+    must(JSON.parse(readFileSync(shared, 'utf8')).sessdata === 'new', '④ SHARED 被旧凭证覆盖了')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  return '两处都只认 SHARED（+ LEGACY 一次性迁移）；真跑四种现场都对，仲裁与跟随已删'
 })
 
 check('C17 两份 TUNING_DEFS 必须逐键一致（面板能调的项与 CLI 读数同源；改一处漏一处＝面板改了没效果）', () => {
@@ -722,6 +816,520 @@ check('C25 videoDir 抽 BV 两处一致：整条链接不能变成 http 开头�
   must(hit && hit[1] === 'BV1xx411c7mD', '整条链接取不到 BV')
   must(!/^http/.test(hit[1]), '抽出来的东西还是 http 开头')
   return `bvOf ${x.length} 字符两处一致，两处 videoDir 都走它`
+})
+
+// #1（2026-10-30 E8 总表）：删除面有两个入口——用户点清理走 removeOwned，自动清理走 autoCleanCache → walkEntries
+//   → isOwnedEntry。removeOwned 早就改成「名字 + meta.json」，isOwnedEntry 却还按 /^BV…/ 名字直接认领，
+//   于是用户在缓存根放一个自己的 BV1234567890/ 会被自动清理连文件一起删。这条钉两件事：
+//   ① 两处 isOwnedEntry 逐字一致且都问 isOwnBvDir；② 真造目录树，用户的 BV 目录必须不被认领。
+check('C26 自动清理与手点清理同一认领判据：BV 目录必须有 meta.json 或为空（#1，P0：别按名字删）', () => {
+  const a = read('index.js')
+  const b = read('tools/look.mjs')
+  const ea = fnBody(a, 'isOwnedEntry')
+  const eb = fnBody(b, 'isOwnedEntry')
+  must(ea === eb, 'isOwnedEntry 两处函数体不一致：len ' + ea.length + ' vs ' + eb.length)
+  must(/return isOwnBvDir\(/.test(ea), 'isOwnedEntry 没走 isOwnBvDir（还在按名字认领）')
+  must(!/\^BV\[0-9A-Za-z\]\{10\}\/i\.test\(first\)\)\s*return true/.test(ea), 'isOwnedEntry 里仍有「按名字直接 return true」')
+  // 真跑（不只看字符串）
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c26-'))
+  try {
+    writeFileSync(join(dir, '.bili-watch-root'), '{}')
+    mkdirSync(join(dir, 'BV1aaaaaaaaa'))
+    writeFileSync(join(dir, 'BV1aaaaaaaaa', 'meta.json'), '{}')
+    mkdirSync(join(dir, 'BV9999999999'))
+    writeFileSync(join(dir, 'BV9999999999', 'mine.mp4'), 'x')
+    mkdirSync(join(dir, 'BV1234567890extra'))
+    writeFileSync(join(dir, 'BV1234567890extra', 'mine.mp4'), 'x')
+    const { isOwnedEntry } = compile(a, ['isOwnBvDir', 'isOwnedEntry'], {
+      prelude: 'const CACHE = ' + JSON.stringify(dir) + "\nconst OWN_CACHE_DIRS = new Set(['_logs','frames','sheets','sheet-tmp','substrip-tmp','_misc','asr','frames-dl','audio-dl','_hot'])",
+      params: ['relative', 'join', 'existsSync', 'readdirSync'],
+      args: [relative, join, existsSync, readdirSync],
+    })
+    must(isOwnedEntry(join(dir, 'BV1aaaaaaaaa')) === true, '有 meta.json 的 BV 目录没被认领（会漏删自己的）')
+    must(isOwnedEntry(join(dir, 'BV9999999999')) === false, '用户自己的 BV 目录被认领了（自动清理会删里面的文件）')
+    must(isOwnedEntry(join(dir, 'BV1234567890extra')) === false, 'BV 前缀陷阱被认领了（正则缺右边界）')
+    return '两处一致且都问 isOwnBvDir；用户 BV 目录与前缀陷阱都不认领'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// #6（2026-10-30 E8 总表）：安装脚本原本只选 Python 3.10–3.13（理由是「onnxruntime 没 cp314 wheel」，
+//   该理由当天被实测推翻，脚本已把 3.14 收进候选，见 C30）。但「已就绪」判据一直是「文件在不在」，
+//   用户机器上早先由 3.14 建的 venv 照绿，跑起来才在 import 炸。
+//   这条钉住失败文案要点名环境版本（不改判据——3.14 能跑，硬拒会误伤）。
+check('C27 环境用 Python 3.14 建时，ASR/OCR 失败文案要点名（#6：别只说「导入失败」）', () => {
+  const src = read('tools/look.mjs')
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c27-'))
+  try {
+    const v314 = join(dir, 'v314', '.venv-asr')
+    mkdirSync(join(v314, 'Scripts'), { recursive: true })
+    writeFileSync(join(v314, 'pyvenv.cfg'), 'version = 3.14.6\n')
+    const v312 = join(dir, 'v312', '.venv-asr')
+    mkdirSync(join(v312, 'Scripts'), { recursive: true })
+    writeFileSync(join(v312, 'pyvenv.cfg'), 'version = 3.12.13\n')
+    const { pyEnvNote } = compile(src, ['pyEnvNote'], {
+      params: ['join', 'dirname', 'readFileSync'],
+      args: [join, dirname, readFileSync],
+    })
+    const a = pyEnvNote(join(v314, 'Scripts', 'python.exe'))
+    const b = pyEnvNote(join(v312, 'Scripts', 'python.exe'))
+    must(a.includes('3.14'), '3.14 建的环境没被点名：' + JSON.stringify(a))
+    must(b === '', '3.12 建的环境不该提示，实际：' + JSON.stringify(b))
+    must(/pyEnvNote\(ASR_PY\)/.test(src), 'ASR 失败文案没接 pyEnvNote')
+    must(/pyEnvNote\(OCR_PY\)/.test(src), 'OCR 失败文案没接 pyEnvNote')
+    return '3.14 点名、3.12 不提示、ASR/OCR 两条失败出口都接了'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// E7-01（2026-10-30，P0）：闸门原来只写在 cmdText 的降级分支里，cmdAsr 完全没有——直接跑到
+//   「[asr] GPU 转写失败，回落 CPU：bad allocation」。WBin 真跑一次 asr 才暴露。
+//   这条把 canRunAsr 真函数抽出来跑四种组合（不只看文案里有没有「可用内存」这几个字）。
+check('C28 asr 闸门两条腿：时长超限拒绝、长片内存不足拒绝、短片不受内存约束（E7-01，P0）', () => {
+  const src = read('tools/look.mjs')
+  const mk = (freeMB) => compile(src, ['canRunAsr', 'fmtSec'], {
+    prelude: [
+      "const ASR_PY = 'X/python.exe'",
+      "const ASR_SCRIPT = 'X/asr.py'",
+      'const asrReady = () => true',
+      'const tuning = () => ({ asrMaxSec: 1800, asrMemMB: 1536 })',
+      'const freemem = () => ' + (freeMB * 1024 * 1024),
+    ].join('\n'),
+  }).canRunAsr
+
+  const overTime = mk(8000)(2000)                        // 33 分钟 > 30 分钟闸门
+  must(overTime.ok === false, '时长超限没拒绝')
+  must(/转写闸门/.test(overTime.why), '时长拒绝的文案没提转写闸门：' + overTime.why.slice(0, 60))
+
+  const lowMemLong = mk(800)(900)                        // 15 分钟片 + 0.78 GB 可用
+  must(lowMemLong.ok === false, '长片内存不足没拒绝')
+  must(/可用内存/.test(lowMemLong.why), '内存拒绝的文案没提可用内存：' + lowMemLong.why.slice(0, 60))
+  // 文案要给人「怎么办」，不能只是个数字（mkl_malloc 允许出现在解释里，它说明为什么会崩）
+  must(/抽帧|关掉|别的程序/.test(lowMemLong.why), '内存拒绝的文案没给替代方案：' + lowMemLong.why.slice(0, 80))
+
+  const lowMemShort = mk(800)(120)                       // 2 分钟片不受内存判据约束
+  must(lowMemShort.ok === true, '短片被内存判据误拒了')
+
+  const okLong = mk(8000)(900)
+  must(okLong.ok === true, '长片内存充足却被拒了：' + JSON.stringify(okLong))
+
+  // 调用点在 transcribe 里，两条入口共用（cmdAsr / cmdText 不必各写一遍）
+  must(/canRunAsr\(/.test(src), '找不到 canRunAsr')
+  const calls = (src.match(/canRunAsr\(/g) || []).length
+  must(calls >= 2, 'canRunAsr 只有定义没调用点（期望至少「定义 + transcribe 里一次」），实际 ' + calls)
+  return '时长/内存两条腿都拒绝，短片放行，transcribe 内统一调用'
+})
+
+// E7-02（2026-10-30，P0）：--out 黑名单由 checkOutDir 抛错拦住，但外层 catch 调 emitFailureJson，
+//   它读同一个 opt('out') 把「拒绝原因」写进被拒的位置——实测 rc=1 的同时
+//   stderr 打着「✓ 已写入 C:/Windows/Temp/…」，文件真的落在系统目录。这条真跑子进程验三个事实。
+check('C29 --out 指向系统目录：rc≠0、目标文件不创建、正文退回 stdout（E7-02，P0）', () => {
+  const bad = 'C:\\Windows\\Temp\\bw-c29-should-not-exist.json'
+  rmSync(bad, { force: true })
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools', 'look.mjs'), 'clean', '--out', bad], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: { ...process.env, BILI_WATCH_CACHE: mkdtempSync(join(tmpdir(), 'bw-c29-cache-')) },
+  })
+  must(r.status !== 0, 'rc 应该非零，实际 ' + r.status)
+  must(!existsSync(bad), '目标文件被创建了——错误处理器绕过了黑名单：' + bad)
+  must(/不能指向系统目录/.test(String(r.stderr || '')), 'stderr 没说明拒绝原因：' + String(r.stderr || '').slice(0, 120))
+  must(!/已写入/.test(String(r.stderr || '')), 'stderr 里出现了「已写入」（说明它真写了被拒的位置）')
+  // 合法路径仍要能写：别修成「一律不写」
+  const okPath = join(mkdtempSync(join(tmpdir(), 'bw-c29-ok-')), 'out.json')
+  const r2 = spawnSync(process.execPath, [join(ROOT, 'tools', 'look.mjs'), 'clean', '--out', okPath], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: { ...process.env, BILI_WATCH_CACHE: mkdtempSync(join(tmpdir(), 'bw-c29-cache2-')) },
+  })
+  // clean 本来就不落 --out（它只打报告），所以这里只验「合法路径不被误拒」，不验写没写文件
+  must(r2.status === 0, '合法 --out 被误拒了：rc=' + r2.status + ' err=' + String(r2.stderr || '').slice(0, 120))
+  must(!/不能指向/.test(String(r2.stderr || '')), '合法路径也报了「不能指向」')
+  return '系统目录 rc≠0 且文件没建、文案说明了原因；合法路径照常写'
+})
+
+// E6 补充（2026-10-30，B 方案后修订）：仓库根曾有一份 fetch-deps.ps1，与 scripts/ 那份逐字相同，
+//   却没有任何引用（代码走 join(SCRIPTS,'fetch-deps.ps1')，README 也只写 scripts\ 路径）。
+//   两份并存时改一份就静默分叉，所以 2026-10-30 把根目录那份移进 备份\，只留 scripts/ 一份。
+//   这条现在守的是「只能有一份」：根目录再出现同名文件，就是又长出了第二个真相源。
+//   同时钉住 3.14 判据本身：这是「PR#4 的前提已被实测推翻」那处修复的承重点，
+//   只钉「文件唯一」是不够的——把正则改回 1[0-3] 照样绿（见 E6-08 的结构性天花板）。
+check('C30 fetch-deps.ps1 只应有一份（在 scripts/）+ Test-PyVersion 收 3.14（E8 #6）', () => {
+  const b = join(ROOT, 'scripts', 'fetch-deps.ps1')
+  must(existsSync(b), 'scripts/fetch-deps.ps1 不存在——插件调的就是这一份')
+  must(
+    !existsSync(join(ROOT, 'fetch-deps.ps1')),
+    '根目录又出现了 fetch-deps.ps1：插件只调 scripts/ 那份，多一份就是第二个真相源，请删掉或移进备份',
+  )
+  const body = read('scripts/fetch-deps.ps1')
+  // 判据承重点：Test-PyVersion 的版本正则必须收到 3.14
+  const m = /function Test-PyVersion[\s\S]*?return \(\$v -match '([^']+)'\)/.exec(body)
+  must(m, '找不到 Test-PyVersion 的版本正则')
+  must(/1\[0-4\]/.test(m[1]), `Test-PyVersion 的正则仍是 ${m[1]}——3.14 会被硬拒（实测 3.14.6 的 venv 里 onnxruntime 1.31.1 可用）`)
+  must(!/3\.14 没有 onnxruntime 的 wheel/.test(body), '脚本里还留着「3.14 没有 onnxruntime 的 wheel」这句已被实测推翻的话')
+  return `判据 ${m[1]} 已收 3.14；全仓只有 scripts/ 一份（${readFileSync(b).length} B）`
+})
+
+// E4-02（2026-10-30，P0）：删 credential 时后端会**同时** push deleted 与 skipped
+//   （SHARED 那份删掉了、LEGACY 那份 rm 失败，或者反过来）。前端单条删除原来写的是
+//   `d.deleted?.length ? 已删除 : 未删除`，于是只报「已删除 credential」，skipped 里的原因被整条吞掉。
+//   注：B 方案（当天下午）已经把「同机别的工具写的凭证」这个 skipped 来源拿掉了，
+//   但「删了 A 没删掉 B」的形状仍然存在（文件被占用 / 权限不足），所以这条断言继续有效，
+//   喂的载荷换成仍然可能发生的那种原因。
+//   这条把 fmtDelMsg 抽出来真跑：只查「源码里有没有 skipped」挡不住它（原来那行也有 skipped）。
+check('C31 删除结果消息：deleted 与 skipped 同时非空时不许只报成功（E4-02，P0）', () => {
+  const { fmtDelMsg } = compile(read('client.js'), ['fmtDelMsg'])
+  // ① E4-02 的真实形状：一份删掉了，另一份没删掉，watch 还会接着用它
+  const m1 = fmtDelMsg({
+    deleted: ['credential'],
+    skipped: [{ id: 'credential', why: '旧位置的凭证删不掉（文件被占用），watch 还会继续用它' }],
+  })
+  must(/已删除/.test(m1), '① 没报已删除：' + m1)
+  must(/继续用它/.test(m1), '① 把 skipped 的原因吞了——这正是 E4-02：' + m1)
+  // ② 干净删掉：不该冒出「跳过」
+  const m2 = fmtDelMsg({ deleted: ['ytdlp'], skipped: [] })
+  must(/已删除/.test(m2), '② 没报已删除：' + m2)
+  must(!/跳过/.test(m2), '② 干净删除却出现了「跳过」：' + m2)
+  // ③ 什么都没删：必须说清原因，不能只说「未删除」
+  const m3 = fmtDelMsg({ deleted: [], skipped: [{ id: 'model', why: '本来就不存在' }] })
+  must(/未删除/.test(m3) && /本来就不存在/.test(m3), '③ 没说清为什么没删：' + m3)
+  // ④ 空载荷不许抛
+  const m4 = fmtDelMsg({})
+  must(/未删除/.test(m4), '④ 空载荷应报未删除：' + m4)
+  // ⑤ 单条与批量必须共用同一份拼装——否则又会各说各话
+  const src = read('client.js')
+  const calls = (src.match(/setMsg\(fmtDelMsg\(/g) || []).length
+  must(calls >= 2, `只找到 ${calls} 处 setMsg(fmtDelMsg(...))：单条删除与批量删除应共用同一份拼装`)
+  return `四种载荷都对（含「删了但没删干净」），${calls} 处调用共用同一份拼装`
+})
+
+// E1-01（2026-10-30，P0）：下载结束写「（成功）」的依据原来是退出码 0。
+//   Windows 上 DSH 跑在带 KILL_ON_JOB_CLOSE 的 Job Object 里，宿主一停整棵树被内核回收，
+//   下载进程跟着死——而日志照样写「退出码 0（成功）」。PR#4 修的是同一功能的另一面
+//   （detached:true 让脚本一行不执行），两个方向都没对：真正的错是「用退出码当成功判据」。
+//   这条把 downloadVerdict 抽出来真跑，喂「退出码 0 但产物没就绪」这个真实形状。
+check('C32 下载结束的「成功」必须由产物推导，不能只看退出码 0（E1-01，P0）', () => {
+  const src = read('index.js')
+  // 目标映射从源码里取，不手抄——否则测试里那份会和实现分叉
+  const mapSrc = /const DOWNLOAD_TARGET_DEPS = \{[\s\S]*?\n\}/.exec(src)
+  must(mapSrc, '找不到 DOWNLOAD_TARGET_DEPS')
+  const { downloadVerdict } = compile(src, ['downloadVerdict'], { prelude: mapSrc[0] })
+  const rows = (pairs) => pairs.map(([id, ok]) => ({ id, ok }))
+
+  // ① 退出码 0 且产物就绪 → 才算成功
+  const v1 = downloadVerdict('ytdlp', 0, null, rows([['ytdlp', true]]))
+  must(v1.ok, '① 产物就绪却判失败：' + v1.note)
+  // ② 就是 E1-01 的真实形状：退出码 0，但 yt-dlp 还是不可用
+  const v2 = downloadVerdict('ytdlp', 0, null, rows([['ytdlp', false]]))
+  must(!v2.ok, '② 退出码 0 就判成功——这正是 E1-01：' + v2.note)
+  must(/仍不可用/.test(v2.note), '② 没说清「没装好」：' + v2.note)
+  // ③ 查不到产物时不许谎称成功
+  const v3 = downloadVerdict('ytdlp', 0, null, null)
+  must(!v3.ok, '③ depRows 失败却判成功：' + v3.note)
+  // ④ 非零退出码、信号，仍按失败
+  must(!downloadVerdict('ytdlp', 1, null, null).ok, '④ 退出码 1 应失败')
+  must(!downloadVerdict('ytdlp', 0, 'SIGTERM', rows([['ytdlp', true]])).ok, '④ 收到信号应失败')
+  // ⑤ -Target all 只要有一项没就绪就不能算成功（且要点名是哪项）
+  const v5 = downloadVerdict('all', 0, null, rows([['ytdlp', true], ['ffmpeg', true], ['asr', false], ['ocr', true], ['model', true]]))
+  must(!v5.ok, '⑤ all 有缺项却判成功：' + v5.note)
+  must(/asr/.test(v5.note), '⑤ 没点名缺的是哪一项：' + v5.note)
+  // ⑥ 退出处理器必须真的用了这个判据
+  must(/downloadVerdict\(/.test(src.slice(src.indexOf("child.on('exit'"))), "child.on('exit') 里没调用 downloadVerdict")
+  return '产物就绪才算成功；退出码 0 但缺项会点名；查不到产物不谎称成功'
+})
+
+// 2026-10-30（用户要求「全面搜一轮本机泄漏」）：把「哪些字面量不许进包」变成一条可执行的断言。
+//   检查面 = 发布面：文件清单直接从 package.json 的 files 取，不手写——手写就会漏掉以后新增的文件。
+//   注意：C:\Windows / C:\Program Files 这类**系统目录**不算泄漏（它们是判据要拦的目标），
+//   所以盘符规则只扫 C:\Users 与 D–Z 盘，避免把黑名单示例本身判成泄漏。
+//
+//   2026-10-30：本机身份类字面量一律不写死在源码里。
+//   原先这里写死了三份身份（一个 Windows 用户名、一个 B 站昵称、一个 B 站 mid）——而本文件会进公开仓库，
+//   等于拿「防泄漏清单」本身去泄漏真实身份（用户名还好，昵称和 mid 是能直接定位到人的）。
+//   现在三种来源，按优先级合并去重：
+//     ① 环境变量 BILI_WATCH_LEAK_IDS（逗号/空白分隔）
+//     ② 仓库外的 `.leak-ids`（一行一个，# 注释，已 gitignore）——发布树天然没有这个文件，
+//        所以在发布树跑自检时这两类会跳过，结果里会明说少扫了什么，不会假装扫过。
+//     ③ 环境里的用户名（USERNAME / USER）
+//   取不到的那一项跳过：纯 ASCII 短名（<4）几乎必然误报（`\busr\b` 之类），
+//   宁可少扫一项，也不要让别的机器一跑就假红；中文昵称按 ≥2 字放宽。
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const LOCAL_USER = (process.env.USERNAME || process.env.USER || '').trim()
+const okId = (s) => s.length >= 4 || (/[^\x00-\x7F]/.test(s) && s.length >= 2)
+const IDENTITY_IDS = (() => {
+  const fromEnv = String(process.env.BILI_WATCH_LEAK_IDS || '').split(/[,，\s]+/).filter(Boolean)
+  let fromFile = []
+  try {
+    fromFile = readFileSync(join(ROOT, '.leak-ids'), 'utf8')
+      .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
+  } catch { /* 没有这个文件是正常情况（发布树、别人的机器） */ }
+  return [...new Set([...fromEnv, ...fromFile].map((s) => s.trim()).filter(okId))]
+})()
+const IDENTITY_WORDS = [...new Set([LOCAL_USER, ...IDENTITY_IDS].filter(okId))]
+const LEAK_PATTERNS = [
+  [/\bbili-duty\b|\bbili-panel\b|_bili-duty/, '同机其它工具的名字'],
+  // 身份这一条不加 \b：中文昵称前后都不是 ASCII 单词字符，加了反而永不命中
+  ...(IDENTITY_WORDS.length ? [[new RegExp(`(?:${IDENTITY_WORDS.map(escapeRe).join('|')})`), '本机身份（用户名 / 昵称 / mid）']] : []),
+  [/Dsh工作区|DeepSeek-Harness|GPT-SoVITS|刷B站|surf CORE/, '本机路径 / 其它项目名'],
+  [/C:[\\/]Users[\\/]/, 'C 盘用户目录'],
+  // 盘符路径：前面不能是字母（否则 `HKCU:\` 的 `U:`、模板串里 `OCR:\n` 的 `R:` 会误报），
+  //   后面必须还有路径字符（否则注释里的占位符 `X:\` 会误报）。
+  [/(^|[^A-Za-z])[D-Z]:[\\/]\S/, '本机盘符绝对路径'],
+]
+check('C33 打包文件里零本机字面量：昵称 / 盘符路径 / 其它工具名（用户要求全面清查）', () => {
+  const pkg = JSON.parse(read('package.json'))
+  const files = [...(pkg.files || []), 'package.json']
+  must(files.length > 5, 'files 白名单解析失败：' + files.length)
+  const hits = []
+  for (const f of files) {
+    let s
+    try { s = read(f) } catch { continue } // files 里可能有本机未生成的路径
+    for (const [re, why] of LEAK_PATTERNS) {
+      const m = re.exec(s)
+      if (m) hits.push(`${f} → ${why}：${JSON.stringify(m[0])}`)
+    }
+  }
+  must(!hits.length, '打包文件里有本机字面量：\n  ' + hits.join('\n  '))
+  // 不打印身份值本身（那等于在日志里再泄漏一次），只说扫了几个、覆盖到哪几类
+  const idNote = IDENTITY_WORDS.length
+    ? `身份项 ${IDENTITY_WORDS.length} 个`
+    : '身份项 0 个（用户名取不到、也没有 .leak-ids → 昵称/mid 两类没扫）'
+  return `${files.length} 个打包文件零命中（${LEAK_PATTERNS.length} 类规则；${idNote}）`
+})
+
+// E6-07 / E3-03（2026-10-30，P1）：符号链接口径。两处注释都写「与对方同口径」，实际都不成立：
+//   dirStat 在 index.js 是 `else`（链接按自身大小计入），在 tools/look.mjs 是 `else if (e.isFile())`
+//   （链接两个分支都不进，直接跳过）；walkEntries 又用 statSync 取大小（= 目标大小）。
+//   后果：「已清理 X MB」按目标大小虚高，而 rmSync 只删链接本身。
+//   这条不靠字符串：造一份假 dirent 列表真跑 dirStat / walkEntries，看它把链接算成多少。
+check('C34 符号链接口径统一：dirStat 两处、walkEntries 都按 lstat 计（E6-07，P1：已清理 MB 会虚高）', () => {
+  const ents = [
+    { name: 'a.txt', isDirectory: () => false, isFile: () => true },
+    { name: 'link', isDirectory: () => false, isFile: () => false }, // 符号链接：两个 is* 都 false
+  ]
+  const readdirSync = () => ents
+  // 文件 100 B、链接自身 7 B；stat 会跟到目标（9999 B）——用它就说明口径错了
+  const lstatSync = (p) => ({ size: String(p).endsWith('link') ? 7 : 100, mtimeMs: 1 })
+  const statSync = () => { throw new Error('用了 statSync（会跟到链接目标）') }
+  for (const [label, src] of [['index.js', read('index.js')], ['tools/look.mjs', read('tools/look.mjs')]]) {
+    const { dirStat } = compile(src, ['dirStat'], {
+      prelude: `const CACHE_MARK = '.bili-watch-root'`,
+      params: ['readdirSync', 'lstatSync', 'statSync', 'join'],
+      args: [readdirSync, lstatSync, statSync, join],
+    })
+    const r = dirStat('/fake')
+    must(r.files === 2, `${label} 的 dirStat 少算了符号链接（files=${r.files}，应为 2）`)
+    must(r.bytes === 107, `${label} 的 dirStat 体积口径不对（bytes=${r.bytes}，应为 107 = 文件 100 + 链接自身 7）`)
+  }
+  const { walkEntries } = compile(read('index.js'), ['walkEntries'], {
+    prelude: `const CACHE_MARK = '.bili-watch-root'\nfunction isOwnedEntry() { return true }`,
+    params: ['readdirSync', 'lstatSync', 'statSync', 'join'],
+    args: [readdirSync, lstatSync, statSync, join],
+  })
+  const out = walkEntries('/fake')
+  must(out.length === 2, `walkEntries 还在用 statSync 取大小（条目数 ${out.length}，应为 2）`)
+  must(out.find((e) => e.path.endsWith('link'))?.size === 7, 'walkEntries 把链接按目标大小算了')
+  return '两处 dirStat 都按 lstat 计链接；walkEntries 也用 lstat'
+})
+
+// #9（2026-10-30，P1）：/download 回包是 { ok, data: { results: [...] } }。单条路径 2026-10-29
+//   改成按 results 读了，批量路径还在看扁平 j.ok / j.why——后端 ok:true 但目标没启动时（宿主
+//   Job Object 被杀、脚本不存在、目标名不认识），批量把失败算成成功，报的原因还是 request()
+//   补的「HTTP 400」，与真实原因完全无关。这条把 readDownloadResp 抽出来真跑三种真实形状。
+check('C35 批量下载必须读 data.results[].why，不能只看 ok（#9，P1：报的原因与真实原因无关）', () => {
+  const src = read('client.js')
+  const { readDownloadResp } = compile(src, ['readDownloadResp'])
+  // ① 后端 400：每一项自己的 why 才是原因
+  const r1 = readDownloadResp({
+    ok: false,
+    why: 'HTTP 400',
+    data: { results: [{ started: false, why: '插件目录里没有 scripts/fetch-deps.ps1' }], started: 0 },
+  })
+  must(r1.allStarted === false, '① 目标没启动却判成成功')
+  must(/fetch-deps\.ps1/.test(r1.why), '① 没取到 results[].why，拿到的是：' + r1.why)
+  // ② ok:true 但目标没启动——这正是 #9 的形状
+  const r2 = readDownloadResp({ ok: true, data: { results: [{ started: false, why: '下载进程被宿主带走' }], started: 0 } })
+  must(r2.allStarted === false, '② ok:true 时把「没启动」算成了成功')
+  // ③ 正常启动
+  const r3 = readDownloadResp({ ok: true, data: { results: [{ started: true, log: 'deps/download.log' }], started: 1 } })
+  must(r3.allStarted === true && r3.log === 'deps/download.log', '③ 正常启动被判失败')
+  // ④ 两处调用点共用同一份解读（定义 1 + 单条 1 + 批量 1）
+  const n = (src.match(/readDownloadResp\(/g) || []).length
+  must(n >= 3, `只找到 ${n} 处 readDownloadResp：单条与批量应共用同一份解读`)
+  return '三种形状都对；单条与批量共用同一份解读'
+})
+
+// #10（2026-10-30，P1）：/login/poll 的 500 分支原来没有 state，前端把 undefined 当「等待中」
+//   无限重试。这条真跑 pollStep 五种输入，并钉住后端异常分支也必须带 state。
+check('C36 登录轮询：认不出的 state 不许当「等待中」（#10，P1：界面会永远等待中）', () => {
+  const { pollStep } = compile(read('client.js'), ['pollStep'])
+  const ok = pollStep({ state: 'ok' })
+  must(ok.act === 'ok', 'state=ok 应结束并保存')
+  const exp = pollStep({ state: 'expired' })
+  must(exp.act === 'stop' && exp.state === 'expired', 'state=expired 应停下')
+  const err = pollStep({ state: 'error', why: '凭证写入失败' })
+  must(err.act === 'stop' && /凭证写入失败/.test(err.why), 'state=error 应停下并带上原因')
+  const wait = pollStep({ state: 'waiting' })
+  must(wait.act === 'wait', 'state=waiting 应继续等')
+  // ⑤ 后端 500 的形状：{ ok:false, why:'HTTP 500：…' }，没有 state
+  const bad = pollStep({ ok: false, why: 'HTTP 500：轮询失败' })
+  must(bad.act === 'retry', '没有 state 时被当成了「等待中」——这正是 #10')
+  must(/HTTP 500/.test(bad.why), '没有 state 时没把后端的原因带出来')
+  // 后端：/login/poll 分支必须自己接住异常并给 state
+  const idx = read('index.js')
+  const i = idx.indexOf("url.pathname === '/api/bili-watch/login/poll'")
+  must(i > 0, '找不到 /login/poll 路由')
+  const seg = idx.slice(i, i + 800)
+  must(/catch/.test(seg), '/login/poll 没接住 loginPollOnce 抛错——会冒到最外层 500，回包没有 state')
+  must(/state:\s*'error'/.test(seg), "/login/poll 的异常分支没写 state:'error'")
+  return '五种状态都对（含后端 500 的无 state 形状）；后端异常也带 state'
+})
+
+// #12（2026-10-30，P1）：外层硬顶写死 20 分钟，而面板能调的 ASR 超时上限是 60 分钟——
+//   调到 3600 的长视频会在第 20 分钟被外层杀掉，报「超时」还分不清哪层杀的。
+check('C37 外层超时必须覆盖内层可调的 ASR 超时上限（#12，P1：调大内层等于没调）', () => {
+  const src = read('index.js')
+  const mk = (asrTimeoutSec) =>
+    compile(src, ['outerBudgetMs'], {
+      prelude: `function readTuning() { return { asrTimeoutSec: ${asrTimeoutSec} } }`,
+    }).outerBudgetMs
+  const b = mk(3600)()
+  must(b > 3600 * 1000, `asrTimeoutSec=3600 时外层只有 ${b} ms——内层还没到点就被外层杀了`)
+  const d = mk(900)()
+  must(d === 1_200_000, `默认配置下外层预算应保持 20 分钟，实际 ${d} ms`)
+  // runLook 必须真的用 limitMs，不能只定义不用
+  const body = fnBody(src, 'runLook')
+  must(/const limitMs =/.test(body), 'runLook 没有引入 limitMs')
+  must(/\},\s*limitMs\)/.test(body), 'runLook 的定时器还在用 timeoutMs——改动没生效')
+  return `asrTimeoutSec=3600 → 外层 ${Math.round(b / 60000)} 分钟；默认仍是 20 分钟`
+})
+
+// #17（2026-10-30，P1）：deps-config.json 原来有三个读入口、三种坏文件行为，只有 readDepsCfgFile
+//   会备份，而真正被读得最多的是两处裸 parse。坏文件只打一句 warning 就返回 {}，
+//   下一次任何写入口整份写回，用户手改坏的配置就永久没了。
+check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否则下次写回就永久覆盖）', () => {
+  const src = read('index.js')
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c38-'))
+  try {
+    const p = join(dir, 'deps-config.json')
+    writeFileSync(p, '{ 坏掉的 json', 'utf8')
+    const { readDepsCfgFile } = compile(src, ['readDepsCfgFile'], {
+      prelude: 'let cfgWarning = null',
+      params: ['readFileSync', 'renameSync', 'basename'],
+      args: [readFileSync, renameSync, basename],
+    })
+    const j = readDepsCfgFile(p)
+    must(j && typeof j === 'object' && !Array.isArray(j), '坏文件应退回默认对象，实际 ' + JSON.stringify(j))
+    must(!existsSync(p), '坏文件还在原地——下次写回会把它覆盖掉')
+    const baks = readdirSync(dir).filter((n) => n.includes('.broken-'))
+    must(baks.length === 1, `没留下备份（目录里：${readdirSync(dir).join(', ') || '空'}）`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  // 三个读入口只剩一种行为：index.js 的 depsCfg 复用 readDepsCfgFile
+  must(/function depsCfg\(\)[\s\S]{0,160}readDepsCfgFile/.test(src), 'index.js 的 depsCfg 没有复用 readDepsCfgFile——坏文件还是只打一句 warning')
+  const look = read('tools/look.mjs')
+  const i = look.indexOf('function readDepsCfg()')
+  must(i > 0, '找不到 tools/look.mjs 的 readDepsCfg')
+  must(/renameSync/.test(look.slice(i, i + 900)), 'tools/look.mjs 的 readDepsCfg 坏了不留档')
+  return '坏文件改名留档 + 回默认值；index.js 与 tools/look.mjs 同口径'
+})
+
+// #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就节流了，
+//   但 cache 占用那块每次都 dirStat(CACHE) 全盘递归 walk（3 万文件实测中位 219 ms）——
+//   面板一开着就是「每 8 秒白扫一遍」，机器上缓存一大就顶到面板 10 秒超时。
+//   这条不能写成「等 30 秒再问一次」：慢、脆，机器一慢就假绿。改成注入假时钟 + 计数桩替掉 dirStat，
+//   数「真 walk 了几次」。TTL 从源码读出来当参数传进去，不在断言里另抄一份常量
+//   （另抄一份就是第二个真相源，改源码不改正则时这条会绿得毫无意义——E6-08 说的正是这个）。
+check('C39 /status 的缓存占用走节流，清理后立刻失效（#11，P1：每 8 秒白扫一遍）', () => {
+  const src = read('index.js')
+  const mTtl = /const CACHE_STAT_TTL_MS = ([0-9]+) \* 1000/.exec(src)
+  must(mTtl, '找不到 CACHE_STAT_TTL_MS 定义——节流被删了？')
+  const ttl = Number(mTtl[1]) * 1000
+  // 8 秒轮询：TTL 至少得是它的两倍才有意义；超过 5 分钟面板看到的就是太旧的数
+  must(ttl >= 16_000 && ttl <= 300_000, `TTL=${ttl} ms 不合理：要么挡不住 8 秒轮询，要么旧到没有参考价值`)
+  must(/let cacheStatVal = null/.test(src), '找不到 cacheStatVal 的初值（变量被改名了？这条断言要跟着改）')
+
+  let walks = 0
+  let now = 1_000_000
+  const { cacheStat, invalidateCacheStat } = compile(src, ['cacheStat', 'invalidateCacheStat'], {
+    prelude: `const CACHE = 'X:/fake-cache'\nlet cacheStatAt = 0\nlet cacheStatVal = null`,
+    params: ['dirStat', 'Date', 'CACHE_STAT_TTL_MS'],
+    // dirStat 换成一个只数调用次数的桩：它被调几次 = 真 walk 了几次
+    args: [() => { walks += 1; return { files: walks, bytes: walks * 100 } }, { now: () => now }, ttl],
+  })
+
+  const r1 = cacheStat()
+  must(walks === 1, `第一次调用没真 walk（walks=${walks}）`)
+  must(r1.files === 1 && r1.bytes === 100, `返回的不是 dirStat 的结果：${JSON.stringify(r1)}`)
+
+  cacheStat()
+  must(walks === 1, `TTL 内第二次调用又 walk 了一遍（walks=${walks}）——节流没生效，等于每 8 秒白扫`)
+
+  now += ttl - 1000
+  cacheStat()
+  must(walks === 1, `TTL 未到就重算了（walks=${walks}）——节流窗口比声明的小`)
+
+  now += 2000
+  cacheStat()
+  must(walks === 2, `TTL 过了还不重算（walks=${walks}）——缓存永不过期，面板会一直显示陈旧的占用`)
+
+  invalidateCacheStat()
+  cacheStat()
+  must(walks === 3, `invalidate 之后没有立刻重算（walks=${walks}）——清理完面板最多 30 秒还在显示清理前的体积`)
+
+  // 调用面：/status 必须走 cacheStat，清理两条路径都必须调 invalidate
+  must(/cache:\s*\{\s*\.\.\.cacheStat\(\)/.test(src), '/status 的 cache 那块没走 cacheStat()')
+  must(!/cache:\s*\{\s*\.\.\.dirStat\(CACHE\)/.test(src), '/status 的 cache 那块还在直接 dirStat(CACHE)')
+  must(/invalidateCacheStat\(\)/.test(fnBody(src, 'autoCleanCache')), 'autoCleanCache 清了东西却不失效缓存，面板读到的是清理前的体积')
+  const iClear = src.indexOf("url.pathname === '/api/bili-watch/cache/clear'")
+  must(iClear > 0, '找不到 /cache/clear 路由')
+  // 只取这一个路由的体：从它到下一个路由判据为止，别把邻家的 invalidate 算进来
+  const iNext = src.indexOf('url.pathname ===', iClear + 10)
+  const clearSeg = src.slice(iClear, iNext > 0 ? iNext : iClear + 2000)
+  must(/invalidateCacheStat\(\)/.test(clearSeg), '/cache/clear 清完不失效缓存')
+
+  return `${ttl / 1000} 秒窗口内 5 次调用只真 walk ${walks} 次（invalidate 那次立刻重算）；两条清理路径都接上了`
+})
+
+// E7-03（2026-10-30，P1）：隔离必须真隔离，而「只设 DSH_HOME」做不到。
+//   机制在 tools/look.mjs 的 DEPS 派生：pref = BILI_WATCH_DEPS || $DSH_HOME/bili-watch/deps，
+//   **但 pref 不存在时回落到包内 deps/**（那份里有真凭证）。于是 credential.json 找到了，
+//   `login --check` 返回 rc=0「✓ 凭证有效：<你的昵称>」——手工检查时看到「隔离下已登录」，
+//   很自然当成「本来就没登录」，整轮检查其实都在用真实身份跑。
+//   真隔离必须两个变量都指空目录：DSH_HOME 管新位置，BILI_WATCH_DEPS 管旧位置 + 挡住回落。
+check('C40 双变量隔离下必须「还没登录」：只设 DSH_HOME 会回落到包内 deps（E7-03，P1）', () => {
+  const box = mkdtempSync(join(tmpdir(), 'bw-verify-c40-'))
+  const home = join(box, 'home')
+  const deps = join(box, 'deps')
+  mkdirSync(home, { recursive: true })
+  mkdirSync(deps, { recursive: true })
+  const run = (env) => {
+    const r = spawnSync(process.execPath, [join(HERE, 'look.mjs'), 'login', '--check'], {
+      env: { ...process.env, ...env },
+      encoding: 'utf8',
+      timeout: 120000,
+    })
+    return { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}` }
+  }
+  try {
+    // ① 双变量：必须 rc≠0，且不能出现「凭证有效」
+    const both = run({ DSH_HOME: home, BILI_WATCH_DEPS: deps })
+    const tail = both.out.trim().slice(0, 200)
+    must(both.code !== 0, `双变量隔离下 login --check 返回 rc=${both.code}——隔离没生效，读到的是本机真实凭证：${tail}`)
+    must(!/凭证有效/.test(both.out), `隔离环境下说「凭证有效」，说明凭证是从别处读来的：${tail}`)
+    must(/还没登录|未登录/.test(both.out), `rc≠0 但没说清是「没登录」，用户看不懂这句：${tail}`)
+
+    // ② 对照：单设 DSH_HOME 时能不能骗过自己。这里**不断言 rc**——它取决于本机包内 deps 有没有凭证，
+    //   换个没登录过的机器同样是 rc≠0。只把事实写进返回信息，让看到的人知道「单变量撞巧过了」不算隔离。
+    const one = run({ DSH_HOME: home, BILI_WATCH_DEPS: '' })
+    return `双变量 rc=${both.code}、文案「还没登录」；只设 DSH_HOME 在本机 rc=${one.code}` +
+      (one.code === 0 ? '（回落到包内 deps 读到了真凭证——这就是假隔离）' : '（本机包内 deps 无凭证；别的机器有，所以单变量永远不能当隔离）')
+  } finally {
+    rmSync(box, { recursive: true, force: true })
+  }
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

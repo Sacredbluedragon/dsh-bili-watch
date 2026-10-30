@@ -127,7 +127,9 @@ const PKG = (() => {
 guard('B1', '11-11 deps-config 硬编码本机路径', () => {
   if (!SRC.depsCfg) return ok('B1', '11-11 deps-config 硬编码本机路径', 'deps/deps-config.json 不存在（无本机路径可泄露）')
   const abs = SRC.depsCfg.match(/"[A-Za-z]:[\\/]{1,2}[^"]*"/g) || []
-  const gsv = /GPT-SoVITS/i.test(SRC.depsCfg)
+  // 2026-10-30（用户要求全面清查本机泄漏）：这里原来还单独匹配本机另一个项目的名字。
+  //   那个名字本身就是本机概念，而且「盘符绝对路径」这一条已经覆盖了它要防的东西——
+  //   名字只是顺带暴露，路径才是根因。去掉名字匹配，保留路径匹配。
   // 台账判据第二半：这个文件不能被 git 跟踪（否则随仓库泄露）。只跑只读的 git ls-files。
   let tracked = null
   try {
@@ -141,13 +143,13 @@ guard('B1', '11-11 deps-config 硬编码本机路径', () => {
     tracked = null
   }
   const parts = []
-  if (abs.length) parts.push(`${abs.length} 条盘符绝对路径${gsv ? '（含 GPT-SoVITS）' : ''}：${abs.slice(0, 2).join(' ')}`)
+  if (abs.length) parts.push(`${abs.length} 条盘符绝对路径：${abs.slice(0, 2).join(' ')}`)
   if (tracked === true) parts.push('且该文件已被 git 跟踪（git ls-files 命中）')
   if (parts.length === 0)
     return ok(
       'B1',
       '11-11 deps-config 硬编码本机路径',
-      `无盘符绝对路径、无 GPT-SoVITS${tracked === false ? '，且未被 git 跟踪' : '（git 状态未取到）'}`,
+      `无盘符绝对路径${tracked === false ? '，且未被 git 跟踪' : '（git 状态未取到）'}`,
     )
   bad('B1', '11-11 deps-config 硬编码本机路径', parts.join('；'))
 })

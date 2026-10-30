@@ -52,9 +52,27 @@ const DEPS = (() => {
   return existsSync(local) ? local : pref
 })()
 // 解析失败不静默：写 stderr（不进 stdout，JSON 模式安全）；ASCII 前缀避免 PS 管道按 GBK 渲染成乱码。
+// #17（2026-10-30，P1）：坏文件必须**先改名留档**再退回默认值。原来只打一行 stderr 就返回 {}，
+//   下一次任何写入口整份写回就把用户手改坏的配置永久覆盖掉——三个读入口里只有 index.js 的
+//   readDepsCfgFile 会备份，而真正被读得最多的是这两处裸 parse。现在两边同口径。
 function readDepsCfg() {
-  try { return JSON.parse(readFileSync(join(DEPS, 'deps-config.json'), 'utf8')) } catch (e) {
-    if (e?.code !== 'ENOENT') process.stderr.write(`[bili-watch] deps-config.json parse failed, using deps dir: ${String(e?.message || e)}\n`)
+  const p = join(DEPS, 'deps-config.json')
+  let raw
+  try {
+    raw = readFileSync(p, 'utf8')
+  } catch (e) {
+    if (e?.code !== 'ENOENT') process.stderr.write(`[bili-watch] deps-config.json read failed, using deps dir: ${String(e?.message || e)}\n`)
+    return {}
+  }
+  if (!raw.trim()) return {}
+  try {
+    const j = JSON.parse(raw)
+    return (j && typeof j === 'object' && !Array.isArray(j)) ? j : {}
+  } catch (e) {
+    const bak = `${p}.broken-${Date.now()}`
+    let note = ''
+    try { renameSync(p, bak); note = `, backed up as ${basename(bak)}` } catch { note = ', backup failed' }
+    process.stderr.write(`[bili-watch] deps-config.json parse failed${note}, using deps dir: ${String(e?.message || e)}\n`)
     return {}
   }
 }
@@ -80,10 +98,14 @@ const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'subst
 function isOwnedEntry(p) {
   const rel = relative(CACHE, p)
   const first = rel.split(/[\\/]/)[0]
-  if (/^BV[0-9A-Za-z]{10}/i.test(first)) return true
   if (OWN_CACHE_DIRS.has(first)) return true
   if (/^\.(meta-|write-test-)/.test(first)) return true
-  return false
+  // #1（2026-10-30 E8 总表 58 条里唯一会删用户文件的那条）：BV 目录不能只认名字。
+  //   原来的 /^BV…/ 直接 return true，于是自动清理（autoCleanCache → walkEntries）与 pruneEmptyDirs
+  //   会把用户在缓存根放的一个恰好叫 BV1234567890/ 的目录当成我们的，连里面用户自己的文件一起删。
+  //   改成与 removeOwned（用户点清理）同一判据 isOwnBvDir：名字像 BV 且（有 meta.json 或目录为空）。
+  //   同一个删除面两个入口判据必须相同，否则只修了一边（E8 根因 D：归属判据宽于实际所有权）。
+  return isOwnBvDir(join(CACHE, first), first)
 }
 function dirStat(dir) {
   let files = 0
@@ -94,9 +116,12 @@ function dirStat(dir) {
       if (e.name === CACHE_MARK || e.name === '_logs') continue
       const p = join(dir, e.name)
       if (e.isDirectory()) { const sub = dirStat(p); files += sub.files; bytes += sub.bytes }
-      // 追加三（2026-10-29，P2）：lstat 不是 stat —— rmSync 删链接不跟进去删目标，
-      //   按 stat 统计会把链接目标的大小算进来，与真实删除量不一致（与 index.js 的 dirStat 同口径）
-      else if (e.isFile()) { try { bytes += lstatSync(p).size } catch {}; files += 1 }
+      // 追加三（2026-10-29，P2）+ E6-07（2026-10-30，P1）：lstat 不是 stat —— rmSync 删链接不跟进去
+      //   删目标，按 stat 统计会把链接目标的大小算进来，与真实删除量不一致。
+      //   而且这里原来写的是 `else if (e.isFile())`：符号链接两个分支都不进，直接被跳过——
+      //   index.js 那边是 `else`，链接按自身大小计入。同一件事两种口径，面板与 CLI 报的占用对不上。
+      //   现在两边一致：非目录一律按 lstat 计一次。
+      else { try { bytes += lstatSync(p).size } catch {}; files += 1 }
     }
   } catch {}
   return { files, bytes }
@@ -149,7 +174,7 @@ function isOurCacheRoot(dir) {
 //   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
 //   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
 function isOwnBvDir(p, name) {
-  if (!/^BV[0-9A-Za-z]{10}/i.test(name)) return false
+  if (!/^BV[0-9A-Za-z]{10}(_|$)/i.test(name)) return false
   if (existsSync(join(p, 'meta.json'))) return true
   // E7 顺带（2026-10-30）：名字是 BV 但目录是空的——那只能是我们建的。
   //   videoDir() 先 mkdir 再校验 BV 有效性，所以 `view BV0000000000` 这类请求失败后会留下一个空壳，
@@ -161,6 +186,8 @@ function isOwnBvDir(p, name) {
   return false
 }
 function removeOwned(dir) {
+  // E6-07（2026-10-30，P1）：下面统计体积一律用 lstat。rmSync 删符号链接只删链接本身，
+  //   按 stat 取的是目标大小——「已清理 X MB」会虚高，而真正腾出的空间是链接那几十字节。
   let files = 0
   let bytes = 0
   const skipped = [] // 非本插件条目，不动（不算失败）
@@ -175,12 +202,12 @@ function removeOwned(dir) {
       const st = dirStat(p)
       try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
-      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === 'login-qr.png') {
       // E7 顺带（2026-10-30）：登录二维码写在缓存根，而原判据只认 BV 目录与 10 个固定子目录，
       //   于是 clean 每次都把它当「不是 bili-watch 的数据」跳过——迁移函数（migrateLegacyCache）却专门保留它，
       //   两处口径互相矛盾，结果是这张图永远留在缓存根。它确实是我们写的，该清。
-      try { const st = statSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
+      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
     } else if (e.isFile() && e.name === CACHE_MARK) {
       // 缓存根标记：静默保留，不进 skip 清单（这是我们自己写的，不是别人的东西）
     } else {
@@ -233,13 +260,16 @@ function pickCacheDir() {
     if (!existsSync(mark)) {
       writeFileSync(mark, JSON.stringify({ version: 1, createdAt: new Date().toISOString() }), 'utf8')
     }
-    // P2-2（2026-10-28 全量检查）：与 index.js:309 的 pickCacheDir 对齐——真写一次探针文件。
+    // P2-2（2026-10-28 全量检查）：与 index.js 的 pickCacheDir 对齐——真写一次探针文件。
     //   原来 CLI 层只 mkdir + 写标记（标记已存在时连写都不写），于是只读目录 / 配额满 / 盘符掉线时
     //   「能建根、写不进」：CLI 与面板算出两个不同的 CACHE，之后所有落盘都失败却一路报 ok。
     const probe = join(want, `.write-test-${process.pid}`)
     writeFileSync(probe, 'ok')
     rmSync(probe, { force: true })
-    return want
+    // #18（2026-10-30，P1）：返回形状与 index.js 对齐成 { dir, fallback }。
+    //   原来这边返回字符串、那边返回对象——改一侧另一侧就拿到 [object Object]，
+    //   而 C8 只查「有没有写探针」，形状分叉一句都不提。
+    return { dir: want, fallback: null }
   } catch (e) {
     try { mkdirSync(defaultDir, { recursive: true }) } catch {}
     // P1-①（2026-10-29 WB 全量审）：回退根必须也带标记，否则删除面（isOurCacheRoot 前置）
@@ -249,7 +279,7 @@ function pickCacheDir() {
       if (!existsSync(m)) writeFileSync(m, JSON.stringify({ version: 1, createdAt: new Date().toISOString(), fallback: true }), 'utf8')
     } catch {}
     console.error(`⚠ 缓存目录不可写，已回退到 ${defaultDir}：${String(e?.message || e)}`)
-    return defaultDir
+    return { dir: defaultDir, fallback: String(e?.message || e) }
   }
 }
 // D98（2026-10-29）：模块加载期只算路径，一个字节都不写。
@@ -265,7 +295,9 @@ function ensureCache() {
   // 先置位再干活：pickCacheDir / migrateLegacyCache 里若间接再触发一次 ensureCache，不会再递归进来
   CACHE_READY = true
   migrateLegacyCache()
-  CACHE = pickCacheDir()
+  const pick = pickCacheDir()
+  // #18：形状统一成 { dir, fallback }；回退文案由 pickCacheDir 自己写 stderr，这里不重复打
+  CACHE = pick.dir
   return CACHE
 }
 // C2（2026-10-27 批次8）：缓存下沉迁移——index.js 启动时做一次；CLI（look.mjs）直接跑时也要做一次，
@@ -304,32 +336,12 @@ function migrateLegacyCache() {
 // D98（2026-10-29）：这里原来是一句裸调用 migrateLegacyCache()，模块加载即搬目录。
 //   现在由 ensureCache() 在「第一次真要读写缓存」时调，顺序仍是「先迁移、再建根探测」。
 const require = createRequire(import.meta.url)
-// 凭证统一到共享路径（与 index.js 同一套）：写只写新路径；panel 旧路径与 deps 旧路径只读回退并迁移（写新、旧文件保留）
+// 凭证（2026-10-30 B 方案）：与 index.js 同一套——只认自己这一份。
+//   以前这里有「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁与单向复制，用户拍板整套拿掉：
+//   那个目录只在特定机器上存在，用户侧是死分支，却把本机概念写进了公开源码。
 const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'credential.json')
-const PANEL_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.json')
 const LEGACY_CRED = join(DEPS, 'credential.json')
 const CRED_FILE = SHARED_CRED
-// 2026-10-28：与 index.js 同源——面板扫码只写小号那份，这里把它单向复制到 SHARED（见 index.js 同名函数注释）。
-const PANEL_SMALL = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-duty', 'bili_credential.small.json')
-// X-10（2026-10-29）：用户主动删凭证后写这份抑制记录（含删除时刻 panel small 的 mtime）。
-//   放凭证同目录、同生命周期：凭证没了它也没意义，deps 被清空也不影响。
-const CRED_CLEARED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cred-cleared.json')
-function syncPanelSmallToShared() {
-  try {
-    const panelAt = statSync(PANEL_SMALL).mtimeMs
-    let sharedAt = 0
-    try { sharedAt = statSync(SHARED_CRED).mtimeMs } catch {}
-    if (sharedAt && panelAt <= sharedAt) return
-    // X-10（2026-10-29）：用户主动删过凭证后，panel 小号那份不能靠 8 秒轮询再复制回来。
-    //   判据用 mtime 而不是时间窗——panel 重新扫码时 PANEL_SMALL 的 mtime 会变新，复制自然恢复。
-    try {
-      const c = JSON.parse(readFileSync(CRED_CLEARED, 'utf8'))
-      if (Number.isFinite(c?.panelMtime) && panelAt <= c.panelMtime) return
-    } catch {}
-    mkdirSync(dirname(SHARED_CRED), { recursive: true })
-    writeFileSync(SHARED_CRED, readFileSync(PANEL_SMALL), { encoding: 'utf8', mode: 0o600 })
-  } catch {}
-}
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')
 
 const UA =
@@ -507,24 +519,14 @@ function loadCred(path) {
     return null
   }
 }
-/** 显式 --cred 优先；其次 panel 大号凭证 / 插件自身凭证（谁新用谁）；都没有就匿名。 */
+/** 显式 --cred 优先；其次插件自己那份凭证；都没有就匿名。 */
 function credFor(explicit) {
   if (explicit) return loadCred(explicit)
-  syncPanelSmallToShared()
-  // 2026-10-27 批次9：panel 侧 mtime 仲裁与 index.js resolveCredPath() 一致——panel 写 bili-duty\bili_credential.json、
-  // 插件面板扫码写 bili-watch\credential.json，两处独立写入口，谁 mtime 新用谁。
-  // 原来「SHARED 存在即返回」会让 panel 侧重登大号后这里永远读旧快照（AI 字幕静默失效）。
-  // E6-01（2026-10-30 复核）：与 index.js resolveCredPath() 有三处**有意不同**，不是分叉——
-  //   ① 本函数返回凭证对象（或 null 当未登录），那边返回路径：调用方要的东西不同；
-  //   ② 那边有一步「本次进程刚扫码写的那份优先」（模块级 sharedWrittenAt），本侧走不到——
-  //      CLI 不扫码，扫码只发生在面板进程；且真扫完 SHARED 的 mtime 必然最新，mtime 仲裁已能选它；
-  //   ③ 残缺凭证：那边返回 LEGACY_CRED 交下游 loadCred 再校验，本侧这里直接判 null 并打警告，
-  //      最终行为一致（都当未登录），差别只是谁说那句警告。
-  const mtimeOf = (p) => { try { return statSync(p).mtimeMs } catch { return 0 } }
-  const sharedAt = mtimeOf(SHARED_CRED)
-  const panelAt = mtimeOf(PANEL_CRED)
-  if (panelAt && panelAt >= sharedAt) return loadCred(PANEL_CRED)
-  if (sharedAt) return loadCred(SHARED_CRED)
+  // 2026-10-30 B 方案：只认 $DSH_HOME/bili-watch/credential.json，与 index.js resolveCredPath() 同一套。
+  //   以前这里有一层「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁（外加一个单向复制），
+  //   用户拍板整套拿掉：那个目录只在特定机器上存在，用户侧是死分支，
+  //   却把本机概念写进了公开源码。E6-01 当初判的「两处有意不同」也随之整段消失。
+  if (existsSync(SHARED_CRED)) return loadCred(SHARED_CRED)
   // deps 旧路径存在则读旧并迁移到新路径（写新、旧文件保留不动）
   if (existsSync(LEGACY_CRED)) {
     const cred = loadCred(LEGACY_CRED)
@@ -533,10 +535,8 @@ function credFor(explicit) {
       //   ① 用户换了 DSH_HOME（换机 / 换盘 / 隔离测试）后仍能登录，以为是新位置的凭证；
       //   ② 做「隔离环境」验证的人（包括对着这份代码做审查的）以为 DSH_HOME 空就等于未登录，
       //      实际上读到的是包内 deps/credential.json 里那份真凭证，测出来的全部是真实身份。
-      //   打一行到 stderr（不污染 stdout 的机器可读格式），只在真正迁移时打一次：
-      //   SHARED / PANEL 任一存在时上面的 mtime 分支早就 return 了，走不到这里。
-      process.stderr.write(`[cred] 没有新位置的凭证，改从旧位置 ${LEGACY_CRED} 读，已复制到 ${SHARED_CRED}
-`)
+      //   打一行到 stderr（不污染 stdout 的机器可读格式），只在真正迁移时打一次。
+      process.stderr.write(`[cred] 没有新位置的凭证，改从旧位置 ${LEGACY_CRED} 读，已复制到 ${SHARED_CRED}\n`)
       try {
         mkdirSync(dirname(SHARED_CRED), { recursive: true })
         writeFileSync(SHARED_CRED, JSON.stringify(cred, null, 2), 'utf8')
@@ -1320,6 +1320,24 @@ function logRun({ command, bv = '', argv = [], code = 0, signal = null, ms = 0, 
 }
 
 // ── 本地 ASR 转写（复用项目 .venv-asr，零 token）────────────────────────
+// #6（2026-10-30 E8 总表）：安装脚本原本只选 Python 3.10–3.13，理由是「onnxruntime 没有 cp314 的 wheel」——
+//   这条理由 2026-10-30 被实测推翻（3.14.6 的 venv 里 onnxruntime 1.31.1 可装可用），脚本已把 3.14 收进候选。
+//   但「已就绪」的判据一直是「文件在不在」——用户机器上早先由 3.14 建的 venv 照样报绿，
+//   跑起来才在 import 阶段炸，而且报的是「导入 faster_whisper 失败」这种看不出根因的话。
+//   这里不改判据，只在失败时点名环境版本，让人一眼看到该重装（3.14 能跑，但 3.12/3.13 更稳）。
+function pyEnvNote(pyExe) {
+  try {
+    const t = readFileSync(join(dirname(pyExe), '..', 'pyvenv.cfg'), 'utf8')
+    const m = /^version\s*=\s*(\d+)\.(\d+)/m.exec(t)
+    if (!m) return ''
+    const maj = Number(m[1])
+    const min = Number(m[2])
+    if (!(maj === 3 && min >= 14)) return ''
+    return '；另外：这个环境是用 Python ' + m[1] + '.' + m[2] + ' 建的——3.14 上 onnxruntime 已有 wheel，但 faster_whisper 的依赖链偶尔还是装不全。跑 scripts/fetch-deps.ps1 -Target asr -Force 会用 3.13 重建'
+  } catch {
+    return ''
+  }
+}
 function asrReady() {
   return existsSync(ASR_PY) && existsSync(ASR_SCRIPT)
 }
@@ -1373,17 +1391,18 @@ function asrExitReason(status) {
   return byCode[code] ? `${byCode[code]}（exit ${code}）` : `exit ${code}`
 }
 function asrFailWhy(r, timeoutMs) {
+  const envNote = pyEnvNote(ASR_PY)
   const tail = String(r?.stderr || r?.stdout || '').trim().split(/\r?\n/).filter((l) => l.trim()).slice(-3).join(' | ').slice(-300)
   if (r?.error) {
     const c = r.error.code || ''
     const what = c === 'ETIMEDOUT'
       ? `转写超时（超过 ${Math.round(Number(timeoutMs || 0) / 1000)} 秒被中止）`
       : `转写进程起不来（${c || r.error.message}）`
-    return `${what}${tail ? '；最后诊断：' + tail : '；进程没来得及输出任何诊断'}`
+    return `${what}${tail ? '；最后诊断：' + tail : '；进程没来得及输出任何诊断'}${envNote}`
   }
   const reason = asrExitReason(r?.status)
-  if (tail) return `转写失败（${reason}）；最后诊断：${tail}`
-  return `转写失败（${reason}）；进程在输出任何诊断前就退出了，多为依赖 DLL 加载失败（见 README「本地转写」一节）`
+  if (tail) return `转写失败（${reason}）；最后诊断：${tail}${envNote}`
+  return `转写失败（${reason}）；进程在输出任何诊断前就退出了，多为依赖 DLL 加载失败（见 README「本地转写」一节）${envNote}`
 }
 
 // 转写可信度判定：ASR 在没人声的音频上不会返回空，会拿最常见模板句填空。
@@ -1589,7 +1608,7 @@ async function runOcr(dir, { json = false } = {}) {
     })
     return { ok: true, text: out.trim() }
   } catch (e) {
-    return { ok: false, why: String(e?.stderr ?? e?.message ?? e).slice(-300) }
+    return { ok: false, why: String(e?.stderr ?? e?.message ?? e).slice(-300) + pyEnvNote(OCR_PY) }
   }
 }
 
@@ -2613,7 +2632,7 @@ function writeMeta(bv, extra = {}, dirHint = '') {
   }
 }
 
-// ── 陌生人内容护栏（2026-10-26 T37：把 _bili-duty.mjs:1544 那套搬回来）────────
+// ── 陌生人内容护栏（2026-10-26 T37：把业务侧脚本里那套搬回来）────────
 // 字幕、评论、弹幕、标题、简介都是不可信的第三方内容：可以读，不能当指令执行。
 // 只做「提示」——命中不代表一定在攻击，没命中也不代表安全。
 // 长文本（字幕/转写）只跑 HIGH 那几条高特异性的，否则「翻译成」「快点」这种日常词会天天误报。
@@ -2627,7 +2646,9 @@ const SUSPECT_ALL = [
   // 二、身份替换
   [/(你|您)(不是|不再是|不能是)(一个)?\s*(AI|人工智能|语言模型|大模型)/i, '要求否认 AI 身份'],
   [/(你|您)(现在)?(是|应该?是)(一个)?(真人|人类|人)[，,。]/i, '要求替换为人类身份'],
-  [/(忘掉|忘记|别记得).{0,8}(你是|自己是谁|大肥鱼)|你(现在)?(叫|改名)/i, '要求遗忘/改名'],
+  // 2026-10-30：原来这里把本机账号昵称写死进正则（用来拦「忘掉你是<昵称>」这种诱导）。
+  //   昵称是用户自己的数据，不该出现在公开源码里——改成拦「忘记你的身份/名字」这个通用形状。
+  [/(忘掉|忘记|别记得).{0,8}(你是|自己是谁|你(的)?(名字|昵称|身份))|你(现在)?(叫|改名)/i, '要求遗忘/改名'],
   [/不(要|许|能)?(让|告诉)(别人|人|任何人)(知道)?(你是|你是个)\s*(AI|模型)/i, '要求隐瞒 AI 身份'],
   // 三、场景/角色逃逸
   [/安全审计|审计模式|渗透测试|红队|授权测试/i, '假定场景逃逸'],

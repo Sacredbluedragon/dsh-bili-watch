@@ -38,8 +38,8 @@
       探测到就写进进程级 HTTP_PROXY/HTTPS_PROXY（huggingface_hub 靠这个）并给 curl / pip 显式带
       --proxy。-NoProxy 强制直连；探测不到就按原来的直连行为跑，不影响没开代理的机器。
     · Python（G-02，2026-10-29）：优先用已安装的 uv（uv venv --python 3.12/3.13，uv 自己管的解释器
-      可离线用），其次 py 启动器的 3.13/3.12/3.11/3.10，最后 PATH 上的 python；跳过 WindowsApps 的
-      应用商店存根。3.14 不行——onnxruntime（OCR）还没有 cp314 的 wheel。
+      可离线用），其次 py 启动器的 3.13/3.12/3.11/3.10/3.14，最后 PATH 上的 python；跳过 WindowsApps 的
+      应用商店存根。3.14 也收，但排在 3.12/3.13 之后（那两个版本 wheel 覆盖最全）。
     · 日志（G-03，2026-10-29）：每一步进度和失败原因都会 append 到 deps\download.log，面板「一键下载」
       的日志就是这个文件（index.js 也把子进程输出重定向进来）。
 #>
@@ -356,13 +356,19 @@ function Ensure-Ytdlp {
   if (-not $DryRun) { Write-Host "    ✓ $exe" }
 }
 
-# G-02（2026-10-29）：Python 选择。原逻辑先试 py -3.14，但 3.14 没有 onnxruntime 的 cp314 wheel，
+# G-02（2026-10-29）：Python 选择。原逻辑先试 py -3.14，当时认为 3.14 没有 onnxruntime 的 cp314 wheel，
 #   本机（PATH 上只有 py 3.14、py -3.10 还指向不存在的用户目录）就是「ASR 也许能装、OCR 必挂」。
+#   2026-10-30 更正：那个前提不成立（3.14.6 的 venv 里 onnxruntime 1.31.1 能 import，ocr 真跑通），
+#   所以 3.14 从「硬拒」改成「排在最后」——优先顺序仍然有意义，硬拒没有。
 #   现在的顺序：-PythonPath（显式）> uv 管的 3.12/3.13（uv venv 可离线，本机已装 3.12.13）
-#   > py 启动器 3.13/3.12/3.11/3.10 > PATH 上的 python。WindowsApps 存根一律跳过。
+#   > py 启动器 3.13/3.12/3.11/3.10/3.14 > PATH 上的 python。WindowsApps 存根一律跳过。
 function Test-PyVersion([string]$v) {
-  # 3.10–3.13 才进：3.14 没有 onnxruntime 的 wheel，<3.10 faster-whisper 装不上
-  return ($v -match '^3\.(1[0-3])$')
+  # 3.10–3.14 都收（<3.10 faster-whisper 装不上）。
+  # 2026-10-30 更正：PR#4 写「3.14 没有 onnxruntime 的 cp314 wheel」据此把 3.14 排除了，
+  #   实测本机 Python 3.14.6 的 venv 里 onnxruntime 1.31.1 与 faster-whisper 1.2.1 都能 import，
+  #   ocr 也真跑通 73.9 秒——那个前提已不成立。硬拒会让「本来能用」的机器判成装不上。
+  #   但优先顺序仍把 3.12/3.13 放前面：那两个版本 wheel 覆盖最全，3.14 的个别依赖可能滞后。
+  return ($v -match '^3\.(1[0-4])$')
 }
 
 function Get-UvPath {
@@ -380,7 +386,7 @@ function Get-SystemPython {
   $sawStub = $false
   $pyLauncher = Get-Command 'py' -ErrorAction SilentlyContinue
   if ($pyLauncher -and $pyLauncher.Source) {
-    foreach ($v in @('3.13', '3.12', '3.11', '3.10')) {
+    foreach ($v in @('3.13', '3.12', '3.11', '3.10', '3.14')) {
       $exe = & $pyLauncher.Source "-$v" -c "import sys;print(sys.executable)" 2>$null
       if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ([string]$exe).Trim())) { return ([string]$exe).Trim() }
     }
@@ -405,7 +411,7 @@ function Get-SystemPython {
   if ($sawStub) {
     throw '只找到 Windows 应用商店的 Python 存根（WindowsApps\python.exe），它不是真的解释器。请装 uv 或 Python 3.12，或用 -PythonPath 指定解释器路径。'
   }
-  throw '找不到 Python 3.10–3.13（3.14 还没有 onnxruntime 的 wheel）。请装 uv 或 Python 3.12，或用 -PythonPath 指定解释器路径。'
+  throw '找不到 Python 3.10–3.14。请装 uv 或 Python 3.12，或用 -PythonPath 指定解释器路径。'
 }
 
 # 返回 @{ Mode='uv'|'python'; Version; Uv; Exe; Desc }，整个脚本只判一次
@@ -417,7 +423,7 @@ function Get-PythonPlan {
     $v = & $PythonPath -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
     if ($LASTEXITCODE -ne 0) { throw "指定的 Python 跑不起来：$PythonPath" }
     $v = ([string]$v).Trim()
-    if (-not (Test-PyVersion $v)) { throw "指定的 Python 是 $v，需要 3.10–3.13（3.14 还没有 onnxruntime 的 wheel）" }
+    if (-not (Test-PyVersion $v)) { throw "指定的 Python 是 $v，需要 3.10–3.14" }
     $script:PyPlan = @{ Mode = 'python'; Version = $v; Uv = ''; Exe = $PythonPath; Desc = "-PythonPath 指定的 Python $v" }
     return $script:PyPlan
   }

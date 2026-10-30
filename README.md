@@ -106,7 +106,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 
 装进 DSH 后，在插件页点 `dsh-bili-watch` 卡片进详情页，里面有一块面板（不用先进设置），日常操作不用去对话里敲命令：
 
-- **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、B 站登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点行末按钮后台装（走内置 `fetch-deps`，体积是估算值，实际以跑完为准）。
+- **依赖状态**：ffmpeg、yt-dlp、ASR 环境、OCR 环境、转写模型、B 站登录凭证逐项列出是否就绪、实际路径、占用体积。缺的点行末按钮装（走内置 `fetch-deps`，体积是估算值，实际以跑完为准）。**下载期间要保持 DSH 开着**——宿主退出会连下载进程一起结束，重进面板再点一次即可，已经下完的项会自动跳过。
 - **扫码登录**：未登录显示「去扫码登录」，已登录是「重新扫码」。二维码在面板里出，手机 B 站扫完自动刷新。凭证存在本机 `$DSH_HOME/bili-watch/credential.json`。
 - **哪些能删**：yt-dlp、转写模型、登录凭证可以直接删；ffmpeg / ASR 环境 / OCR 环境不给删除按钮——环境删了要重跑 `fetch-deps` 装回来，代价比省下的空间大，面板只在旁边标出实际位置。
 - **批量操作**：标题行的「批量下载 / 批量清理」打开勾选清单，删除前会再确认一次。
@@ -254,7 +254,7 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
 
 仅 AI 字幕需要登录。凭证优先级：`--cred` > `$DSH_HOME/bili-watch/credential.json` > 匿名。
 
-例外：若本机安装了 bili-duty 且其凭证文件更新，watch 优先复用。面板删除凭证后若 bili-duty 仍存在，仍将使用共享登录态。
+watch 只读自己这一份，不会去跟随同机其它工具写的凭证（旧版会按 mtime 挑最新的那份，容易出现「面板显示已退出、实际还在用别的身份」）。早期版本留下的旧位置凭证（`deps/` 下那份）会在第一次读到时**一次性**复制到 `$DSH_HOME/bili-watch/credential.json`，之后不再回读。
 
 凭证文件等同账号登录态，禁止外传或提交版本库。
 
