@@ -9,7 +9,7 @@ DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内
 ## 为什么用它
 
 - **本地跑不上传**：ASR 转写 + OCR 抽帧全在本机，不依赖云 API、不花钱
-- **防字幕诱饵**：语速异常或字幕自称「实验/钓鱼」即判可疑；关键词命中率只在语速也异常时才作补充；可疑时抽 5 帧 OCR 比对画面
+- **防字幕诱饵**：语速异常或字幕自称「实验/钓鱼」即判可疑；关键词命中率只在语速也异常时才作补充；可疑时加 `--verify` 抽 5 帧 OCR 比对画面（不加只提示一句）
 - **二次读瞬时**：缓存目录 + 文件锁，同一视频二次读取秒出
 - **为 AI 设计**：manifest 落盘 + 摘要输出，agent 直接消费不用再解析
 
@@ -19,7 +19,7 @@ DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内
 - 降级链：AI 字幕 → 本地 ASR → 抽帧 OCR → 读图，四级全 miss 时退出码为 1
 - 匿名可用：元数据、评论、弹幕、搜索、热榜无需登录
 - 可选依赖：ffmpeg（抽帧）、Python venv（ASR/OCR）、faster-whisper（转写模型）
-- Web 面板：依赖管理、扫码登录、缓存清理、17 项运行时参数可调
+- Web 面板：依赖管理、扫码登录、缓存清理、18 项运行时参数可调
 
 ## 安装
 
@@ -63,7 +63,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | 命令 | 说明 |
 |---|---|
 | `view <target>` | 元数据 + 简介 + 热评。不下载、不依赖 ffmpeg，匿名可用 |
-| `peek <target>` | 元数据 + 热评 + 5 帧均匀抽帧。需下载 360p（约 1 MB/min）；OCR 环境就绪时顺带识别。仅 B 站 |
+| `peek <target>` | 元数据 + 热评 + 5 帧画面。先取 B 站官方截帧接口，不下视频；取不到才回落下载 360p 抽帧（约 1 MB/min）；OCR 环境就绪时顺带识别。仅 B 站 |
 | `sub <BV或链接> [--format srt\|json\|md\|txt] [--out <path>]` | AI 字幕。`--format` 输出 SRT / JSON（含时间戳）/ Markdown（含跳转链接）/ 纯文本 txt。需登录 |
 | `comments <bv> [N]` | 评论区，默认按热度排序 |
 | `asr <target>` | 本地 ASR 转写，附「可信 / 疑似幻觉」判定 |
@@ -85,18 +85,18 @@ node tools/look.mjs view BV1EPnG6DEJC
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `--format` | enum | — | 输出格式。`--out` 必须配合此参数使用，单独指定 `--out` 返回退出码 1 |
-| `--out <path>` | string | — | 落盘路径，相对当前工作目录（cwd）。目录不存在时自动创建 |
+| `--format` | enum | — | 输出格式。`text` / `sub` / `comments` / `danmaku` / `local` 落盘时必须配合此参数，单独指定 `--out` 返回退出码 1 |
+| `--out <path>` | string | — | 落盘路径，相对当前工作目录（cwd），目录不存在时自动创建。`text` / `sub` / `comments` / `danmaku` / `local` 写文件；`frames` 用它指定输出目录。`sheet` / `ocr` / `substrip` 固定写缓存目录，不收 `--out` |
 | `--ffmpeg <path>` | string | — | ffmpeg 可执行文件路径 |
 | `--cred <path>` | string | — | 凭证 JSON 路径，格式 `{sessdata, bili_jct, buvid3, buvid4}` |
 | `--asr-max <ms>` | number | 1800000 | 转写时长闸门（毫秒）。视频长于此值时仅输出画面描述 |
-| `--head <n>` | number | 0（不截断） | 长文本摘要长度。不传或传 0 = 输出全文 |
+| `--head <n>` | number | 0（按自动规则） | 只给前 n 字。不传或传 0 时按「正文超过 800 字只给开头 400 字 + 落盘路径」处理；要全文用 `--full` |
 | `--full` | flag | — | 输出全文（不截断） |
 | `--verify` | flag | — | 字幕可疑时抽 5 帧 OCR 交叉校验。字幕正常时不触发 |
 | `--fresh` | flag | — | 忽略缓存强制重跑 |
 | `--mark-seen` | flag | — | 标记为已读 |
 | `--no-time` | flag | — | text/sub 默认输出带 `[mm:ss]` 逐句时间码，加这个退回纯文本（不带时间戳） |
-| `--at <时刻>` | string | — | frames/sheet 精看某一刻，支持三种写法：`750`（秒）、`12:30`（分:秒）、`12:30-13:10`（区间） |
+| `--at <时刻>` | string | — | `frames` 精看某一刻，支持三种写法：`750`（秒）、`12:30`（分:秒）、`12:30-13:10`（区间） |
 
 完整参数列表见 `bili-watch help`。
 
@@ -176,7 +176,7 @@ dsh plugin --profile web remove dsh-bili-watch
 
 ### 卸载前备份
 
-包内 `deps/` 随卸载删除，需提前拷出以下 4 份文件，重装后放回原位：
+0.3.4 起依赖与配置都在 `$DSH_HOME/bili-watch/deps`（包外），卸载**不会**删掉。只有首次启动还没把包内 `deps/` 搬完的用户（这时仍在用包内那份）才需要提前拷出以下 4 份文件，重装后放回原位：
 
 1. `deps/deps-config.json` — 运行时参数与自定义缓存路径
 2. `deps/cache-config.json` — 自动清理规则
@@ -242,11 +242,11 @@ BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all
 powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
 ```
 
-装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 500 MB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会用 `ctypes.WinDLL("cublas64_12.dll")` 真加载一次——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
+装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 500 MB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会真加载一次 `cublas64_12.dll` 校验——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
 
 **为什么第一次慢**：`-Target all` 不会自动装它（不问、不装 500 MB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
 
-**怎么关**：面板「转写与抽帧」里的「转写时用 GPU」取消勾选（存的是 `asrDevice: cpu`），或命令行 `set BILI_ASR_DEVICE=cpu`。删掉运行库也能自动退回 CPU，不会报错。
+**怎么关**：面板「转写与抽帧」里的「转写时用 GPU」取消勾选（存的是 `asrDevice: cpu`），或把 `deps/deps-config.json` 里的 `asrDevice` 写成 `cpu`。删掉运行库也能自动退回 CPU，不会报错。
 
 **没有卡能不能开**：能，但开了也走 CPU——`auto` 的语义是「有可用 CUDA 就用，没有或显存不足就回落 CPU」。
 

@@ -4032,7 +4032,7 @@ const HELP = `用法:
             ffmpeg超时 ffmpegTimeoutSec(秒,默认300)/命令超时 cmdTimeoutSec(秒,默认180)，写 deps/deps-config.json
             或面板「常规」「高级设置」；--asr-max <毫秒> 只覆盖转写闸门（flag > config > 默认）。
   --no-time：text/sub 默认输出带 [mm:ss] 逐句时间码，加这个退回纯文本（不带时间戳）。
-  --at <时刻>：frames/sheet 精看某一刻，支持三种写法——750（秒）、12:30（分:秒）、12:30-13:10（区间）。
+  --at <时刻>：frames 精看某一刻，支持三种写法——750（秒）、12:30（分:秒）、12:30-13:10（区间）。
 `
 // 6-15：unhandledRejection / uncaughtException 兜底——落 last-error.json 并 exit 1，别让进程直接崩无记录
 function crashDump(err, kind) {
