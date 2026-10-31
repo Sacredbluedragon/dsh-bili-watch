@@ -68,16 +68,17 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `comments <bv> [N]` | 评论区，默认按热度排序 |
 | `asr <target>` | 本地 ASR 转写，附「可信 / 疑似幻觉」判定 |
 | `frames <target> [--step <sec>] [--ocr]` | 抽帧；`--ocr` 附带画面文字识别 |
-| `ocr <bv>` | 抽帧并 OCR |
+| `ocr <bv> [--step <sec>]` | 抽帧并 OCR |
 | `text <target> [--format json\|md]` | 四级降级链：字幕 → 转写 → 抽帧 OCR → 读图。全 miss 退出码 1 |
 | `sheet <bv> [--grid 3x3]` | 均匀抽帧拼图，默认 9 帧 |
 | `substrip <bv> [--step <sec>]` | 底部字幕竖拼 |
 | `danmaku <bv>` | 弹幕热区（按时间桶统计峰值） |
 | `local <path> [--ocr] [--frames]` | 本地视频文件走降级链（从转写层起）。仅 CLI |
-| `search <关键词> [--days 3] [--limit 10] [--order pubdate\|click]` | 视频搜索。`--days` 生效时最多抓 3 页，结果仍按 `--limit` 截断 |
+| `search <关键词> [--days N] [--limit 10] [--order pubdate\|click]` | 视频搜索。`--days` 不传或传 0 表示不限时间；传了则只留最近 N 天发布的，并按播放量降序（最多抓 3 页，结果仍按 `--limit` 截断） |
 | `hot [--limit 10]` | 综合热门榜 |
 | `login [--check] [--poll] [--key <key>]` | 扫码登录。`--check` 校验凭证有效性；`--key` 需配合 `--poll` |
 | `clean` | 清空缓存根。任务进行中（锁文件存活）时拒绝并返回非零退出码 |
+| `help` | 打印完整用法（所有命令、全部参数） |
 
 `<target>` 接受 BV 号、`b23.tv` 短链、av 号或 URL。
 
@@ -93,12 +94,27 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `--head <n>` | number | 0（按自动规则） | 只给前 n 字。不传或传 0 时按「正文超过 800 字只给开头 400 字 + 落盘路径」处理；要全文用 `--full` |
 | `--full` | flag | — | 输出全文（不截断） |
 | `--verify` | flag | — | 字幕可疑时抽 5 帧 OCR 交叉校验。字幕正常时不触发 |
-| `--fresh` | flag | — | 忽略缓存强制重跑 |
+| `--fresh` | flag | — | 忽略缓存强制重跑。只在 `peek` / `frames` / `sheet` / `substrip` 四条命令生效 |
 | `--mark-seen` | flag | — | 标记为已读 |
+| `--p <n>` | number | 1 | 多 P 视频取第几个分 P |
+| `--scene` | flag | — | 仅 `frames`：按画面变化点抽帧（吸附到变化最多的时刻），比等间隔更准也更省 |
+| `--fast` | flag | — | 仅 `text`：跳过本地转写，字幕拿不到就直接抽帧 OCR |
 | `--no-time` | flag | — | text/sub 默认输出带 `[mm:ss]` 逐句时间码，加这个退回纯文本（不带时间戳） |
 | `--at <时刻>` | string | — | `frames` 精看某一刻，支持三种写法：`750`（秒）、`12:30`（分:秒）、`12:30-13:10`（区间） |
 
 完整参数列表见 `bili-watch help`。
+
+### 画面索引
+
+`frames --at`、`sheet`、`peek` 三处输出都会带索引，格式固定：
+
+```
+r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
+```
+
+- `r1c1` = 第 1 行第 1 列（`sheet` 按行从左到右编号；`frames --at` 只有一格）
+- `00:00-00:05` = 这一格覆盖视频的哪一段
+- `@00:02` = 这一格实际取的是第 2 秒那一帧
 
 ### 长文本保护
 
@@ -112,6 +128,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 - **扫码登录**：未登录显示「去扫码登录」，已登录是「重新扫码」。二维码在面板里出，手机 B 站扫完自动刷新。凭证存在本机 `$DSH_HOME/bili-watch/credential.json`。
 - **哪些能删**：yt-dlp、转写模型、登录凭证可以直接删；ffmpeg / ASR 环境 / OCR 环境不给删除按钮——环境删了要重跑 `fetch-deps` 装回来，代价比省下的空间大，面板只在旁边标出实际位置。
 - **批量操作**：标题行的「批量下载 / 批量清理」打开勾选清单，删除前会再确认一次。
+- **排查提示词**：面板里点一下按钮，把一段现成的排查指令复制到剪贴板，粘给你自己机器上的 agent 就行——它会按里面的步骤只读排查（不改你的配置、不删东西），最后整理成一份现象 / 环境 / 日志 / 已排查项 / 怀疑点的报告。按症状分成几段：「依赖装不上」「转写/OCR 失败」「面板打不开」，各对应自己那一种情况，不会混着给你。
 - **抽帧缓存**：显示当前占用与文件数，「立即清除」一键清空；不点则按规则自动清理（保留天数、总量上限），超过从最旧的删起。规则存 `deps/cache-config.json`，启动时与打开面板时各查一次。
 - **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `"cache"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——本版不动那些文件，要清理得你自己删。
 - **运行时参数**：转写闸门、抽帧张数上限这类常改的放常规组，其余收在「高级设置」里（默认收起），每项都标了范围和「调大/调小会怎样」。
@@ -125,10 +142,11 @@ node tools/look.mjs view BV1EPnG6DEJC
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `BILI_WATCH_PROJ` | `deps/` | ASR/OCR 环境目录 |
+| `BILI_WATCH_DEPS` | `$DSH_HOME/bili-watch/deps` | 依赖根目录（ASR/OCR 环境、模型、ffmpeg 都在这下面）。CLI、面板、一键脚本三处同源 |
+| `BILI_WATCH_PROJ` | 同 `BILI_WATCH_DEPS` | ASR/OCR 环境目录。不设时跟着 `BILI_WATCH_DEPS` 走 |
 | `BILI_WATCH_FFMPEG` | — | ffmpeg 可执行文件路径 |
-| `BILI_WATCH_YTDLP` | — | yt-dlp 可执行文件路径 |
-| `BILI_WATCH_SEEN` | `deps/seen.md` | 已读标记文件路径 |
+| `BILI_WATCH_YTDLP` | — | yt-dlp 可执行文件路径。**仅 CLI 生效**（面板只做 B 站，不需要 yt-dlp） |
+| `BILI_WATCH_SEEN` | `<BILI_WATCH_DEPS>/seen.md` | 已读标记文件路径 |
 | `BILI_WATCH_CACHE` | `$DSH_HOME/bili-watch/cache` | 抽帧缓存根目录。优先级：环境变量 > `deps/deps-config.json` > 默认值 |
 | `BILI_WATCH_MIRROR` | — | 设为 `cn` 时 `fetch-deps` 走国内镜像 |
 | `HF_ENDPOINT` | `https://hf-mirror.com` | 转写模型下载端点 |
@@ -166,7 +184,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 - 登录凭证：`$DSH_HOME/bili-watch/credential.json`（缓存根的兄弟文件，清理缓存时勿误删上级目录）
 - 自定义缓存位置：设置 `BILI_WATCH_CACHE` 环境变量，或在 `deps/deps-config.json` 写入 `"cache": "<dir>"`。指向外部目录时插件自动创建 `bili-watch-cache/` 子目录作为缓存根
 - 修改后需重启 DSH 生效
-- 自动清理规则（保留天数 / 总量上限）存于 `deps/cache-config.json`，默认保留 7 天 / 上限 2048 MB，启动时与打开面板时各检查一次
+- 自动清理规则（保留天数 / 总量上限）存于 `deps/cache-config.json`，**首次默认保留 7 天 / 上限 2048 MB**（改过就以你改的为准，面板「保存规则」也是写这个文件），启动时与打开面板时各检查一次
 - **缓存根归插件专用**：`clean` 与面板「立即清除」按名字整棵删这 10 个子目录 —— `_logs` `frames` `sheets` `sheet-tmp` `substrip-tmp` `_misc` `asr` `frames-dl` `audio-dl` `_hot`，里面的东西一律不保留。别把自己的文件放进这些名字的目录；放在缓存根**根目录下**、名字不在上表的文件不会被删（`clean` 会跳过并列进「不是 bili-watch 的缓存条目」）
 
 ## 卸载
@@ -233,19 +251,39 @@ BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all
 
 | 你的机器 | 面板「GPU 运行库」一行 | 转写 |
 |---|---|---|
-| 有 NVIDIA 卡 + 已装运行库 | 绿点，显示 `cublas64_12.dll` | 走 GPU，比 CPU 快 2–8 倍 |
-| 有 NVIDIA 卡 + 没装运行库 | 灰点，提示「装上快 2-8 倍」 | 走 CPU（功能一样，只是慢些） |
-| 没有 NVIDIA 卡 | 灰点，说明没有 `nvidia-smi` | 走 CPU |
+| 有 NVIDIA 卡 + 已装运行库 | 绿点，显示 `cublas64_12.dll`（Linux 是 `libcublas.so.12`） | 走 GPU，比 CPU 约快 2 倍 |
+| 有 NVIDIA 卡 + 没装运行库 | 红点，提示装上约快 2 倍 | 走 CPU（功能一样，只是慢些） |
+| 没有 NVIDIA 卡 | 红点，说明没有 `nvidia-smi`，**不显示「下载」按钮** | 走 CPU |
 
-**怎么装**：面板上点那一行的「下载」，或命令行：
+（「约 2 倍」是实测口径：同一台机器 5 分钟音频 GPU 13.6–14.7 s vs CPU 27.2–32.9 s，多次测量 1.96–2.24×，随 CPU 负载波动。）
+
+**怎么装（Windows）**：面板上点那一行的「下载」，或命令行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
 ```
 
-装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 500 MB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会真加载一次 `cublas64_12.dll` 校验——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
+装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 1.4 GB（下载），装完占约 2 GB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会真加载一次 `cublas64_12.dll` 校验——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
 
-**为什么第一次慢**：`-Target all` 不会自动装它（不问、不装 500 MB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
+**怎么装（Linux）**：和 Windows 一样，面板上点那一行的「下载」，或命令行：
+
+```bash
+bash scripts/fetch-deps.sh cuda
+```
+
+装的是同样三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），装进 ASR 的 venv，装完脚本会跑一次 `--probe-gpu` 校验（`libcublas.so.12` 能不能载入 + ctranslate2 看不看得到卡）。**展开后约 2.2 GB**（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB），比 Windows 那三个 wheel 大得多，装之前先看磁盘。
+
+不需要配 `LD_LIBRARY_PATH`：`deps/_bili-asr.py` 启动时会按 `RTLD_GLOBAL` 预载 venv 里的 `nvidia/*/lib`，探测（`--probe-gpu`）与真转写共用这一处。
+
+想自己用 pip 装也行——路径按脚本自己解析的来（设过 `BILI_WATCH_DEPS` 或改过 `DSH_HOME` 时不是默认值）：
+
+```bash
+DEPS="$(bash scripts/fetch-deps.sh where)"
+"$DEPS/.venv-asr/bin/pip" install \
+  nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-nvrtc-cu12
+```
+
+**为什么第一次慢**：`all`（Windows 是 `-Target all`）不会自动装它（不问、不装那 1.4 GB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
 
 **怎么关**：面板「转写与抽帧」里的「转写时用 GPU」取消勾选（存的是 `asrDevice: cpu`），或把 `deps/deps-config.json` 里的 `asrDevice` 写成 `cpu`。删掉运行库也能自动退回 CPU，不会报错。
 

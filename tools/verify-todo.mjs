@@ -17,8 +17,11 @@
  */
 import { readFileSync, existsSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
+// 2026-10-31 切片 10：peek 的目录名搬进 lib/frames.mjs（纯函数）。
+//   只读原则不变：import 一个纯函数不写盘，比「正则抠源码写法」更耐改，也更接近它要断的行为。
+import { framesDirName, shotsDirName } from '../lib/frames.mjs'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const ROOT =
@@ -34,6 +37,13 @@ const F = {
   cordis: join(ROOT, 'cordis.patch.yml'),
   client: join(ROOT, 'client.js'),
   depsCfg: join(ROOT, 'deps/deps-config.json'),
+  // 2026-10-31 切片 7：输出层（say/warn/QUIET）与参数层搬到这里，B6/B33 要看它
+  cli: join(ROOT, 'tools/cli-io.mjs'),
+  // 2026-10-31 切片 8（api）：jget（412 风控分支）搬进 lib/bili-api.mjs，B14 要看它
+  api: join(ROOT, 'lib/bili-api.mjs'),
+  // 2026-10-31 切片 9 第二步：downloadTo（B13 的 content-type 判据）与 cachedMp4（B16 的前缀）
+  //   搬进 lib/media.mjs，判据要跟着搬，否则 fnBody 抠不到函数体 = 假红。
+  media: join(ROOT, 'lib/media.mjs'),
 }
 
 // ── 读文件（缺失不抛，返回 null） ───────────────────────────────────────
@@ -61,7 +71,10 @@ const cnt = (s, re) => (s ? (s.match(re) || []).length : 0)
  *  本仓所有顶层函数都以列 0 的 `}` 收尾，这个假设在 13 个被测函数上逐个验过。 */
 function fnBody(src, name) {
   if (!src) return null
-  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:async[ \\t]+)?function[ \\t]+${name}[ \\t]*\\(`)
+  // 2026-10-31 切片 8：允许 `export` 前缀——lib/ 下的实现都是 `export function xxx(`，
+  //   原来只认「行首（可带 async）function」，于是 B14 在 jget 搬进 lib 之后报「未找到 jget()」。
+  //   这个正则本身就是「先匹配再断言」的预处理，C79 直接喂合成源码验它（B5 那次就是预处理出错）。
+  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?function[ \\t]+${name}[ \\t]*\\(`)
   const m = re.exec(src)
   if (!m) return null
   const end = src.indexOf('\n}', m.index)
@@ -69,11 +82,50 @@ function fnBody(src, name) {
 }
 
 /** 去掉行注释与块注释，避免注释里的词被当成用户可见文案 */
+// 剥注释（保留换行，行号不变）。
+//
+// 2026-10-31 切片 7 重写：原来先剥 /* */ 再剥 //，于是**一行 `//` 注释里只要出现 `/*`**
+//   （比如「搬到 tools/commands/*.mjs」这种写法），扫描器就以为块注释开始了，
+//   一路吃到下一个 `*/`——look.mjs 那次从第 67 行吃到第 304 行，把 biliCodeReason 的
+//   中文文案整段吞掉，B5 于是从 PASS 变 FAIL。判据没坏，是扫描面坏了。
+//   （同族问题：C41「注释里的 $repoOnly 也算」、C54「注释里的 av 19 也算」、C73「注释掉的调用也算」。）
+// 现在逐字符扫：字符串（' " `）里的 // 与 /* 都不算注释起点，注释里的 /* 也不会另起一块。
+// 已知不做的事：模板串里的 ${…} 当普通字符串内容处理（本仓库没有在 ${} 里写注释的写法）。
 function stripComments(src) {
   if (!src) return ''
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:\\])\/\/[^\n]*/g, '$1')
+  let out = ''
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    const n = src[i + 1]
+    if (c === '/' && n === '/') {
+      while (i < src.length && src[i] !== '\n') i++
+      out += '\n'
+      continue
+    }
+    if (c === '/' && n === '*') {
+      i += 2
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
+        if (src[i] === '\n') out += '\n'
+        i++
+      }
+      i++ // 吃掉 '/'
+      continue
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c
+      out += c
+      i++
+      while (i < src.length && src[i] !== q) {
+        if (src[i] === '\\') { out += src[i]; i++ }
+        if (i < src.length) out += src[i]
+        i++
+      }
+      if (i < src.length) out += src[i]
+      continue
+    }
+    out += c
+  }
+  return out
 }
 
 function lineOf(src, idx) {
@@ -113,6 +165,7 @@ function guard(id, name, fn) {
 
 const LOOK = SRC.look
 const INDEX = SRC.index
+const CLI = SRC.cli
 const PKG = (() => {
   try {
     return JSON.parse(SRC.pkg || '{}')
@@ -120,6 +173,15 @@ const PKG = (() => {
     return null
   }
 })()
+
+// 切片 1（2026-10-31）：cleanKey/bvOf/cutCp/looksLikeOwnUrlDir 已搬到 lib/keys.mjs。
+//   这里 import 真跑，与 verify.mjs 的 C7 同口径；搬家未生效（lib 缺失）时置 null，B3 自行降级。
+let libKeys = null
+try {
+  libKeys = await import(pathToFileURL(join(ROOT, 'lib/keys.mjs')).href)
+} catch {
+  libKeys = null
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // B1  11-11  deps-config.json 硬编码本机 ffmpeg 路径
@@ -169,24 +231,29 @@ guard('B2', '11-10 files 漏 README.md', () => {
 // B3  15-9  cleanKey 不挡「带后缀」的 Windows 保留名（con.txt）
 // ══════════════════════════════════════════════════════════════════════
 guard('B3', '15-9 cleanKey 带后缀保留名', () => {
-  const body = fnBody(LOOK, 'cleanKey')
-  if (!body) return bad('B3', '15-9 cleanKey 带后缀保留名', '未找到 cleanKey()（改名或已删）')
-  const MARK = 'con|prn|aux|nul|com[0-9]|lpt[0-9])'
-  const at = body.indexOf(MARK)
-  if (at < 0) return bad('B3', '15-9 cleanKey 带后缀保留名', 'cleanKey 里完全没有保留名判断')
-  // 取保留名分组右括号之后的 8 个字符，看是 $ 收尾还是容忍 .后缀
-  const after = body.slice(at + MARK.length, at + MARK.length + 8)
-  const onlyExact = after.trimStart().startsWith('$')
-  const tolerantByRegex = /\\\./.test(after)
-  const tolerantByCode =
-    /split\(\s*['"]\.['"]\s*\)/.test(body) || /replace\(\s*\/\\\.[^/]*\/\s*,\s*''\s*\)/.test(body)
-  if (!onlyExact || tolerantByRegex || tolerantByCode)
-    return ok('B3', '15-9 cleanKey 带后缀保留名', `保留名判断容忍扩展名（分组后为「${after.trim()}」）`)
-  bad(
-    'B3',
-    '15-9 cleanKey 带后缀保留名',
-    `保留名正则以 $ 收尾（分组后为「${after.trim()}」），只挡 con 本身；con.txt / NUL.txt 放行`,
-  )
+  if (!libKeys || !libKeys.cleanKey)
+    return bad('B3', '15-9 cleanKey 带后缀保留名', 'lib/keys.mjs 未找到或 cleanKey 未导出（切片 1 搬家未生效？）')
+  const ck = libKeys.cleanKey
+  // 台账 15-9：旧实现只挡裸保留名 con，放行 con.txt / NUL.ini（Windows 上仍是设备名）。
+  //   新实现按去扩展名后的 base 判，应连后缀一起压成 _misc；普通名不可误伤。
+  const cases = [
+    ['con', '_misc', '裸保留名'],
+    ['con.txt', '_misc', '带 .txt 后缀的保留名'],
+    ['NUL.ini', '_misc', '带 .ini 后缀的保留名（大小写不敏感）'],
+    ['com1', '_misc', 'com 系保留名'],
+    ['prn.json', '_misc', 'prn 带后缀'],
+    ['config', 'config', '普通名不应被误伤'],
+  ]
+  for (const [inp, want, why] of cases) {
+    const got = ck(inp)
+    if (got !== want)
+      return bad(
+        'B3',
+        '15-9 cleanKey 带后缀保留名',
+        `cleanKey(${JSON.stringify(inp)}) = ${JSON.stringify(got)}，期望 ${JSON.stringify(want)}（${why}）`,
+      )
+  }
+  ok('B3', '15-9 cleanKey 带后缀保留名', `${cases.length} 条对抗输入：裸保留名 + 带后缀保留名均压成 _misc，普通名不误伤`)
 })
 
 // ══════════════════════════════════════════════════════════════════════
@@ -236,7 +303,8 @@ guard('B5', '9-3 视频不存在无中文', () => {
 guard('B6', '2-11 sub 坏格式错误进 stdout', () => {
   const body = fnBody(LOOK, 'cmdSub')
   if (!body) return bad('B6', '2-11 sub 坏格式错误进 stdout', '未找到 cmdSub()')
-  const q = /QUIET\s*=\s*opts\.format\s*===\s*'srt'/.exec(body)
+  // 切片 7：QUIET 的赋值搬成 setQuiet(...)，判据跟着改，含义不变
+  const q = /setQuiet\(opts\.format\s*===\s*'srt'/.exec(body)
   const badFmt = /say\(\s*`?✗ 不认识的 --format/.exec(body)
   if (!badFmt) return ok('B6', '2-11 sub 坏格式错误进 stdout', '坏格式分支已不存在或已改走 stderr')
   if (!q) return bad('B6', '2-11 sub 坏格式错误进 stdout', 'cmdSub 不再按 format 设 QUIET，通道不明')
@@ -368,8 +436,12 @@ guard('B12', '3-12 缓存 key 不含 cid', () => {
 // B13  9-15  downloadTo 不判 content-type，风控 HTML 被当直链
 // ══════════════════════════════════════════════════════════════════════
 guard('B13', '9-15 风控 HTML 当直链', () => {
-  const body = fnBody(LOOK, 'downloadTo')
-  if (!body) return bad('B13', '9-15 风控 HTML 当直链', '未找到 downloadTo()')
+  // 2026-10-31 切片 9 第二步：downloadTo 搬进 lib/media.mjs（入口知识走参数：headers/maxBytes/onNetError）。
+  //   判据跟着搬到实现处，并加一条「look.mjs 不许再留第二份」——留了就是两处判据，迟早不同步。
+  const body = fnBody(SRC.media || '', 'downloadTo')
+  if (!body) return bad('B13', '9-15 风控 HTML 当直链', '未找到 downloadTo()（lib/media.mjs）')
+  if (/async function downloadTo|export async function downloadTo/.test(LOOK || ''))
+    return bad('B13', '9-15 风控 HTML 当直链', 'look.mjs 又定义了一份 downloadTo——content-type 判据会分成两份')
   if (/content-type/i.test(body)) return ok('B13', '9-15 风控 HTML 当直链', 'downloadTo 有 content-type 判定')
   bad(
     'B13',
@@ -382,9 +454,12 @@ guard('B13', '9-15 风控 HTML 当直链', () => {
 // B14  9-2  412 风控无中文提示，且静默降级 ASR
 // ══════════════════════════════════════════════════════════════════════
 guard('B14', '9-2 412 无提示且降级 ASR', () => {
-  const body = fnBody(LOOK, 'jget')
-  if (!body) return bad('B14', '9-2 412 无提示且降级 ASR', '未找到 jget()')
-  const has412 = /412/.test(body) || /412/.test(LOOK || '')
+  // 2026-10-31 切片 8（api）：jget 搬进 lib/bili-api.mjs。判据同时盯两处——
+  //   实现处要有 412 分支，look.mjs 不许再留一份自己的实现（留了就是两处判据，迟早不同步）。
+  const body = fnBody(SRC.api || '', 'jget')
+  if (!body) return bad('B14', '9-2 412 无提示且降级 ASR', '未找到 jget()（lib/bili-api.mjs）')
+  if (/async function jget[(]/.test(LOOK || '')) return bad('B14', '9-2 412 无提示且降级 ASR', 'look.mjs 又定义了一份 jget——412 判据会分成两份')
+  const has412 = /412/.test(body)
   if (has412) return ok('B14', '9-2 412 无提示且降级 ASR', '代码里出现 412 分支')
   bad(
     'B14',
@@ -413,23 +488,34 @@ guard('B15', '15-7 slugTitle 尾点与 emoji', () => {
 // B16  4-3  peek 与 frames 各下一份 mp4
 // ══════════════════════════════════════════════════════════════════════
 guard('B16', '4-3 peek/frames 各下一份 mp4', () => {
-  const peek = fnBody(LOOK, 'peekFrames')
-  const cache = fnBody(LOOK, 'cachedMp4')
-  if (!peek || !cache) return bad('B16', '4-3 peek/frames 各下一份 mp4', '未找到 peekFrames() 或 cachedMp4()')
-  const peekDir = /join\(CACHE,\s*'frames',\s*`([^`]*)`\)/.exec(peek)
+  // 2026-10-31 切片 10：peek 的目录名搬进 lib/frames.mjs 的 shotsDirName（纯函数，import 即真跑）。
+  //   原来这条判据是「正则抠 look.mjs 里 join(cacheDir(),'frames',`…`) 这个写法」——
+  //   写法一改就假红（今晚第 N 次同族），而它要断的行为其实很具体：
+  //   peek 的目录名必须落在 cachedMp4 认的 `<BV>-p<page>-` 前缀里，
+  //   否则 frames 永远复用不到 peek 下载的那份 mp4，两个命令各下一份。
+  const peekDir = shotsDirName('BV1aaaaaaaaa', 2)
+  const cache = fnBody(SRC.media || '', 'cachedMp4')
+  if (!cache) return bad('B16', '4-3 peek/frames 各下一份 mp4', '未找到 cachedMp4()（lib/media.mjs）')
   const cachePrefix = /startsWith\(`([^`]*)`\)/.exec(cache)
-  if (!peekDir || !cachePrefix)
-    return bad('B16', '4-3 peek/frames 各下一份 mp4', '目录模板或 cachedMp4 前缀未识别，需人工看')
-  const p = peekDir[1]
-  const c = cachePrefix[1]
-  // peek 目录形如 `${bv}-peek-p${p}`，cachedMp4 只认 `${bv}-p${page}-`
-  if (p.includes('-peek-') && c.includes('${bv}-p${page}-'))
+  if (!cachePrefix)
+    return bad('B16', '4-3 peek/frames 各下一份 mp4', 'cachedMp4 前缀未识别，需人工看')
+  // 把前缀模板换成真实目录名（`${bv}` → BV1aaaaaaaaa，`${page}` → 2），再问「这个目录名落在前缀里吗」
+  const real = cachePrefix[1].replace(/\$\{bv\}/g, 'BV1aaaaaaaaa').replace(/\$\{page\}/g, '2')
+  if (!peekDir.startsWith(real))
     return bad(
       'B16',
       '4-3 peek/frames 各下一份 mp4',
-      `peek 落在 "${p}"，cachedMp4 只认 "${c}" → peek 的 mp4 永不被 frames 复用，各下一份`,
+      `peek 落在 "${peekDir}"，cachedMp4 只认 "${real}" → peek 的 mp4 永不被 frames 复用，各下一份`,
     )
-  ok('B16', '4-3 peek/frames 各下一份 mp4', `peek 目录 "${p}" 与 cachedMp4 前缀 "${c}" 可对上`)
+  // frames 自己的目录名也得落在同一前缀里：它把自己的 mp4 放在那儿，
+  // cachedMp4 找不回来就等于白下（这正是这条判据要防的「各下一份」）
+  const fdir = framesDirName('BV1aaaaaaaaa', 2, '5s')
+  if (!fdir.startsWith(real))
+    return bad('B16', '4-3 peek/frames 各下一份 mp4', `frames 目录 "${fdir}" 不在 cachedMp4 的前缀 "${real}" 里`)
+  // 目录构造不许在 look.mjs 里再抄一份（抄一份就迟早分叉）
+  if (/join\(\s*(?:CACHE|cacheDir\(\))\s*,\s*'frames'/.test(LOOK || ''))
+    return bad('B16', '4-3 peek/frames 各下一份 mp4', 'look.mjs 又自己拼了 frames 目录——目录模板会分成两份')
+  ok('B16', '4-3 peek/frames 各下一份 mp4', `peek 目录 "${peekDir}" 与 frames 目录 "${fdir}" 都能被 cachedMp4 的前缀 "${real}" 命中`)
 })
 
 // ══════════════════════════════════════════════════════════════════════
@@ -700,13 +786,19 @@ guard('B33', '2-27 进度行进 stdout', () => {
   // 三条同时成立才 PASS：① look.mjs 解析 --quiet 且置 QUIET=true；② say() 在 QUIET 时走 console.error；
   // ③ index.js 工具层 execute 无条件下发 --quiet。缺哪条在证据里写明。
   const misses = []
-  if (!/argv\.includes\(['"]--quiet['"]\)/.test(LOOK || '')) misses.push('look.mjs 未解析 --quiet')
-  else if (!/QUIET\s*=\s*true/.test(LOOK || '')) misses.push('look.mjs 解析了 --quiet 但未置 QUIET=true')
-  if (!/const say = \(\.\.\.a\) => \(QUIET \? console\.error : console\.log\)/.test(LOOK || ''))
+  // 切片 7：这三样本事都在 tools/cli-io.mjs 里了（look.mjs 只剩 import）。
+  //   多加一条「look.mjs 不许自己再定义 say」——否则搬出去之后有人补一份本地实现，
+  //   两条判据都还是绿的，QUIET 却分成两份状态。
+  if (!/argv\.includes\(['"]--quiet['"]\)/.test(CLI || '')) misses.push('cli-io.mjs 未解析 --quiet')
+  else if (!/setQuiet\(true\)/.test(CLI || '')) misses.push('cli-io.mjs 解析了 --quiet 但没调 setQuiet(true)')
+  if (!/const say = \(\.\.\.a\) => \(QUIET \? console\.error : console\.log\)/.test(CLI || ''))
     misses.push('say() 在 QUIET 时未走 console.error')
+  if (!/export function setQuiet/.test(CLI || '')) misses.push('cli-io.mjs 没导出 setQuiet（外面写不了 QUIET）')
+  if (/const say = /.test(LOOK || '')) misses.push('look.mjs 自己又定义了一份 say（QUIET 会分成两份状态）')
+  if (!/from '\.\/cli-io\.mjs'/.test(LOOK || '')) misses.push('look.mjs 没有从 cli-io.mjs 引入输出层')
   if (!/extra\.push\(['"]--quiet['"]\)/.test(INDEX || '')) misses.push('index.js execute 未无条件下发 --quiet')
   if (misses.length === 0)
-    return ok('B33', '2-27 进度行进 stdout', '三条判据齐备：look 解析 --quiet→QUIET=true、say 在 QUIET 时走 stderr、index 无条件下发 --quiet')
+    return ok('B33', '2-27 进度行进 stdout', '判据齐备：cli-io 解析 --quiet→setQuiet(true)、say 在 QUIET 时走 stderr、index 无条件下发 --quiet、look 没有第二份 say')
   bad('B33', '2-27 进度行进 stdout', `缺 ${misses.length} 条判据：${misses.join('；')}`)
 })
 

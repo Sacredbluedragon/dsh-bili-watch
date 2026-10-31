@@ -14,6 +14,40 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSy
 import { tmpdir, homedir } from 'node:os'
 import { dirname, join, relative, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// 2026-10-31 切片 1：cleanKey / bvOf / cutCp / looksLikeOwnUrlDir 原来在本文件有一份、
+//   tools/look.mjs 里也有一份（逐字相同）。搬进 lib/keys.mjs 后物理上只剩一份，两个进程各 import。
+//   依赖只有一个只读常量 OWN_CACHE_DIRS（lib/consts.mjs），不碰可变状态，可以放心共用。
+// 2026-10-31 切片 2：锁判据（pidAlive / readLock / lockExpired / hasAnyLock / isAdoptableDir）
+//   同理搬进 lib/locks.mjs；CACHE_MARK 从 lib/consts.mjs 拿。
+// 2026-10-31 切片 4：consts 里的两个常量在本文件已经没人读了——CACHE_MARK 只被 pickCacheDir 用、
+//   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进 lib/cache-path.mjs 了。
+//   留着 import 会让人以为本文件还在判根标记/子目录归属。
+// 切片 4：isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
+import { hasAnyLock } from './lib/locks.mjs'
+// 2026-10-31 切片 2：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
+//   切片 4 起 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
+import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned } from './lib/cache-own.mjs'
+import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
+// 2026-10-31 切片 3：调优表与钳制/换算搬进 lib/tuning.mjs。
+//   原来本文件与 tools/look.mjs 各写一份 TUNING_DEFS，靠 C17 逐键比对绑在一起；
+//   现在物理上只有一份，两个入口只负责「把配置读出来」（depsCfg / readDepsCfg）。
+import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults, tuningRanges } from './lib/tuning.mjs'
+// 2026-10-31 切片 3-C：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
+import { logRun } from './lib/runs.mjs'
+// 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
+//   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
+import { readJsonOrBackup as readJsonOrBackupRaw } from './lib/config.mjs'
+// 2026-10-31 切片 4：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
+//   前三个切片搬的是纯函数，compile 抽出来跑等于真跑；这一片搬的是可变模块状态 + 「谁先调」，
+//   所以判据也换了（C64 真起两个进程比对实际路径 / C65 未初始化必抛，见 tools/verify.mjs）。
+import { cacheAdoptNotice, cacheDir, initCachePath, previewCacheDir, videoDir } from './lib/cache-path.mjs'
+// 2026-10-31 切片 5：凭证的位置 / 完整性判据 / 旧路径迁移搬进 lib/cred.mjs。
+//   本文件与 tools/look.mjs 原来各有一份迁移逻辑，四字段清单更是散在三处；
+//   现在只有一份，两个入口各自把结构化结果翻译成自己的文案（面板静默 → /status，CLI 打 stderr）。
+import { adoptLegacyCred, credPaths, fillBuvids, missingCredFields, pickLoginCookies } from './lib/cred.mjs'
+// 2026-10-31 切片 7：路由守卫搬进 lib/route-claim.mjs（原样不改，只是从私有变导出，
+//   好让 C74 直接断言「同路径被拒 / 不同路径不冲突 / release 后可重登记」）。
+import { claimRoute, releaseRoute } from './lib/route-claim.mjs'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
 // 工具输出上限：超了就把全文落文件、只回摘要。
@@ -23,60 +57,13 @@ import { fileURLToPath } from 'node:url'
 const toolTextCap = () => readTuning().toolTextCap
 const toolTextHead = () => readTuning().toolHead
 
-// ── 进程级路由守卫（T41-P0-1）：fiber 重放/多实例下同一路径只注册一次 ──
-// 参照 dsh-memory-evolve/lib/route-guard.js（MIT）：claim 成功才注册；
-// effect dispose 时 release，否则重放后新回调跳过注册、路由永久 404。
-const ROUTE_PATHS = new Set()
-function claimRoute(path) {
-  if (ROUTE_PATHS.has(path)) return false
-  ROUTE_PATHS.add(path)
-  return true
-}
-function releaseRoute(path) {
-  ROUTE_PATHS.delete(path)
-}
+// 进程级路由守卫已搬到 lib/route-claim.mjs（2026-10-31 切片 7）——收进 lib 后可以直接
+//   import 断言「不同路径不冲突 / release 后可重登记」，不必为了测试给生产代码开口子。
 
-function cleanKey(s) {
-  // 只留字母数字与 _ . -；挡掉 .. / . / Windows 保留设备名，避免输入直接决定磁盘路径
-  // P2-5（2026-10-28 全量检查）：两处 cleanKey 必须逐字一致（面板与 CLI 不许各算一个目录名）——
-  //   ① 尾部点号/空格在 Windows 上会被系统吃掉，「建出来的目录名」与「下次拼出来的目录名」不一致；
-  //   ② 保留名要连后缀一起挡（con.txt / NUL.ini 在 Windows 上照样是设备名），按去扩展名后的基名判。
-  const k = String(s || '').replace(/[^\w.-]/g, '').slice(0, 40).replace(/[\s.]+$/, '')
-  const base = k.split('.')[0]
-  if (!k || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i.test(base)) return '_misc'
-  return k
-}
+// cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31 切片 1）——两处逐字相同的实现只留一份。
+// videoDir 已搬到 lib/cache-path.mjs（2026-10-31 切片 4）——它读缓存根，而缓存根现在住在那个模块里。
 
-/** T34-P0-1 / E6-02（2026-10-30）：模型可能把整条链接当 key 传进来，先取 BV 再建目录。
- *  两处必须逐字一致（面板与 CLI 不许各算一个目录名）；CLI 的 positional 是原样接的，
- *  比插件侧更容易收到整条链接，漏了这一侧会造出 http 开头的目录名。 */
-function bvOf(s) {
-  const m = /(BV[0-9A-Za-z]{10})/.exec(String(s || ''))
-  return m ? m[1] : s
-}
-/** 按视频分目录：CACHE/<BV>/<cmd>.txt —— 同一个视频各命令的输出收在一处 */
-function videoDir(key) {
-  const base = cleanKey(bvOf(key))
-  mkdirSync(CACHE, { recursive: true })
-  // 同一个 BV 已经有目录（可能被 CLI 改成「BV_标题」）就用它，别建第二个兄弟目录（2026-10-26 审查 T01/T02）
-  try {
-    for (const d of readdirSync(CACHE)) {
-      if (d === base || d.startsWith(base + '_')) return join(CACHE, d)
-    }
-  } catch {}
-  const d = join(CACHE, base)
-  mkdirSync(d, { recursive: true })
-  return d
-}
-
-/** N05-B4（2026-10-27 加）：按码点截断。emoji 是代理对，`slice(0, n)` 会从中间切开，
- *  回显末位变成 U+FFFD（`�`）；落盘文件是完整的，只有给模型的这段被切坏。 */
-function cutCp(s, n) {
-  const str = String(s ?? '')
-  if (str.length <= n) return str
-  const a = Array.from(str)
-  return a.length <= n ? str : a.slice(0, n).join('')
-}
+// cutCp 已搬到 lib/keys.mjs（2026-10-31 切片 1）。
 
 let TOOL_FILE_SEQ = 0
 /** 长文本 → 落盘 + 摘要；短文本原样返回（不论长短都先落一份到缓存）。
@@ -215,8 +202,11 @@ function scheduleDepsMigration() {
 // 本机路径来源：env 优先，其次 deps\deps-config.json（写文件即生效，不必重启），最后 deps 自身。
 // 配置文件不进包（deps 只留空目录），发布时无需脱敏。
 // 解析失败不写 stdout/stderr（会污染 --format json 与 PowerShell 管道），
-// 而是记进 cfgWarning，由 /status 的 warnings 带给面板；ENOENT（没配过）不算异常。
-let cfgWarning = null
+// 而是攒进 cfgWarnings，由 /status 的 warnings 带给面板；ENOENT（没配过）不算异常。
+// 2026-10-31 切片 3-B：原来是 `let cfgWarning = null`，谁后读谁覆盖——两个配置文件同时坏，
+//   面板只看得到最后一条。现在攒成数组（去重，同一条不重复堆），读盘行为本身搬进 lib/config.mjs。
+const cfgWarnings = []
+const pushWarn = (msg) => { if (msg && !cfgWarnings.includes(msg)) cfgWarnings.push(msg) }
 // issue #2 P3-3（2026-10-28）：bili_watch 工具没注册成功时原来只 console.warn，桌面端看不到控制台，
 // 用户会以为「工具坏了」。改成同时记一条，由 /status 的 warnings 带到面板。
 let toolsWarning = null
@@ -227,64 +217,15 @@ let toolsWarning = null
 function depsCfg() {
   return readDepsCfgFile(join(DEPS, 'deps-config.json'))
 }
-/**
- * 参数分层（2026-10-28 阶段B）：面板可调的五个数值，全部并进 deps\deps-config.json，
- * 不新开第四份配置文件。优先级 CLI flag > deps-config.json > 这里的常量默认。
- * 校验只写一处（tuneOne）：非法/超界/非数字一律静默回落默认值，不抛错、不中断命令。
- */
-const TUNING_DEFS = {
-  asrMaxSec: { def: 1800, min: 300, max: 3600 },
-  maxFrames: { def: 500, min: 100, max: 1000 },
-  asrTimeoutSec: { def: 900, min: 300, max: 3600 },
-  ffmpegTimeoutSec: { def: 300, min: 60, max: 1800 },
-  cmdTimeoutSec: { def: 180, min: 60, max: 900 },
-  // 2026-10-28 老大要求「高级设置放开，能调的都给调」：下面 8 项原来是硬编码。
-  // 全部整数（tuneOne 会 Math.floor，别写小数）；键集必须与 tools/look.mjs:2878 那份完全一致，
-  // verify.mjs 的 C17 会逐键比对，改一处漏一处直接红。
-  asrMemMB: { def: 1536, min: 512, max: 16384 },   // 跑本地转写要多少可用内存（MB），不够就跳
-  lockTtlMin: { def: 30, min: 5, max: 240 },       // 残留锁多久算过期（分钟）
-  unitLimit: { def: 5000, min: 1000, max: 20000 }, // 单个内容单元（字幕段/评论）字符上限
-  textLimit: { def: 800, min: 200, max: 5000 },    // 文本层默认给多少字
-  toolTextCap: { def: 2000, min: 500, max: 12000 },// 工具层单次回给模型的总字数（调大会挤占对话上下文）
-  toolHead: { def: 800, min: 200, max: 5000 },     // 工具层默认 head 字数
-  dmBucketSec: { def: 30, min: 5, max: 120 },      // 弹幕热区按多少秒一桶
-  dmTop: { def: 5, min: 1, max: 20 },              // 弹幕热区取前几桶
-  // 2026-10-28 第二批 3 项：都是「撞上了只能报 bug、自己没法自救」的。
-  // 语速用 ×10 整数存（20 = 2.0 字/秒），因为 tuneOne 会 Math.floor，不能写小数。
-  downloadMaxMB: { def: 512, min: 64, max: 4096 }, // 单个视频/音频下载上限（4K 素材会撞）
-  subRateMin10: { def: 20, min: 5, max: 60 },      // 字幕语速下限×10，低于判「可疑」
-  subRateMax10: { def: 85, min: 30, max: 200 },    // 字幕语速上限×10，高于判「可疑」
-  textBrief: { def: 400, min: 100, max: 3000 },    // 超长文本只给开头多少字（其余落盘）
-  // 第十条（2026-10-29）：ASR 推理设备。枚举项不走数值钳制（tuneOne 先看 kind）。
-  //   只有 auto / cpu 两态：auto = 有可用 CUDA 就用、失败回落 CPU（_bili-asr.py 里实现）。
-  //   不暴露 cuda 是因为「强制 cuda」在没有 GPU 的机器上只会多一次失败日志，没有收益。
-  asrDevice: { def: 'auto', kind: 'enum', values: ['auto', 'cpu'] },
-}
-const TUNING_KEYS = Object.keys(TUNING_DEFS)
-const tuningDefaults = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, TUNING_DEFS[k].def]))
-// 第十条（2026-10-29）：枚举项（asrDevice）的「范围」是可选值数组，不是 [min, max]
-const tuningRanges = () => Object.fromEntries(TUNING_KEYS.map((k) => [k, TUNING_DEFS[k].kind === 'enum' ? TUNING_DEFS[k].values : [TUNING_DEFS[k].min, TUNING_DEFS[k].max]]))
-function tuneOne(key, raw) {
-  const d = TUNING_DEFS[key]
-  // 第十条（2026-10-29）：枚举项（asrDevice）不走数值钳制，否则 Math.floor('auto') = NaN
-  if (d.kind === 'enum') {
-    const s = String(raw ?? '').trim().toLowerCase()
-    return d.values.includes(s) ? s : d.def
-  }
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return d.def
-  if (n < d.min || n > d.max) return d.def
-  return Math.floor(n) // 与 tools/look.mjs 的 clampTuning 取整口径一致（两处必须同语义）
-}
+// 参数分层（2026-10-28 阶段B）：面板可调的数值全部并进 deps\deps-config.json，不新开第四份配置文件。
+// 表与钳制已搬到 lib/tuning.mjs（2026-10-31 切片 3）——原来这里与 tools/look.mjs 各写一份，
+//   靠 C17 逐键比对绑在一起；现在物理上只剩一份，面板与 CLI 不可能再各读各的默认值。
 /** 每次调用都读盘（照 cacheCfg 的写法）：index.js 是常驻进程，存闭包就是「面板改了插件还是老的」。 */
 function readTuning() {
-  const cfg = depsCfg()
-  const out = {}
-  for (const k of TUNING_KEYS) out[k] = tuneOne(k, cfg[k])
-  return out
+  return normalizeTuning(depsCfg())
 }
 /**
- * 读 deps-config.json，坏文件先备份再退回默认值（X-16a，2026-10-28 WB-CN N12 §2 头号）。
+ * 读 deps-config.json，坏文件先备份再退回默认值（X-16a，2026-10-28 N12 §2 头号）。
  *
  * 原来两处写入口都是 `try { cur = JSON.parse(readFileSync(p)) } catch {}`：
  * 解析失败 cur 变 `{}`，下次改**任意一个**参数就整份写回——ffmpeg 路径、cache 目录、
@@ -298,27 +239,23 @@ function readTuning() {
  *   现在抽成一个函数。行为以已经改对的那两处为准（uiCfg / cacheCfg）。
  * 留档而不是直接拒绝写，是因为拒绝写会让面板「保存」一直失败、用户也不知道该改哪个文件。
  */
+/**
+ * 读配置的统一薄壳：行为在 lib/config.mjs（留档 + 回默认值 + 结构化 problem），
+ * 这里只负责把 problem 翻成中文文案并攒进 cfgWarnings。
+ * 保留原签名（读不到就返回 fallback 本身），三处调用点（deps-config / ui / 缓存策略）不用改。
+ */
 function readJsonOrBackup(p, fallback) {
-  let raw
-  try {
-    raw = readFileSync(p, 'utf8')
-  } catch (e) {
-    if (e?.code !== 'ENOENT') cfgWarning = `${basename(p)} 读取失败：${String(e?.message || e)}`
-    return fallback
-  }
-  if (!raw.trim()) return fallback
-  try {
-    return JSON.parse(raw)
-  } catch (e) {
-    const bak = `${p}.broken-${Date.now()}`
-    try {
-      renameSync(p, bak)
-      cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}），原文件已备份为 ${basename(bak)}，本次按默认值继续`
-    } catch (e2) {
-      cfgWarning = `${basename(p)} 解析失败（${String(e?.message || e)}）且备份失败（${String(e2?.message || e2)}），本次按默认值继续`
-    }
-    return fallback
-  }
+  const { value, problem } = readJsonOrBackupRaw(p, fallback)
+  if (problem) pushWarn(cfgProblemText(p, problem))
+  return value
+}
+/** problem → 面板上那句中文。文案留在 index.js：CLI 侧要的是 ASCII 前缀的英文（见 tools/look.mjs）。 */
+function cfgProblemText(p, problem) {
+  const name = basename(p)
+  const err = problem.error
+  if (problem.kind === 'read') return `${name} 读取失败：${err}`
+  if (problem.backup) return `${name} 解析失败（${err}），原文件已备份为 ${basename(problem.backup)}，本次按默认值继续`
+  return `${name} 解析失败（${err}）且备份失败（${String(problem.backupFailed || '')}），本次按默认值继续`
 }
 
 function readDepsCfgFile(p) {
@@ -375,305 +312,77 @@ function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEP
 //     ② 「跟随别人写的凭证」本身就不该是 watch 的职责——读谁的号应该由用户在本插件里扫。
 //   现在规则只有一条：$DSH_HOME/bili-watch/credential.json；没有就从 deps/credential.json
 //   （更旧的 legacy）迁移一次；都没有就是未登录（匿名请求）。
-const SHARED_CRED = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'credential.json')
-const LEGACY_CRED = join(DEPS, 'credential.json')
+const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
+// 迁移与校验搬进 lib/cred.mjs（2026-10-31 切片 5）：这里只要「这次该读哪个路径」。
+//   面板侧原本就静默（不打印），所以这里对 problem 一律不翻译——凭证状态由 /status 的 credState 解释。
 function resolveCredPath() {
-  if (existsSync(SHARED_CRED)) return SHARED_CRED
-  if (existsSync(LEGACY_CRED)) {
-    try {
-      // 2026-10-26 收口（DSH 拍板）：迁移走 loadCred 同一路径——先解析 JSON 并校验必填字段，
-      // 残缺该拒就拒（继续用旧路径），不把坏凭证原样搬到新路径。
-      const j = JSON.parse(readFileSync(LEGACY_CRED, 'utf8'))
-      const missing = ['sessdata', 'bili_jct', 'buvid3', 'buvid4'].filter((k) => !j[k])
-      if (missing.length) return LEGACY_CRED
-      mkdirSync(dirname(SHARED_CRED), { recursive: true })
-      writeFileSync(SHARED_CRED, JSON.stringify(j, null, 2), { encoding: 'utf8', mode: 0o600 })
-      return SHARED_CRED // 2026-10-26 批次5：只在真写成功后才返回新路径
-    } catch {
-      return LEGACY_CRED // JSON 解析失败或写 SHARED 抛错：继续用旧凭证，不返回没写成功的新路径
-    }
-  }
-  return SHARED_CRED
+  return adoptLegacyCred({ shared: SHARED_CRED, legacy: LEGACY_CRED }).path
 }
 const LAST_RUN = join(DEPS, 'last-run.json')
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > $DSH_HOME/bili-watch/cache。发布版不含本机路径。
 // 自定义目录不可写时不让功能哑掉：回退到默认路径（$DSH_HOME/bili-watch/cache），并把原因挂进 /status.warnings。
-// 缓存根标记：只有我们自己写过这个文件，才认「这个目录已经是缓存根」
-const CACHE_MARK = '.bili-watch-root'
-const OWN_CACHE_DIRS = new Set(['_logs', 'frames', 'sheets', 'sheet-tmp', 'substrip-tmp', '_misc', 'asr', 'frames-dl', 'audio-dl', '_hot'])
-function isOwnedEntry(p) {
-  const rel = relative(CACHE, p)
-  const first = rel.split(/[\\/]/)[0]
-  if (OWN_CACHE_DIRS.has(first)) return true
-  if (/^\.(meta-|write-test-)/.test(first)) return true
-  // #1（2026-10-30 E8 总表 58 条里唯一会删用户文件的那条）：BV 目录不能只认名字。
-  //   原来的 /^BV…/ 直接 return true，于是自动清理（autoCleanCache → walkEntries）与 pruneEmptyDirs
-  //   会把用户在缓存根放的一个恰好叫 BV1234567890/ 的目录当成我们的，连里面用户自己的文件一起删。
-  //   改成与 removeOwned（用户点清理）同一判据 isOwnBvDir：名字像 BV 且（有 meta.json 或目录为空）。
-  //   同一个删除面两个入口判据必须相同，否则只修了一边（E8 根因 D：归属判据宽于实际所有权）。
-  return isOwnBvDir(join(CACHE, first), first)
-}
+// 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31 切片 2）——两处同名同值的「身份凭证」只留一份。
+// OWN_CACHE_DIRS 已搬到 lib/consts.mjs（2026-10-31 切片 1）——两处同名同值的常量只留一份。
+// isOwnedEntry 已搬到 lib/cache-own.mjs（2026-10-31 切片 2），签名变成 isOwnedEntry(root, p)——
+//   缓存根由调用方传入（切片 4 把 CACHE 搬进状态模块时，这里只换实参）。
+//   #1（2026-10-30 E8）：BV 目录不能只认名字，否则自动清理会把用户的 BV1234567890/ 连文件一起删；
+//   现在的判据与 removeOwned 完全同一套（isOwnBvDir），同族说明见 lib/cache-own.mjs 文件头。
 // A-3（2026-10-28 阶段A）：清理前确认「没有任何会写盘的子目录在被占用」。
-//   原实现只查 frames/.lock 与 frames/<子>/.lock，漏掉 sheet-tmp / substrip-tmp / CACHE 根的 .meta-*.lock / asr。
-//   递归扫（深度 ≤3），只认文件名以 .lock 结尾（覆盖 .lock / .BV-p1-2s.lock / .meta-xx.lock / .BV-grid.lock）。
-//   与 tools/look.mjs 的同名函数必须逐字一致（面板与 CLI 判据不能分叉）。
-// P1（2026-10-28 全量检查）：判据补上「判活 + 判过期」。原来只看文件名存在，于是 Ctrl-C / 强杀 / 断电
-//   留下一个 .lock 会让 autoCleanCache 永远 locked、而唯一逃生口 clean 用同一判据也被堵死，
-//   缓存只涨不消且没有 --force。这里与 tryLock 用完全相同的判据：持有者进程还活着且未过期才算被占用。
-//   下面三个辅助函数与 tools/look.mjs:647-662 逐字一致。
+//   实现已搬到 lib/locks.mjs（2026-10-31 切片 2）——面板与 CLI 的判据物理上只留一份。
+//   判活 + 判过期两条判据的由来见那边的文件头与 hasAnyLock 注释。
 // 2026-10-28 高级设置放开：与 tools/look.mjs 同源，从 readTuning().lockTtlMin 取（默认 30 分钟）
 // X-14（2026-10-29）：TTL 还必须覆盖一次最长转写——asrTimeoutSec 上限 60 分钟 > 默认 TTL 30 分钟，
 //   转写跑满时锁先被判过期、别的进程抢进来 → 双持。所以取两者的较大值（与 CLI 同一判据）。
-const lockTtlMs = () => {
-  const t = readTuning()
-  return Math.max(t.lockTtlMin * 60 * 1000, (t.asrTimeoutSec + 120) * 1000)
-}
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false
-  try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
-}
-function readLock(f) {
-  try {
-    const j = JSON.parse(readFileSync(f, 'utf8'))
-    if (Number.isInteger(j?.pid) && j.pid > 0) return j
-  } catch {}
-  return null
-}
-function lockExpired(owner) {
-  if (!owner) return true
-  return Date.now() - (owner.at || 0) > (owner.ttlMs || lockTtlMs())
-}
-function hasAnyLock(root) {
-  const walk = (d, depth) => {
-    if (depth > 3) return false
-    let ents
-    try { ents = readdirSync(d, { withFileTypes: true }) } catch { return false }
-    for (const e of ents) {
-      if (e.isFile() && e.name.endsWith('.lock')) {
-        const owner = readLock(join(d, e.name))
-        if (owner && pidAlive(owner.pid) && !lockExpired(owner)) return true
-        continue // 残留锁不算占用（真清的时候由 tryLock / unlockStale 负责删）
-      }
-      if (e.isDirectory() && walk(join(d, e.name), depth + 1)) return true
-    }
-    return false
-  }
-  return walk(root, 0)
-}
-// 2026-10-28：cleanKey 会把整条链接压成目录名（如 httpsb23.tvabc123）——短链没解析成 BV 时
-// 插件自己就建了这种目录，清理时必须认它，否则「立即清除」会留一堆删不掉的垃圾（用户实测剩 3 个）。
-// 10-28 又实测剩两个：`search` 的落盘目录名来自查询词（如 `DeepSeekHarness`）、`hot` 落 `_hot`。
-// 判据：里面**只有**我们自己的产物，且至少有一个 `*.tool.txt`。用户素材目录装的是 mp4/jpg，不会是这个形态；
-// 要求「至少一个 tool.txt」是给「名字不像 URL 的目录」加门槛，空目录仍只认名字像 URL 的。
-function looksLikeOwnUrlDir(p, name) {
-  let ents
-  try { ents = readdirSync(p, { withFileTypes: true }) } catch { return false }
-  if (!ents.length) return /^https?/i.test(name)
-  let hasToolTxt = false
-  for (const e of ents) {
-    if (e.isDirectory()) {
-      if (!OWN_CACHE_DIRS.has(e.name)) return false
-      continue
-    }
-    if (/\.tool\.txt$/i.test(e.name)) hasToolTxt = true
-    else if (!/^(meta\.json|.*\.lock)$/i.test(e.name)) return false
-  }
-  return hasToolTxt || /^https?/i.test(name)
-}
-// 追加一配套（2026-10-29，P0）：能不能把「用户指定的目录」直接当缓存根。
-//   能认领的只有三种：不存在（我们会新建）/ 空的 / 已经带我们的标记。
-//   有内容又没有标记 = 用户自己的目录（素材库、下载目录），绝不认领 —— 否则 pickCacheDir 这一次就把标记写进去，
+//   切片 2 时它没跟着锁判据搬走（它读盘，而 CLI 侧的对应物叫 tuning()，两个名字），于是
+//   lib/locks.mjs 只能收一个 ttlMs 参数。切片 3 把算式收到 lib/tuning.mjs 的 lockTtlMsOf：
+//   这里只剩「读配置」，两个入口喂给 lockTtlMsOf 的都是 normalizeTuning 的结果，算式不再有第二份。
+const lockTtlMs = () => lockTtlMsOf(readTuning())
+// pidAlive / readLock / lockExpired / hasAnyLock 已搬到 lib/locks.mjs（2026-10-31 切片 2）。
+//   注意签名变了：lockExpired(owner, ttlMs)、hasAnyLock(root, ttlMs)——TTL 由调用方算好传入。
+// looksLikeOwnUrlDir 已搬到 lib/keys.mjs（2026-10-31 切片 1）——两处逐字相同的实现只留一份。
+// isAdoptableDir 已搬到 lib/locks.mjs（2026-10-31 切片 2）。它守住的那条线没变：
+//   能认领的只有三种——不存在（我们会新建）/ 空的 / 已经带我们的标记；
+//   有内容又没有标记 = 用户自己的目录（素材库、下载目录），绝不认领，否则 pickCacheDir 这次就把标记写进去，
 //   紧接着 removeOwned 看到标记就开始按名字删，守卫等于空转（实测：指向素材库跑 clean 会删掉 4 个用户文件）。
-function isAdoptableDir(dir) {
-  try {
-    if (!existsSync(dir)) return true
-    if (existsSync(join(dir, CACHE_MARK))) return true
-    return readdirSync(dir).length === 0
-  } catch {
-    return false
-  }
-}
-// 删除面守卫（2026-10-29 追加一，P0）：只有带根标记的目录才算「我们的缓存根」。
-//   CACHE 来自 BILI_WATCH_CACHE / deps-config.json 的 cache，用户可以指到任何目录；指到一个恰好含 BV* 子目录的
-//   素材库，按名字判据就会把用户文件删掉。pickCacheDir() 返回前一定写标记（幂等），所以正常路径上标记一定在；
-//   标记不在就一律不删——宁可留垃圾，也不删用户文件。
-function isOurCacheRoot(dir) {
-  try {
-    return existsSync(join(dir, CACHE_MARK))
-  } catch {
-    return false
-  }
-}
-// 追加二（2026-10-29，P1）：BV 目录不能只认名字——名字像 BV 且里面真有我们写的 meta.json，才算是我们的产物。
-//   meta.json 只有 writeMeta() 会写，用户素材库不会有；frames / asr / _logs 这类通用名不当身份凭证。
-//   这是判 BV 目录归属的唯一判据，按条目判，不管整个目录长什么样。
-function isOwnBvDir(p, name) {
-  if (!/^BV[0-9A-Za-z]{10}(_|$)/i.test(name)) return false
-  if (existsSync(join(p, 'meta.json'))) return true
-  // E7 顺带（2026-10-30）：名字是 BV 但目录是空的——那只能是我们建的。
-  //   videoDir() 先 mkdir 再校验 BV 有效性，所以 `view BV0000000000` 这类请求失败后会留下一个空壳，
-  //   而原判据要求 meta.json，于是这个空壳既清不掉、也永远不消失（用户看到缓存里有个不认识的目录）。
-  //   用户自己不会在缓存根里放一个恰好叫 BV+10 位字符的空目录，放宽到「空」是安全的。
-  try {
-    if (readdirSync(p).length === 0) return true
-  } catch {}
-  return false
-}
-function removeOwned(dir) {
-  // E6-07（2026-10-30，P1）：下面统计体积一律用 lstat。rmSync 删符号链接只删链接本身，
-  //   按 stat 取的是目标大小——「已清理 X MB」会虚高，而真正腾出的空间是链接那几十字节。
-  let files = 0
-  let bytes = 0
-  const skipped = [] // 非本插件条目，不动（不算失败）
-  const failed = [] // 本插件条目但真没删掉（只读目录 / 权限）
-  // 追加一：不是带标记的缓存根，一个文件都不动
-  if (!isOurCacheRoot(dir)) return { files, bytes, skipped: [{ name: dir, why: '不是一个带标记的缓存根，不动' }], failed }
-  let list = []
-  try { list = readdirSync(dir, { withFileTypes: true }) } catch { return { files, bytes, skipped, failed } }
-  for (const e of list) {
-    const p = join(dir, e.name)
-    if (e.isDirectory() && (isOwnBvDir(p, e.name) || OWN_CACHE_DIRS.has(e.name) || looksLikeOwnUrlDir(p, e.name))) {
-      const st = dirStat(p)
-      try { rmSync(p, { recursive: true, force: true }); files += st.files; bytes += st.bytes } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
-    } else if (e.isFile() && /^\.(meta-|write-test-)/.test(e.name)) {
-      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
-    } else if (e.isFile() && e.name === 'login-qr.png') {
-      // E7 顺带（2026-10-30）：登录二维码写在缓存根，而原判据只认 BV 目录与 10 个固定子目录，
-      //   于是 clean 每次都把它当「不是 bili-watch 的数据」跳过——迁移函数（migrateLegacyCache）却专门保留它，
-      //   两处口径互相矛盾，结果是这张图永远留在缓存根。它确实是我们写的，该清。
-      try { const st = lstatSync(p); rmSync(p, { force: true }); files += 1; bytes += st.size } catch (err) { failed.push({ name: e.name, why: String(err?.message || err) }) }
-    } else if (e.isFile() && e.name === CACHE_MARK) {
-      // 缓存根标记：静默保留，不进 skip 清单
-    } else {
-      skipped.push({ name: e.name, why: '不是 bili-watch 的缓存条目，不动' })
-    }
-  }
-  return { files, bytes, skipped, failed }
-}
+// isOurCacheRoot / isOwnBvDir / removeOwned / dirStat 已搬到 lib/cache-own.mjs（2026-10-31 切片 2）。
+//   搬的动机就是「删除面判据只能有一份」：历史上两次删到用户文件（2026-10-29 素材库、
+//   2026-10-30 E8 #1 自动清理），根因都是两处判据不同步。三道闸与由来见那边的文件头。
+// removeOwned 见上：已搬到 lib/cache-own.mjs（2026-10-31 切片 2）。
 // D98（2026-10-29）：推导缓存根拆成两步——resolveCacheDir() 纯算路径（不 mkdir、不写探针），
 //   pickCacheDir() 才落盘 + 可写探测。拆开是因为 pickCacheDir 会往根目录写 .write-test-<pid> 探针，
 //   建目录、写探针、删探针三件事都会改根目录 mtime；而「只加载模块、还没真读缓存」的那段时间不该有痕迹。
-function resolveCacheDir() {
-  // 缓存下沉：默认根是 bili-watch/cache，凭证在它的上一层（bili-watch/credential.json）
-  const defaultDir = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cache')
-  const userWant = process.env.BILI_WATCH_CACHE || depsCfg().cache
-  let want = userWant ? userWant : defaultDir
-  // 用户指定了外部目录、且它还不是本工具的缓存根时，拼一个专属子目录——
-  // 绝不把用户自己的目录直接当缓存根，否则 clean 会在用户目录里找 frames/asr 删
-  // 追加一配套（2026-10-29）：这里原来判「目录里有 BV* 子目录、且里面有 meta.json」就认领它，
-  //   而素材库完全可能长这样。改成认「标记 / 空目录 / 不存在」，认不出来就退到它下面的专属子目录：
-  //   既不认领、也不删用户的任何东西。
-  if (userWant && !isAdoptableDir(want)) want = join(userWant, 'bili-watch-cache')
-  return want
+// 2026-10-31 切片 4：这两步、以及 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
+//   本文件只剩三个薄壳：读配置 → 交给 lib → 处理回退文案。为什么状态必须搬走：
+//   两个入口原来各有一份 `let CACHE` + 各自的 `CACHE_READY`，判据靠人肉对齐——
+//   runsFile 在 index.js 里走 ensureCache()、在 look.mjs 里直接读 CACHE，就是这种分叉的产物。
+//   现在读取一律走 lib 的 cacheDir()（未初始化必抛），忘记初始化当场就炸，不会静默写进错的路径。
+const cacheWant = () => process.env.BILI_WATCH_CACHE || depsCfg().cache
+
+// 回退告警只报一次：initCachePath 返回的 first 只在「这一次真的初始化了」时为 true，
+//   之后都是幂等返回同一个 fallback。/status 每 8 秒轮询，没有 first 判据就会把同一条塞满 warnings。
+function ensureCache() {
+  const r = initCachePath(cacheWant)
+  if (r.fallback && r.first) {
+    pushWarn(`缓存目录不可写，已回退到 ${maskAbs(r.dir)}：${maskAbs(r.fallback)}`)
+  }
+  return r.dir
 }
 
-// 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做。与 tools/look.mjs 的 cacheAdoptNotice 同源。
-// 用户把缓存指到外部目录、那目录里已经有东西、又不是我们的根时，resolveCacheDir 会退到它下面的
-// bili-watch-cache；旧目录原封不动留着，用户容易以为「清了就是清了」。这里只生成一句话，不清理。
+// 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做；正文与判据在 lib/cache-path.mjs。
 // 严格「只提示」：认领旧目录的开关（--adopt）还没做，所以提示里不提任何当前版本不存在的参数。
-// 路径取 resolveCacheDir() 当次结果。
 // P1-②（2026-10-29 WB 全量审）：/status 是 8 秒轮询，dirStat 会递归 walk 用户目录
 //   （实测 2.8 万文件 664 ms 中位、首跑 2 秒），同步 walk 会顶到面板 10 秒超时并卡别的路由。
 //   所以这里按 10 分钟节流——配置变了最多晚 10 分钟反映，换掉的是每 8 秒一次的全盘扫描。
+//   节流留在本文件而不是 lib：它跟「面板轮询周期」有关，是调用方的性能策略，不是路径语义。
 let adoptNoticeCacheAt = 0
 let adoptNoticeCacheVal = null
-function cacheAdoptNotice() {
+function adoptNoticeThrottled() {
   if (Date.now() - adoptNoticeCacheAt < 10 * 60 * 1000) return adoptNoticeCacheVal
   adoptNoticeCacheAt = Date.now()
-  adoptNoticeCacheVal = (() => {
-    try {
-      const userWant = process.env.BILI_WATCH_CACHE || depsCfg().cache
-      if (!userWant) return null
-      if (!existsSync(userWant)) return null
-      if (isAdoptableDir(userWant)) return null
-      const st = dirStat(userWant)               // 与面板「当前占用」同一个 lstat 实现
-      if (!st.files) return null
-      return { old: userWant, next: resolveCacheDir(), files: st.files, mb: Math.round(st.bytes / 104857.6) / 10 }
-    } catch { return null }
-  })()
+  adoptNoticeCacheVal = cacheAdoptNotice(cacheWant())
   return adoptNoticeCacheVal
 }
-function pickCacheDir() {
-  const defaultDir = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'cache')
-  const want = resolveCacheDir()
-  try {
-    mkdirSync(want, { recursive: true })
-    // 写缓存根标记（幂等；标记存在就不重写）
-    const mark = join(want, CACHE_MARK)
-    if (!existsSync(mark)) {
-      writeFileSync(mark, JSON.stringify({ version: 1, createdAt: new Date().toISOString() }), 'utf8')
-    }
-    const probe = join(want, `.write-test-${process.pid}`)
-    writeFileSync(probe, 'ok')
-    rmSync(probe, { force: true })
-    return { dir: want, fallback: null }
-  } catch (e) {
-    try { mkdirSync(defaultDir, { recursive: true }) } catch {}
-    // P1-①（2026-10-29 WB 全量审）：回退根必须也带标记。
-    //   删除面第一行是 `if (!isOurCacheRoot(dir)) return`，回退根没标记 → 本次运行里 clean
-    //   与自动清理永远删不动、面板报「已清理 0 个文件」，而回退是每次重算的，不会自己恢复。
-    try {
-      const m = join(defaultDir, CACHE_MARK)
-      if (!existsSync(m)) writeFileSync(m, JSON.stringify({ version: 1, createdAt: new Date().toISOString(), fallback: true }), 'utf8')
-    } catch {}
-    return { dir: defaultDir, fallback: String(e?.message || e) }
-  }
-}
-// 缓存下沉迁移：把旧根 bili-watch/ 下的 BV* 目录和缓存子目录挪到 bili-watch/cache/
-// 凭证、login-qr.png 等根级文件不动；只 rename，不删；幂等；不阻断启动
-function migrateLegacyCache() {
-  const oldRoot = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch')
-  const newRoot = join(oldRoot, 'cache')
-  if (!existsSync(oldRoot)) return
-  let moved = 0, skipped = 0
-  try {
-    mkdirSync(newRoot, { recursive: true })
-    let entries = []
-    try { entries = readdirSync(oldRoot, { withFileTypes: true }) } catch { return }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue
-      // 不挪 cache/ 自己
-      if (e.name === 'cache') continue
-      // 只挪 BV* 目录和 OWN_CACHE_DIRS 里的项
-      const isBv = /^BV[0-9A-Za-z]{10}/i.test(e.name)
-      const isOwn = OWN_CACHE_DIRS.has(e.name)
-      if (!isBv && !isOwn) { skipped++; continue }
-      const src = join(oldRoot, e.name)
-      const dst = join(newRoot, e.name)
-      // 幂等：目标已存在就跳过，不覆盖
-      if (existsSync(dst)) { skipped++; continue }
-      try {
-        renameSync(src, dst)
-        moved++
-      } catch { skipped++ }
-    }
-    if (moved > 0 || skipped > 0) {
-      try {
-        const logDir = join(newRoot, '_logs')
-        mkdirSync(logDir, { recursive: true })
-        appendFileSync(join(logDir, 'migrate.log'),
-          `[${new Date().toISOString()}] [migrate] 已下沉 ${moved} 项到 cache/，跳过 ${skipped} 项（凭证与根级文件不动）\n`, 'utf8')
-      } catch {}
-      console.error(`[migrate] 已下沉 ${moved} 项到 cache/，跳过 ${skipped} 项（凭证与根级文件不动）`)
-    }
-  } catch {}
-}
-// D98（2026-10-29）：模块加载期不再搬目录、不再建缓存根。
-//   原来这三行是裸调用：插件模块一被 import（宿主 dump 配置、跑 dsh 子命令、被别的插件间接 require），
-//   就先 rename 一遍旧根 bili-watch/ 下的 BV*，再 mkdir + 写探针。只是「加载」就动了用户的盘，
-//   旧根项多时要白等一串 rename，两层目录 mtime 全变。
-//   现在推迟到 apply() 开头（真要注册路由/清缓存/读写视频目录之前），一次进程只做一次。
-let CACHE = resolveCacheDir() // 纯路径，先给个值，避免任何早调用拿到 undefined
-let CACHE_READY = false
-function ensureCache() {
-  if (CACHE_READY) return CACHE
-  CACHE_READY = true // 先置位再干活：pickCacheDir / migrateLegacyCache 里若间接再进来，不递归
-  migrateLegacyCache()
-  const pick = pickCacheDir()
-  CACHE = pick.dir
-  if (pick.fallback) cfgWarning = `缓存目录不可写，已回退到 ${maskAbs(CACHE)}：${maskAbs(pick.fallback)}`
-  return CACHE
-}
+
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
 function venvAsr() { const p = projDir(); return [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(p, '.venv-asr', PY_DIR, PY_EXE)] }
@@ -738,7 +447,10 @@ const ESTIMATES = {
   asr: '约 294 MB（venv）',
   ocr: '约 263 MB（venv）',
   model: '约 464 MB',
-  cuda: '约 500 MB（pip 三个 wheel）',
+  // issue #7（2026-10-31）实测 Windows：下载约 1.4 GB（cublas 553 MB + cudnn 743 MB + nvrtc 76 MB），
+  //   装完 site-packages/nvidia 约 2.0 GB。原来写「约 500 MB」是估的，用户按它算流量会差三倍。
+  // issue #5：Linux 那三个 wheel 更大（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB，展开约 2.2 GB）。
+  cuda: process.platform === 'win32' ? '约 1.4 GB（下载）/ 约 2 GB（装完）' : '约 2.2 GB（pip 三个 wheel，Linux 版更大）',
 }
 
 // 面板内扫码登录（与 tools/look.mjs 的 login 同一套接口，凭证落同一个文件）
@@ -759,51 +471,17 @@ const PLUGIN_VERSION = (() => {
 // D98：缓存根是懒初始化的（ensureCache），这里必须现算——顶层常量会把「未初始化时算出的纯路径」固化下来，
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个用不上的旧路径。
 const runsFile = () => join(ensureCache(), '_logs', 'runs.jsonl')
-function appendRunLine(entry) {
-  try {
-    const RUNS_FILE = runsFile()
-    mkdirSync(dirname(RUNS_FILE), { recursive: true })
-    // 轮转：超 5 MB 或 2000 行就换成 .1（诊断日志不能无限涨）
-    try {
-      const st = statSync(RUNS_FILE)
-      const lines = Math.max(1, readFileSync(RUNS_FILE, 'utf8').split('\n').length - 1)
-      if (st.size > 5 * 1024 * 1024 || lines > 2000) {
-        const bak = RUNS_FILE + '.1'
-        try { rmSync(bak, { force: true }) } catch {}
-        try { renameSync(RUNS_FILE, bak) } catch {}
-      }
-    } catch {}
-    appendFileSync(RUNS_FILE, JSON.stringify(entry) + '\n', 'utf8')
-  } catch {}
-}
-function logRun({ command, bv = '', argv = [], code = 0, signal = null, ms = 0, stderr = '' }) {
-  try {
-    const entry = {
-      at: new Date().toISOString(),
-      command,
-      bv: String(bv || ''),
-      argv,
-      code,
-      signal,
-      ms,
-      version: PLUGIN_VERSION,
-      ok: code === 0,
-    }
-    if (!entry.ok) {
-      entry.stderr = String(stderr || '').slice(-4000)
-      // 按视频一份 last-error.json：事后直接定位「这条视频坏在哪」
-      if (/^BV[0-9A-Za-z]{10}$/.test(entry.bv)) {
-        const d = videoDir(entry.bv)
-        if (d) writeFileSync(join(d, 'last-error.json'), JSON.stringify(entry, null, 2) + '\n', 'utf8')
-      }
-    }
-    appendRunLine(entry)
-  } catch {}
-}
+// 轮转、追加、失败现场三件一起搬进 lib/runs.mjs（2026-10-31 切片 3-C 搬了追加，切片 5 补齐 logRun）。
+//   两处原来逐字相同（18 行 × 2）；真正的差异用参数表达：面板侧没有 diag/trackTail（不传 extra），
+//   缓存根由本文件的 ensureCache 决定（传 videoDirOf）。
 function runLogRecord(args, code, err, ms) {
   const command = String(args?.[0] || '')
   const bv = ['clean', 'login', 'hot'].includes(command) ? '' : String(args?.[1] || '')
-  logRun({ command, bv, argv: args || [], code, ms, stderr: err })
+  // runsFile 传**惰性函数**而不是字符串：缓存根没初始化时 runsFile() 会抛，
+  //   传字符串 = 求值点在调用点（logRun 的 try 之外）→ 异常会冒到 child.on('close') 里。
+  //   传函数 = 求值点回到 logRun 内部（try 里）→ 抛了只是日志写不进去，插件继续跑（基线行为）。
+  //   2026-10-31 三审（切片 5）抓出并修。
+  logRun(runsFile, { command, bv, argv: args || [], code, ms, stderr: err, version: PLUGIN_VERSION }, { videoDirOf: videoDir })
 }
 
 // #12（2026-10-30，P1）：外层硬顶原来写死 20 分钟，而面板能调的内层 ASR 超时上限是 60 分钟。
@@ -903,35 +581,8 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
 }
 
 // ── 面板内扫码登录 ─────────────────────────────────────────────────────────
-/** 从 poll 响应的 Set-Cookie 里挑登录需要的几个 cookie。 */
-function pickLoginCookies(list) {
-  const jar = {}
-  const want = { SESSDATA: 'sessdata', bili_jct: 'bili_jct', DedeUserID: 'dedeuserid', buvid3: 'buvid3', buvid4: 'buvid4' }
-  for (const raw of list ?? []) {
-    const first = String(raw).split(';')[0] || ''
-    const i = first.indexOf('=')
-    if (i <= 0) continue
-    const k = first.slice(0, i).trim()
-    const v = first.slice(i + 1).trim()
-    if (want[k] && v) jar[want[k]] = v
-  }
-  return jar
-}
-
-/** poll 往往只给 buvid3，buvid4 走 finger/spi 补。 */
-async function fillBuvids(jar) {
-  if (jar.buvid3 && jar.buvid4) return jar
-  try {
-    // E6（2026-10-30）：M-04 给 CLI 侧三处补了超时，插件侧这一处漏了——
-    //   内网屏蔽 *.bilibili.com 时这里会挂到 TCP 超时（Windows 约 21 秒），面板登录跟着卡。
-    //   取值与同文件 QR_GEN / QR_POLL 一致。
-    const r = await fetch(SPI, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) })
-    const j = await r.json()
-    if (!jar.buvid3 && j?.data?.b_3) jar.buvid3 = j.data.b_3
-    if (!jar.buvid4 && j?.data?.b_4) jar.buvid4 = j.data.b_4
-  } catch {}
-  return jar
-}
+// pickLoginCookies / fillBuvids 已搬到 lib/cred.mjs（2026-10-31 切片 5）——两个入口逐字相同，
+//   只有 fillBuvids 的超时值不同，那属于各侧的节奏（面板侧与 QR_GEN / QR_POLL 对齐 8 秒）。
 
 /** 生成扫码登录二维码：返回 qrcode_key 与可直接插进页面的 SVG。 */
 async function loginQr() {
@@ -965,7 +616,7 @@ async function loginPollOnce(key) {
   } catch {}
   const code = body?.data?.code
   if (code === 0) {
-    const jar = await fillBuvids(pickLoginCookies(setCookies))
+    const jar = await fillBuvids(pickLoginCookies(setCookies), { timeoutMs: 8000, ua: UA, spi: SPI })
     if (!jar.sessdata) return { ok: false, state: 'error', why: '登录成功但响应里没有 SESSDATA' }
     try {
       mkdirSync(dirname(SHARED_CRED), { recursive: true })
@@ -1022,7 +673,7 @@ function credState() {
     //   阶段 A 的 A-4 只修了 CLI 侧，面板这半边一直是「文件存在 + 30 天年龄」就算 ok——
     //   残缺凭证（缺 sessdata/bili_jct/buvid3/buvid4）照样报 ok，面板依赖清单打 ✓，
     //   而实际所有请求都在匿名态：用户以为登录了，拿到的却是匿名结果，且看不出哪里不对。
-    const missing = ['sessdata', 'bili_jct', 'buvid3', 'buvid4'].filter((k) => !j?.[k])
+    const missing = missingCredFields(j)
     if (missing.length) return { exists: true, state: 'incomplete', missing, updatedAt: t, ageDays }
     return { exists: true, state: ageDays > 30 ? 'expired' : 'ok', updatedAt: t, ageDays }
   } catch {
@@ -1030,31 +681,8 @@ function credState() {
   }
 }
 
-function dirStat(dir) {
-  let bytes = 0
-  let files = 0
-  const walk = (d) => {
-    for (const e of readdirSync(d, { withFileTypes: true })) {
-      // 10-28：标记文件与运行日志不算「缓存占用」——面板「当前占用」应当等于「立即清除能清掉的量」，
-      // 否则清了以后永远显示 52 B + 日志大小，用户以为没清干净。
-      if (e.name === CACHE_MARK || e.name === '_logs') continue
-      const p = join(d, e.name)
-      if (e.isDirectory()) walk(p)
-      else {
-        files += 1
-        try {
-          // 追加三（2026-10-29，P2）：用 lstat 不是 stat —— rmSync 删链接时不会跟着进去删目标，
-          //   原来按 stat 统计会把链接目标的大小算进「已清理 X MB」，口径与真实删除不一致。
-          bytes += lstatSync(p).size
-        } catch {}
-      }
-    }
-  }
-  try {
-    walk(dir)
-  } catch {}
-  return { bytes, files }
-}
+// dirStat 已搬到 lib/cache-own.mjs（2026-10-31 切片 2）——面板「当前占用」与 clean「已清理 X MB」
+//   必须同一口径（跳过标记与 _logs、一律 lstat），两处各写一份就是口径对不上的老病根。
 
 // #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就按 10 分钟节流了，
 //   但 cache 那块占用每次都重新 dirStat(CACHE) 全盘递归 walk（3 万文件实测中位 219 ms，
@@ -1065,7 +693,7 @@ let cacheStatAt = 0
 let cacheStatVal = null
 function cacheStat() {
   if (cacheStatVal && Date.now() - cacheStatAt < CACHE_STAT_TTL_MS) return cacheStatVal
-  cacheStatVal = dirStat(CACHE)
+  cacheStatVal = dirStat(cacheDir())
   cacheStatAt = Date.now()
   return cacheStatVal
 }
@@ -1091,9 +719,9 @@ function walkEntries(dir) {
     for (const e of list) {
       const p = join(d, e.name)
       if (e.isDirectory()) {
-        if (isOwnedEntry(p)) walk(p)
+        if (isOwnedEntry(dir, p)) walk(p)
       } else {
-        if (!isOwnedEntry(p)) continue
+        if (!isOwnedEntry(dir, p)) continue
         try {
           // E6-07（2026-10-30，P1）：lstat 不是 stat。rmSync 删符号链接只删链接本身，
           //   按 stat 取的是目标大小——「按总量清理」会拿一个虚高的体积去凑阈值，
@@ -1116,7 +744,7 @@ function cacheCfg() {
   }
 }
 
-// WB-CN N13（2026-10-28）：原来吞异常、无返回值，三处调用都不看结果——「保存规则」写盘失败仍回
+// N13（2026-10-28）：原来吞异常、无返回值，三处调用都不看结果——「保存规则」写盘失败仍回
 // 200 {ok:true}，与 BLK-02 同族（BLK-02 只修了 tuning 那条）。现在把结果交出去，调用方按失败处理。
 function writeCacheCfg(days, maxMb) {
   try {
@@ -1184,16 +812,17 @@ let lastCleanAt = 0
 function autoCleanCache(opts = {}) {
   // T31-P2-6：面板每 8 秒轮询 /status，不许每次都全量 walk 缓存目录
   if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true, failed: [] }
-  if (!existsSync(CACHE)) return { removed: 0, bytes: 0, failed: [] }
+  if (!existsSync(cacheDir())) return { removed: 0, bytes: 0, failed: [] }
   // 追加一（2026-10-29，P0）：没有根标记就不是我们建过的缓存根，一律不清（CACHE 可以被指到任何目录）
-  if (!isOurCacheRoot(CACHE)) return { removed: 0, bytes: 0, skipped: true, noMark: true, failed: [] }
+  if (!isOurCacheRoot(cacheDir())) return { removed: 0, bytes: 0, skipped: true, noMark: true, failed: [] }
   // W-04（2026-10-28 阶段B-①）：有正在跑的转写/抽帧（任何子目录有 .lock）就不自动清，
   //   否则会删掉正在写的 asr/sheet 产物（转写白跑且无提示）。与 /cache/clear 同判据。
-  if (hasAnyLock(CACHE)) return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [] }
+  // 切片 2：TTL 由这里算好传进去（lib 里的判据不读配置）
+  if (hasAnyLock(cacheDir(), lockTtlMs())) return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [] }
   const { days, maxMb } = cacheCfg()
   const cutoff = Date.now() - days * 86400000
   const limit = maxMb * 1024 * 1024
-  const entries = walkEntries(CACHE)
+  const entries = walkEntries(cacheDir())
   let removed = 0
   let bytes = 0
   // M-05：删不掉的文件必须记下来。以前两处 catch {} 是空的，被占用 / 只读 / 超长路径时
@@ -1207,7 +836,7 @@ function autoCleanCache(opts = {}) {
         removed += 1
         bytes += e.size
       } catch (err) {
-        failed.push({ name: relative(CACHE, e.path), why: String(err?.message || err) })
+        failed.push({ name: relative(cacheDir(), e.path), why: String(err?.message || err) })
       }
     } else {
       fresh.push(e)
@@ -1223,13 +852,13 @@ function autoCleanCache(opts = {}) {
         bytes += e.size
         total -= e.size
       } catch (err) {
-        failed.push({ name: relative(CACHE, e.path), why: String(err?.message || err) })
+        failed.push({ name: relative(cacheDir(), e.path), why: String(err?.message || err) })
       }
       if (total <= limit) break
     }
   }
   // 清单 1-7：只删文件会留一堆空目录（跑 100 个视频留 100 个空目录）；删完后自底向上清白名单内空目录
-  pruneEmptyDirs(CACHE)
+  pruneEmptyDirs(cacheDir())
   lastCleanAt = Date.now()
   // #11：清了东西就让占用缓存失效，否则面板最多 30 秒还在显示清理前的体积
   if (removed) invalidateCacheStat()
@@ -1251,7 +880,7 @@ function pruneEmptyDirs(root) {
     for (const e of list) {
       if (!e.isDirectory()) continue
       const p = join(d, e.name)
-      if (isOwnedEntry(p)) {
+      if (isOwnedEntry(root, p)) {
         collect(p)
         dirs.push(p)
       }
@@ -1266,7 +895,7 @@ function pruneEmptyDirs(root) {
 }
 
 /**
- * 10-28 豆包派单（20261028-1015-DB）：取消绝对路径遮罩，面板显示完整路径。
+ * 10-28 派单（20261028-1015-DB）：取消绝对路径遮罩，面板显示完整路径。
  * 原来按「14-8」把 /status 里的本机绝对路径遮成 `…\basename`，理由是「别把本机路径吐给面板」。
  * 现在这个理由不成立：`/api/bili-watch` 的每个请求（**含 GET /status**）在进路由分支之前
  * 都先过 `sameOriginBlocked(req)`，而它的第一条判据就是 `socket.remoteAddress` 必须是回环——
@@ -1300,7 +929,10 @@ function ytdlpVersion() {
 
 // 第十条（2026-10-29）：GPU 状态。三个问题分开答，别混成一个布尔：
 //   deviceCount——有没有 NVIDIA 卡（nvidia-smi -L 的行数）
-//   dllReady——cuBLAS DLL 能不能真加载（派单要求：不看 pip 包名，真跑 ctypes.WinDLL）
+//   dllReady——cuBLAS 运行库能不能真加载（派单要求：不看 pip 包名，真跑一次加载）。
+//     Windows 是 ctypes.WinDLL("cublas64_12.dll")，Linux 是先 RTLD_GLOBAL 预载
+//     nvidia/*/lib 再 CDLL("libcublas.so.12") —— 两边都下沉到 _bili-asr.py --probe-gpu，
+//     这里只读退出码，不分平台写第二份判据（issue #5）。
 //   cudaLibs——venv 里有没有 nvidia 包（只作说明，不作 ok 判据）
 // 探测要跑两个子进程，/status 每 8 秒轮询一次，所以缓存 5 分钟；删完 GPU 运行库后 resetGpuCache() 立刻作废。
 // GPU 第二轮（2026-10-29）：原来 probeGpu 是同步 execFileSync，缓存失效那一次会堵住事件循环，
@@ -1315,7 +947,7 @@ const GPU_PROBE_TIMEOUT_MS = 10000
 const GPU_CACHE_MS = 5 * 60 * 1000
 let _gpuCache = { at: 0, val: null }
 let _probePromise = null
-// ④（2026-10-30，WB-CN 按 lifecycle 复核补的）：reset 之后，在飞那次探测的结果必须作废。
+// ④（2026-10-30，按 lifecycle 复核补的）：reset 之后，在飞那次探测的结果必须作废。
 //   原来 resetGpuCache() 只把 _probePromise 置 null，旧 Promise 完成时照样 .then 写 _gpuCache——
 //   用户在面板点了「重置」（比如刚装完 GPU 运行库），旧探测（基于旧环境）落地会把新结论盖掉，
 //   而且盖完又有 5 分钟缓存。序号就是「这次结果还算不算数」的凭据。
@@ -1379,10 +1011,15 @@ async function probeGpu() {
   const notes = []
   let confident = true // 探测过程没被超时/异常打断，结论可信 → 才允许写缓存
   let deviceCount = 0
+  // 「确定没有卡」单独记一个布尔：面板据此决定给不给「一键下载 GPU 运行库」的按钮。
+  //   不能用 deviceCount === 0 代替 —— nvidia-smi 超时/异常时也是 0，那时我们并不知道有没有卡，
+  //   把按钮藏起来会让有卡的人无从下手。只有 ENOENT（确实没这个命令）才算确定没卡。
+  let noCard = false
   const smi = await execFileP('nvidia-smi', ['-L'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
   if (smi.ok) {
     deviceCount = smi.stdout.split('\n').filter((l) => /^\s*GPU\s+\d+:/.test(l)).length
   } else if (smi.err?.code === 'ENOENT') {
+    noCard = true
     notes.push('没有 nvidia-smi（未装 NVIDIA 驱动，或不是 NVIDIA 卡）')
   } else {
     confident = false
@@ -1398,32 +1035,33 @@ async function probeGpu() {
       confident = false
       notes.push(`venv 里查 nvidia 包超时：${probeWhy(spec)}`)
     }
-    if (process.platform === 'win32') {
-      // 2026-10-29 修：原来在这里直接 `ctypes.WinDLL("cublas64_12.dll")`，但 pip 装的
-      //   cublas 在 site-packages/nvidia/*/bin 里、不在默认 DLL 搜索路径 —— 结果是
-      //   「_bili-asr.py 能跑 GPU，面板却说运行库没装」。判据现在改由 ASR 脚本自己答
-      //   （它本来就先跑 _add_nvidia_dll_dirs()），一个实现，两处不会分叉。
-      const asrPy = join(DEPS, '_bili-asr.py')
-      if (!existsSync(asrPy)) {
-        // 脚本确实不在 = 确定的结论（明确没环境），照常可缓存；不确定的只有「超时/异常」
-        notes.push(`ASR 脚本不存在（${asrPy}），无法探测 DLL`)
-      } else {
-        const dll = await execFileP(py, [asrPy, '--probe-gpu'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8' })
-        dllReady = dll.ok
-        if (!dllReady) {
-          // 超时 = 不知道结果（不确定，不写缓存）；正常非 0 退出 = 确定没装/不在搜索路径
-          if (dll.err?.killed) confident = false
-          notes.push(`cublas64_12.dll 加载失败：${probeWhy(dll)}`)
-        }
-      }
+    // 2026-10-29 修：原来在这里直接 `ctypes.WinDLL("cublas64_12.dll")`，但 pip 装的
+    //   cublas 在 site-packages/nvidia/*/bin 里、不在默认 DLL 搜索路径 —— 结果是
+    //   「_bili-asr.py 能跑 GPU，面板却说运行库没装」。判据现在改由 ASR 脚本自己答
+    //   （它本来就先跑 _add_nvidia_dll_dirs()），一个实现，两处不会分叉。
+    //
+    // 2026-10-31（issue #5）：原来只有 win32 分支走这条路，非 win32 只 push 一句提示、
+    //   dllReady 保持 false —— Linux 上有卡、运行库也装好了，这一行仍然恒红（面板唯一的
+    //   GPU 状态出口）。现在两个平台统一走 `--probe-gpu`，平台差异全在脚本里：
+    //   win32 用 WinDLL，Linux 先按 RTLD_GLOBAL 预载 nvidia/*/lib 再 CDLL("libcublas.so.12")。
+    const asrPy = join(DEPS, '_bili-asr.py')
+    if (!existsSync(asrPy)) {
+      // 脚本确实不在 = 确定的结论（明确没环境），照常可缓存；不确定的只有「超时/异常」
+      notes.push(`ASR 脚本不存在（${asrPy}），无法探测运行库`)
     } else {
-      notes.push('非 Windows：GPU 运行库走系统 CUDA，不做 DLL 探测')
+      const dll = await execFileP(py, [asrPy, '--probe-gpu'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8' })
+      dllReady = dll.ok
+      if (!dllReady) {
+        // 超时 = 不知道结果（不确定，不写缓存）；正常非 0 退出 = 确定没装/不在搜索路径
+        if (dll.err?.killed) confident = false
+        notes.push(`${process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12'} 加载失败：${probeWhy(dll)}`)
+      }
     }
   } else {
     // venv 确实不存在 = 确定的「明确没环境」，可缓存（不必每 8 秒重探）
     notes.push('ASR 环境还没装，装完才能判断 GPU 运行库')
   }
-  return { val: { deviceCount, dllReady, cudaLibs, note: notes.join('；') }, confident }
+  return { val: { deviceCount, dllReady, cudaLibs, noCard, note: notes.join('；') }, confident }
 }
 
 // C-04（2026-10-29）：面板以前只看 venv 里的 python.exe 在不在就标绿。缺 VC++ Redist 时
@@ -1566,20 +1204,42 @@ async function depRows(gpuVal) {
   const cudaSize = (() => {
     try {
       const py = venvAsr().find((p) => existsSync(p)) || ''
-      if (!py || process.platform !== 'win32') return 0
-      return dirStat(join(dirname(dirname(py)), 'Lib', 'site-packages', 'nvidia')).bytes
+      if (!py) return 0
+      const venvRoot = dirname(dirname(py))
+      // 2026-10-31（issue #5 同族）：原来只认 Windows 布局 <venv>\Lib\site-packages，
+      //   Linux 的 site-packages 在 <venv>/lib/pythonX.Y/site-packages，这里原来恒 0。
+      if (process.platform === 'win32') return dirStat(join(venvRoot, 'Lib', 'site-packages', 'nvidia')).bytes
+      const libDir = join(venvRoot, 'lib')
+      if (!existsSync(libDir)) return 0
+      let total = 0
+      for (const e of readdirSync(libDir)) {
+        if (!e.startsWith('python')) continue
+        total += dirStat(join(libDir, e, 'site-packages', 'nvidia')).bytes
+      }
+      return total
     } catch { return 0 }
   })()
   rows.push({
     id: 'cuda',
     name: 'GPU 运行库（cuBLAS + cuDNN）',
     ok: gpu.dllReady,
+    // 2026-10-31（issue #5）：文案按平台分开 —— Linux 上照 Windows 说「装上快 2-8 倍」
+    //   等于给了个不存在的手工路径（README 那段只写 PowerShell 脚本）。
+    //   「2-8 倍」也改成「约 2 倍」：issue 作者同机多次实测 1.96–2.24×，
+    //   量级差一档会让复测的人直接怀疑数据。
     detail: gpu.dllReady
       ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 卡）` : ''}，转写走 GPU`
       : (gpu.deviceCount
-        ? `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——装上转写快 2-8 倍`
+        ? (process.platform === 'win32'
+          ? `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——装上转写约快 2 倍`
+          : `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——在 ASR 环境里装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（见 README 的 Linux 装法）`)
         : (gpu.note || '没有 NVIDIA 卡，转写走 CPU')),
-    path: gpu.dllReady ? 'cublas64_12.dll' : '',
+    path: gpu.dllReady ? (process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12') : '',
+    // 确定没有 NVIDIA 卡时不给「一键下载」按钮：装了也用不上，Linux 上那是 2.2 GB。
+    //   判据用 noCard（只有 nvidia-smi 是 ENOENT 才为真），不是 deviceCount === 0 ——
+    //   探测超时/异常时 deviceCount 也是 0，那时藏按钮会让有卡的人无从下手。
+    //   client.js 的 canDownloadRow 认这个字段（缺省 = 可下载，向后兼容）。
+    installable: !gpu.noCard,
     removable: gpu.cudaLibs,
     removableWhy: gpu.cudaLibs ? '' : '还没装（或装在系统里，不归插件管），没什么可删的',
     size: cudaSize,
@@ -1648,7 +1308,11 @@ function downloadVerdict(target, code, signal, rows) {
 function runDownload(target) {
   const script = join(SCRIPTS, 'fetch-deps.ps1')
   if (!existsSync(script)) return { started: false, why: '插件目录里没有 scripts/fetch-deps.ps1' }
-  const allowed = ['ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'all']
+  // issue #5（2026-10-31）：原来这张表没有 cuda，而面板的「GPU 运行库」行在没装时
+  //   会渲染「一键下载」按钮（client.js 的 canDownload = !d.ok），点下去后端直接回
+  //   「不支持的依赖：cuda」—— 两个平台都是死按钮，README 却写着「点那一行的下载」。
+  //   现在两个脚本都有 cuda 分支（ps1 -Target cuda / sh 的 cuda），这里放行。
+  const allowed = ['ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda', 'all']
   if (!allowed.includes(target)) return { started: false, why: `不支持的依赖：${target}` }
   try {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
@@ -2034,13 +1698,22 @@ async function lookup({ command, bv, positionals = [], extra = [], badOut = fals
   return { ok: !failed, text: parts.join(String.fromCharCode(10)) }
 }
 
-function apply(ctx) {
+// ── apply() 的五个子系统（2026-10-31 切片 6）─────────────────────────────
+// 原来是一个 425 行的函数：启动动作、斜杠命令、单链提示、工具注册、设置页端点全在里面。
+// 拆的时候只搬不改——块内每一行都是原样搬过来的（缩进都没动）。
+//   depsCfg() / readTuning() / readDepsCfg() 这些调用仍然在原来那一层，没顺手改成注入参数：
+//   注入是行为改动，混在搬运里红了就分不清是谁弄坏的。
+
+/** ① 进程级启动动作：缓存根初始化、按天数/总量清一次、deps 搬家排后台。 */
+function bootCache(ctx) {
   // D98（2026-10-29）：缓存根与旧目录迁移在这里做（一个进程一次），不在模块加载期做——
   //   加载 ≠ 使用：宿主 dump 配置、跑 dsh 子命令时也会 import 这个模块，那些场景不该搬用户的目录。
   try {
     ensureCache()
   } catch (e) {
-    ctx.logger?.warn?.(`[dsh-bili-watch] 缓存目录初始化失败，继续用 ${CACHE}：${String(e?.message || e)}`)
+    // 切片 4：这里**不能**调 cacheDir()——正因为初始化失败才走到这条分支，它一定会抛。
+    //   用 previewCacheDir 打「本来打算用的路径」，与原来「保留 CACHE 的纯路径」同一个意思。
+    ctx.logger?.warn?.(`[dsh-bili-watch] 缓存目录初始化失败，继续用 ${previewCacheDir(cacheWant())}：${String(e?.message || e)}`)
   }
   // 启动时按「天数 + 总量阈值」清一次缓存，不点按钮也不会无限涨
   try {
@@ -2052,7 +1725,10 @@ function apply(ctx) {
 
   // X-30 第二轮：deps 搬家排后台（3 秒后，那时插件已注册完）。本次启动仍用包内那份。
   scheduleDepsMigration()
+}
 
+/** ② 斜杠命令：人敲，确定性执行，不花推理 token。 */
+function registerSlashCommand(ctx) {
   // ① 斜杠命令：人敲，确定性执行，不花推理 token
   ctx.commands.register({
     definitionId: 'dsh-bili-watch',
@@ -2071,7 +1747,10 @@ function apply(ctx) {
       return { kind: r.ok ? 'success' : 'error', text: trimForModel(r.text, command, bv, false, { full: fullOn, head: headOn }) }
     },
   })
+}
 
+/** ③ 单条链接软提示：只往消息流里加一条旁白，绝不替用户调用工具。 */
+function registerAutoHint(ctx) {
   // ①-b 单条链接软提示：只往消息流里加一条旁白，绝不替用户调用工具
   //     开关落 deps/ui-config.json 的 autoHint（DEFAULT_UI_CFG 见上）
   try {
@@ -2119,7 +1798,10 @@ function apply(ctx) {
   } catch (e) {
     try { ctx.logger?.info?.(`[dsh-bili-watch] pre-step 钩子没挂上：${e?.message ?? e}`) } catch {}
   }
+}
 
+/** ④ 同名工具 bili_watch：模型可调，需要看视频时自己来。 */
+function registerTool(ctx) {
   // ② 同名工具：模型可调，需要看视频时自己来，不依赖用户敲命令
   //    必须用 defineTool 包一层：ctx.tools.register 收的是编译好的 tool 对象，
   //    直接传 options 会让发往模型的 parameters 变成 null（报 INVALID_REQUEST: schema must be type "object"）。
@@ -2273,7 +1955,10 @@ function apply(ctx) {
     toolsWarning = '[dsh-bili-watch] 未找到 @deepseek-ai/dsh-tools，bili_watch 工具未注册（/bili 命令与插件面板不受影响）'
     console.warn(toolsWarning)
   }
+}
 
+/** ⑤ 设置页端点 /api/bili-watch：读盘状态 + 清缓存（唯一写操作是删本机缓存）。返回 dispose。 */
+function registerPanelRoute(ctx) {
   // ③ 设置页：读盘状态 + 清缓存（只读优先；唯一写操作是删本机抽帧缓存目录）
   try {
     // 多实例/重放路由守卫：同一路径只注册一次，后续实例跳过（T41-P0-1）
@@ -2300,16 +1985,18 @@ function apply(ctx) {
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
-                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(CACHE), lastAutoClean: cleaned },
+                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(cacheDir()), lastAutoClean: cleaned },
                     tuning: readTuning(),
                     tuningDefaults: tuningDefaults(),
                     tuningRanges: tuningRanges(),
                     lastRun: readLastRun(),
                     ui: uiCfg(),
                     // 追加四（2026-10-29）：旧缓存提示走 warnings，与 CLI clean 的那行同源。
-                    warnings: [cfgWarning, toolsWarning, depsWarning,
+                    // 切片 3-B：配置告警改成数组（坏文件 / 缓存回退各一条，不再互相覆盖）。
+                    warnings: [...cfgWarnings, toolsWarning, depsWarning,
                       ...(() => {
-                        const a = cacheAdoptNotice()
+                        // 切片 4：走节流壳（lib 里那份是纯函数，每 8 秒轮询都全盘 walk 会顶穿面板超时）
+                        const a = adoptNoticeThrottled()
                         if (!a) return []
                         return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删）。`]
                       })(),
@@ -2352,7 +2039,7 @@ function apply(ctx) {
                 //   锁可能在 frames/.lock 根，也可能在每个抽帧子目录 frames/<bv>-pN-<step>s/.lock。
                 // A-3（2026-10-28 阶段A）：原来只查 frames 一层锁，漏掉 sheet-tmp / substrip-tmp /
                 //   CACHE 根的 .meta-*.lock / asr 等会写盘的子目录。改成递归扫（hasAnyLock，限深度 3）。
-                const locked = hasAnyLock(CACHE)
+                const locked = hasAnyLock(cacheDir(), lockTtlMs())
                 if (locked) {
                   return sendJson(res, 200, {
                     ok: false,
@@ -2361,7 +2048,7 @@ function apply(ctx) {
                   })
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
-                const cleared = removeOwned(CACHE)
+                const cleared = removeOwned(cacheDir())
                 // #11：清完立刻让占用缓存失效——面板紧接着那次 /status 要看到清完的真实体积
                 invalidateCacheStat()
                 // 9-8：有权限问题删不掉时不报成功，且 removed 只数真删掉的；面板按 ok/why 显示「部分失败：N 项」
@@ -2458,6 +2145,14 @@ function apply(ctx) {
       ctx.logger?.info?.(`[dsh-bili-watch] 设置页端点没挂上：${e?.message ?? e}`)
     } catch {}
   }
+}
+
+function apply(ctx) {
+  bootCache(ctx)
+  registerSlashCommand(ctx)
+  registerAutoHint(ctx)
+  registerTool(ctx)
+  return registerPanelRoute(ctx)
 }
 
 export { apply, inject, name }

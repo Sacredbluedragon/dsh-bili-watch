@@ -81,14 +81,16 @@ os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2))
 
 
 def _add_nvidia_dll_dirs() -> None:
-    """Windows 上把 pip 装的 nvidia-*-cu12 的 bin 目录加进 DLL 搜索路径。
+    """把 pip 装的 nvidia-*-cu12 里的库加进搜索路径。
 
-    为什么要这一步：ctranslate2 在 Windows 上靠系统 PATH 找 cublas64_12.dll / cudnn64_9.dll。
+    为什么要这一步：ctranslate2 靠系统搜索路径找 cublas64_12.dll / libcublas.so.12。
     用户按 issue #3 的做法 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 之后，
-    DLL 躺在本环境的 site-packages/nvidia/<lib>/bin 里，不主动加路径就还是找不到。
+    库躺在本环境的 site-packages/nvidia/<lib>/bin（Windows）或 <lib>/lib（Linux）里，
+    不主动加路径就还是找不到。
+
+    Windows 与 Linux 的做法不同，但都必须在这一处做完 —— 探测（--probe-gpu）与真转写
+    共用同一个入口，谁改加载方式探测自动跟着变（issue #5 的 ② 就是为此）。
     """
-    if os.name != "nt":
-        return
     try:
         import sysconfig
         site = sysconfig.get_paths().get("purelib") or ""
@@ -97,14 +99,77 @@ def _add_nvidia_dll_dirs() -> None:
     if not site:
         return
     import glob
-    for d in sorted(glob.glob(os.path.join(site, "nvidia", "*", "bin"))):
-        if not os.path.isdir(d):
-            continue
-        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    if os.name == "nt":
+        for d in sorted(glob.glob(os.path.join(site, "nvidia", "*", "bin"))):
+            if not os.path.isdir(d):
+                continue
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(d)  # Python 3.8+：显式 DLL 目录，比只改 PATH 可靠
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    # Linux / macOS：没有 add_dll_directory 的等价物，只能按 RTLD_GLOBAL 预载，
+    #   之后 ctranslate2 按 soname dlopen("libcublas.so.12") 才能命中。
+    #   issue #5 坑：原来这里第一句就是 `if os.name != "nt": return`，Linux 侧什么都不做，
+    #   于是干净解释器下 CDLL("libcublas.so.12") 必失败（库不在默认搜索路径）。
+    #   预载循环必须包 try/except：nvidia/*/lib 里混着版本不匹配的库是常态
+    #   （最典型 libcudnn.so.9 与当前 CUDA 小版本不符，或用户只装了 cublas / 只装了 cudnn），
+    #   裸 CDLL 一抛就让整个进程带 traceback 退出，把「转写其实能跑」误报成失败。
+    #   issue 作者的四场景对照表验过：容错只放过可选库，不会掩盖 cublas 缺失。
+    try:
+        import ctypes
+    except Exception:  # noqa: BLE001
+        return
+    for so in sorted(glob.glob(os.path.join(site, "nvidia", "*", "lib", "lib*.so*"))):
         try:
-            os.add_dll_directory(d)  # Python 3.8+：显式 DLL 目录，比只改 PATH 可靠
-        except Exception:  # noqa: BLE001
+            ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
             pass
+
+
+def _probe_gpu(platform_name=None) -> int:
+    """--probe-gpu 的实现：0 = 运行库可用，1 = 不可用。
+
+    2026-10-31（issue #5）：原来这段内联在 main() 里、写死 WinDLL，Linux 的 ctypes 没有
+    WinDLL 属性 → --probe-gpu 在 Linux 上恒 exit 1（AttributeError 被 except 吞掉）。
+    现在按平台分开：Windows 仍只看 DLL 能不能加载（判据不变，不动已验证的行为）；
+    Linux 还要再问 ctranslate2 看得见几张卡 —— 库能载入但驱动/卡不对时它返回 0，
+    只看 CDLL 会把这种情况判成绿。
+
+    platform_name 只给测试用（本机是 Windows，跑不到 Linux 分支）；
+    生产调用不传，取 os.name。
+    """
+    try:
+        import ctypes
+    except Exception as e:  # noqa: BLE001
+        print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
+        return 1
+    if (platform_name or os.name) == "nt":
+        try:
+            ctypes.WinDLL("cublas64_12.dll")
+        except Exception as e:  # noqa: BLE001
+            print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
+            return 1
+    else:
+        # 预载已经由 _add_nvidia_dll_dirs() 做过，这里只做验证
+        try:
+            ctypes.CDLL("libcublas.so.12")
+        except OSError as e:
+            print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
+            return 1
+        try:
+            import ctranslate2
+            n = ctranslate2.get_cuda_device_count()
+        except Exception as e:  # noqa: BLE001
+            print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
+            return 1
+        if n <= 0:
+            print("[asr] gpu-probe fail: libcublas 能载入，但 ctranslate2 看不到 CUDA 卡"
+                  "（驱动版本、显存或 CUDA 运行时不匹配）", file=sys.stderr)
+            return 1
+    print("[asr] gpu-probe ok")
+    return 0
 
 
 def main() -> int:
@@ -130,15 +195,11 @@ def main() -> int:
     #   「实际能跑 GPU，面板却说运行库没装」。本文件上面已经加过 DLL 目录，
     #   直接在这里试，调用方（index.js 的 probeGpu）拿退出码即可。
     #   这就是「一个接口对一个实现」：谁改动 DLL 加载方式，探测自动跟着变。
+    #
+    # 2026-10-31（issue #5）：判据本身下沉到 _probe_gpu()，好让 Windows / Linux
+    #   两条分支都能被单独测到（本机只有 Windows）。
     if args.probe_gpu:
-        try:
-            import ctypes
-            ctypes.WinDLL("cublas64_12.dll")
-            print("[asr] gpu-probe ok")
-            return 0
-        except Exception as e:  # noqa: BLE001
-            print("[asr] gpu-probe fail: " + str(e), file=sys.stderr)
-            return 1
+        return _probe_gpu()
 
     if not args.src:
         print("[asr] 缺少文件路径", file=sys.stderr)

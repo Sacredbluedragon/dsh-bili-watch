@@ -22,7 +22,7 @@
     · 幂等：目标已存在默认跳过，-Force 重下。
     · -DryRun 只打印将执行的命令，不下载不写盘。
     · 国内网络用 -Mirror cn：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror。
-    · -Gpu ask|yes|no：要不要装 CUDA 运行库（cuBLAS + cuDNN，约 500 MB）。ask 会问一句：装了 ASR 能用 GPU 快 2-8 倍，不装就走 CPU。
+    · -Gpu ask|yes|no：要不要装 CUDA 运行库（cuBLAS + cuDNN，约 1.4 GB）。ask 会问一句：装了 ASR 能用 GPU 约快 2 倍，不装就走 CPU。
     · ffmpeg 来源是 BtbN 的 latest 构建，版本随上游变化，不锁具体版本。
     · pip 包锁死四版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
       ctranslate2==4.8.3（10-28 issue #2 P3-2：4.8.4 在部分机器加载模型即 0xC0000005 硬崩，
@@ -47,7 +47,7 @@ param(
   [ValidateSet('all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda')]
   [string]$Target = 'all',
   [switch]$Force,
-  # GPU 运行库（cuBLAS + cuDNN，约 500 MB）怎么处理：ask=问一句（默认，非交互时按 no）/ yes / no
+  # GPU 运行库（cuBLAS + cuDNN，约 1.4 GB）怎么处理：ask=问一句（默认，非交互时按 no）/ yes / no
   [ValidateSet('ask', 'yes', 'no')]
   [string]$Gpu = 'ask',
   [switch]$DryRun,
@@ -71,11 +71,26 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $DepsLocal = Join-Path $Root 'deps'
 if ($env:BILI_WATCH_DEPS) {
   $Deps = $env:BILI_WATCH_DEPS
+  $DepsFrom = 'BILI_WATCH_DEPS'
 } else {
   $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
   $DepsPreferred = Join-Path $dshHome 'bili-watch\deps'
-  if ((Test-Path -LiteralPath $DepsPreferred) -or -not (Test-Path -LiteralPath $DepsLocal)) { $Deps = $DepsPreferred } else { $Deps = $DepsLocal }
+  # 2026-10-31 复核：这里原来判的是「包内 deps **存在**」，而 index.js:185 判的是「**有内容**」
+  #   （readdirSync().length > 0）。包内是空目录时两者分叉：运行时用包外，脚本却装进包内，
+  #   面板永远「不可用」——与 issue #6 坑 1 同一个坑，只是这边走 PowerShell。
+  #   上面注释本来就写着「有内容」，是实现没跟上。Get-ChildItem -Force 含隐藏项，与 readdirSync 同口径。
+  $localHas = (Test-Path -LiteralPath $DepsLocal) -and
+    ((Get-ChildItem -LiteralPath $DepsLocal -Force -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)
+  if ((Test-Path -LiteralPath $DepsPreferred) -or -not $localHas) {
+    $Deps = $DepsPreferred
+    $DepsFrom = if (Test-Path -LiteralPath $DepsPreferred) { '包外（$DSH_HOME\bili-watch\deps，已存在）' } else { '包外（$DSH_HOME\bili-watch\deps，新建）' }
+  } else {
+    $Deps = $DepsLocal
+    $DepsFrom = '包内（插件目录下的 deps 已有内容，包外还没有）'
+  }
 }
+# 与 fetch-deps.sh 一致：用户排障时要能看出装到哪去了
+Write-Host "==> deps 目录：$Deps（来源：$DepsFrom）"
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $Deps | Out-Null }
 
 # G-03（2026-10-29）：下载/安装的每一步都 append 到 deps\download.log。
@@ -386,9 +401,21 @@ function Get-SystemPython {
   $sawStub = $false
   $pyLauncher = Get-Command 'py' -ErrorAction SilentlyContinue
   if ($pyLauncher -and $pyLauncher.Source) {
-    foreach ($v in @('3.13', '3.12', '3.11', '3.10', '3.14')) {
-      $exe = & $pyLauncher.Source "-$v" -c "import sys;print(sys.executable)" 2>$null
-      if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ([string]$exe).Trim())) { return ([string]$exe).Trim() }
+    # issue #7（2026-10-31）：本脚本全局 $ErrorActionPreference='Stop'（:63），而 py 启动器探测
+    #   「没装的版本」时会往 stderr 写 [ERROR] No runtime installed that matches 3.x。
+    #   Stop 下原生命令写 stderr 会抛 NativeCommandError —— 第一个候选 3.13 就炸，整条回退链
+    #   一次都没走到（本机 py -0 只有 3.14.6，实测直接抛）。
+    #   与同文件 GPU 探测那段（±520 行）同一个坑，那次只修了一处。
+    $eapProbe = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      foreach ($v in @('3.13', '3.12', '3.11', '3.10', '3.14')) {
+        $exe = & $pyLauncher.Source "-$v" -c "import sys;print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath ([string]$exe).Trim())) { return ([string]$exe).Trim() }
+        Write-Host "    py -$v 不可用（退出码 $LASTEXITCODE），试下一个版本" -ForegroundColor DarkGray
+      }
+    } finally {
+      $ErrorActionPreference = $eapProbe
     }
   }
   foreach ($c in @('python', 'python3')) {
@@ -472,7 +499,7 @@ function New-DepVenv([string]$venv) {
 #   装完必须真试一次 DLL——pip 装成功不代表能加载（缺 VC++ Redist 时 pip 也成功、import 才崩）。
 function Install-CudaLibs {
   param([string]$Py = '')
-  Write-Step 'GPU 运行库（cuBLAS + cuDNN + nvrtc，约 500 MB）'
+  Write-Step 'GPU 运行库（cuBLAS + cuDNN + nvrtc，约 1.4 GB）'
   if (-not $Py) { $Py = Join-Path (Join-Path $Deps '.venv-asr') 'Scripts\python.exe' }
   if (-not (Test-Path -LiteralPath $Py)) {
     Write-Host '    ! 还没装 ASR 环境：GPU 运行库要装进 .venv-asr，先跑 -Target asr' -ForegroundColor Yellow
@@ -505,7 +532,7 @@ function Install-CudaLibs {
 #   为什么不直接返回对象：Get-Command 给的是 ApplicationInfo（有 .Source、**没有** .FullName），
 #   Get-Item 给的是 FileInfo（有 .FullName、**没有** .Source）。两种对象没有一个共同的可执行属性，
 #   谁按单一属性取值，都会在另一条分支上拿到 $null，然后 `& $null --query-gpu=...` 抛
-#   误导性的「nvidia-smi 查询异常」——比改前更糟（豆包 11:40 验收抓到，本机实测确认：
+#   误导性的「nvidia-smi 查询异常」——比改前更糟（验收时抓到，本机实测确认：
 #   ApplicationInfo.Source=路径 / .FullName=空；FileInfo 正好相反）。
 #   所以这里把两条来源都归一到 $smiPath，取值只取一次。
 function Resolve-NvidiaSmi {
@@ -538,7 +565,7 @@ function Ensure-Asr {
       Write-Host "    [dry-run] `"$($plan.Exe)`" -m venv `"$venv`""
       Write-Host "    [dry-run] `"$py`" -m pip install `"faster-whisper==1.2.1`" `"av==15.1.0`" `"ctranslate2==4.8.3`" -i $PyIndex"
     }
-    Write-Host '    [dry-run] 检测到 NVIDIA 显卡时会问一句「装 GPU 运行库吗（约 500 MB）」，选是才装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（非交互或 -Gpu no 则跳过）'
+    Write-Host '    [dry-run] 检测到 NVIDIA 显卡时会问一句「装 GPU 运行库吗（约 1.4 GB）」，选是才装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（非交互或 -Gpu no 则跳过）'
     return
   }
   $py = New-DepVenv $venv
@@ -554,10 +581,10 @@ function Ensure-Asr {
   }
   # issue #3 第 4 条（2026-10-29）实测：不装 CUDA 12 的 cuBLAS + cuDNN 时，
   #   --device auto 能探到 GPU、模型也能加载，但一转写就报 Library cublas64_12.dll is not found。
-  #   有 N 卡就顺手装上（pip 包，约 500 MB，不用装整套 CUDA Toolkit），没有就跳过、继续用 CPU。
+  #   有 N 卡就顺手装上（pip 包，约 1.4 GB，不用装整套 CUDA Toolkit），没有就跳过、继续用 CPU。
   # M-06（2026-10-29）：以前只看 `nvidia-smi -L` 的退出码，三种误判：
   #   ① 驱动装了但 nvidia-smi 不在 PATH（NVIDIA App 新装 / 非默认路径）→ 明明有卡却说没有；
-  #   ② 驱动 <525（CUDA 12 最低要求）→ 白下 500 MB，装了也用不了；
+  #   ② 驱动 <525（CUDA 12 最低要求）→ 白下 1.4 GB，装了也用不了；
   #   ③ 显存 <2 GB（small 模型 float16 约需 1 GB）→ 装了加载即 OOM。
   #   改成查 driver_version + memory.total，不满足就把原因说清楚，别让用户白下。
   $nv = $false
@@ -600,20 +627,20 @@ function Ensure-Asr {
     } elseif ($script:InAll) {
       # 第十条：all 不问、不装（要装请 -Target cuda / -Gpu yes）
       $wantGpu = $false
-      Write-Host '    (all) 跳过 GPU 运行库（约 500 MB）；要装请单独跑 -Target cuda' -ForegroundColor DarkGray
+      Write-Host '    (all) 跳过 GPU 运行库（约 1.4 GB）；要装请单独跑 -Target cuda' -ForegroundColor DarkGray
     } elseif ([Console]::IsInputRedirected) {
       # 无人值守（脚本里被调）时不要卡在 Read-Host 上，按「不装」处理
       $wantGpu = $false
       Write-Host '    检测到 NVIDIA 显卡；非交互环境跳过 GPU 运行库（要装请传 -Gpu yes）' -ForegroundColor DarkGray
     } else {
-      Write-Host '    检测到 NVIDIA 显卡。要不要装 CUDA 运行库（cuBLAS + cuDNN，约 500 MB）？' -ForegroundColor Cyan
-      Write-Host '      装了：ASR 用 GPU 转写，比 CPU 快 2-8 倍；不装：ASR 走 CPU，功能一样但慢些。' -ForegroundColor DarkGray
+      Write-Host '    检测到 NVIDIA 显卡。要不要装 CUDA 运行库（cuBLAS + cuDNN，约 1.4 GB）？' -ForegroundColor Cyan
+      Write-Host '      装了：ASR 用 GPU 转写，比 CPU 约快 2 倍；不装：ASR 走 CPU，功能一样但慢些。' -ForegroundColor DarkGray
       $ans = Read-Host '    装 GPU 运行库？[y/N]'
       $wantGpu = ($ans -match '^(y|yes|是)$')
     }
   }
   if ($wantGpu) {
-    Write-Host '    检测到 NVIDIA 显卡，补装 CUDA 12 运行库（cuBLAS + cuDNN，约 500 MB）…'
+    Write-Host '    检测到 NVIDIA 显卡，补装 CUDA 12 运行库（cuBLAS + cuDNN，约 1.4 GB）…'
     Install-CudaLibs -Py $py
   } elseif ($nv) {
     Write-Host '    按你的选择不装 GPU 运行库，ASR 走 CPU' -ForegroundColor DarkGray
@@ -713,7 +740,7 @@ function Record-BinaryVersions {
   Write-Host "    ✓ 二进制版本记录 -> $out"
 }
 
-# 第十条：all 模式下不弹「装 GPU 运行库吗」——批量安装不该卡在交互上，也不该悄悄拉 500 MB。
+# 第十条：all 模式下不弹「装 GPU 运行库吗」——批量安装不该卡在交互上，也不该悄悄拉 1.4 GB。
 #   要装 GPU 运行库请显式 -Target cuda（或 -Gpu yes）。
 $script:InAll = ($Target -eq 'all')
 
@@ -737,7 +764,7 @@ $steps = switch ($Target) {
   'ocr' { @('ocr') }
   'model' { @('model') }
   'cuda' { @('cuda') }
-  # 第十条：all 不自动带 cuda——保持「不问、不装 500 MB」的语义，要装请 -Target cuda
+  # 第十条：all 不自动带 cuda——保持「不问、不装 1.4 GB」的语义，要装请 -Target cuda
   default { @('ffmpeg', 'ytdlp', 'asr', 'ocr', 'model') }
 }
 
