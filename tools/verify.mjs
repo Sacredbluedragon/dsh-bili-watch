@@ -14,6 +14,9 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, relative, basename } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// C97（2026-11-01 0.4.1 第 2 条）：client.js 是给宿主加载的浏览器脚本，要验它「宿主太老时抛不抛」，
+//   只能在假 window 里真求值——用 vm 而不是 new Function，才与宿主的脚本执行语义一致。
+import vm from 'node:vm'
 // 2026-10-31 切片 1：被测函数搬进 lib/ 之后，断言可以直接 import 真跑——
 //   不必再「读整份源码 → 正则抠函数体 → new Function 重编译」三件套。
 //   这不是「放松」：原来的 C7/C25 是「比两处函数体是否相等」，只证明两边写得一样，不证明写得对；
@@ -46,7 +49,7 @@ import {
 } from '../lib/media.mjs'
 // 2026-10-31 切片 10：cache 层（目录 / manifest / 等他人）搬进 lib/frames.mjs；
 //   抢锁放锁搬进 lib/locks.mjs 的 makeLocks。C47/C87/C88 直接 import 真跑。
-import { ensureDir, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest } from '../lib/frames.mjs'
+import { ensureDir, frameFilesToKeep, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest } from '../lib/frames.mjs'
 import { makeLocks } from '../lib/locks.mjs'
 // 2026-10-31 三审：C90 的三条守卫需要 logRun（切片 5）与缓存根推导（切片 4）的真跑。
 import { logRun } from '../lib/runs.mjs'
@@ -137,12 +140,19 @@ check('数据模式短路还在（P0：--format json 不许被提示污染）', 
 //   前面补 `async` 是为了片段里有 `await` 时不误报（`async function` 被 indexOf 命中时
 //   只从 `function` 起切，`async` 关键字是丢掉的）。
 const fnBody = (src, name) => {
-  const i = src.indexOf(`function ${name}(`)
-  must(i >= 0, `找不到 function ${name}`)
-  const j = src.slice(i).search(/\n\}/)
-  must(j > 0, `${name} 的函数体没有行首闭合括号`)
-  const body = src.slice(i, i + j + 2)
-  const isAsync = /async\s$/.test(src.slice(Math.max(0, i - 6), i))
+  // 2026-11-01（0.4.1 第 7 条）：原来用 `src.indexOf('function ' + name + '(')`——
+  //   ① 认不出 `export function name(`（lib/ 下全是这个形状，抽不到就报「找不到函数」）；
+  //   ② 会命中**注释里**的同名声明（改成按行首匹配，注释行前面是 `//` 或 ` *`，匹配不上）。
+  //   两条都只改「怎么找」，找到之后仍然从 `function` 起切 —— 返回值形状不变，
+  //   下游 compile() 拿到的还是能直接包进 `new Function` 的片段（export 前缀必须丢掉）。
+  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?function[ \\t]+${name}[ \\t]*\\(`)
+  const m = re.exec(src)
+  must(m, `找不到 function ${name}`)
+  const i = m.index + m[0].indexOf('function')
+  const j = src.indexOf('\n}', i)
+  must(j > i, `${name} 的函数体没有行首闭合括号`)
+  const body = src.slice(i, j + 2)
+  const isAsync = /async\s$/.test(src.slice(Math.max(0, i - 20), i))
   try {
     new Function(`return (${isAsync ? 'async ' : ''}${body})`)
   } catch (e) {
@@ -1896,10 +1906,37 @@ check('C47 frames --at 换时刻不许撞缓存（P0：--at 460 与 --at 750 都
   must(JSON.stringify(framesToShow([750, 460], mixed)) === '["f_12m30s.jpg","f_7m40s.jpg"]', '多个时刻时没按请求顺序列')
   must(JSON.stringify(framesToShow(null, mixed)) === '["f_12m30s.jpg","f_7m40s.jpg"]', 'r.times 缺失（老缓存）时没退回目录扫描排序')
   must(stripComments(fnBody(b, 'cmdFrames')).includes('framesToShow(r.times'), 'cmdFrames 没走 framesToShow')
-  // 6. --fresh 删得掉 at 产物（files 里只认 <bv>-NN.jpg 时，f_7m40s.jpg 永远删不掉）
-  const producedLine = fnBody(b, 'grabFrames').split('\n').find((l) => l.includes('const produced'))
-  must(producedLine && producedLine.includes('f_'), 'manifest.files 没把 at 产物（f_12m30s.jpg）算进去——--fresh 删不掉旧时刻帧')
-  return `atDirTag([460])=${d460} ≠ ${d750}；times 不等不命中、零帧不命中、无 times 的老 manifest 非 at 仍命中；manifest 往返 times=${JSON.stringify(backTimes)}`
+  // 6. --fresh 删得掉 at 产物：**真跑** manifest.files 那条链路（0.4.1 第 12 条）
+  //   原来只查 `const produced` 那一行含不含 `f_` —— 那问的是「源码里有没有这个字」，
+  //   既不看算出来的清单对不对，也不看它到底有没有进 manifest。
+  //   现在判定是 lib/frames.mjs 的纯函数 frameFilesToKeep，喂真文件名看真输出；
+  //   再落一次真 manifest 读回来比对，把「files: produced 真进没进」也一并验掉。
+  //   （不需要下 B 站视频 / 起 ffmpeg：`jpgs()` 只是 `listJpgs(dir)`，这段判定本来就不碰 ffmpeg。）
+  const BV = 'BV1aaaaaaaaa'
+  const dirFiles = [
+    `${BV}-01.jpg`, `${BV}-02.jpg`,      // 等间隔产物
+    'f_7m40s.jpg', 'f_12m30s.jpg',       // --at 产物
+    'f_1m05s.jpg',                       // --at 产物（秒补零，两位）
+    'note.txt',                          // 不是 jpg
+    `${BV}-p2-01.jpg`,                   // 另一个分P的产物，不该算进本批
+  ]
+  const kept = frameFilesToKeep(BV, dirFiles)
+  must(JSON.stringify(kept) === JSON.stringify([`${BV}-01.jpg`, `${BV}-02.jpg`, 'f_7m40s.jpg', 'f_12m30s.jpg', 'f_1m05s.jpg']),
+    `本次产物清单是 ${JSON.stringify(kept)} —— 少了 f_ 会漏删旧时刻帧，混进 -p2- 会误删别的分P`)
+  must(frameFilesToKeep(BV, ['f_7m40s.jpg']).length === 1,
+    '只有 at 产物时清单为空 —— --fresh 会走「没有清单就一律不碰」，旧时刻帧永远删不掉')
+  const tmp2 = mkdtempSync(join(tmpdir(), 'bw-c47b-'))
+  let backFiles
+  try {
+    writeManifest(tmp2, { ok: true, bv: BV, frames: kept.length, files: kept, times: [460, 750] })
+    backFiles = readManifest(tmp2)?.files
+  } finally { rmSync(tmp2, { recursive: true, force: true }) }
+  must(JSON.stringify(backFiles) === JSON.stringify(kept),
+    `manifest.files 读回来是 ${JSON.stringify(backFiles)}，与写进去的 ${JSON.stringify(kept)} 不一致 —— --fresh 拿不到清单`)
+  // 调用点也必须真接上：判定函数与 manifest 里那份得是同一个来源
+  must(grabBody.includes('frameFilesToKeep('), 'grabFrames 没走 frameFilesToKeep —— 清单和判定不是同一份')
+  must(/files:\s*produced\b/.test(grabBody), 'grabFrames 没把 produced 传进 writeManifest 的 files')
+  return `atDirTag([460])=${d460} ≠ ${d750}；times 不等不命中、零帧不命中、无 times 的老 manifest 非 at 仍命中；manifest 往返 times=${JSON.stringify(backTimes)}；本次产物清单 ${kept.length} 项（含 f_ at 产物、不含 -p2-）真写进 manifest.files 并读回`
 })
 
 check('C48 GPU：不确定的结论不许写缓存（P1：一次超时锁死 5 分钟，用户盯着假状态）', () => {
@@ -3450,7 +3487,24 @@ check('C78 jget 五支真跑：412 风控、200+HTML 风控、-352 翻译、5xx 
   // 6-10 的失败现场：每次响应都要记一笔，且 200 的 HTML 也要记（事后才查得清风控页长什么样）
   must(r.diagCount === 7, `onDiag 记了 ${r.diagCount} 次（7 次请求应记 7 次）`)
   must(r.diagHtml?.[1] === 200, `HTML 风控页的 diag 状态码不是 200：${JSON.stringify(r.diagHtml)}`)
-  return '412 / HTML / -352 / -999 / 5xx 重试两次 / 404 全对，diag 七次'
+  // ── 请求头（2026-11-01 第 1 条）────────────────────────────────────────
+  // 断的是**服务器端收到的头**，不是源码里有没有那句字符串 —— 只有前者能证明「发出去的是它」。
+  // 为什么要有这条：lib 化时 jget 的默认头从 H 退成 `{}`，而探针一直不传 headers，
+  //   于是这条守卫验的是「裸奔的 jget」：本地服务器什么都不挑，线上 B 站必 412，
+  //   2026-11-01 之前全仓库**零条**断言检查请求头（扰动默认头回 `{}` 时 109 条全绿）。
+  must(
+    Array.isArray(r.hdrUA) && r.hdrUA.length === 1 && /^Mozilla\/5\.0 /.test(r.hdrUA[0]),
+    `8 次请求的 user-agent 不是同一个浏览器 UA：${JSON.stringify(r.hdrUA)}（lib 的默认头丢了或被写成空串）`
+  )
+  must(
+    Array.isArray(r.hdrRef) && r.hdrRef.length === 1 && r.hdrRef[0] === 'https://www.bilibili.com/',
+    `8 次请求的 referer 不是同一个站点根：${JSON.stringify(r.hdrRef)}`
+  )
+  // **不要**为「入口把 `headers = H` 改成 `{}` 时这条仍然绿」再补断言。
+  //   默认参数是**整体替换**不是合并：入口一旦传了 headers，lib 的 DEFAULT_HEADERS 就不参与，
+  //   所以这里绿是对的（薄壳少一层兜底只少一个 Cookie，属于入口的事）。
+  //   补一条「断薄壳」的断言就是纸老虎——它永远不会红，还会让人以为 lib 的默认值在兜底。
+  return '412 / HTML / -352 / -999 / 5xx 重试两次 / 404 全对，diag 七次；8 次请求都带同一个 UA + Referer'
 })
 
 // ── C79：verify-todo 的 fnBody（预处理函数）自检 ─────────────────────────
@@ -3479,7 +3533,13 @@ check('C79 verify-todo 的 fnBody 自检：export 前缀要认、注释里的同
   // 注释里的同名声明：整行以 // 开头，正则要求行首是 function/async/export，必须取不到
   must(fnBody(src, 'ghost') === null, '注释里的 function ghost(... 被当成了真声明')
   must(fnBody(src, 'nope') === null, '不存在的函数名返回了内容')
-  return 'export 认、ghost 不认、截断在行首 } 之前'
+  // 2026-11-01（0.4.1 第 7 条）：抽到「半截垃圾」必须当没抽到（null），不许把片段交出去。
+  //   函数体里有一行以 `}` 开头（模板字符串里很常见）就会被提前截断，而 B 系列全是字符串匹配，
+  //   垃圾照样能匹配出结论。这里做编译自检：解析不了 → null → 调用方走「未找到」那条明路。
+  const broken = ['function broken() {', '  const s = `', '}', '`', '  return s', '}', ''].join('\n')
+  must(fnBody(broken, 'broken') === null,
+    `截断后的垃圾片段没被编译自检拦下（交出去会让下游拿它算出红或绿，两种都不代表真事）：${JSON.stringify(fnBody(broken, 'broken'))}`)
+  return 'export 认、ghost 不认、截断在行首 } 之前、半截垃圾返回 null'
 })
 
 // ── C81/C82：ffExec 与 findFfmpeg 真起进程（切片 9 第一步，DSH 20:05 点名）─────────
@@ -3875,14 +3935,25 @@ check('C88 抢锁放锁真跑：抢不到不放别人的锁、owner 校验、过
     const dir = join(tmp, 'd')
     ensureDir(dir)
     let ttlSeen = 7
-    // TTL 传的是**取值函数**：每次抢锁现取，改配置下一把生效
+    // TTL 传的是**取值函数**：每次抢锁现取，改配置下一把生效。
+    // 7 这个值只用来证明「真的现取」——验证完**立刻**升到 60 秒再往下跑。
+    //   （2026-11-01 0.4.1 第 12 条：原来整个用例都是 7，于是 ①「主人还活着就抢不到」变成了
+    //    与调度赛跑——Windows 上读一次锁 + pidAlive 就可能超过 7ms，锁被判过期接管，
+    //    l2 不为 null，断言随机红。这不是被测代码的 bug，是用例自己埋的定时炸弹。）
     const locks = makeLocks({ ttlMs: () => ttlSeen })
     // tryLockSync 是同步版（tryLock 是 async，见下面的子进程探针）
+    const lTtl = locks.tryLockSync(dir)
+    must(lTtl && lTtl.f, '验证 TTL 现取的那把锁没抢到')
+    must(JSON.parse(readFileSync(lTtl.f, 'utf8')).ttlMs === 7, `锁体里的 ttl 是 ${JSON.parse(readFileSync(lTtl.f, 'utf8')).ttlMs}，应是现取的 7`)
+    locks.unlock(lTtl)
+    must(!existsSync(lTtl.f), '验证 TTL 的那把锁解不掉')
+    // 往下全程用一个不可能在本次运行里过期的 TTL：这些用例要验的是 owner/接管判据，不是超时
+    ttlSeen = 60000
     const l1 = locks.tryLockSync(dir)
     must(l1 && l1.f, '第一次抢锁失败')
     must(existsSync(l1.f), '抢到锁但锁文件不在')
     const body = JSON.parse(readFileSync(l1.f, 'utf8'))
-    must(body.ttlMs === 7, `锁体里的 ttl 是 ${body.ttlMs}，应是现取的 7`)
+    must(body.ttlMs === 60000, `锁体里的 ttl 是 ${body.ttlMs}，应是升上去的 60000（TTL 不是现取的）`)
     must(body.owner === l1.owner, '锁体 owner 与返回值不一致')
     must(Number.isInteger(body.pid) && body.pid > 0, '锁体里没有合法 pid')
     // ① 主人还活着 → 抢不到，且**不能删掉别人的锁**（A-1 的正身）
@@ -3907,9 +3978,10 @@ check('C88 抢锁放锁真跑：抢不到不放别人的锁、owner 校验、过
     must(JSON.parse(readFileSync(dead, 'utf8')).owner === l3.owner, '接管后锁的持有者没换成新主人')
     locks.unlock(l3)
     // ⑤ TTL 是现取的：改了取值函数，下一把锁就带新值
-    ttlSeen = 99
+    //   这里也不用毫秒级的值——同一个道理，用例不该自己埋「读一次就过期」的雷。
+    ttlSeen = 45000
     const l4 = locks.tryLockSync(dir)
-    must(l4 && JSON.parse(readFileSync(l4.f, 'utf8')).ttlMs === 99, 'TTL 不是现取的（改配置后仍写旧值）')
+    must(l4 && JSON.parse(readFileSync(l4.f, 'utf8')).ttlMs === 45000, 'TTL 不是现取的（改配置后仍写旧值）')
     locks.unlock(l4)
     // ⑥ 异步那半截（tryLock 会 sleep 重试）另起进程真跑——check() 回调是同步的（C77）
     const probe = spawnSync(process.execPath, [join(HERE, 'fixtures', 'lock-probe.mjs')], {
@@ -3937,8 +4009,9 @@ check('C88 抢锁放锁真跑：抢不到不放别人的锁、owner 校验、过
 // ── C89：切片 11 的三稿复制提示词（正文逐字节一致 + 按钮位置 + 不带内部东西）──────
 // DSH 21:05 的验收是「把三个按钮实际复制出的文本各贴一份原样出来」——靠人眼比不行，
 // 改成可执行断言：把 client.js 里 `const COPY_XXX = String.raw`...`` 当浏览器里那样求值，
-// 与审查文件里的三个代码块逐字节比。任何人改了稿子忘了同步、或改坏了转义，这条都会红。
-check('C89 三稿复制提示词：正文与审查文件逐字节一致、三稿互斥、按钮在对应区块、无内部编号', () => {
+// 与基准文件（`tools/fixtures/copy-texts.md`）里的三个代码块逐字节比。
+// 任何人改了稿子忘了同步、或改坏了转义，这条都会红。
+check('C89 三稿复制提示词：正文与基准文件逐字节一致、三稿互斥、按钮在对应区块、无内部编号', () => {
   const cli = read('client.js')
   const names = ['COPY_DEPS', 'COPY_ASR', 'COPY_PANEL']
   const texts = {}
@@ -3949,18 +4022,24 @@ check('C89 三稿复制提示词：正文与审查文件逐字节一致、三稿
     // 普通模板字符串会把 \\S 吃掉），${ORIGIN} 照样插值。
     texts[n] = new Function('ORIGIN', `return String.raw\`${m[1]}\``)('{{ORIGIN}}')
   }
-  // ① 与审查文件逐字节一致（审查文件不在仓库里 → 拿不到时跳过这一项，其余照查）
-  const mdPath = join(ROOT, '..', '..', '项目', 'bili-watch', '审查', '20261031-复制提示词三稿.md')
-  let mdNote = '审查文件不在（不在本仓库内，跳过逐字节比对）'
-  if (existsSync(mdPath)) {
-    const mdBlocks = [...readFileSync(mdPath, 'utf8').matchAll(/```\n([\s\S]*?)```/g)].map((m) => m[1])
-    must(mdBlocks.length === 3, `审查文件里代码块是 ${mdBlocks.length} 个，应为 3 个`)
-    names.forEach((n, i) => {
-      must(texts[n] === mdBlocks[i],
-        `${n} 与审查文件第 ${i + 1} 段不一致（${texts[n].length} B vs ${mdBlocks[i].length} B）——正文改了要同步`)
-    })
-    mdNote = '三段都与审查文件逐字节一致'
-  }
+  // ① 与基准文件逐字节一致
+  //   2026-11-01 0.4.1 第 12 条（一）：原来文件不在时只往 mdNote 写一句「跳过」就继续，整条仍 PASS。
+  //   这是 C89 自己犯的毛病——判据依赖仓库外的文件时，**要么红要么 skip，不许静默通过**。
+  //   2026-11-01 0.4.1 第 12 条（二，用户拍板）：基准从仓库外搬进 `tools/fixtures/copy-texts.md`。
+  //   原来那条路径是 `../../项目/bili-watch/审查/…`，是工作区里的文件——vendor 出去或 CI 上
+  //   必然缺、必然红；更根本的是，断言的价值在于「期望值独立于被测代码」，基准只在
+  //   我这台机器上，等于这条断言对外不存在。
+  //   基准不进 npm 包（`tools/` 不在 package.json 的 files 里），发布出去的是 client.js 里的正身。
+  const mdPath = join(HERE, 'fixtures', 'copy-texts.md')
+  must(existsSync(mdPath),
+    `基准文件不在：${mdPath} —— 逐字节比对这一项没做，不能算过（它随仓库走，缺了说明 checkout 不完整）`)
+  const mdBlocks = [...readFileSync(mdPath, 'utf8').matchAll(/```\n([\s\S]*?)```/g)].map((m) => m[1])
+  must(mdBlocks.length === 3, `基准文件里代码块是 ${mdBlocks.length} 个，应为 3 个`)
+  names.forEach((n, i) => {
+    must(texts[n] === mdBlocks[i],
+      `${n} 与基准文件第 ${i + 1} 段不一致（${texts[n].length} B vs ${mdBlocks[i].length} B）——正文改了要同步`)
+  })
+  const mdNote = '三段都与基准文件逐字节一致'
   // ② 三稿互斥：症状不同，正文不能雷同（雷同＝三稿当一份用，正是要防的坑）
   must(texts.COPY_DEPS !== texts.COPY_ASR, '稿一与稿二正文一样')
   must(texts.COPY_DEPS !== texts.COPY_PANEL, '稿一与稿三正文一样')
@@ -4509,6 +4588,311 @@ check('C94 fetch-deps.sh：清单判断不吃 SIGPIPE(141)、ffmpeg 真跑只认
     })
   }
 }
+
+// ── C97：宿主太老时必须「抛」，不许「静默跳过」（2026-11-01 0.4.1 第 2 条）────────
+// 原来的写法是给 MODULE_LOADER 一个空实现 + console.warn：本文件能加载完，但宿主照样报
+//   `loaded without registering`——那句话指向**结果**（面板没注册），不指向**原因**（宿主 < 0.2.0-rc.2）。
+// 断法：把 client.js 当浏览器脚本在假 window 里真求值（vm），必须抛那句带版本要求的话。
+//   旧写法在这里会「走完整个文件且不抛」，所以这条能红——不是读源码里有没有 throw 两个字。
+check('C97 宿主缺 window.__ModuleLoader__ 时 client.js 直接抛「需要 DSH ≥ 0.2.0-rc.2」，不许静默跳过', () => {
+  const src = read('client.js')
+  const sandbox = { window: {}, console: { warn() {}, log() {}, error() {} } }
+  let err = null
+  let finished = false
+  try {
+    vm.runInNewContext(src, sandbox, { timeout: 10000 })
+    finished = true
+  } catch (e) {
+    err = e
+  }
+  must(!finished, '假 window（没有 __ModuleLoader__）里跑完了整个文件——fallback 又变回静默跳过了')
+  const msg = String((err && err.message) || err)
+  must(/DSH\s*≥\s*0\.2\.0-rc\.2/.test(msg), `抛的不是「宿主太老」这句：${msg.slice(0, 160)}`)
+  must(/window\.__ModuleLoader__/.test(msg), `报错里没点名缺的是 window.__ModuleLoader__（用户据此才能搜到原因）：${msg.slice(0, 160)}`)
+  return '假 window 下直接抛，报错点名「需要 DSH ≥ 0.2.0-rc.2」与缺失的 window.__ModuleLoader__'
+})
+
+// ── C98：ensure_venv 的**出口**也要验一次 import（2026-11-01 0.4.1 第 3 条）──────
+// 入口验了（`if "$dir/bin/python" -c "import $mod"`），装完之后没有：pip 返回 0 就直接打 ✓。
+// 空壳 venv、requires-python 不满足、wheel 落到别的解释器，这三种都是 install 成功、import 失败，
+// 要等用户跑转写才炸，而且报的是「转写失败」，与「依赖没装上」隔了一层。
+// 真跑：PATH 上放一个假 python3（建得出 venv、pip 一律 exit 0、只有 `-c "import …"` 的退出码可控）。
+//   两个方向都跑——只跑失败那个方向的话，「脚本在别处提前退出」会被当成「拦住了」。
+check('C98 fetch-deps.sh：pip 返回 0 不算装成，装完必须再 import 一次；失败要删半成品并说清原因', () => {
+  const bash = findBash()
+  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
+  if (!bash || !existsSync(shPath)) {
+    skip('C98 fetch-deps.sh 出口验证', '本机没有 bash 或找不到 scripts/fetch-deps.sh')
+    return 'ok'
+  }
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c98-'))
+  const binDir = join(tmp, 'bin')
+  const fakePy = join(binDir, 'python3')
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const writeFake = (importRc) => writeFileSync(fakePy, [
+    '#!/bin/sh',
+    'dir=""; code=""; prev=""',
+    'for a in "$@"; do',
+    '  [ "$prev" = "venv" ] && dir="$a"',
+    '  [ "$prev" = "-c" ] && code="$a"',
+    '  prev="$a"',
+    'done',
+    'case "$*" in',
+    '  *"-m venv"*) mkdir -p "$dir/bin"; cp "$0" "$dir/bin/python"; chmod +x "$dir/bin/python"; exit 0 ;;',
+    'esac',
+    'if [ -n "$code" ]; then',
+    '  case "$code" in "import "*) exit ' + importRc + ' ;; esac',
+    'fi',
+    'exit 0',
+    '',
+  ].join('\n'))
+  // Git Bash 里 `rm -rf "C:\\…\\deps/.venv-asr"` 这种**混合分隔符**路径会被本机安全壳拒
+  //   （SAFE_DELETE_INVALID_PATH）。用户侧 fetch-deps.sh 只在 Linux/macOS 跑，路径本来就是 POSIX；
+  //   所以这里也传 POSIX 路径，测的才是脚本本身。Node 侧仍用 Windows 路径建/查。
+  const toPosix = (p) => String(p).replace(/\\/g, '/').replace(/^([A-Za-z]):/, (m, d) => '/' + d.toLowerCase())
+  const runAsr = (tag) => {
+    const deps = join(tmp, 'deps-' + tag)
+    mkdirSync(deps, { recursive: true })
+    const env = { ...process.env, PATH: binDir + sep + (process.env.PATH || ''), BILI_WATCH_DEPS: toPosix(deps), HOME: toPosix(join(tmp, 'home')) }
+    delete env.BASH_ENV
+    const r = spawnSync(bash, [shPath, 'asr'], { encoding: 'utf8', timeout: 120000, env })
+    return { r, venv: join(deps, '.venv-asr'), out: String(r.stdout || '') + String(r.stderr || '') }
+  }
+  try {
+    mkdirSync(binDir, { recursive: true })
+    // ① 能 import：必须一路走到 ✓ —— 证明这条链没在别处断，否则 ② 的红是假红
+    writeFake(0)
+    const good = runAsr('ok')
+    must(good.r.status === 0, `正常路径退出码 ${good.r.status}：${good.out.slice(-300)}`)
+    must(/✓ .*\.venv-asr/.test(good.out), `正常路径没打 ✓：${good.out.slice(-300)}`)
+    must(existsSync(good.venv), '正常路径的 venv 不见了')
+    // ② pip 说装成了、import 却失败：必须非零退出 + 删半成品 + 说清「装完仍 import 失败」
+    writeFake(1)
+    const bad = runAsr('bad')
+    must(bad.r.status !== 0,
+      `install 成功但 import 失败时脚本仍然 exit 0 —— 空壳 venv 会被当成装好了，用户到转写才炸：${bad.out.slice(-300)}`)
+    must(/装完了但 import faster_whisper 仍然失败/.test(bad.out),
+      `报错没点明「装完仍 import 失败」（用户据此才能判断是依赖问题不是网络问题）：${bad.out.slice(-300)}`)
+    must(!existsSync(bad.venv),
+      '失败后没删半成品 venv —— 下次重跑会被入口的「已存在就跳过」判据当成装好了')
+    return 'import 通了才打 ✓；pip 说成了但 import 不通 → exit 1 + 删半成品 + 说清原因'
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+// ── C99：sheet 认 --at（2026-11-01 0.4.1 第 5 条）────────────────────────────
+// frames 有 --at、sheet 没有：同一个「我只要这几秒的画面」的需求，两处得到两种结果。
+// 断三件：① 调用点真把 --at 传下去（不传的话下面全绿也没意义）；
+//        ② --at 模式按时刻取帧（f_12m30s.jpg），**不是** `${bv}-NN.jpg`；
+//        ③ 索引里的秒数从文件名读，推不出就给 null（不许编 00:00）。
+check('C99 sheet 认 --at：按时刻取帧、索引时间从文件名读、推不出留空', () => {
+  const src = read('tools/look.mjs')
+  const callLine = src.split('\n').find((l) => /cmdSheet\(BV, \{/.test(l)) || ''
+  must(/at:\s*opt\('at'\)/.test(callLine), `sheet 的调用点没把 --at 传下去（用户敲了也不生效）：${callLine.trim().slice(0, 160)}`)
+  must(/look\.mjs sheet <BV或链接>[^\n]*--at/.test(src), '--help 里的 sheet 用法没写 --at')
+  // 两个纯函数真跑（与 look.mjs 里同一份源码；依赖用同名 prelude 注入）
+  const prelude = `
+    const frameList = (dir, bv) => { const out = []; for (let i = 1; i < 1000; i++) { const n = join(dir, bv + '-' + String(i).padStart(2, '0') + '.jpg'); if (!existsSync(n)) break; out.push(n) } return out }
+    const framesToShow = (times, dirFiles) => Array.isArray(times) && times.length
+      ? times.map((t) => 'f_' + Math.floor(t / 60) + 'm' + String(t % 60).padStart(2, '0') + 's.jpg')
+      : dirFiles.filter((f) => f.startsWith('f_') && f.endsWith('.jpg')).sort()
+  `
+  const { sheetFrameFiles, frameSecOf } = compile(src, ['sheetFrameFiles', 'frameSecOf'], {
+    prelude,
+    params: ['join', 'basename', 'existsSync'],
+    args: [join, basename, existsSync],
+  })
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c99-'))
+  try {
+    writeFileSync(join(tmp, 'f_0m05s.jpg'), 'x')
+    writeFileSync(join(tmp, 'f_12m30s.jpg'), 'x')
+    const atFiles = sheetFrameFiles(tmp, 'BV1xx', '0:05,12:30', [5, 750], readdirSync(tmp))
+    must(atFiles.length === 2 && atFiles.every((f) => /f_\d+m\d+s\.jpg$/.test(f)),
+      `--at 模式没按时刻取帧（原来固定走 frameList，会直接「没抽到帧」）：${JSON.stringify(atFiles)}`)
+    const partial = sheetFrameFiles(tmp, 'BV1xx', '0:05,9:99', [5, 5999], readdirSync(tmp))
+    must(partial.length === 1, `请求了但不存在的时刻没被过滤（会拼进一个不存在的文件）：${JSON.stringify(partial)}`)
+    writeFileSync(join(tmp, 'BV1xx-01.jpg'), 'x')
+    writeFileSync(join(tmp, 'BV1xx-02.jpg'), 'x')
+    const plain = sheetFrameFiles(tmp, 'BV1xx', '', null, readdirSync(tmp))
+    must(plain.length === 2 && plain.every((f) => /BV1xx-\d\d\.jpg$/.test(f)),
+      `普通模式的帧选择被改坏了（这是老路径，不该动）：${JSON.stringify(plain)}`)
+    must(frameSecOf(join(tmp, 'f_12m30s.jpg'), 0, 0) === 750,
+      '--at 的索引没从文件名读时间——会退回按 step 推，于是九宫格索引显示 00:00 / 00:02，与用户要的时刻不符')
+    must(frameSecOf(join(tmp, 'BV1xx-02.jpg'), 1, 2) === 2, '普通模式按 step 推时间算错了')
+    must(frameSecOf(join(tmp, 'BV1xx-02.jpg'), 1, 0) === null, '推不出时间时应该给 null（不许编一个 00:00 出来）')
+    return '调用点传 at；--at 取 f_*m*s.jpg 并滤掉不存在的时刻；索引 750s；普通模式与推不出时的 null 都没变'
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+// ── C100：/cache/clear 的 skipped 要上屏（2026-11-01 0.4.1 第 6 条，E4-10）──────────
+// 后端 index.js 的 /cache/clear 一直返回 data.skipped（「认出来不是本插件的、所以没删」），
+// 前端只读 removed/bytes/failed。后果：面板说「缓存已清理」，用户去目录一看文件还在。
+check('C100 /cache/clear 的 skipped 要上屏（E4-10）：有就点名原因，没有就一个字不多', () => {
+  const src = read('client.js')
+  must(/const keptNote = fmtSkippedNote\(d\)/.test(src),
+    'saveCache 没调用 fmtSkippedNote —— 函数写在文件里没人用，等于没改')
+  const { fmtSkippedNote } = compile(src, ['fmtSkippedNote'])
+  must(fmtSkippedNote({}) === '', '没有 skipped 时不该多话（正常清理路径要保持安静）')
+  must(fmtSkippedNote({ skipped: [] }) === '', 'skipped 是空数组时也不该多话')
+  must(fmtSkippedNote(null) === '', 'data 缺失时崩了/多话了')
+  const one = fmtSkippedNote({ skipped: [{ name: '我的视频.mp4', why: '不在白名单' }] })
+  must(one.includes('我的视频.mp4') && one.includes('不在白名单'), `skipped 的文件名/原因没上屏：${one}`)
+  must(one.includes('保留 1 项'), `没说清保留了几项（用户无法判断要不要自己动手删）：${one}`)
+  const many = fmtSkippedNote({ skipped: Array.from({ length: 6 }, (_, i) => ({ name: `f${i}.mp4`, why: 'x' })) })
+  must(many.includes('保留 6 项'), `总数不对（应报 6 项）：${many}`)
+  must(/等 6 项/.test(many), `超过 3 个没收敛成「等 N 项」，会把对话框刷屏：${many}`)
+  must(fmtSkippedNote({ skipped: ['纯字符串.mp4'] }).includes('纯字符串.mp4'), '老形状（字符串数组）会崩或不显示')
+  return '空→静默；1 项点名原因；6 项收敛成「等 6 项」；字符串形状兼容'
+})
+
+// ── C101：verify.mjs 自己的 fnBody 也要认 export、也不吃注释（2026-11-01 0.4.1 第 7 条）──
+// C79 只验了 verify-todo 那份。verify.mjs 这份原来用 `indexOf('function name(')`：
+//   ① 认不出 `export function`（lib/ 下全是这个形状，抽不到就报「找不到函数」，
+//      报错长得像「函数被删了」而不像「工具抽错了」）；
+//   ② 会命中注释里的同名声明，抽出一段从注释切到下一个行首 `}` 的垃圾。
+// 两个 fnBody 不统一（各抽各的文件，今天安全），所以这里是**第二份**自检，不是重复。
+check('C101 verify.mjs 的 fnBody：认 export 前缀、不吃注释里的同名声明、返回值仍是纯 function', () => {
+  const src = [
+    '// function real(a) { 这是注释里的老实现，不许被取到',
+    'export async function real(a) {',
+    '  const x = 1',
+    '  if (x) {',
+    '    return a * 2',
+    '  }',
+    '}',
+    'const after = 1',
+  ].join('\n')
+  const body = fnBody(src, 'real')
+  must(/return a \* 2/.test(body), `抽到的不是真函数体：${JSON.stringify(body.slice(0, 80))}`)
+  must(!/老实现/.test(body), '命中了注释里的同名声明（这条是 indexOf 那个洞的原样复现）')
+  must(!/after/.test(body), '函数体吃过了行首闭合括号')
+  // compile() 会把返回值直接包进 `new Function('return ( ... )')`，带 export 前缀就是语法错，
+  // 所以这里必须从 `function` 起切。
+  must(/^function /.test(body), `返回值不是以 function 开头（compile 会语法错）：${JSON.stringify(body.slice(0, 30))}`)
+  let threw = ''
+  try { fnBody(src, 'nope') } catch (e) { threw = String(e.message || e) }
+  must(/找不到 function nope/.test(threw), `不存在的函数名没报「找不到」：${threw}`)
+  return 'export async 认出且从 function 起切；注释同名不吃；不存在时报找不到'
+})
+
+// ── C102：deps 判据只有一份（2026-11-01 0.4.1 第 8 条）──────────────────────────
+// 原来 index.js 与 tools/look.mjs 各写一份「用哪份 deps」，且**不是逐字相同**：
+//   index 判「包内有内容」，look 判「包内目录存在」。干净安装（包内 deps 是空目录）时，
+//   面板用包外、CLI 用包内 —— 装到哪、读哪个 venv，两边各说各话。版本号那份同理（只是路径差一层）。
+// 这条断两件：① 两个入口都真走 lib（没有偷偷再算一份）；② lib 的五种场景判据对。
+check('C102 deps 判据只有一份：两个入口都走 lib/plugin-paths.mjs，五种场景判据对', () => {
+  const iSrc = read('index.js')
+  const lSrc = read('tools/look.mjs')
+  must(/resolveDepsDir\(\{ pluginRoot: HERE/.test(iSrc), 'index.js 没走 lib 的 resolveDepsDir（判据又分叉了）')
+  must(/resolveDepsDir\(\{ pluginRoot: join\(HERE, '\.\.'\)/.test(lSrc), 'tools/look.mjs 没走 lib 的 resolveDepsDir')
+  must(!/const DEPS = \(\(\) =>/.test(iSrc + lSrc), '还有入口在自己算 DEPS')
+  must(!/PLUGIN_VERSION = \(\(\) =>/.test(iSrc + lSrc), '还有入口在自己读版本号')
+  must(/readPluginVersion\(HERE\)/.test(iSrc) && /readPluginVersion\(join\(HERE, '\.\.'\)\)/.test(lSrc),
+    '版本号没走 lib 的 readPluginVersion')
+  const { resolveDepsDir } = compile(read('lib/plugin-paths.mjs'), ['depsPaths', 'resolveDepsDir'], {
+    params: ['join', 'resolve', 'existsSync', 'readdirSync', 'mkdirSync', 'homedir'],
+    // homedir 给个假值即可：下面每个场景都显式传 home，默认值只在不传时才求值
+    args: [join, resolve, existsSync, readdirSync, mkdirSync, () => join(tmpdir(), 'bw-c102-nohome')],
+  })
+  const box = mkdtempSync(join(tmpdir(), 'bw-c102-'))
+  try {
+    const mk = (p) => { mkdirSync(p, { recursive: true }); return p }
+    // ① 包内是空目录、包外没有 → 包外（这格就是原来两边分叉的地方，CLI 侧随之改了判据）
+    const rootA = mk(join(box, 'a', 'pkg'))
+    mk(join(rootA, 'deps'))
+    const homeA = join(box, 'a', 'home')
+    const eA = resolveDepsDir({ pluginRoot: rootA, env: { DSH_HOME: homeA }, home: homeA })
+    must(eA === join(homeA, 'bili-watch', 'deps'), `包内空目录时没判包外（还是「存在即用」那套）：${eA}`)
+    // ② 包内有内容 → 包内（老安装、用户把依赖装在包里，不能突然读不到）
+    const rootB = mk(join(box, 'b', 'pkg'))
+    mk(join(rootB, 'deps'))
+    writeFileSync(join(rootB, 'deps', 'x.txt'), 'x')
+    const homeB = join(box, 'b', 'home')
+    must(resolveDepsDir({ pluginRoot: rootB, env: { DSH_HOME: homeB }, home: homeB }) === join(rootB, 'deps'),
+      '包内有内容时没判包内（会让老用户的 venv / 模型突然失效）')
+    // ③ 包外已存在 → 包外，且不覆盖
+    const rootC = mk(join(box, 'c', 'pkg'))
+    mk(join(rootC, 'deps'))
+    writeFileSync(join(rootC, 'deps', 'x.txt'), 'x')
+    const homeC = mk(join(box, 'c', 'home'))
+    mk(join(homeC, 'bili-watch', 'deps'))
+    must(resolveDepsDir({ pluginRoot: rootC, env: { DSH_HOME: homeC }, home: homeC }) === join(homeC, 'bili-watch', 'deps'),
+      '包外已存在时没判包外')
+    // ④ BILI_WATCH_DEPS 最高优先
+    const rootD = mk(join(box, 'd', 'pkg'))
+    mk(join(rootD, 'deps'))
+    const explicit = join(box, 'd', 'custom')
+    must(resolveDepsDir({ pluginRoot: rootD, env: { BILI_WATCH_DEPS: explicit }, home: join(box, 'd', 'home') }) === explicit,
+      'BILI_WATCH_DEPS 没优先')
+    // ⑤ 只有面板侧（mkdirPref）建目录；CLI 缺省不许有副作用
+    const rootE = mk(join(box, 'e', 'pkg'))
+    mk(join(rootE, 'deps'))
+    const homeE = join(box, 'e', 'home')
+    const eE = resolveDepsDir({ pluginRoot: rootE, env: { DSH_HOME: homeE }, home: homeE, mkdirPref: true })
+    must(eE === join(homeE, 'bili-watch', 'deps') && existsSync(eE), 'mkdirPref=true 时没建出包外目录（面板首次启动写不进去）')
+    const rootF = mk(join(box, 'f', 'pkg'))
+    mk(join(rootF, 'deps'))
+    const homeF = join(box, 'f', 'home')
+    const eF = resolveDepsDir({ pluginRoot: rootF, env: { DSH_HOME: homeF }, home: homeF })
+    must(eF === join(homeF, 'bili-watch', 'deps') && !existsSync(eF), 'CLI 侧（mkdirPref 缺省）也去建目录了——只读命令不该有副作用')
+    return '两入口同走 lib；空包内→包外、有内容→包内、包外优先、BILI_WATCH_DEPS 优先、只有面板建目录'
+  } finally { rmSync(box, { recursive: true, force: true }) }
+})
+
+// ── C103：两个入口不许有「同名不同物」的顶层定义（2026-11-01 0.4.1 第 9 条）──────
+// 原来 index.js 有 `function depsCfg()`（每次调用读盘），tools/look.mjs 有 `const depsCfg = readDepsCfg()`
+// （模块加载时的快照）。同名不同物 → 外部审查脚本看见 `depsCfg.cache` 以为是当前配置，
+// 实际拿到的是快照；反过来看见 `depsCfg()` 以为是同一份对象。人也会这么读。
+// 这条是通用闸：以后再有人把「函数」和「常量」用同一个名字分放两个入口，这里会红。
+check('C103 两个入口没有同名异类的顶层定义（depsCfg 那种撞名会让外部审查脚本读错东西）', () => {
+  const defs = (file) => {
+    const s = read(file)
+    const map = new Map()
+    for (const m of s.matchAll(/^(?:export\s+)?function\s+([A-Za-z0-9_$]+)/gm)) map.set(m[1], 'function')
+    for (const m of s.matchAll(/^(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*=/gm)) if (!map.has(m[1])) map.set(m[1], 'const')
+    return map
+  }
+  const a = defs('index.js')
+  const b = defs('tools/look.mjs')
+  must(a.size > 50 && b.size > 50, `扫面不对（顶层定义 index ${a.size} / look ${b.size}），正则失效了`)
+  const clash = []
+  for (const [name, kind] of a) {
+    if (b.has(name) && b.get(name) !== kind) clash.push(`${name}（index=${kind} / look=${b.get(name)}）`)
+  }
+  must(clash.length === 0, `两个入口有同名异类的顶层定义：${clash.join('、')} —— 外部审查脚本会按名字读错东西`)
+  return `index ${a.size} 个顶层定义 / look ${b.size} 个，无同名异类`
+})
+
+// ── C104：缓存根的「谁负责初始化」必须与代码一致（2026-11-01 0.4.1 第 11 条）──────────
+// cache-path.mjs 原来写「现在两侧统一走 cacheDir()」，而 index.js 的 runsFile 实际走 ensureCache()。
+// 注释错还是代码错？核下来是**注释错**：
+//   · CLI 一条命令一进程，没初始化就是真没初始化 → cacheDir() 必抛，最省事；
+//   · 面板是常驻进程，runLogRecord 可能在 apply() 之前被调到 → ensureCache() 幂等就地初始化，
+//     否则整条日志丢掉。它拿的不是「未初始化的纯路径」，所以不属于「伪装成初始化好了」那种错。
+// 两边算出来的根是同一个（C64 真起两个进程比过），差异只在「谁负责初始化」。
+// 这条钉住这个分工：谁把它改成「统一」了，就直接红——那种「统一」会把日志或初始化时机弄坏。
+check('C104 缓存根初始化责任分明：CLI 的 runsFile 走 cacheDir()（必抛），面板走 ensureCache()（幂等）', () => {
+  const iSrc = read('index.js')
+  const lSrc = read('tools/look.mjs')
+  must(/const runsFile = \(\) => join\(ensureCache\(\), '_logs', 'runs\.jsonl'\)/.test(iSrc),
+    'index.js 的 runsFile 不再走 ensureCache() —— 换成 cacheDir() 会在 apply() 之前抛，整条日志丢掉')
+  must(/const runsFile = \(\) => join\(cacheDir\(\), '_logs', 'runs\.jsonl'\)/.test(lSrc),
+    'tools/look.mjs 的 runsFile 不再是 cacheDir() —— CLI 侧应保留「未初始化必抛」')
+  // 面板侧「幂等」的落点就在这个定义上：ensureCache 必须只是 initCachePath(cacheWant) 的薄壳。
+  //   哪天它被改成「先读一个已有 CACHE、没有再初始化」，这里的幂等就变成了「读到空就抛」，注释又对不上了。
+  must(/function ensureCache\(\) \{\s*\n\s*const r = initCachePath\(cacheWant\)/.test(iSrc),
+    'index.js 的 ensureCache 不再是 initCachePath(cacheWant) 的薄壳 —— 面板侧的「幂等就地初始化」前提没了')
+  // 注释靶子：这两句都已经被实证为「与代码不符」，写回去就红（它们正是第 11 条要修的东西）
+  const badNotes = [
+    /一律走 lib 的 cacheDir\(\)/,
+    /缓存根没初始化时 runsFile\(\) 会抛/,
+  ].filter((re) => re.test(iSrc))
+  must(badNotes.length === 0, `index.js 又写回了与代码不符的注释：${badNotes.map(String).join(' / ')}`)
+  const libSrc = read('lib/cache-path.mjs')
+  // 只认「整行就是那句断言」的写法（新注释里引用这句时带引号、不是行首，不该误判）
+  must(!/^\/\/\s*现在两侧统一走 cacheDir\(\)/m.test(libSrc), 'cache-path.mjs 又写回了「两侧统一走 cacheDir()」，与代码不符')
+  must(/ensureCache\(\)/.test(libSrc), 'cache-path.mjs 的说明没提面板侧的 ensureCache()，读者会以为两边一样')
+  return 'CLI=cacheDir（必抛）/ 面板=ensureCache（幂等自初始化）；文档与代码一致'
+})
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
 let pass = 0, fail = 0, skipN = 0

@@ -9,13 +9,20 @@
  * 后端只走 host 的 /api/bili-watch（读盘 + 清缓存 + 起下载），面板不存任何凭证。
  * 挂载点：plugins.bundle.config（key = 包名），因此设置页里看不到它，只在插件详情页出现。
  */
-// DSH < 0.2.0-rc.2 的宿主没有 window.__ModuleLoader__，直接调用会抛 TypeError：面板白屏，且面板之外
-// 没有任何提示（普通用户不会开 F12）。这里补一个空实现让本文件正常加载完——面板不注册，但宿主不白屏，
-// 控制台留一行能看懂的警告。
+// DSH < 0.2.0-rc.2 的宿主没有 window.__ModuleLoader__，直接调用会抛 TypeError。
+// 以前这里补一个**空实现**让本文件加载完、只留一行 console.warn —— 结果是宿主照样报
+//   `loaded without registering`：那句话指向**结果**（面板没注册），不指向**原因**（宿主太老），
+//   普通用户只看到「插件坏了」，而警告躺在控制台里没人看。
+// 2026-11-01（0.4.1 第 2 条）：改成直接抛。报错本身带原因与版本要求，宿主把它原样抛给用户。
+//   守卫见 C97：在假 window 里求值本文件，必须抛这句话。
 const MODULE_LOADER =
   typeof window !== 'undefined' && window.__ModuleLoader__ && typeof window.__ModuleLoader__.load === 'function'
     ? window.__ModuleLoader__
-    : { load() { console.warn('[dsh-bili-watch] 需要 DSH ≥ 0.2.0-rc.2（当前宿主缺 window.__ModuleLoader__），插件面板不会显示。请升级 DSH 后重试。') } }
+    : (() => {
+        throw new Error(
+          '[dsh-bili-watch] 需要 DSH ≥ 0.2.0-rc.2：当前宿主没有 window.__ModuleLoader__，插件面板无法注册。请升级 DSH 后重试。'
+        )
+      })()
 
 // E4-02（2026-10-30，P0）：删除结果的消息拼装抽成一处，两处调用点共用。
 //   原来单条删除（delOne）写的是 `d.deleted?.length ? 已删除 : 未删除`，而后端删 credential 时
@@ -30,6 +37,23 @@ function fmtDelMsg(d) {
   if (deleted && skipped) return `已删除：${deleted}；跳过：${skipped}`
   if (deleted) return `已删除：${deleted}`
   return `未删除：${skipped || '未知原因'}`
+}
+
+// E4-10（2026-11-01 第 6 条）：/cache/clear 的 skipped —— 后端一直返回，前端一直没读。
+//   skipped 是「认出来不是本插件的、所以没删」的文件（共享缓存目录里用户自己的素材、
+//   用户自己放进 frames 的东西）。不读的后果：用户点「清除」，面板说「缓存已清理」，
+//   去目录一看文件还在 —— 以为清理有 bug，其实是「按设计没动」。
+//   抽成顶层纯函数是为了能被 C100 真跑，而不是「源码里出现 skipped 三个字」。
+function fmtSkippedNote(d) {
+  const skipped = Array.isArray(d && d.skipped) ? d.skipped : []
+  if (!skipped.length) return ''
+  const one = (s) => {
+    if (s && typeof s === 'object') return `${s.name || s.id || '（未命名）'}${s.why ? `（${s.why}）` : ''}`
+    return String(s)
+  }
+  const list = skipped.slice(0, 3).map(one).join('、')
+  const more = skipped.length > 3 ? ` 等 ${skipped.length} 项` : ''
+  return `保留 ${skipped.length} 项不是本插件的文件（${list}${more}）`
 }
 
 // issue #5 同族（2026-10-31，深入审查）：哪些行该显示「一键下载」。
@@ -582,17 +606,25 @@ MODULE_LOADER.load({
           const d = j?.data || {}
           const removed = Number(d.removed || 0)
           const failed = Array.isArray(d.failed) ? d.failed : []
+          // E4-10（第 6 条）：除了删掉的和删不掉的，还有第三种「认出来但不是我们的、按设计没动」。
+          //   不报它，「缓存已清理」就和目录里还在的文件互相打脸。
+          const keptNote = fmtSkippedNote(d)
           if (j?.ok === false && failed.length) {
             const list = failed.slice(0, 5).map((f) => `${f.name}（${f.why}）`).join('、')
             setMsg(
               `缓存清理完成：成功 ${removed} 个 / ${fmtBytes(Number(d.bytes || 0))}，` +
               `失败 ${failed.length} 项 —— ${list}${failed.length > 5 ? ` 等 ${failed.length} 项` : ''}。` +
+              (keptNote ? `${keptNote}。` : '') +
               '删不掉通常是文件正被 ffmpeg / 转写进程占用、目录只读，或路径过长；关掉占用后重试即可。',
             )
           } else if (j?.ok === false) {
             setMsg(j.why || '清理缓存失败')
           } else {
-            setMsg(`缓存已清理（${removed} 个文件 / ${fmtBytes(Number(d.bytes || 0))}）；此后按 ${days} 天、${maxMb} MB 自动清理`)
+            setMsg(
+              `缓存已清理（${removed} 个文件 / ${fmtBytes(Number(d.bytes || 0))}）` +
+              (keptNote ? `；${keptNote}` : '') +
+              `；此后按 ${days} 天、${maxMb} MB 自动清理`,
+            )
           }
           dirtyRef.current = false
           await load()

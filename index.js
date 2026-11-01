@@ -28,12 +28,18 @@ import { hasAnyLock } from './lib/locks.mjs'
 //   切片 4 起 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
 import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned } from './lib/cache-own.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
+// 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
+//   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
+//   本文件里只用于扫码登录那三处（QR_GEN / QR_POLL / fillBuvids）。
+import { UA } from './lib/consts.mjs'
 // 2026-10-31 切片 3：调优表与钳制/换算搬进 lib/tuning.mjs。
 //   原来本文件与 tools/look.mjs 各写一份 TUNING_DEFS，靠 C17 逐键比对绑在一起；
 //   现在物理上只有一份，两个入口只负责「把配置读出来」（depsCfg / readDepsCfg）。
 import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults, tuningRanges } from './lib/tuning.mjs'
 // 2026-10-31 切片 3-C：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
+// 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
+import { depsPaths, readPluginVersion, resolveDepsDir } from './lib/plugin-paths.mjs'
 // 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
 import { readJsonOrBackup as readJsonOrBackupRaw } from './lib/config.mjs'
@@ -155,25 +161,13 @@ function copyTreeSync(src, dst) {
     copyFileSync(src, dst)
   }
 }
-const DEPS_PREF = process.env.BILI_WATCH_DEPS || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'deps')
-const DEPS_LOCAL = join(HERE, 'deps')
-// X-30 第二轮（2026-10-29）：搬家的标记文件。只有搬成功才写，下次启动见到它才用新位置。
-const DEPS_MOVED_MARK = join(DEPS_PREF, '.deps-moved')
-// 当前用哪份——**同步决定、不搬东西**。
-//   第一轮是「模块加载期同步 copyTreeSync 搬 460 MB」，慢盘上堵事件循环 30–90 秒，
-//   cordis 可能误判插件无响应把进程杀掉。现在加载期只做几个 existsSync，搬家交给后台。
-const DEPS = (() => {
-  if (resolve(DEPS_PREF) === resolve(DEPS_LOCAL)) return DEPS_PREF
-  // 上次已经搬完（有标记）→ 用包外
-  if (existsSync(DEPS_MOVED_MARK)) return DEPS_PREF
-  // 包外已经有东西（用户手动放的 / 以前搬过但没标记）→ 用包外，不覆盖用户数据
-  if (existsSync(DEPS_PREF)) return DEPS_PREF
-  let srcHas = false
-  try { srcHas = existsSync(DEPS_LOCAL) && readdirSync(DEPS_LOCAL).length > 0 } catch {}
-  if (!srcHas) { try { mkdirSync(DEPS_PREF, { recursive: true }) } catch {} ; return DEPS_PREF }
-  // 包内有内容、包外还没有 → **本次先用包内**（功能立即能用，事件循环不堵），搬家排后台
-  return DEPS_LOCAL
-})()
+// 2026-11-01（0.4.1 第 8 条）：deps 的三个候选路径与「用哪份」的判据搬进 lib/plugin-paths.mjs。
+//   tools/look.mjs 原来有一份「长得像但差一截」的：它只判包内目录**存在**，不判有内容，
+//   于是干净安装（包内 deps 是空目录）时面板用包外、CLI 用包内。判据现在只有一份，以本文件为准。
+const { pref: DEPS_PREF, local: DEPS_LOCAL, movedMark: DEPS_MOVED_MARK } = depsPaths({ pluginRoot: HERE })
+// 当前用哪份——**同步决定、不搬东西**。搬家见下面的 scheduleDepsMigration。
+//   mkdirPref：包内外都没内容时顺手建出包外目录（面板要往里写）；CLI 侧不建。
+const DEPS = resolveDepsDir({ pluginRoot: HERE, mkdirPref: true })
 /**
  * X-30 第二轮：后台把包内 deps 搬到包外，搬完写 .deps-moved，**下次启动生效**。
  * 由 apply() 在插件注册完之后调，3 秒延迟——那时插件已经装好，堵一会儿不影响 cordis 判活。
@@ -354,8 +348,10 @@ const lockTtlMs = () => lockTtlMsOf(readTuning())
 // 2026-10-31 切片 4：这两步、以及 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
 //   本文件只剩三个薄壳：读配置 → 交给 lib → 处理回退文案。为什么状态必须搬走：
 //   两个入口原来各有一份 `let CACHE` + 各自的 `CACHE_READY`，判据靠人肉对齐——
-//   runsFile 在 index.js 里走 ensureCache()、在 look.mjs 里直接读 CACHE，就是这种分叉的产物。
-//   现在读取一律走 lib 的 cacheDir()（未初始化必抛），忘记初始化当场就炸，不会静默写进错的路径。
+//   runsFile 在 index.js 里走 ensureCache()、在 look.mjs 里走 cacheDir()，就是这种分叉的产物。
+//   现在读取一律走 lib：CLI 侧 cacheDir()（未初始化必抛），忘记初始化当场就炸，不会静默写进错的路径；
+//   本文件这侧是 ensureCache()（幂等就地初始化，原因见 runLogRecord 上方的注释）。
+//   两边算出来的根相同（lib 的 C64 真起两个进程比过），差别只在「谁负责初始化」——这是有意的。
 const cacheWant = () => process.env.BILI_WATCH_CACHE || depsCfg().cache
 
 // 回退告警只报一次：initCachePath 返回的 first 只在「这一次真的初始化了」时为 true，
@@ -454,8 +450,7 @@ const ESTIMATES = {
 }
 
 // 面板内扫码登录（与 tools/look.mjs 的 login 同一套接口，凭证落同一个文件）
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+// UA 已搬到 lib/consts.mjs（2026-11-01 第 1 条），上面 import。
 const QR_GEN = 'https://passport.bilibili.com/x/passport-login/web/qrcode/generate?source=main-fe-header'
 const QR_POLL = (key) =>
   'https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=' + encodeURIComponent(key) + '&source=main-fe-header'
@@ -465,9 +460,8 @@ const name = 'dsh-bili-watch'
 const inject = ['commands', 'webServer', 'agents']
 
 // ── 失败现场落盘（T25-P0-1：一次调用失败后，能只靠磁盘复现）────────────
-const PLUGIN_VERSION = (() => {
-  try { return JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8')).version || '' } catch { return '' }
-})()
+// 版本号读取搬进 lib/plugin-paths.mjs（2026-11-01 第 8 条）——旁边 CLI 那份逻辑一模一样，只是路径差一层。
+const PLUGIN_VERSION = readPluginVersion(HERE)
 // D98：缓存根是懒初始化的（ensureCache），这里必须现算——顶层常量会把「未初始化时算出的纯路径」固化下来，
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个用不上的旧路径。
 const runsFile = () => join(ensureCache(), '_logs', 'runs.jsonl')
@@ -477,10 +471,15 @@ const runsFile = () => join(ensureCache(), '_logs', 'runs.jsonl')
 function runLogRecord(args, code, err, ms) {
   const command = String(args?.[0] || '')
   const bv = ['clean', 'login', 'hot'].includes(command) ? '' : String(args?.[1] || '')
-  // runsFile 传**惰性函数**而不是字符串：缓存根没初始化时 runsFile() 会抛，
+  // runsFile 传**惰性函数**而不是字符串：真要抛的时候，抛点必须在 logRun 的 try 里。
   //   传字符串 = 求值点在调用点（logRun 的 try 之外）→ 异常会冒到 child.on('close') 里。
   //   传函数 = 求值点回到 logRun 内部（try 里）→ 抛了只是日志写不进去，插件继续跑（基线行为）。
   //   2026-10-31 三审（切片 5）抓出并修。
+  //   注意：本文件这条路径**平时不会抛** —— `ensureCache()` 是 initCachePath(cacheWant).dir，
+  //   幂等，没初始化就当场初始化（见 index.js 的 ensureCache 定义与 lib/cache-path.mjs 头注释）。
+  //   会抛的是 lib/cache-path.mjs 的 cacheDir()，那是 tools/look.mjs 走的路径。
+  //   「就地初始化」正是面板要的：runLogRecord 可能在 apply() 之前被调到，抛了整条日志就丢了。
+  //   这段原来说「缓存根没初始化时这里会抛」，是错的（2026-11-01 第 11 条更正，C104 钉住）。
   logRun(runsFile, { command, bv, argv: args || [], code, ms, stderr: err, version: PLUGIN_VERSION }, { videoDirOf: videoDir })
 }
 

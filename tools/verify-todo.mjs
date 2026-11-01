@@ -78,7 +78,20 @@ function fnBody(src, name) {
   const m = re.exec(src)
   if (!m) return null
   const end = src.indexOf('\n}', m.index)
-  return end < 0 ? null : src.slice(m.index, end + 2)
+  if (end < 0) return null
+  const body = src.slice(m.index, end + 2)
+  // 2026-11-01（0.4.1 第 7 条）：编译自检。原来抽到多长就返回多长——函数体里有一行以 `}`
+  //   开头（模板字符串里很常见）就会提前截断，返回一段「看着像函数、其实是垃圾」的片段，
+  //   而 B 系列全是 indexOf / 正则，垃圾照样能匹配出结论。抽出来解析不了就当没抽到（null），
+  //   让调用方走「未找到」那条明路，而不是拿垃圾去算。
+  //   export 前缀要去掉才能当表达式求值：本函数返回的片段保留原样（下游要按原文匹配）。
+  const probe = body.replace(/^\s+/, '').replace(/^export\s+/, '')
+  try {
+    new Function(`return (${probe})`)
+  } catch {
+    return null
+  }
+  return body
 }
 
 /** 去掉行注释与块注释，避免注释里的词被当成用户可见文案 */

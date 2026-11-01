@@ -332,6 +332,17 @@ ensure_venv() {
     echo "✗ 安装 ${pkgs[*]} 失败（已删除半成品 venv，重跑即可重试）" >&2
     return 1
   fi
+  # 出口验证（2026-11-01，0.4.1 第 3 条）：pip 返回 0 **不等于**装成了。
+  #   入口那里已经验过一次 `import $mod`（半成品陷阱），但装完之后没有再验一次：
+  #   requires-python 不满足、wheel 落到别的解释器、空壳 venv 上装成「看起来装了」，
+  #   这三种都是 install 成功、import 失败。不在这里拦，等到跑 ASR 才炸，
+  #   用户看到的是「转写失败」，与「依赖没装上」隔了一层。守卫见 C98。
+  if ! "$dir/bin/python" -c "import $mod" 2>/dev/null; then
+    rm -rf "$dir"
+    echo "✗ ${pkgs[*]} 装完了但 import $mod 仍然失败（pip 返回 0 不算装成）—— 已删除半成品 venv，重跑即可重试" >&2
+    echo "    排查：$dir/bin/python -c \"import $mod\" 看真实报错；或确认 python3 版本满足包的 requires-python" >&2
+    return 1
+  fi
   echo "    ✓ $dir/bin/python"
 }
 

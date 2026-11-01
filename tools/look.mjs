@@ -50,6 +50,13 @@ import { hasAnyLock, makeLocks } from '../lib/locks.mjs'
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进了 lib/cache-path.mjs）。
 import { removeOwned } from '../lib/cache-own.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from '../lib/keys.mjs'
+// 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
+//   （与 index.js 同一份；原来这里那份判据差一截，见下面 DEPS 处的注释）。
+import { readPluginVersion, resolveDepsDir } from '../lib/plugin-paths.mjs'
+// 2026-11-01（0.4.1 第 1 条）：UA / Referer 搬进 lib/consts.mjs。lib/bili-api.mjs 的 jget
+//   默认请求头要用同一份，而 lib 不能反向 import 入口。原来本文件与 index.js 各写一份、
+//   逐字相同；REF_VIDEO 与 REF 的值也一直完全一样（都是站点根），合并成一个 REF。
+import { REF, UA } from '../lib/consts.mjs'
 // 2026-10-31 切片 3：调优表 / 钳制 / TTL 换算搬进 lib/tuning.mjs。
 //   与 index.js 共用同一份 TUNING_DEFS，「面板改了 CLI 没生效」这一类的分叉从物理上消失。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
@@ -104,16 +111,11 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 // 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ / deps\deps-config.json
-// X-30（2026-10-29）：与 index.js 同一口径——deps 默认在包外（$DSH_HOME\bili-watch\deps），
-//   这样重装包不会把 venv / 模型一起删掉。搬家由插件启动时做；CLI 先跑、新位置还不存在时
-//   就用包内那份（与 index.js 迁移前的状态一致），不在这里同步复制 460 MB。
-const DEPS = (() => {
-  const pref = process.env.BILI_WATCH_DEPS || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'bili-watch', 'deps')
-  const local = join(HERE, '..', 'deps')
-  if (resolve(pref) === resolve(local)) return pref
-  if (existsSync(pref)) return pref
-  return existsSync(local) ? local : pref
-})()
+// X-30（2026-10-29）：deps 默认在包外（$DSH_HOME\bili-watch\deps），重装包不会把 venv / 模型一起删掉。
+// 2026-11-01（0.4.1 第 8 条）：判据搬进 lib/plugin-paths.mjs —— 这里原来那份只判「包内 deps 目录
+//   存在」，index.js 判的是「包内 deps **有内容**」。干净安装（包内是空目录）时两边分叉：
+//   面板用包外、CLI 用包内空目录。现在与运行时同一份判据（以 index.js 为准），CLI 不再单独判。
+const DEPS = resolveDepsDir({ pluginRoot: join(HERE, '..') })
 // 解析失败不静默：写 stderr（不进 stdout，JSON 模式安全）；ASCII 前缀避免 PS 管道按 GBK 渲染成乱码。
 // #17（2026-10-30，P1）：坏文件必须**先改名留档**再退回默认值。原来只打一行 stderr 就返回 {}，
 //   下一次任何写入口整份写回就把用户手改坏的配置永久覆盖掉——三个读入口里只有 index.js 的
@@ -133,8 +135,13 @@ function readDepsCfg() {
   }
   return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {}
 }
-const depsCfg = readDepsCfg()
-const PROJ = process.env.BILI_WATCH_PROJ || depsCfg.proj || DEPS
+// 2026-11-01（0.4.1 第 9 条）：原来这里叫 `depsCfg`，而 index.js 里 `depsCfg` 是个**函数**
+//   （`function depsCfg() { return readDepsCfgFile(...) }`，每次调用都读盘）。
+//   同名不同物让外部审查脚本直接绕过：看到 `depsCfg.cache` 会以为拿到的是「当前配置」，
+//   其实这里是**模块加载时读一次的快照**（CLI 进程活一次，别处改配置它不会跟着变）。
+//   改名把语义写进名字里，两边的差异就摆在眼前，不用去翻 index.js。
+const depsCfgSnapshot = readDepsCfg()
+const PROJ = process.env.BILI_WATCH_PROJ || depsCfgSnapshot.proj || DEPS
 const pick = (...cands) => cands.find((p) => existsSync(p)) ?? cands[cands.length - 1]
 const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
 const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
@@ -143,7 +150,7 @@ const ASR_SCRIPT = pick(join(DEPS, '_bili-asr.py'), join(PROJ, '_bili-asr.py'))
 const OCR_PY = pick(join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(PROJ, '.venv-ocr', PY_DIR, PY_EXE))
 const HF_HOME_DIR = pick(join(DEPS, '.hf-home'), join(PROJ, '.hf-home'))
 const OCR_SCRIPT = join(HERE, 'ocr.py')
-const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || depsCfg.ffmpeg || ''
+const FFMPEG_CAND = process.env.BILI_WATCH_FFMPEG || depsCfgSnapshot.ffmpeg || ''
 // 缺 ffmpeg 时的统一指路（一键脚本 / 环境变量 / --ffmpeg 三条出路）
 const FFMPEG_HINT =
   '跑 scripts/fetch-deps.ps1 -Target ffmpeg（macOS/Linux：bash scripts/fetch-deps.sh 或系统包管理器装），或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
@@ -163,7 +170,7 @@ const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 //   本文件只剩一个薄壳：读配置 → 交给 lib → 打回退文案。读取一律走 cacheDir()，
 //   没初始化就抛（原来这里 `let CACHE = resolveCacheDir()` 会让「忘了初始化」看起来一切正常，
 //   runsFile() 就是直接读它的——日志会写进一棵没探测过可写性的树里）。
-const cacheWant = () => process.env.BILI_WATCH_CACHE || depsCfg.cache
+const cacheWant = () => process.env.BILI_WATCH_CACHE || depsCfgSnapshot.cache
 
 // 回退文案只打一次：first 只在「这一次真的初始化了」时为 true，之后 initCachePath 幂等返回同一个 fallback。
 //   runsFile() 在退出钩子里也会走 ensureCache()，没有这个判据就会把同一行 stderr 打好几遍。
@@ -186,10 +193,7 @@ const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
 const CRED_FILE = SHARED_CRED
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')
 
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-const REF = 'https://www.bilibili.com/'
-const REF_VIDEO = 'https://www.bilibili.com/'
+// UA / REF 在上面从 lib/consts.mjs import（2026-11-01 第 1 条）。REF_VIDEO 已合并进 REF。
 // 匿名设备指纹：首跑随机生成并落 deps/.anon-buvid3（.gitignore 已排除），避免所有用户共用同一个 buvid3
 function anonBuvid3() {
   const f = join(DEPS, '.anon-buvid3')
@@ -316,7 +320,7 @@ function credFor(explicit) {
 }
 // 2026-10-31 切片 8（api）：UA / Referer / 匿名头都在本文件（它们依赖 DEPS 与 anonymous buvid3 落盘），
 //   所以这里只把这份匿名头交给 lib——lib 不知道 DSH_HOME 是什么。
-const headersFor = (cred) => headersForApi(cred, { ua: UA, ref: REF_VIDEO, anon: H })
+const headersFor = (cred) => headersForApi(cred, { ua: UA, ref: REF, anon: H })
 
 // ── wbi 签名（字幕主通道 x/player/wbi/v2 必需）──────────────────────────
 // 2026-10-31 切片 8（api）：MIXIN_KEY_ENC_TAB / getMixinKey / wbiKeys / wbiSign 全部搬进 lib/bili-api.mjs。
@@ -495,7 +499,7 @@ const framesCacheHit = framesCacheHitIn
 //   三处抽帧入口（peekFrames / grabFrames / grabFramesLocal）共用这一份，
 //   「等别人做完」那段 for 循环也搬成 waitManifest——原来三处各抄一遍，只有次数不同。
 import {
-  ensureDir, framesDir, framesDirName, framesRoot, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest,
+  ensureDir, frameFilesToKeep, framesDir, framesDirName, framesRoot, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest,
 } from '../lib/frames.mjs'
 
 // 2026-10-31 切片 9 第一步：ffExec / findFfmpeg 搬进 lib/media.mjs。
@@ -840,7 +844,9 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     // V1：本次产物的文件名写进 manifest.files，下一轮 --fresh 只按这份清单删
     // P1（2026-10-30）：at 模式的产物是 f_7m40s.jpg，原来只认 `<bv>-NN.jpg`，于是 files 恒为空数组，
     //   下次 --fresh 走「manifest 没有 files 清单 → 一律不碰」，同一个 --out 目录里的旧时刻帧永远删不掉。
-    const produced = jpgs().filter((f) => new RegExp(`^${bv}-\\d+\\.jpg$`).test(f) || /^f_\d+m\d+s\.jpg$/.test(f))
+    // 2026-11-01（0.4.1 第 12 条）：判定抽进 lib/frames.mjs 的 frameFilesToKeep —— 抽出来才能在
+    //   verify 里真跑（喂真文件名看真输出），原来那里只能 grep 这一行含不含 `f_`。
+    const produced = frameFilesToKeep(bv, jpgs())
     writeManifest(dir, { ok: true, bv, p: v.p, step: safeStep, scene, sceneTh: scene ? sceneTh : 0, frames: n, files: produced, times: atTimes })
     return { dir, mp4, frames: n, sceneTh: scene ? sceneTh : 0, times: atTimes }
   } finally {
@@ -865,9 +871,8 @@ function asrScriptTag() {
 }
 
 // ── 失败现场落盘（T25-P0-1：一次调用失败后，能只靠磁盘复现）────────────
-const PLUGIN_VERSION = (() => {
-  try { return JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8')).version || '' } catch { return '' }
-})()
+// 2026-11-01（0.4.1 第 8 条）：与 index.js 同一份读取（lib/plugin-paths.mjs 的 readPluginVersion）。
+const PLUGIN_VERSION = readPluginVersion(join(HERE, '..'))
 // D98：缓存根改成懒初始化（ensureCache），这里必须现算。写成顶层常量会把「未初始化时的纯路径」固化下来：
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个已经用不上的旧路径。
 const runsFile = () => join(cacheDir(), '_logs', 'runs.jsonl')
@@ -1862,14 +1867,42 @@ function pickEven(files, n) {
   return out
 }
 
+// sheet --at 的输出文件名指纹（2026-11-01 第 5 条）：同一 BV 不同时刻的拼图不能互相覆盖。
+//   取 --at 原串的短哈希——稳定、可复现，且不依赖时长（时长要拉 view 才有，这里没有）。
+//   只用于文件名，不参与缓存判据（缓存判据在 lib/frames.mjs 的 framesCacheHit）。
+const atTagOf = (at) => 'at-' + createHash('sha1').update(String(at)).digest('hex').slice(0, 6)
+
+// sheet 要拼哪些帧：两种模式的帧名完全不是一套——普通模式 `${bv}-NN.jpg`（按序号），
+//   --at 模式 `f_12m30s.jpg`（按时刻）。原来固定走 frameList，于是 `sheet --at` 永远「没抽到帧」。
+//   抽成顶层纯函数是为了能被 verify 真跑（C99），而不是「源码里出现了 framesToShow」。
+function sheetFrameFiles(dir, bv, at, times, dirFiles) {
+  if (!at) return frameList(dir, bv)
+  return framesToShow(times, dirFiles).map((f) => join(dir, f)).filter((f) => existsSync(f))
+}
+
+// 这一格是第几秒。--at 从文件名读（f_12m30s.jpg → 750）；普通模式按 step 推，推不出就给 null
+//   （null 时索引行不打，别编一个 00:00 出来骗人）。
+function frameSecOf(file, i, stepUsed) {
+  const atM = /f_(\d+)m(\d+)s\.jpg$/.exec(basename(file))
+  if (atM) return parseInt(atM[1], 10) * 60 + parseInt(atM[2], 10)
+  const m = /-([0-9]+)\.jpg$/.exec(file)
+  const n2 = m ? Number(m[1]) : i + 1
+  return stepUsed > 0 ? Math.max(0, (n2 - 1) * stepUsed) : null
+}
+
 async function cmdSheet(bv, opts = {}) {
   const grid = String(opts.grid ?? '3x3').toLowerCase()
   const [cols, rows] = grid.split('x').map(Number)
   if (!cols || !rows) { process.exitCode = 1; console.error('✗ 格子格式应是 3x3 / 4x4'); return }
   const n = cols * rows
-  console.log(`九宫格 ${bv}（${grid}，从抽帧里均匀挑 ${n} 张拼一张图）`)
-  const r = await grabFrames(bv, { step: opts.step ?? 0, p: opts.p ?? 1, ffmpeg: opts.ffmpeg, fresh: opts.fresh })
-  const files = frameList(r.dir, bv)
+  // 2026-11-01（0.4.1 第 5 条）：--at 与 frames 走同一套 parseAtTimes（在 grabFrames 里），
+  //   这里只负责把 at 传下去 + 后续按「时刻命名的帧」读文件。
+  const at = String(opts.at ?? '').trim()
+  console.log(`九宫格 ${bv}（${grid}，从抽帧里均匀挑 ${n} 张拼一张图）${at ? ` · 指定时刻 ${at}` : ''}`)
+  const r = await grabFrames(bv, { step: opts.step ?? 0, p: opts.p ?? 1, ffmpeg: opts.ffmpeg, fresh: opts.fresh, at })
+  // --at 模式下抽出来的是 f_12m30s.jpg（按时刻命名），`${bv}-NN.jpg` 那套文件根本不存在——
+  //   原来固定用 frameList，于是 sheet --at 会走到「没抽到帧」。选择逻辑见 sheetFrameFiles。
+  const files = sheetFrameFiles(r.dir, bv, at, r.times, readdirSync(r.dir))
   if (!files.length) { process.exitCode = 1; console.error('✗ 没抽到帧'); return }
   const picked = pickEven(files, n)
   // T35-E：同一 BV 同一格子的拼图互斥——tmp 目录是 rmSync 重建的，两个进程同时拼会互删对方的工作目录
@@ -1882,20 +1915,16 @@ async function cmdSheet(bv, opts = {}) {
     picked.forEach((f, i) => copyFileSync(f, join(tmp, `${String(i + 1).padStart(2, '0')}.jpg`)))
     const bin = findFfmpeg(opts.ffmpeg)
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
-    const out = join(cacheDir(), 'sheets', `${bv}-p${opts.p ?? 1}-${grid}.jpg`)
+    const out = join(cacheDir(), 'sheets', `${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`)
     mkdirSync(dirname(out), { recursive: true })
     ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], ffTimeoutMs())
     console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
     // T42：九宫格没有时间轴，模型看图不知道「第几格是第几秒」；写一份 manifest 并打一行
     const stepUsed = Number((/-([0-9]+)s$/.exec(r.dir) || [])[1] || opts.step || 0)
-    const cellSec = (f, i) => {
-      const m = /-([0-9]+)\.jpg$/.exec(f)
-      const n2 = m ? Number(m[1]) : i + 1
-      return stepUsed > 0 ? Math.max(0, (n2 - 1) * stepUsed) : null
-    }
+    const cellSec = (f, i) => frameSecOf(f, i, stepUsed)
     const cells = picked.map((f, i) => { const sec = cellSec(f, i); return { cell: i + 1, file: basename(f), sec, mmss: sec == null ? '?' : fmtSec(sec) } })
     try {
-      writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
+      writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, at: at || null, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
     } catch {}
     // A4：时间索引固定格式 r1c1 00:00-00:05 @00:02
     console.log('索引：')
@@ -3175,7 +3204,8 @@ const HELP = `用法:
   node look.mjs asr <BV或链接或URL> [--ffmpeg 路径] [--asr-max 毫秒] [--head N] [--full]  本地转写（B 站或通用 URL 均可）
   node look.mjs frames <BV或链接或URL> [--step 2] [--out 目录] [--ffmpeg 路径] [--fresh] [--ocr] [--scene]
                                          --scene：吸附画面变化点抽帧（默认关；仅 B 站）
-  node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2]   N 帧拼一张九宫格（仅 B 站）
+  node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2] [--at 12:30,01:05:00]   N 帧拼一张九宫格（仅 B 站）
+                                         --at：只要这些时刻的画面（与 frames 同一套写法；给了就忽略 --step）
   node look.mjs substrip <BV或链接> [--step 7]          底部字幕带竖拼一张图（仅 B 站）
   node look.mjs ocr <BV或链接> [--step 2]     抽帧 + OCR 出文字（仅 B 站）
   node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--verify] [--head N] [--full] [--format json] [--out 文件]
@@ -3379,7 +3409,9 @@ try {
   } else if (cmd === 'frames') {
     await cmdFrames(BV, { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene'), at: opt('at') })
   } else if (cmd === 'sheet') {
-    await cmdSheet(BV, { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh') })
+    // 2026-11-01（0.4.1 第 5 条）：sheet 原来不认 --at，而 frames 认。同一个「要这几秒的画面」需求，
+    //   用户在两处得到两种结果（sheet 静默按 --step 抽），补上，走同一套 parseAtTimes。
+    await cmdSheet(BV, { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), at: opt('at') })
   } else if (cmd === 'substrip') {
     await cmdSubstrip(BV, { step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh') })
   } else if (cmd === 'ocr') {
