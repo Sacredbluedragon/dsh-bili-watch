@@ -221,7 +221,7 @@ MODULE_LOADER.load({
     // ORIGIN：面板自己的地址。**不写死 127.0.0.1:3080** —— 用户改过端口时写死的地址会指向错的地方。
     const ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : ''
 
-    // COPY_DEPS：与 审查/20261031-复制提示词三稿.md 里的代码块逐字节一致（verify 有断言盯着）。
+    // COPY_DEPS：与 tools/fixtures/copy-texts.md 里的代码块逐字节一致（verify 有断言盯着）。
     //   String.raw 是必须的——正文里有 .venv-asr\Scripts\python.exe，普通模板字符串会把 \S 吃掉。
     const COPY_DEPS = String.raw`我在用 DSH 的 bili-watch 插件（B 站看内容），现在依赖装不上：面板「运行依赖」里有一行永远是红的，或者我点了「下载」一直没反应。
 
@@ -263,7 +263,7 @@ MODULE_LOADER.load({
 不要修改任何文件。查完如果有明显该修的地方，列出来问我，不要自己动手。
 `
 
-    // COPY_ASR：与 审查/20261031-复制提示词三稿.md 里的代码块逐字节一致（verify 有断言盯着）。
+    // COPY_ASR：与 tools/fixtures/copy-texts.md 里的代码块逐字节一致（verify 有断言盯着）。
     //   String.raw 是必须的——正文里有 .venv-asr\Scripts\python.exe，普通模板字符串会把 \S 吃掉。
     const COPY_ASR = String.raw`我在用 DSH 的 bili-watch 插件（B 站看内容），转写（ASR）或画面文字识别（OCR）一直失败：跑转写时报错，或者每次都悄悄回落到 CPU 速度。
 
@@ -300,7 +300,7 @@ MODULE_LOADER.load({
 不要修改任何文件。
 `
 
-    // COPY_PANEL：与 审查/20261031-复制提示词三稿.md 里的代码块逐字节一致（verify 有断言盯着）。
+    // COPY_PANEL：与 tools/fixtures/copy-texts.md 里的代码块逐字节一致（verify 有断言盯着）。
     //   String.raw 是必须的——正文里有 .venv-asr\Scripts\python.exe，普通模板字符串会把 \S 吃掉。
     const COPY_PANEL = String.raw`我在用 DSH 的 bili-watch 插件（B 站看内容），面板打不开或者点了没反应：插件列表里报错、面板一直转圈、或点了某个按钮没有任何反应。
 
