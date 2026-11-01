@@ -13,6 +13,14 @@ DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内
 - **二次读瞬时**：缓存目录 + 文件锁，同一视频二次读取秒出
 - **为 AI 设计**：manifest 落盘 + 摘要输出，agent 直接消费不用再解析
 
+## 一条链接进来之后
+
+![一条链接进来之后](docs/workflow.png)
+
+给它一个链接，它按成本从低到高找文本：**官方字幕 → 本地转写 → 画面认字**。字幕几秒就有；没有字幕才下模型转写；连音轨都没有才逐帧认画面。哪一级没成都会写进报告的「来源」行，不会把截图的字当成台词。
+
+想改代码、想知道模块怎么分层，见文末[「模块架构」](#模块架构)。
+
 ## 特性
 
 - 支持 `b23.tv` 短链、BV 号、av 号及通用 URL（经 yt-dlp）
@@ -348,28 +356,9 @@ AI 字幕（需登录）
 
 ## 模块架构
 
-```mermaid
-flowchart TD
-    subgraph L1["index.js（DSH 进程内）"]
-        DT["defineTool 注册 bili_watch"]
-        CR["commands.register 注册 /bili"]
-        WS["webServer 路由 / 面板"]
-    end
-    subgraph L2["tools/look.mjs（子进程）"]
-        LOOK["node tools/look.mjs <cmd>"]
-    end
-    subgraph L3["外部依赖（可选）"]
-        PY["deps/_bili-asr.py ASR"]
-        FF["ffmpeg 抽帧"]
-        YT["yt-dlp 下载"]
-    end
-    DT -->|spawn| LOOK
-    CR -->|spawn| LOOK
-    WS -.->|面板写凭证 / 内容命令 spawn| LOOK
-    LOOK -->|spawn| PY
-    LOOK -->|spawn| FF
-    LOOK -->|spawn| YT
-```
+![bili-watch 调用链](docs/architecture.png)
+
+上排是 `index.js` 里的三个注册点，它们都只做参数整形，最后 spawn 同一个子进程；业务逻辑全在 `tools/look.mjs`，npm bin 与插件调的是同一个文件。中排左右两件只跟子进程发生关系：缓存目录是读写，`lib/` 是 import（14 个模块，锁 / 缓存 / 凭证各一份）。下排是四个可选外部依赖，缺哪个就少哪条能力——没有 ffmpeg 就只有字幕与评论，没有 ASR 退回读字幕，没有 yt-dlp 就只处理 B 站链接。
 
 ## 致谢
 

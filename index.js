@@ -1525,15 +1525,34 @@ function sameOriginBlocked(req) {
   return null
 }
 
-/** 读 POST 的小 JSON body；读不到就返回 {}，端点自己决定默认值。 */
+/**
+ * 读 POST 的小 JSON body；读不到就返回 {}，端点自己决定默认值。
+ *
+ * 2026-11-01（P0）：64 KB 闸原来是 `req.destroy()` 了事，两个后果都是真测出来的
+ *   （`tools/fixtures/readbody-probe.mjs`，真 server + 真 70 KB POST）：
+ *     ① `IncomingMessage.destroy()` 不带 error 参数时**不 emit 'error'**，'end' 也不会来
+ *        → 这个 Promise 永远 pending，闭包里那份 `raw` 跟着一起泄漏（每个超限请求一份）；
+ *     ② socket 被销毁 → 200 写不回去，客户端拿到的是 ECONNRESET / socket hang up，
+ *        面板上表现为一个**英文网络错误**，没有任何人话提示。
+ *   现在改成「超过闸就丢掉后续分片、不再攒」，让 'end' 正常来、Promise 正常落地：
+ *   内存有界（最多 64 KB 一份且随即清空）、socket 不毁、端点照常按 {} 处理。
+ *
+ *   没有顺手改成「回 413」：那要在每个端点各写一遍响应，超出这条函数的职责；
+ *   而且 `resolve({})` 与「body 不是合法 JSON」走同一条既有路径，端点不用改。
+ *   代价：超限的写入会被当成空 body 处理（保存类端点会写默认值），但这类请求
+ *   在面板里只可能来自异常客户端——保留注释在此，别当成「没这回事」。
+ */
 function readJsonBody(req) {
   return new Promise((resolve) => {
     let raw = ''
+    let tooBig = false
     req.on('data', (d) => {
+      if (tooBig) return
       raw += d
-      if (raw.length > 65536) req.destroy()
+      if (raw.length > 65536) { tooBig = true; raw = '' }
     })
     req.on('end', () => {
+      if (tooBig) return resolve({})
       try {
         resolve(JSON.parse(raw))
       } catch {

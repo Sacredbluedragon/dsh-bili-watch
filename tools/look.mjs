@@ -481,7 +481,7 @@ const lockTtlMs = () => lockTtlMsOf(tuning())
 //   而它们的目录/manifest/等待也一起搬（lib/frames.mjs）——cache 层得先能单独站着。
 //   TTL 传的是**取值函数** lockTtlMs（不是算好的值）：面板改完设置，下一把锁立刻用新 TTL。
 //   unlockStale 跟着搬走、不再导出：它只服务 tryLock 内部清残留，导出去等于鼓励「抢不到就自己清」。
-const { tryLockSync, tryLock, unlock } = makeLocks({ ttlMs: lockTtlMs, sleep })
+const { tryLockSync, tryLock, unlock, heartbeat } = makeLocks({ ttlMs: lockTtlMs, sleep })
 // A-3（2026-10-28 阶段A）：清理前确认「没有任何会写盘的子目录在被占用」。
 //   原实现只查 frames/.lock 与 frames/<子>/.lock，漏掉 sheet-tmp / substrip-tmp / CACHE 根的 .meta-*.lock / asr。
 //   递归扫（深度 ≤3），只认文件名以 .lock 结尾（覆盖 .lock / .BV-p1-2s.lock / .meta-xx.lock / .BV-grid.lock）。
@@ -1053,6 +1053,13 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
   const cacheTxt = join(dir, `${bv}-p${v.p}-${v.cid}-${model}-${asrScriptTag()}.txt`)
   const cacheTxtTmp = cacheTxt + '.tmp'
   const hdr = `User-Agent: ${UA}\r\nReferer: ${REF}\r\n`
+  // X-14 第一步（2026-11-01）：续期。持锁这一段比一次转写长——中间还有「下载 DASH 音轨 +
+  //   ffmpeg 转 wav」，时长随视频大小涨，而 lockTtlMsOf 只把 +120 秒留给它。面板把「锁过期」
+  //   拉到 5 分钟时，大视频必超 → 锁被判过期 → 别人抢进来 → 两个进程写同一个
+  //   `cacheTxt + '.tmp'`（**这个 tmp 名不带 pid**）→ 结果交错。
+  //   丢锁不许静默：置 lost，收尾时把本次结果作废（继续当成功返回，等于把污染结果交出去）。
+  let lost = null
+  const hb = heartbeat(lock, { onLost: (e) => { lost = e.why } })
   try {
     // 缓存命中检查必须在 try 内：return 时 finally 的 unlock 才能执行，否则锁泄漏（同一 BV 永远报「正在处理」）
     if (existsSync(cacheTxt)) {
@@ -1157,6 +1164,12 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
       const diag = String(r2.stderr || '').split(String.fromCharCode(10)).filter((l) => /vad|speech|chars|语种/i.test(l)).join(' | ').slice(0, 400)
       return { ok: false, why: `转写零字${kept ? `（音频已留在 ${kept}）` : ''}${diag ? '；诊断：' + diag : ''}` }
     }
+    if (lost) {
+      // 锁在跑到一半没了（被抢 / 被清 / 写不进去）：这份 text 可能已经和别人的写入交错过，
+      // 不能当成功结果交出去，更不能留在缓存里（下一轮会被当成命中）。
+      try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {}
+      return { ok: false, why: `转写期间锁已被别的进程抢走（${lost}），本次结果可能已损坏，已作废` }
+    }
     return { ok: true, text, chars: text.length, verify, cues: cues || undefined }
   } catch (e) {
     try { if (existsSync(cacheTxtTmp)) unlinkSync(cacheTxtTmp) } catch {}
@@ -1165,6 +1178,8 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
     try {
       if (existsSync(wav)) unlinkSync(wav)
     } catch {}
+    // 先停表再放锁：顺序反过来的话，stop 之前那一次刷写可能把「别人的锁」改成我们的 at
+    hb.stop()
     unlock(lock)
   }
 }

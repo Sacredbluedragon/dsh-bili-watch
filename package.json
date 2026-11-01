@@ -1,13 +1,10 @@
 {
     "name":  "dsh-bili-watch",
-    "version":  "0.4.2",
+    "version":  "0.4.3",
     "private":  false,
     "description":  "把 B 站视频读成文本给 AI 用：元数据、评论、弹幕、字幕、本地 ASR 转写、抽帧 OCR；支持 b23.tv 短链与 av 号，抽帧缓存目录可换。本地跑不上传、内容一致性检查、二次读瞬时、为 AI 设计落盘+摘要。",
     "type":  "module",
     "main":  "index.js",
-    "scripts":  {
-                    "verify":  "node tools/verify.mjs \u0026\u0026 node tools/verify-todo.mjs"
-                },
     "bin":  {
                 "bili-watch":  "tools/look.mjs"
             },
@@ -43,7 +40,9 @@
                   "auto-trigger.js",
                   "LICENSE",
                   "README.md",
-                  "THIRD_PARTY_NOTICES.md"
+                  "THIRD_PARTY_NOTICES.md",
+                  "docs/workflow.png",
+                  "docs/architecture.png"
               ],
     "keywords":  [
                      "bilibili",

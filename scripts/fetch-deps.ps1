@@ -64,7 +64,12 @@ $ErrorActionPreference = 'Stop'
 # PS 5.1 默认 GBK 控制台会把中文/勾号显示成乱码；只影响显示，不影响逻辑
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# 根定位：一律用 $PSScriptRoot（2026-11-01 第三轮复核统一，三个 .ps1 同一写法）。
+#   原来这里是 Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)：
+#   -File 调用下结果相同，但 $MyInvocation.MyCommand.Path 在点源（. .\x.ps1）或 ISE 里可以是空，
+#   Split-Path -Parent $null 之后的 $Root 会退化成「相对当前工作目录」——三种写法里最脆的一种。
+#   $PSScriptRoot 是 PS 3.0+ 在脚本执行时必然填好的自动变量，点源与非点源都对。
+$Root = Split-Path -Parent $PSScriptRoot
 # X-30（2026-10-29）：deps 默认装到包外（$DSH_HOME\bili-watch\deps），重装包不会连 venv/模型一起删。
 #   解析顺序：BILI_WATCH_DEPS > $DSH_HOME\bili-watch\deps；插件还没搬家、包内 deps\ 有内容时仍装包内，
 #   免得「装到空目录、看不到已有 venv」重复下 460 MB。与 index.js / tools/look.mjs 同一口径。
