@@ -88,6 +88,11 @@ const EXEMPT = [
   { file: 'tools/look.mjs', match: /C:\\Windows/, why: '拦危险路径的测试用例' },
   { file: 'tools/cli-io.mjs', match: /C:\\Windows|任一盘符根|全是 c:\\ 开头/, why: '讲路径归一化绕过的注释示例，不是本机路径' },
   { file: 'lib/cred.mjs', match: /SESSDATA:\s*'sessdata'/, why: '字段名映射表，不是真值' },
+  // 2026-11-02（发版前审查）：这文件里的 `C:\...` / `` `C:\` `` 是**讲 Windows tar 陷阱**的
+  //   命令示例——GNU tar 会把 `-C C:\...` 里的 `C:\` 当成远程主机名。它不是本机路径，
+  //   改成别的写法那句注释就失真了（失真后读者反而会去试裸 tar）。
+  //   match 收窄到 `GNU tar` 这个只在讲这个坑的行上出现的词，不是整文件豁免。
+  { file: 'scripts/fetch-deps.mjs', match: /GNU tar/, why: '讲 Windows 裸 tar 把盘符当远程主机的注释示例，不是本机路径' },
 ];
 
 const files = listTargets();

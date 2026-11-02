@@ -10,6 +10,9 @@
 
 import { mkdirSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+// 2026-11-02 批 1b：VALUE_OPTS 的唯一来源。lib/params.mjs 没有任何 IO 与副作用，
+//   也不 import 本文件，所以不构成循环依赖。
+import { VALUE_FLAG_NAMES } from '../lib/params.mjs'
 
 
 // ── 6-10/6-11：失败现场记录——jget 风控页 URL+响应体前 1000 字、[track] 尾部落 last-error.json ──
@@ -86,8 +89,12 @@ const argv = process.argv.slice(2)
 const cmd = argv[0]
 // B33：工具层（index.js）无条件带 --quiet——此时 [track]/进度类走 say() 一律进 stderr，stdout 只留正文
 if (argv.includes('--quiet')) setQuiet(true)
-// 带值的选项：解析位置参数时必须跳过它们的值，否则 `hot --limit 2` 会把 "2" 当成 BV
-const VALUE_OPTS = new Set(['cred', 'days', 'ffmpeg', 'grid', 'key', 'limit', 'order', 'out', 'p', 'step', 'format', 'head', 'asr-max'])
+// 带值的选项：解析位置参数时必须跳过它们的值，否则 `hot --limit 2` 会把 "2" 当成 BV。
+// 2026-11-02 批 1b：改为从 lib/params.mjs 生成。原来这里手写 13 项，与 look.mjs 的
+//   KNOWN_FLAGS 是两张各自维护的表 —— 结果 `at` 只进了 KNOWN_FLAGS、没进这张表，
+//   于是 `frames --at 12:30 BV1xx` 里那个 12:30 被当成第一个位置参数（BV 落到了 pos[2]）。
+//   两张表合成一张之后，这类「一边有一边没有」在结构上不会再有。
+const VALUE_OPTS = new Set(VALUE_FLAG_NAMES)
 function positional(list) {
   const out = []
   for (let i = 0; i < list.length; i++) {

@@ -1,0 +1,124 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// 以下由 tools/verify.mjs 生成：上面是 scripts/fetch-deps.mjs **原样**的定义段
+// （切到「// ── 主流程」锚点为止），所以被测函数的身体一个字都没被手抄过。
+//
+// 这里只做一件事：**桩掉外部能力**（网络下载、tar 二进制、pip、python 探测），
+// 然后按 BW_PROBE_MODE 真跑一条分支。桩掉的都是「环境」，不是被测逻辑 ——
+// 被测的 if/else、文案、退出路径全是原样代码。
+// ═══════════════════════════════════════════════════════════════════════════
+const PROBE_MODE = process.env.BW_PROBE_MODE || ''
+const PROBE_DIR = process.env.BW_PROBE_DIR || ''
+const REAL_RUN = run
+const REAL_DOWNLOAD = download
+
+const say = (k, v) => console.log(`PROBE_${k}=${v}`)
+
+// 假 ffmpeg 解压产物：-xJf 桩要真在 -C 目标里造出 ffmpeg / ffprobe 两个文件，
+// 因为后面 copyFileSync / chmodSync 走的是原样代码。
+function unpackFakes(dest) {
+  const d = join(dest, 'ffmpeg-7.1-static')
+  mkdirSync(d, { recursive: true })
+  writeFileSync(join(d, 'ffmpeg'), 'fake-ffmpeg')
+  writeFileSync(join(d, 'ffprobe'), 'fake-ffprobe')
+}
+
+if (PROBE_MODE === 'ffmpeg-html') {
+  // C56：镜像回了一张 HTML 错误页。download 照实写进去（这就是 curl exit 0 拿到的字节），
+  //   tar 拒绝它（真 tar 的行为由 verify.mjs 侧单独真跑一次校准）。
+  download = (url, out) => {
+    writeFileSync(out, '<!DOCTYPE html><html><body>404 Not Found</body></html>')
+  }
+  run = (cmd, args) => {
+    if (args[0] === '-tJf') return { code: 2, out: '', err: 'tar: This does not look like a tar archive' }
+    return REAL_RUN(cmd, args)
+  }
+  try {
+    ensureFfmpegLinux(join(PROBE_DIR, 'ffmpeg'), join(PROBE_DIR, 'ffprobe'))
+    say('RESULT', 'ok')
+  } catch (e) {
+    say('RESULT', `throw:${e.message}`)
+  }
+} else if (PROBE_MODE === 'ffmpeg-list6000') {
+  // C60：归档是真 xz，但清单里没有 ffmpeg/ffprobe（6000 项 filler）。
+  download = (url, out) => {
+    writeFileSync(out, Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]))
+  }
+  run = (cmd, args) => {
+    if (args[0] === '-tJf') {
+      const lines = []
+      for (let i = 0; i < 6000; i++) lines.push(`ffmpeg-x-static/filler-${i}`)
+      return { code: 0, out: lines.join('\n'), err: '' }
+    }
+    return REAL_RUN(cmd, args)
+  }
+  try {
+    ensureFfmpegLinux(join(PROBE_DIR, 'ffmpeg'), join(PROBE_DIR, 'ffprobe'))
+    say('RESULT', 'ok')
+  } catch (e) {
+    say('RESULT', `throw:${e.message}`)
+  }
+} else if (PROBE_MODE === 'ffmpeg-version') {
+  // C61：解压产物在，但 -version 跑不跑得起来决定「✓」还是 throw。
+  download = (url, out) => {
+    writeFileSync(out, Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]))
+  }
+  run = (cmd, args) => {
+    if (args[0] === '-tJf') return { code: 0, out: 'ffmpeg-7.1-static/ffmpeg\nffmpeg-7.1-static/ffprobe\n', err: '' }
+    if (args[0] === '-xJf') { unpackFakes(args[3]); return { code: 0, out: '', err: '' } }
+    if (args[0] === '-version') {
+      // 注意失败那支**也带 stdout**：C94 要证明「有输出但退出码非 0」必须判失败，
+      //   如果失败时 out 是空的，那条断言就分不清「看了退出码」和「看了有没有输出」。
+      return process.env.BW_PROBE_VER_CODE === '1'
+        ? { code: 1, out: 'ffmpeg version fake-but-exit-1', err: 'error while loading shared libraries: libc.so.6' }
+        : { code: 0, out: 'ffmpeg version 7.1-static-test\nbuilt with gcc 13', err: '' }
+    }
+    return REAL_RUN(cmd, args)
+  }
+  try {
+    ensureFfmpegLinux(join(PROBE_DIR, 'ffmpeg'), join(PROBE_DIR, 'ffprobe'))
+    say('RESULT', 'ok')
+  } catch (e) {
+    say('RESULT', `throw:${e.message}`)
+  }
+} else if (PROBE_MODE === 'bootstrap-pip') {
+  // C57①：venv 里没有 pip、没有 ensurepip，get-pip.py 也取不到（离线/被墙）。
+  run = () => ({ code: 1, out: '', err: 'no module named pip' })
+  download = () => { throw new Error('TEST: 网络已桩掉') }
+  say('RESULT', String(bootstrapPip(join(PROBE_DIR, 'fake-python'))))
+} else if (PROBE_MODE === 'move-venv') {
+  // C57②：半成品 venv 必须真的被改名留档（不是只在屏幕上说一句）。
+  const venv = join(PROBE_DIR, '.venv-asr')
+  mkdirSync(join(venv, 'Scripts'), { recursive: true })
+  writeFileSync(join(venv, 'Scripts', 'python.exe'), 'half-built')
+  moveSemiVenv(venv)
+  say('VIVID', String(existsSync(venv)))
+  let olds = []
+  try { olds = readdirSync(PROBE_DIR).filter((n) => n.startsWith('.venv-asr.old-')) } catch {}
+  say('OLDS', olds.join(','))
+  say('OLDSIZE', olds.length ? String(dirSize(join(PROBE_DIR, olds[0]))) : '0')
+} else if (PROBE_MODE === 'venv-import') {
+  // C98：pip 返回 0 不算装成 —— 装完必须再 import 一次，失败要改名留档并说清原因。
+  newVenv = () => join(PROBE_DIR, 'fake-python')
+  pyPlan = () => ({ mode: 'python', version: '3.12', uv: '', exe: 'fake-python', desc: 'probe' })
+  bootstrapPip = () => true
+  pipInstall = () => ({ code: 0, out: '', err: '' })
+  run = (cmd, args) => {
+    if (args[0] === '-c' && String(args[1] || '').startsWith('import ')) return { code: 1, out: '', err: 'ModuleNotFoundError' }
+    return { code: 0, out: '', err: '' }
+  }
+  const venv = join(PROBE_DIR, '.venv-asr')
+  mkdirSync(venv, { recursive: true })
+  writeFileSync(join(venv, 'marker'), 'x')
+  try {
+    ensureVenv(venv, 'faster_whisper', ['faster-whisper==1.2.1'])
+    say('RESULT', 'ok')
+  } catch (e) {
+    say('RESULT', `throw:${e.message}`)
+  }
+  let olds = []
+  try { olds = readdirSync(PROBE_DIR).filter((n) => n.startsWith('.venv-asr.old-')) } catch {}
+  say('OLDS', olds.join(','))
+  say('VIVID', String(existsSync(venv)))
+} else {
+  say('RESULT', `unknown-mode:${PROBE_MODE}`)
+}

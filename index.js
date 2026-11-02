@@ -42,7 +42,7 @@ import { logRun } from './lib/runs.mjs'
 import { depsPaths, readPluginVersion, resolveDepsDir } from './lib/plugin-paths.mjs'
 // 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
-import { readJsonOrBackup as readJsonOrBackupRaw } from './lib/config.mjs'
+import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/config.mjs'
 // 2026-10-31 切片 4：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
 //   前三个切片搬的是纯函数，compile 抽出来跑等于真跑；这一片搬的是可变模块状态 + 「谁先调」，
 //   所以判据也换了（C64 真起两个进程比对实际路径 / C65 未初始化必抛，见 tools/verify.mjs）。
@@ -291,7 +291,8 @@ function writeTuning(body) {
   if (bad.length) return { ok: false, code: 400, why: bad.join('；') }
   if (!touched) return { ok: true, data: cur }
   try {
-    writeFileSync(p, JSON.stringify(cur, null, 2), 'utf8')
+    // 原子写（tmp + rename）。写不出半截文件，失败仍是抛给下面这个 catch。
+    writeJsonAtomic(p, cur)
     return { ok: true, data: cur }
   } catch (e) {
     return { ok: false, code: 500, why: String(e?.message || e) }
@@ -366,7 +367,7 @@ function ensureCache() {
 
 // 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做；正文与判据在 lib/cache-path.mjs。
 // 严格「只提示」：认领旧目录的开关（--adopt）还没做，所以提示里不提任何当前版本不存在的参数。
-// P1-②（2026-10-29 WB 全量审）：/status 是 8 秒轮询，dirStat 会递归 walk 用户目录
+// P1-②（2026-10-29 全量审）：/status 是 8 秒轮询，dirStat 会递归 walk 用户目录
 //   （实测 2.8 万文件 664 ms 中位、首跑 2 秒），同步 walk 会顶到面板 10 秒超时并卡别的路由。
 //   所以这里按 10 分钟节流——配置变了最多晚 10 分钟反映，换掉的是每 8 秒一次的全盘扫描。
 //   节流留在本文件而不是 lib：它跟「面板轮询周期」有关，是调用方的性能策略，不是路径语义。
@@ -430,7 +431,10 @@ function uiCfg() {
 function writeUiCfg(patch) {
   const cur = uiCfg()
   const next = { ...cur, ...patch }
-  writeFileSync(UI_CFG, JSON.stringify(next, null, 2), 'utf8')
+  // 原子写。**故意仍然不包 try/catch**——这处的失败语义是「抛给调用方」，
+  //   这次只换机制不动语义（要不要统一成 {ok,why} 是另一件事）。把它顺手包起来，
+  //   就没人能验证「统一失败处理」到底改了什么。
+  writeJsonAtomic(UI_CFG, next)
   return next
 }
 const DEFAULT_CACHE_DAYS = 7
@@ -619,22 +623,21 @@ async function loginPollOnce(key) {
     if (!jar.sessdata) return { ok: false, state: 'error', why: '登录成功但响应里没有 SESSDATA' }
     try {
       mkdirSync(dirname(SHARED_CRED), { recursive: true })
-      writeFileSync(
+      // 改走原子写。mode 由 opts 传，tmp 建时就是 0600（见 lib/config.mjs 的「0600 点」）。
+      //   字段一个没动：updatedAt / note 是排查线索（哪个入口、什么时候写的），2026-11-02 定为「只统一失败处理、不统一字段」。
+      writeJsonAtomic(
         SHARED_CRED,
-        JSON.stringify(
-          {
-            sessdata: jar.sessdata,
-            bili_jct: jar.bili_jct || '',
-            buvid3: jar.buvid3 || '',
-            buvid4: jar.buvid4 || '',
-            mid: jar.dedeuserid || '',
-            note: '扫码登录（插件面板），只用于读取 AI 字幕',
-            updatedAt: new Date().toISOString(),
-          },
-          null,
-          2,
-        ),
-        { encoding: 'utf8', mode: 0o600 },
+        {
+          sessdata: jar.sessdata,
+          bili_jct: jar.bili_jct || '',
+          buvid3: jar.buvid3 || '',
+          buvid4: jar.buvid4 || '',
+          mid: jar.dedeuserid || '',
+          note: '扫码登录（插件面板），只用于读取 AI 字幕',
+          updatedAt: new Date().toISOString(),
+        },
+        2,
+        { mode: 0o600 },
       )
     } catch (e) {
       return { ok: false, state: 'error', why: `凭证写入失败：${e?.message ?? e}` }
@@ -648,7 +651,9 @@ async function loginPollOnce(key) {
 // ── 设置页状态（只读端点 + 清缓存按钮）──────────────────────────────────────
 function writeLastRun(command, code, ms) {
   try {
-    writeFileSync(LAST_RUN, JSON.stringify({ time: new Date().toISOString(), command, code, ok: code === 0, ms: Number.isFinite(ms) ? ms : null }), 'utf8')
+    // 原子写，indent 0 保持原来那种紧凑格式（这个文件是给人扫一眼的，不是给人改的）。
+    //   空 catch 是有意的：这是「每条命令后写一次」的旁路统计，写不进去不该把命令的退出码带偏。
+    writeJsonAtomic(LAST_RUN, { time: new Date().toISOString(), command, code, ok: code === 0, ms: Number.isFinite(ms) ? ms : null }, 0)
   } catch {}
 }
 
@@ -747,7 +752,8 @@ function cacheCfg() {
 // 200 {ok:true}，与 BLK-02 同族（BLK-02 只修了 tuning 那条）。现在把结果交出去，调用方按失败处理。
 function writeCacheCfg(days, maxMb) {
   try {
-    writeFileSync(CACHE_CFG, JSON.stringify({ days, maxMb }), 'utf8')
+    // 原子写，indent 0 保持原格式。失败仍返回 {ok:false,why}，不抛（语义不动）。
+    writeJsonAtomic(CACHE_CFG, { days, maxMb }, 0)
     return { ok: true }
   } catch (e) {
     return { ok: false, why: String(e?.message || e) }
@@ -760,7 +766,9 @@ function writeDepsCfg(patch) {
   const cur = readDepsCfgFile(p)
   const next = { ...cur, ...patch }
   try {
-    writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')
+    // 原子写。这个文件是跨进程共享的（面板写、look.mjs 子进程读），
+    //   半截 JSON 的后果最重：CLI 读到 parse 失败 → 留档回 {} → 调优配置全回默认值。
+    writeJsonAtomic(p, next)
     // issue #2 P2-2（2026-10-28）：resolveFfmpeg 有 5 分钟缓存，改了 ffmpeg 路径后 /status 还会
     //   报旧路径 5 分钟。配置一写就清缓存，下一次 /status 立刻重探。
     ffmpegProbeCache = { at: 0, path: '' }
@@ -1305,37 +1313,31 @@ function downloadVerdict(target, code, signal, rows) {
 
 /** 一键下载：异步拉起插件自带的 fetch-deps 脚本，立刻返回日志路径（不等下载结束）。 */
 function runDownload(target) {
-  const script = join(SCRIPTS, 'fetch-deps.ps1')
-  if (!existsSync(script)) return { started: false, why: '插件目录里没有 scripts/fetch-deps.ps1' }
+  const script = join(SCRIPTS, 'fetch-deps.mjs')
+  if (!existsSync(script)) return { started: false, why: '插件目录里没有 scripts/fetch-deps.mjs' }
   // issue #5（2026-10-31）：原来这张表没有 cuda，而面板的「GPU 运行库」行在没装时
   //   会渲染「一键下载」按钮（client.js 的 canDownload = !d.ok），点下去后端直接回
   //   「不支持的依赖：cuda」—— 两个平台都是死按钮，README 却写着「点那一行的下载」。
-  //   现在两个脚本都有 cuda 分支（ps1 -Target cuda / sh 的 cuda），这里放行。
+  //   现在脚本有 cuda 分支，这里放行。
   const allowed = ['ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda', 'all']
   if (!allowed.includes(target)) return { started: false, why: `不支持的依赖：${target}` }
   try {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
   } catch {}
-  const win = process.platform === 'win32'
-  // G-04（2026-10-29）：powershell 用绝对路径。以前是裸名 'powershell.exe' 交给 PATH 解析，
-  //   宿主被以受限 PATH 拉起时可能解析不到；用绝对路径后日志里也能直接看出到底调了哪个 exe。
-  const cmd = win
-    ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    : 'bash'
-  const args = win
-    ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Target', target]
-    : [script.replace(/\.ps1$/i, '.sh'), target]
-  // G-04（2026-10-29，致命根因）：Windows 上 detached:true 会被 libuv 映射成 DETACHED_PROCESS，
-  //   powershell.exe 启动后约 0.5 秒内以 exit code 0 退出，但 -File 脚本一行都不执行——
-  //   stdout/stderr 全空，连脚本第一行该写的落盘标记都不出现。本机控制变量实测：同样的参数、
-  //   stdio（ignore/inherit/pipe）与是否绝对路径都不影响结论，只把 detached 切成 false 就正常执行。
-  //   注意：win32 用 detached:false 只是为了让它真的执行，**不是**为了「关掉宿主继续下」——
-  //   宿主在带 KILL_ON_JOB_CLOSE 的 Job Object 里（见上方 downloadVerdict 那段），宿主一退出，
-  //   内核会把下载进程一起回收。所以面板文案只说「已开始」，不许承诺能跨宿主存活。
-  const detached = process.platform !== 'win32'
+  // 2026-11-02（fetch-deps 合一）：脚本从「Windows 走 powershell -File .ps1 / 其它走 bash .sh」
+  //   改成两个平台都用 node 跑同一份 .mjs。
+  //   用 process.execPath 而不是裸 'node'：宿主自己就是 node 拉起来的，这样能保证子进程用的是
+  //   同一个解释器；用户机器上 'node' 未必在 PATH 里（尤其是 DSH 打包分发的情况）。
+  const cmd = process.execPath
+  const args = [script, target]
+  // G-04（2026-10-29）：那条「win32 下 detached:true 会让 powershell.exe 启动后 0.5 秒内
+  //   以 exit code 0 退出、脚本一行都不执行」的坑随 powershell 一起消失了，但这一行**不因合并而改**：
+  //   本轮只换解释器，不顺带动进程生命周期。非 win32 仍用 detached（与合并前一致）。
+  //   注意：不管 detached 与否，宿主在带 KILL_ON_JOB_CLOSE 的 Job Object 里，宿主一退出内核就把
+  //   下载进程一起回收。所以面板文案只说「已开始」，不许承诺能跨宿主存活。
   // A-下载黑洞（2026-10-29 二次修正）：子进程输出不再 stdio:'ignore'，也不再和宿主事件挤同一个文件——
   //   脚本自己的逐行输出写 deps\download.out.log；deps\download.log 只留宿主侧结构化事件
-  //   （开始 / pid / detached / 退出码）。fetch-deps.ps1 自己也会往 download.log 写关键节点和失败原因，
+  //   （开始 / pid / detached / 退出码）。fetch-deps 脚本自己也会往 download.log 写关键节点和失败原因，
   //   两个文件合起来看：宿主确实拉起了进程 + 脚本到底跑到哪一步。
   const outLog = join(DEPS, 'download.out.log')
   let outFd = null

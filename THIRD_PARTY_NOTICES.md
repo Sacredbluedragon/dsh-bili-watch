@@ -1,6 +1,6 @@
 # 第三方组件许可声明（THIRD_PARTY_NOTICES）
 
-本插件随 npm 包分发的内容，以及由 `scripts/fetch-deps.ps1` 在本机按需安装、**不随本包分发**的第三方组件，其版本与许可如下。
+本插件随 npm 包分发的内容，以及由 `scripts/fetch-deps.mjs` 在本机按需安装、**不随本包分发**的第三方组件，其版本与许可如下。
 
 版本号均在本机实测对过：随包依赖来自 `node_modules/qrcode/package.json`；本机 venv 依赖来自
 `deps/.venv-asr/Lib/site-packages/*.dist-info/METADATA` 与
@@ -21,7 +21,7 @@
 
 ## 二、由 fetch-deps 安装、不随本包分发的组件
 
-以下组件由用户运行 `scripts/fetch-deps.ps1` 时按需下载/安装到 `deps\` 下，**不**打包进 npm 发布物。
+以下组件由用户运行 `scripts/fetch-deps.mjs` 时按需下载/安装到 `deps\` 下，**不**打包进 npm 发布物。
 其中三个 pip 包在脚本里锁死版本（本机实测能跑）：`faster-whisper==1.2.1`、`av==15.1.0`、
 `rapidocr-onnxruntime==1.2.3`；其余 pip 包为其传递依赖，版本以本机实测为准。
 ffmpeg 与 yt-dlp 不锁版本（跟上游走），装完的实际版本记录在 `deps\last-run.json`。
@@ -78,4 +78,4 @@ ffmpeg 与 yt-dlp 不锁版本（跟上游走），装完的实际版本记录�
 
 ---
 
-本文件由 dsh-bili-watch 维护；如更新依赖版本，请同步刷新上表与 `scripts/fetch-deps.ps1` 中的锁版号。
+本文件由 dsh-bili-watch 维护；如更新依赖版本，请同步刷新上表与 `scripts/fetch-deps.mjs` 中的锁版号。

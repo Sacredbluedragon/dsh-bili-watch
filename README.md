@@ -78,7 +78,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `frames <target> [--step <sec>] [--ocr]` | 抽帧；`--ocr` 附带画面文字识别 |
 | `ocr <bv> [--step <sec>]` | 抽帧并 OCR |
 | `text <target> [--format json\|md]` | 四级降级链：字幕 → 转写 → 抽帧 OCR → 读图。全 miss 退出码 1 |
-| `sheet <bv> [--grid 3x3]` | 均匀抽帧拼图，默认 9 帧 |
+| `sheet <bv> [--grid 3x3] [--cues]` | 均匀抽帧拼图，默认 9 帧；`--cues` 每格下方附该时段台词 |
 | `substrip <bv> [--step <sec>]` | 底部字幕竖拼 |
 | `danmaku <bv>` | 弹幕热区（按时间桶统计峰值） |
 | `local <path> [--ocr] [--frames]` | 本地视频文件走降级链（从转写层起）。仅 CLI |
@@ -109,6 +109,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `--fast` | flag | — | 仅 `text`：跳过本地转写，字幕拿不到就直接抽帧 OCR |
 | `--no-time` | flag | — | text/sub 默认输出带 `[mm:ss]` 逐句时间码，加这个退回纯文本（不带时间戳） |
 | `--at <时刻>` | string | — | `frames` 精看某一刻，支持三种写法：`750`（秒）、`12:30`（分:秒）、`12:30-13:10`（区间） |
+| `--cues` | flag | — | 仅 `sheet`：每格索引行下方附该时段的字幕台词（每格最多 2 行、每行 48 字符，超出以 `…` 截断）。折行按字符数算，不是显示宽度，中文一行看着会比英文宽。台词按「本格时间点 → 下一格时间点」切分，与索引行的 `[start, start+step)` 不是同一口径。视频没有字幕轨时整段不加，不会留空行 |
 
 完整参数列表见 `bili-watch help`。
 
@@ -127,6 +128,17 @@ r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
 ### 长文本保护
 
 正文超过 800 字时，终端仅返回前 400 字摘要 + 落盘路径，全文写入缓存目录。工具层（`bili_watch`）阈值为 2000 字（摘要 800 字）。
+
+### 陌生人内容护栏
+
+字幕、评论是 B 站用户生成的第三方内容，**是素材不是指令**。命中有注入特征的句子时：
+
+- **终端**：stderr 打一行警告（同一视频同一类别只报一次），并说明是「其中指向你的要求」不要执行——不是「里面任何要求」，字幕里正常有祈使句；
+- **`--format json`**：payload 多一个 `_untrusted` 字段 `{ source, kind, bv, hits, note }`。下划线前缀是扩展字段的通行写法，解析器忽略未知键即可；**没有命中时这个字段不出现，输出与没有护栏时逐字节相同**；
+- **`--format srt/md/txt`**：命中时在文件头（srt 是每段前）加一行 `[第三方内容·未消毒]` 注记；
+- **落盘两份**：`<kind>.txt` 是纯正文（给程序 read + 解析，格式不变），`<kind>.wrapped.txt` 带 `[source: …]` 标记与围栏（给模型 read），提示词指向后者。
+
+护栏只做**提示与标记**，不是安全边界：命中不代表一定在攻击，没命中也不代表安全（按 OWASP，输入过滤属 supporting control，承重的是「标记 + 不下放权限」）。所以长文本只跑两件**形态**检查：不可见字符（零宽 / tag 字符 / 双向控制符，正常字幕不会有、零误报）＋ 边界标记自校验。语义类规则刻意不加——实测那三条在 20 条正常字幕上误报 8 条（40%），而中文注入分类器的召回上限也只有 25%（Prompt Guard 2 中文 recall 0.2529）。
 
 ## 面板
 
@@ -234,20 +246,18 @@ dsh plugin --profile web remove dsh-bili-watch
 
 ### 一键安装依赖
 
-```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all
-powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target all -Mirror cn
-
-# 单项：ffmpeg / ytdlp / asr / ocr / model
-powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target ytdlp
-```
-
 ```bash
-# macOS / Linux
-bash scripts/fetch-deps.sh all
-BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all
+# 三个平台同一条命令（Windows / macOS / Linux）
+node scripts/fetch-deps.mjs all
+node scripts/fetch-deps.mjs all --mirror cn        # 国内网络：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror
+
+# 单项：ffmpeg / ytdlp / asr / ocr / model / cuda
+node scripts/fetch-deps.mjs ytdlp
+node scripts/fetch-deps.mjs asr --force            # 环境坏了重建
+node scripts/fetch-deps.mjs where                  # 只回答「装到哪」，不下载不建目录
 ```
+
+`--dry-run` 只打印将执行的命令、不下载不写盘；`--proxy <地址>` / `--no-proxy` 处理代理；`--gpu ask|yes|no` 决定要不要装 CUDA 运行库。
 
 > **依赖装在哪**（0.3.4 起）：默认放 `$DSH_HOME/bili-watch/deps`（`DSH_HOME` 默认 `~/.dsh`），**不在插件包目录里**——这样 `npm uninstall` / 重装插件不会把两个 venv 和 460 MB 模型一起删掉。
 > 从旧版升级时，首次启动会自动把包内 `deps/` 搬过去（复制完成后才切换，中途失败继续用包内那份，面板会给出提示）；包内旧的 `deps/` 不再使用，确认新位置正常后可以手动删除。
@@ -267,8 +277,8 @@ BILI_WATCH_MIRROR=cn bash scripts/fetch-deps.sh all
 
 **怎么装（Windows）**：面板上点那一行的「下载」，或命令行：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
+```bash
+node scripts/fetch-deps.mjs cuda
 ```
 
 装的是 pip 上的三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），**约 1.4 GB（下载），装完占约 2 GB**，装在 ASR 的 venv 里，不需要装整套 CUDA Toolkit。装完脚本会真加载一次 `cublas64_12.dll` 校验——pip 装成功不代表 DLL 能加载（缺 VC++ Redist 时会 `DLL load failed`）。
@@ -276,7 +286,7 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1 -Target cuda
 **怎么装（Linux）**：和 Windows 一样，面板上点那一行的「下载」，或命令行：
 
 ```bash
-bash scripts/fetch-deps.sh cuda
+node scripts/fetch-deps.mjs cuda
 ```
 
 装的是同样三个 wheel（`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` + `nvidia-cuda-nvrtc-cu12`），装进 ASR 的 venv，装完脚本会跑一次 `--probe-gpu` 校验（`libcublas.so.12` 能不能载入 + ctranslate2 看不看得到卡）。**展开后约 2.2 GB**（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB），比 Windows 那三个 wheel 大得多，装之前先看磁盘。
@@ -286,12 +296,12 @@ bash scripts/fetch-deps.sh cuda
 想自己用 pip 装也行——路径按脚本自己解析的来（设过 `BILI_WATCH_DEPS` 或改过 `DSH_HOME` 时不是默认值）：
 
 ```bash
-DEPS="$(bash scripts/fetch-deps.sh where)"
+DEPS="$(node scripts/fetch-deps.mjs where)"   # 路径打在 stdout；那行说明打在 stderr
 "$DEPS/.venv-asr/bin/pip" install \
   nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-nvrtc-cu12
 ```
 
-**为什么第一次慢**：`all`（Windows 是 `-Target all`）不会自动装它（不问、不装那 1.4 GB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
+**为什么第一次慢**：`all` 不会自动装它（不问、不装那 1.4 GB）；首次转写还要加载模型到显存，比后续调用慢十几秒。
 
 **怎么关**：面板「转写与抽帧」里的「转写时用 GPU」取消勾选（存的是 `asrDevice: cpu`），或把 `deps/deps-config.json` 里的 `asrDevice` 写成 `cpu`。删掉运行库也能自动退回 CPU，不会报错。
 
@@ -358,7 +368,7 @@ AI 字幕（需登录）
 
 ![bili-watch 调用链](docs/architecture.png)
 
-上排是 `index.js` 里的三个注册点，它们都只做参数整形，最后 spawn 同一个子进程；业务逻辑全在 `tools/look.mjs`，npm bin 与插件调的是同一个文件。中排左右两件只跟子进程发生关系：缓存目录是读写，`lib/` 是 import（14 个模块，锁 / 缓存 / 凭证各一份）。下排是四个可选外部依赖，缺哪个就少哪条能力——没有 ffmpeg 就只有字幕与评论，没有 ASR 退回读字幕，没有 yt-dlp 就只处理 B 站链接。
+上排是 `index.js` 里的三个注册点，它们都只做参数整形，最后 spawn 同一个子进程；业务逻辑全在 `tools/look.mjs`，npm bin 与插件调的是同一个文件。中排左右两件只跟子进程发生关系：缓存目录是读写，`lib/` 是 import（15 个模块，锁 / 缓存 / 凭证各一份）。下排是四个可选外部依赖，缺哪个就少哪条能力——没有 ffmpeg 就只有字幕与评论，没有 ASR 退回读字幕，没有 yt-dlp 就只处理 B 站链接。
 
 ## 致谢
 

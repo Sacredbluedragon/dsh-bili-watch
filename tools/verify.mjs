@@ -8,7 +8,7 @@
  * 用法：node tools/verify.mjs
  * 不进 npm 包（files 里只留 tools/look.mjs，见 package.json）。
  */
-import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readdirSync, renameSync, copyFileSync, openSync, closeSync, statSync, symlinkSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readdirSync, renameSync, copyFileSync, openSync, closeSync, statSync, symlinkSync, chmodSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -62,6 +62,24 @@ import { makeChecker, must } from './check-run.mjs'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8')
+
+/**
+ * 2026-11-02 批 1b：`look.mjs` 认不认某个 flag —— **真跑**，不读源码。
+ *
+ * 原来 C9 / C42 / C44 是「读 look.mjs，找 `const KNOWN_FLAGS = new Set([...])` 里有没有这个词」。
+ * 批 1b 把 KNOWN_FLAGS 改成从 lib/params.mjs 生成，那三处同时红 —— 不是代码坏了，
+ * 是判据在验「字面量长什么样」而不是「运行时认不认」。
+ *
+ * 改成真跑之后判据更强：谁把 KNOWN_FLAGS 打空、或者生成链断了，这里立刻红；
+ * 而它不再关心源码怎么写。用 `help` 命令是因为它只打 HELP、不做任何实际工作。
+ */
+function flagAccepted(flag, val) {
+  const r = spawnSync(process.execPath, [join(HERE, 'look.mjs'), 'help', `--${flag}`, ...(val ? [val] : [])], {
+    cwd: ROOT, encoding: 'utf8', timeout: 30000,
+  })
+  const err = r.stderr || ''
+  return { ok: !/未知参数/.test(err), status: r.status, err }
+}
 
 const results = []
 // 2026-10-31 切片 8（DSH 18:48）：执行器搬进 tools/check-run.mjs，就为了让它**自己可被断言**——
@@ -781,14 +799,15 @@ check('C8 pickCacheDir 建根 + 真写可写探针，正常/回退都返回 { di
 
 
 check('C9 KNOWN_FLAGS 两处都认识 --asr-max（P2：真生效却被报「未知参数已忽略」）', () => {
+  // index.js 侧仍是数组字面量，读源码；look.mjs 侧改真跑（批 1b：那边已改成从参数表生成，
+  //   再读字面量就是验「长什么样」而不是「认不认」）。
   const a = read('index.js')
-  const b = read('tools/look.mjs')
   const iA = a.indexOf('const KNOWN_FLAGS')
-  const iB = b.indexOf('const KNOWN_FLAGS')
-  must(iA >= 0 && iB >= 0, '找不到 KNOWN_FLAGS')
+  must(iA >= 0, '找不到 index.js 的 KNOWN_FLAGS')
   must(a.slice(iA, iA + 700).includes("'--asr-max'"), 'index.js 的 KNOWN_FLAGS 缺 --asr-max')
-  must(b.slice(iB, iB + 700).includes("'asr-max'"), 'look.mjs 的 KNOWN_FLAGS 缺 asr-max')
-  return 'ok'
+  const r = flagAccepted('asr-max', '30000')
+  must(r.ok, `look.mjs 报「未知参数 --asr-max」：stderr=${r.err.slice(0, 160)}`)
+  return 'index.js 字面量有 --asr-max；look.mjs 真跑 help --asr-max 不报未知参数'
 })
 
 check('C10 clean 把「删除失败」与「不是我们的数据」分开报（P2：原来 EPERM 被说成「没动」且 rc=0）', () => {
@@ -1128,10 +1147,14 @@ check('C20 GPU 依赖行 + 删除走 pip uninstall + -Target cuda 在、all 不�
   const seg = idx.slice(i, i + 800)
   must(/pip['"],\s*['"]uninstall/.test(seg), 'cuda 删除没走 pip uninstall（只删目录会留 dist-info，重装报「已安装」但文件没了）')
   must(!/rmSync\([^)]*nvidia/.test(seg), 'cuda 删除直接 rmSync 了 nvidia 目录（必须走 pip）')
-  const ps = read('scripts/fetch-deps.ps1')
-  must(/'cuda'/.test(ps), 'fetch-deps.ps1 没有 cuda target')
-  must(!/default \{ @\('ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda'\)/.test(ps), 'all 的步骤表把 cuda 带上了（应当保持「不问、不装 1.4 GB」）')
-  return 'deps 行 + /status.gpu + pip uninstall + -Target cuda 都在，all 不含 cuda'
+  // 2026-11-02（fetch-deps 合一）：被测对象从 scripts/fetch-deps.ps1 变成 scripts/fetch-deps.mjs。
+  //   断言的意思没变：cuda 必须是一个能被单独选中的 target，但不能混进 all 的步骤表。
+  const fd = read('scripts/fetch-deps.mjs')
+  must(/TARGETS = \[[^\]]*'cuda'/.test(fd), 'fetch-deps.mjs 的 Target 清单里没有 cuda')
+  const stepsM = fd.match(/const STEPS = TARGET === 'all' \? \[([^\]]*)\]/)
+  must(stepsM, "fetch-deps.mjs 里找不到 all 的步骤表（const STEPS = TARGET === 'all' ? [...]）")
+  must(!/cuda/.test(stepsM[1]), 'all 的步骤表把 cuda 带上了（应当保持「不问、不装 1.4 GB」）')
+  return 'deps 行 + /status.gpu + pip uninstall + cuda target 都在，all 不含 cuda'
 })
 
 // C21/C22（2026-10-29，rumo-test）：clean 的两条行为第一次真跑。
@@ -1486,20 +1509,26 @@ check('C29 --out 指向系统目录：rc≠0、目标文件不创建、正文退
 //   这条现在守的是「只能有一份」：根目录再出现同名文件，就是又长出了第二个真相源。
 //   同时钉住 3.14 判据本身：这是「PR#4 的前提已被实测推翻」那处修复的承重点，
 //   只钉「文件唯一」是不够的——把正则改回 1[0-3] 照样绿（见 E6-08 的结构性天花板）。
-check('C30 fetch-deps.ps1 只应有一份（在 scripts/）+ Test-PyVersion 收 3.14（E8 #6）', () => {
-  const b = join(ROOT, 'scripts', 'fetch-deps.ps1')
-  must(existsSync(b), 'scripts/fetch-deps.ps1 不存在——插件调的就是这一份')
+// 2026-11-02（fetch-deps 合一）：被测对象从 .ps1 换成 .mjs，断言意思不变——
+//   ① 只能有一份（多一份就是第二个真相源）；② Python 版本正则必须收到 3.14。
+check('C30 fetch-deps 只应有一份（在 scripts/）+ Python 版本正则收 3.14（E8 #6）', () => {
+  const b = join(ROOT, 'scripts', 'fetch-deps.mjs')
+  must(existsSync(b), 'scripts/fetch-deps.mjs 不存在——插件调的就是这一份')
   must(
-    !existsSync(join(ROOT, 'fetch-deps.ps1')),
-    '根目录又出现了 fetch-deps.ps1：插件只调 scripts/ 那份，多一份就是第二个真相源，请删掉或移进备份',
+    !existsSync(join(ROOT, 'fetch-deps.mjs')),
+    '根目录又出现了 fetch-deps.mjs：插件只调 scripts/ 那份，多一份就是第二个真相源，请删掉或移进备份',
   )
-  const body = read('scripts/fetch-deps.ps1')
-  // 判据承重点：Test-PyVersion 的版本正则必须收到 3.14
-  const m = /function Test-PyVersion[\s\S]*?return \(\$v -match '([^']+)'\)/.exec(body)
-  must(m, '找不到 Test-PyVersion 的版本正则')
-  must(/1\[0-4\]/.test(m[1]), `Test-PyVersion 的正则仍是 ${m[1]}——3.14 会被硬拒（实测 3.14.6 的 venv 里 onnxruntime 1.31.1 可用）`)
-  must(!/3\.14 没有 onnxruntime 的 wheel/.test(body), '脚本里还留着「3.14 没有 onnxruntime 的 wheel」这句已被实测推翻的话')
-  return `判据 ${m[1]} 已收 3.14；全仓只有 scripts/ 一份（${readFileSync(b).length} B）`
+  // 合并前的两份实现（.ps1 / .sh）如果还留着，就是「一份名义上删了、一份还在跑」的形状
+  for (const old of ['fetch-deps.ps1', 'fetch-deps.sh']) {
+    must(!existsSync(join(ROOT, 'scripts', old)), `scripts/${old} 还在——合并后只该有 fetch-deps.mjs，旧实现留着就是第二份真相源`)
+  }
+  const body = read('scripts/fetch-deps.mjs')
+  // 判据承重点：Python 版本判定必须收到 3.14
+  const m = /function pyOk\(v\) \{\s*return \/([^/]+)\//.exec(body)
+  must(m, '找不到 pyOk 的版本正则')
+  must(/1\[0-4\]/.test(m[1]), `pyOk 的正则仍是 /${m[1]}/——3.14 会被硬拒（实测 3.14.6 的 venv 里 onnxruntime 1.31.1 可用）`)
+  must(!/return \(\$v -match/.test(body), '还残留 PowerShell 写法（$v -match）——看起来是没搬完')
+  return `判据 /${m[1]}/ 已收 3.14；全仓只有 scripts/ 一份（${readFileSync(b).length} B）`
 })
 
 // E4-02（2026-10-30，P0）：删 credential 时后端会**同时** push deleted 与 skipped
@@ -1806,6 +1835,479 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
 //   这条不能写成「等 30 秒再问一次」：慢、脆，机器一慢就假绿。改成注入假时钟 + 计数桩替掉 dirStat，
 //   数「真 walk 了几次」。TTL 从源码读出来当参数传进去，不在断言里另抄一份常量
 //   （另抄一份就是第二个真相源，改源码不改正则时这条会绿得毫无意义——E6-08 说的正是这个）。
+// ── 批 2a：五处状态写入的原子化（2026-11-02）────────────────────────────────
+// 换掉的是 index.js 里五个写函数：writeTuning / writeDepsCfg / writeUiCfg / writeLastRun / writeCacheCfg。
+//   这五个名字在 verify.mjs 里原来是**零命中**（DSH 20:20 手工列表、我复了一遍 grep），下面是新覆盖。
+// 五条分工：C131 正常路径与格式 / C132 写失败路径 / C133 跨进程并发（不变量）/
+//   C135 rename 重试逻辑（确定性桩）/ C134 失败语义没被顺手改掉。
+//   C135 排在这里而不是文件末尾，因为它就是从 C133 拆出来的那半（见 C133 头注释），
+//   放在一起看才看得出「为什么一个用真并发、一个用桩」。编号没按顺序排，别当笔误。
+//
+// 为什么 C132 要「抠函数体 + 桩」而不是真造一个磁盘满：`writeJsonAtomic` 唯一的失败入口是
+//   writeFileSync / renameSync 抛错，没有可注入的依赖。抠出定义段、只把 fs 三个函数换成桩，
+//   被测的 if/else、catch、清理逻辑一个字没动 —— 这是测真代码，不是复刻。
+
+// 从源码抠出模块级常量声明：手抄一份 prelude 就是「复刻」，常量一改判据不会跟着变。
+const declOf = (src, name) => {
+  const m = new RegExp(`^[ \\t]*(?:const|let)[ \\t]+${name}[ \\t]*=.*$`, 'm').exec(src)
+  must(m, `lib/config.mjs 里找不到模块级声明 ${name}（函数依赖它，判据抽不出来就会静默退化）`)
+  return m[0].trim()
+}
+// writeJsonAtomic 的依赖：计数器 / 重试参数 / 重试错误码表 / 同步小睡
+const atomicPrelude = (src) =>
+  [declOf(src, 'WRITE_SEQ'), declOf(src, 'RENAME_RETRY_MS'), declOf(src, 'RENAME_RETRY_CODES'), declOf(src, 'sleepSync')].join('\n')
+
+check('C131 五处状态写入走原子写，且原有两种格式逐字节不变（批 2a）', () => {
+  const cfg = read('lib/config.mjs')
+  const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+    prelude: atomicPrelude(cfg),
+    params: ['writeFileSync', 'renameSync', 'rmSync'],
+    args: [writeFileSync, renameSync, rmSync],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c131-'))
+  try {
+    const p = join(dir, 'deps-config.json')
+    const obj = { ffmpeg: 'C:\\bin\\ffmpeg.exe', unitLimit: 5000 }
+    // ① 缩进 2（writeTuning / writeUiCfg / writeDepsCfg 三处原有格式）。
+    //   基线**不是我以为的格式**，是真跑旧实现一次存下来的字节。96feae6 里这三处原文：
+    //     writeFileSync(p, JSON.stringify(cur, null, 2), 'utf8')          // writeTuning   :294
+    //     writeFileSync(UI_CFG, JSON.stringify(next, null, 2), 'utf8')    // writeUiCfg     :433
+    //     writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')         // writeDepsCfg   :763
+    //   下面这行就是它原样跑一次（DSH 20:28 的要求：不是断言「看起来一样」，是真拿旧版跑一遍比）。
+    const baseA = join(dir, 'base-a.json')
+    writeFileSync(baseA, JSON.stringify(obj, null, 2), 'utf8')
+    writeJsonAtomic(p, obj)
+    const wantA = readFileSync(baseA, 'utf8')
+    const gotA = readFileSync(p, 'utf8')
+    must(
+      gotA === wantA,
+      `缩进 2 的写盘结果与 96feae6 的写入结果不一致：旧版结尾 ${JSON.stringify(wantA.slice(-40))}，新版 ${JSON.stringify(gotA.slice(-40))}`,
+    )
+    must(!gotA.endsWith('\n'), '写盘结果多了尾换行 —— 旧实现没有，这会让逐字节比对的下游看到差异')
+    // ② 紧凑格式（writeLastRun / writeCacheCfg 两处原有格式）。96feae6 原文：
+    //     writeFileSync(LAST_RUN, JSON.stringify({...}), 'utf8')            // writeLastRun  :651
+    //     writeFileSync(CACHE_CFG, JSON.stringify({ days, maxMb }), 'utf8') // writeCacheCfg  :750
+    const compact = { days: 7, maxMb: 0 }
+    const baseB = join(dir, 'base-b.json')
+    writeFileSync(baseB, JSON.stringify(compact), 'utf8')
+    writeJsonAtomic(p, compact, 0)
+    must(
+      readFileSync(p, 'utf8') === readFileSync(baseB, 'utf8'),
+      'indent 0 的写盘结果与 96feae6 的紧凑格式不一致 —— 改前这两处是 JSON.stringify(x) 无缩进，加缩进就变了文件字节',
+    )
+    // ③ 覆盖：写两次，读回来必须是新的完整内容（不是旧的、也不是混合）
+    writeJsonAtomic(p, { a: 1, pad: 'x'.repeat(5000) })
+    writeJsonAtomic(p, { a: 2 })
+    must(readFileSync(p, 'utf8') === JSON.stringify({ a: 2 }, null, 2), '第二次写没有完整覆盖第一次（读到旧内容或新旧混合）')
+    // ④ 不留 tmp（base-a / base-b 是本判据自己造的基线文件，不算残留）
+    const extra = readdirSync(dir).filter((n) => !['deps-config.json', 'base-a.json', 'base-b.json'].includes(n))
+    must(extra.length === 0, `写完之后目录里多了东西（${extra.join(', ')}）—— tmp 没清干净`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  // ⑤ index.js 侧：五个函数体内必须走 writeJsonAtomic，且不再有裸 writeFileSync。
+  //   逐函数抠体，不是 grep 全文 —— grep 全文会被别的函数里的正常写入蒙混过去。
+  const idx = read('index.js')
+  for (const f of ['writeTuning', 'writeDepsCfg', 'writeUiCfg', 'writeLastRun', 'writeCacheCfg']) {
+    const body = stripComments(fnBody(idx, f))
+    must(body.includes('writeJsonAtomic('), `${f} 没走 writeJsonAtomic（还是裸写？）`)
+    must(!body.includes('writeFileSync('), `${f} 里还有裸 writeFileSync —— 五处原子化漏了这一处`)
+  }
+  return '基线 = 96feae6 三处写入表达式真跑结果：缩进 2 / 紧凑两种格式逐字节一致 + 覆盖完整 + 零残留 tmp + 五处都走原子写'
+})
+
+check('C132 写 tmp 中途失败：目标文件逐字节不变、不留残留 tmp（批 2a）', () => {
+  const cfg = read('lib/config.mjs')
+  let stubCalls = 0
+  // 桩：**先真写半截到盘，再抛 ENOSPC**。写半截是故意的 —— 如果 catch 里忘了删 tmp，
+  //   下面「零残留」那条才照得出来；只抛不写的话，残留断言永远绿。
+  const stubWrite = (p, data) => {
+    stubCalls++
+    writeFileSync(p, String(data).slice(0, Math.floor(String(data).length / 2)), 'utf8')
+    throw Object.assign(new Error('ENOSPC: no space left on device (simulated)'), { code: 'ENOSPC' })
+  }
+  const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+    prelude: atomicPrelude(cfg),
+    params: ['writeFileSync', 'renameSync', 'rmSync'],
+    args: [stubWrite, renameSync, rmSync],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c132-'))
+  try {
+    const p = join(dir, 'deps-config.json')
+    const oldText = JSON.stringify({ keep: 'old', n: 111 }, null, 2)
+    writeFileSync(p, oldText, 'utf8')
+    let err = null
+    try {
+      writeJsonAtomic(p, { keep: 'new', pad: 'y'.repeat(2000) })
+    } catch (e) {
+      err = e
+    }
+    must(stubCalls === 1, `桩一次都没被调用（stubCalls=${stubCalls}）—— 这条根本没测到东西`)
+    must(err, '写盘失败却没抛出去：调用方的失败分支永远走不到（假保存）')
+    must(err?.code === 'ENOSPC', `抛出来的不是原始错误（${err?.code}）—— 失败原因被换掉了，调用方没法判断该重试还是该报错`)
+    const now = readFileSync(p, 'utf8')
+    must(now === oldText, `写失败后目标文件变了 —— 旧配置被半截内容破坏：${JSON.stringify(now.slice(0, 60))}`)
+    const left = readdirSync(dir).filter((n) => n.endsWith('.tmp'))
+    must(left.length === 0, `写失败后留下残留 tmp（${left.join(', ')}）—— 下次谁扫这个目录会把它当成配置文件`)
+    return '半截写 → 抛原始错误 / 旧内容逐字节保留 / 零残留 tmp'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C133 一个进程密集读、另一个进程持续写：读到的永远是完整 JSON（批 2a 核心）', () => {
+  // 为什么是独立探针而不是在 check 里 await：check() 是同步收集，async 函数直接 await 进来
+  //   会被记成 PASS（2026-11-01 踩过）。所以并发逻辑丢给 fixtures/atomic-race.mjs，
+  //   它自己 spawn 两个子进程，把结论打成一行 JSON 回来。
+  //
+  // 2026-11-02 修：这条原来还断言 `writer.hardFail === 0`（重试用完仍有写失败）与 `sawMax >= 50`，
+  //   **两条都是 flaky**。实测：把重试去掉时 hardFail=4~6（能抓到），但**有重试时偶尔也是 1**
+  //   （7 档退避共 78ms，在系统负载高时不够）。于是「H 轮改 index.js 的 catch」这种
+  //   与探针毫无关系的扰动，都让这条红了一次——判据随机红比永远绿更坏，下一个人会去调阈值。
+  //
+  //   根因是把两种确定性不同的东西捆在一条里：
+  //     · `bad === 0` 是**不变量**（原子写的定义：要么旧全量、要么新全量）；
+  //     · `hardFail === 0` 是**概率属性**（这个读密度下重试够不够）。
+  //   现在这条只判不变量；「重试逻辑在不在、上限对不对」交给 C135 用**确定性桩**判
+  //   （桩 renameSync 抛 N 次 EPERM，不依赖任何调度运气）。hardFail 与 sawMax 降级为 detail 里的信息。
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c133-'))
+  try {
+    const target = join(dir, 'deps-config.json')
+    writeFileSync(target, JSON.stringify({ seq: -1, pad: 'x'.repeat(100 * 1024) }), 'utf8')
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'atomic-race.mjs'), target, '100', '1000', '100'], {
+      encoding: 'utf8',
+      timeout: 120000,
+      env: baseEnv(),
+    })
+    must(r.status === 0, `探针没跑起来（rc=${r.status}）：${(r.stderr || '').slice(0, 300)}`)
+    let out = null
+    try {
+      out = JSON.parse(String(r.stdout || '').trim().split('\n').pop())
+    } catch {}
+    must(out, `探针输出不是预期 JSON：${(r.stdout || '').slice(0, 200)}`)
+    must(out.reader?.bad === 0, `读到 ${out.reader?.bad} 次半截 JSON —— 原子写没起作用（改前的裸写在这个规模下会读到 6–12 次）`)
+    must(out.reader?.weird === 0, `读到 ${out.reader?.weird} 次结构不完整的对象（能 parse 但字段缺），共 ${out.reader?.ok} 次正常`)
+    must(out.reader?.ok >= 500, `正常读只成功 ${out.reader?.ok} 次（应接近 1000）—— 探针多半空转了，这条等于没测`)
+    // 「另一个进程能读到**新值**」——这是 DSH 20:28 判据 2 的核心（跨进程可见）。
+    //   只断言 >0 不断言具体值：重试偶尔会漏一次（hardFail=1 不是错误，见上面那段），
+    //   但要 100 次写里连一次都没被读到，说明写根本没生效或读方解析不了。
+    must((out.reader?.sawMax ?? -1) > 0, `读进程从没读到过新值（最大 seq=${out.reader?.sawMax}）—— 原子写之后另一个进程读不到更新，配置改了不生效`)
+    must(out.tmpLeft === 0, `跑完目录里留有 ${out.tmpLeft} 个 .tmp`)
+    // hardFail / sawMax 只报不断言（见函数头那段）。写不进去会让 sawMax 停在中途，
+    //   但那是「重试够不够」，C135 用桩判得更准。
+    return `100 次写 / 1000 次读：0 半截、0 结构不完整、读到 ${out.reader.ok} 次正常；写失败 ${out.writer?.hardFail} 次、最大 seq=${out.reader.sawMax}（信息，不断言）`
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C135 rename 遇 EPERM 会退避重试，遇到别的错误码立刻抛（Windows 上并发读会挡住 rename）', () => {
+  // 这条替代 C133 原来那条 flaky 的 hardFail 断言：用**确定性桩**验证重试逻辑本身，
+  //   不依赖调度运气，也不会因为机器忙就红。
+  //
+  // 为什么这件事重要：Windows 上 rename 覆盖「正被别的进程打开读」的文件会 EPERM
+  //   （POSIX 不会：rename 只看目录权限）。而面板写 deps-config.json 的同时，
+  //   tools/look.mjs 的 tuning() 一次调用要读它十几次。不重试的话，加了原子性反而让
+  //   「保存」随机失败——比改前的裸写更糟（裸写从不失败）。
+  const cfg = read('lib/config.mjs')
+  const mk = (plan) => {
+    // plan：按顺序消费的重试结果；'ok' 表示真 rename，字符串表示抛对应 code 的错误
+    let n = 0
+    const stubRename = (tmp, p) => {
+      const step = plan[Math.min(n, plan.length - 1)]
+      n++
+      if (step === 'ok') return renameSync(tmp, p)
+      throw Object.assign(new Error(`${step}: operation not permitted (simulated)`), { code: step })
+    }
+    const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+      prelude: atomicPrelude(cfg),
+      params: ['writeFileSync', 'renameSync', 'rmSync'],
+      args: [writeFileSync, stubRename, rmSync],
+    })
+    return { writeJsonAtomic, calls: () => n }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c135-'))
+  try {
+    // ① 前 3 次 EPERM、第 4 次成功：必须写成，且真的重试了 4 次
+    const a = mk(['EPERM', 'EPERM', 'EBUSY', 'ok'])
+    const pa = join(dir, 'a.json')
+    a.writeJsonAtomic(pa, { k: 1 })
+    must(readFileSync(pa, 'utf8') === JSON.stringify({ k: 1 }, null, 2), '前三次 EPERM/EBUSY 之后应当第 4 次写成功（重试没生效或内容不对）')
+    must(a.calls() === 4, `应当尝试 4 次，实际 ${a.calls()} 次 —— 重试次数与预期不符`)
+
+    // ② 一直 EPERM：必须抛出来（不能吞），且不留 tmp
+    const b = mk(['EPERM'])
+    const pb = join(dir, 'b.json')
+    writeFileSync(pb, 'OLD', 'utf8')
+    let errB = null
+    try {
+      b.writeJsonAtomic(pb, { k: 2 })
+    } catch (e) {
+      errB = e
+    }
+    must(errB, '一直 EPERM 却没有任何异常 —— 写没成功却报成功（假保存）')
+    must(errB?.code === 'EPERM', `抛出来的不是 EPERM（${errB?.code}），调用方没法区分「稍后重试」和「配置目录不对」`)
+    must(b.calls() > 1, `只尝试了 ${b.calls()} 次就放弃 —— 没有重试`)
+    must(b.calls() <= 20, `重试了 ${b.calls()} 次 —— 上限失控（正常是 7 次退避）`)
+    must(readFileSync(pb, 'utf8') === 'OLD', '重试全失败后目标文件被动了（应当原样保留旧内容）')
+    must(readdirSync(dir).filter((n) => n.endsWith('.tmp')).length === 0, '重试全失败后留下残留 tmp')
+
+    // ③ 非重试类错误（比如目标目录不存在）：必须立刻抛，不许白等 78ms 退避
+    const c = mk(['ENOENT', 'ok'])
+    let errC = null
+    try {
+      c.writeJsonAtomic(join(dir, 'c.json'), { k: 3 })
+    } catch (e) {
+      errC = e
+    }
+    must(errC?.code === 'ENOENT', `ENOENT 应当直接抛出去，实际 ${errC ? '抛了 ' + errC.code : '没抛'}`)
+    must(c.calls() === 1, `ENOENT 被重试了 ${c.calls()} 次 —— 只该对 EPERM/EBUSY/EACCES 退避，别的错误重试也没用`)
+    return 'EPERM/EBUSY 会退避重试（4 次写成）/ 一直失败则抛原始码且零残留 tmp / ENOENT 立刻抛不空转'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C134 五处写函数的失败语义没被 2a 顺手改掉（抛 / 吞 / ok:false 各归各位）', () => {
+  // 这条防两件事：
+  //   ① 顺手把五种失败形态统一了 —— 那是 2b 的活，提前做了会让 2b 无法验证自己改了什么；
+  //   ② 顺手把 writeLastRun 的空 catch 去掉 —— 那个 catch 是有意的：它是「每条命令后写一次」的
+  //      旁路统计（index.js 里紧跟在每条命令执行完之后），写不进去不该把命令的退出码带偏。
+  // 这是**结构判据**，不是运行时判据：它只能证明「这次 diff 里没人动这些出口」，
+  //   证不了「运行时确实如此」—— 后者由 C131/C132 覆盖。之所以接受这个较弱形态，
+  //   是因为「有没有人动过这些出口」本身就是源码事实，抠函数体看比造五种失败场景真跑更直接，
+  //   而且造场景要先能注入 fs 失败，那需要给生产代码开测试后门。
+  const idx = read('index.js')
+  const bodyOf = (n) => stripComments(fnBody(idx, n))
+  const ui = bodyOf('writeUiCfg')
+  must(!/try\s*\{/.test(ui), 'writeUiCfg 被包了 try —— 它的语义是「直接抛给调用方」，包起来就把失败变成静默了')
+  must(!ui.includes('return { ok'), 'writeUiCfg 开始返回 {ok:...} 了 —— 返回值形态被改，那是 2b 的事')
+  const lastRun = bodyOf('writeLastRun')
+  must(/catch\s*\{\s*\}/.test(lastRun), 'writeLastRun 的空 catch 没了 —— 写盘失败会把命令的退出码带偏')
+  must(!lastRun.includes('return {'), 'writeLastRun 开始返回值了 —— 它的语义是「吞掉、什么都不说」')
+  for (const n of ['writeTuning', 'writeDepsCfg', 'writeCacheCfg']) {
+    const b = bodyOf(n)
+    must(/return\s*\{\s*ok:\s*false/.test(b), `${n} 不再返回 {ok:false,...} 了`)
+    if (n === 'writeTuning') {
+      must(/code:\s*400/.test(b), 'writeTuning 的 code: 400 没了（参数非法要能区分出 4xx）')
+    } else {
+      must(!/code:\s*\d+/.test(b), `${n} 多了 code 字段 —— code 只在 HTTP 层加（DSH 20:20 拍的口径）`)
+    }
+  }
+  return 'writeUiCfg 仍抛 / writeLastRun 仍吞 / 三个仍返回 ok:false（code 只在 writeTuning）'
+})
+
+// ── 批 2b：四处 0600 凭证写入点（2026-11-02）──────────────────────────────────
+//
+// 四处 = index.js 面板扫码 / lib/cred.mjs 的 adoptLegacyCred / tools/look.mjs 的 --poll 与 login。
+// 前三处写同一个 deps/credential.json（`CRED_FILE = SHARED_CRED`），第四处写 deps/login-key.json
+//   —— 另一个文件、生命周期更短（登录成功或二维码过期就删）。
+//
+// 「四处」这个数不写在判据里当常量，而是逐文件数实际出现次数（C137）：上一版把「三处」写死在
+//   lib/config.mjs 注释里，结果人和工具互相引用、`login-key.json` 整条漏掉。数字写进注释会腐化，
+//   现在注释里留的是可 grep 的标记「0600 点」。
+
+check('C136 writeJsonAtomic 的 mode：tmp 建时带 0600、chmod 只打 tmp、且在 rename 之前（批 2b）', () => {
+  // 为什么用桩判顺序、不真跑 stat：Windows 上 mode/chmod 全是空操作（2026-11-02 实测 stat 恒 666），
+  //   真跑只能在 POSIX 上验（那条交给 C139，Windows skip）。而「顺序」这个事在 Windows 上
+  //   一点症状都没有，却正是 DSH 指出的风险来源：先 rename 再 chmod 目标，目标若已被删就 ENOENT，
+  //   于是「写成功了却报失败」——tools/look.mjs 的 login 分支写完马上删 login-key.json，正好有这个窗口。
+  const cfg = read('lib/config.mjs')
+  const calls = []
+  const stubWrite = (p, data, opt) => { calls.push(['write', p, opt]) }
+  const stubRename = (a, b) => { calls.push(['rename', a, b]) }
+  const stubRm = (p) => { calls.push(['rm', p]) }
+  const okChmod = (p, m) => { calls.push(['chmod', p, m]) }
+  const mk = (chmodStub) =>
+    compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+      prelude: atomicPrelude(cfg),
+      params: ['writeFileSync', 'chmodSync', 'renameSync', 'rmSync'],
+      args: [stubWrite, chmodStub, stubRename, stubRm],
+    })
+
+  const { writeJsonAtomic } = mk(okChmod)
+  writeJsonAtomic('/x/credential.json', { a: 1 }, 2, { mode: 0o600 })
+  const w = calls.find((c) => c[0] === 'write')
+  must(w, '桩一次都没被调用 —— 这条根本没测到东西')
+  must(w[2] && w[2].mode === 0o600, `tmp 建的时候没带 mode（第三个参数是 ${JSON.stringify(w[2])}）—— 文件按 umask 先建成 0644，中间有一段可读窗口`)
+  must(w[2].encoding === 'utf8', 'tmp 写入没指定 utf8 —— Windows 中文路径下会按当前代码页落盘')
+  const ch = calls.filter((c) => c[0] === 'chmod')
+  must(ch.length === 1, `chmod 调了 ${ch.length} 次（应恰好 1 次）—— 多出来的那次多半是 rename 之后去补目标权限，目标被删就 ENOENT`)
+  must(ch[0][1] === w[1], `chmod 打的不是 tmp（打的是 ${ch[0][1]}）—— 打在目标上就多一条「目标被删 → ENOENT」的失败路径`)
+  must(ch[0][2] === 0o600, `chmod 的 mode 是 ${ch[0][2]}，不是 0o600`)
+  const iCh = calls.findIndex((c) => c[0] === 'chmod')
+  const iRn = calls.findIndex((c) => c[0] === 'rename')
+  must(iCh >= 0 && iRn >= 0 && iCh < iRn, `chmod 不在 rename 之前（chmod@${iCh}, rename@${iRn}）—— 先换 inode 再补权限，中间目标已是 0644`)
+  must(calls.filter((c) => c[0] === 'rename').length === 1, 'rename 次数不是 1')
+
+  // 不传 mode（五处状态写就是这么调的）：一次 chmod 都不许有。
+  // 多一次系统调用是小事，「多一条失败路径」才是事 —— 状态写不该因为权限而失败。
+  calls.length = 0
+  writeJsonAtomic('/x/deps-config.json', { a: 1 }, 0)
+  must(!calls.some((c) => c[0] === 'chmod'), '不传 mode 也调了 chmod —— 五处状态写会跟着多一条失败路径')
+  const w2 = calls.find((c) => c[0] === 'write')
+  must(typeof w2[2] === 'string', '不传 mode 时写入参数不是 "utf8" 字符串了 —— 2a 的调用形态被改了')
+
+  // chmod 失败：必须删 tmp、抛原始错误码、且**不许 rename**。
+  //   静默当成成功正是这个参数要防的事（权限没设对 = 凭证可读，功能却全正常）。
+  calls.length = 0
+  const { writeJsonAtomic: bad } = mk((p, m) => {
+    calls.push(['chmod', p, m])
+    throw Object.assign(new Error('EPERM: chmod denied (simulated)'), { code: 'EPERM' })
+  })
+  let e2 = null
+  try { bad('/x/c.json', { a: 1 }, 2, { mode: 0o600 }) } catch (e) { e2 = e }
+  must(e2 && e2.code === 'EPERM', `chmod 失败被吞了（抛出来的是 ${e2 && e2.code}）—— 权限没设对却当成功`)
+  must(calls.some((c) => c[0] === 'rm'), 'chmod 失败后没删 tmp')
+  must(!calls.some((c) => c[0] === 'rename'), 'chmod 失败后仍然 rename 了 —— 把一个权限不对的文件换上了正式位置')
+  return 'tmp 建时带 0600 / chmod 恰好 1 次且只打 tmp / chmod 在 rename 前 / 不传 mode 零 chmod / chmod 失败删 tmp 并抛原码'
+})
+
+check('C137 四处凭证写入点都改走 writeJsonAtomic 带 mode，没有残留的裸写与「写完再 chmod」（批 2b）', () => {
+  // 数实际出现次数，不认「有一处改了就算过」：漏改一处时那种写法照样绿 ——
+  //   这正是 2a 那轮「五处实现只验了三处」的同型坑，这次换到 0600 上。
+  const files = { 'index.js': read('index.js'), 'lib/cred.mjs': read('lib/cred.mjs'), 'tools/look.mjs': read('tools/look.mjs') }
+  const want = { 'index.js': 1, 'lib/cred.mjs': 1, 'tools/look.mjs': 2 }
+  for (const [name, src] of Object.entries(files)) {
+    const s = stripComments(src)
+    const n = (s.match(/mode:\s*0o600/g) || []).length
+    must(n === want[name], `${name} 里 mode: 0o600 出现 ${n} 次，应为 ${want[name]} —— 少一处就是「改了但没改全」`)
+    // 反向：裸 writeFileSync 写这三个变量，一个都不许留
+    const bare = s.match(/writeFileSync\s*\(\s*(SHARED_CRED|CRED_FILE|LOGIN_KEY_FILE)\b/g) || []
+    must(bare.length === 0, `${name} 里还有裸 writeFileSync(${bare.join(', ')}) —— 那一处没有原子性，进程被杀会留半截`)
+    // 反向：chmodSync(…, 0o600) 回潮 = 有人把「写完再 chmod 目标」加回来了
+    const chmod = s.match(/chmodSync\s*\([^)]*0o600/g) || []
+    must(chmod.length === 0, `${name} 里还有 chmodSync(…, 0o600) —— 那一步在 rename 之后，会多一条 ENOENT 失败路径`)
+  }
+  // 注释里的标记必须在（它是「四处」这件事的唯一可查来源）
+  must(/0600 点/.test(read('lib/config.mjs')), 'lib/config.mjs 里找不到「0600 点」标记 —— 那样「哪四处」又要靠人记，上一版就是这么漏掉 login-key.json 的')
+  return 'index 1 / cred 1 / look 2 处 mode；裸写 0、回潮 chmod 0；标记在'
+})
+
+check('C138 四处写出的字节与旧写法逐字节相同（indent 2、无尾换行、中文不转义）（批 2b）', () => {
+  const cfg = read('lib/config.mjs')
+  const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+    prelude: atomicPrelude(cfg),
+    params: ['writeFileSync', 'chmodSync', 'renameSync', 'rmSync'],
+    args: [writeFileSync, chmodSync, renameSync, rmSync],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c138-'))
+  try {
+    const o = { sessdata: 'a%3Db', bili_jct: '', buvid3: 'x', buvid4: '', mid: '123', note: '扫码登录（插件面板），只用于读取 AI 字幕', updatedAt: '2026-11-02T00:00:00.000Z' }
+    const p = join(dir, 'credential.json')
+    writeJsonAtomic(p, o, 2, { mode: 0o600 })
+    const got = readFileSync(p, 'utf8')
+    // 旧写法：四处都是 `writeFileSync(x, JSON.stringify(obj, null, 2), ...)`，不带尾换行。
+    const want = JSON.stringify(o, null, 2)
+    must(got === want, `字节不一致：旧写法 ${want.length}B、新写法 ${got.length}B`)
+    must(!got.endsWith('\n'), '多了尾换行 —— 旧写法四处都没有')
+    must(got.includes('扫码登录'), '中文被转义 —— 写盘编码不是 utf8')
+    // 紧凑格式（indent 0）也必须还是原来那个：`writeLastRun` / `writeCacheCfg` 用的是它
+    const p2 = join(dir, 'last-run.json')
+    writeJsonAtomic(p2, { a: 1 }, 0)
+    must(readFileSync(p2, 'utf8') === '{"a":1}', `indent 0 的输出变了：${readFileSync(p2, 'utf8')}`)
+    return `${want.length}B 逐字节一致、无尾换行、中文未转义；紧凑格式仍是 {"a":1}`
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip 不假绿）（批 2b）', () => {
+  // 这条是唯一真跑权限的判据，所以 Windows 上必须 skip 而不是「跑一遍说通过」：
+  //   实测 Windows 上 mode/chmod 都是空操作（stat 恒 666），真跑也只能得出结论「666」，
+  //   把它判成 PASS 就是拿一个必然成立的观察冒充判据。
+  if (process.platform === 'win32') {
+    skip('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip 不假绿）', 'win32：mode/chmod 是空操作（实测 stat 恒 666），权限语义只在 POSIX 上存在；参数是否传入由 C136 覆盖')
+    return
+  }
+  const cfg = read('lib/config.mjs')
+  const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+    prelude: atomicPrelude(cfg),
+    params: ['writeFileSync', 'chmodSync', 'renameSync', 'rmSync'],
+    args: [writeFileSync, chmodSync, renameSync, rmSync],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c139-'))
+  try {
+    // 先造一个「权限已经被改宽」的旧文件：rename 换 inode 后，旧文件的 0644 **不该**被继承下来。
+    const p = join(dir, 'credential.json')
+    writeFileSync(p, '{"old":true}', 'utf8')
+    chmodSync(p, 0o644)
+    writeJsonAtomic(p, { new: true }, 2, { mode: 0o600 })
+    const m = statSync(p).mode & 0o777
+    must(m === 0o600, `落盘权限是 ${m.toString(8)}，不是 600 —— 凭证对同机其他用户可读（这一步不会报错，只有权限变了）`)
+    return `旧文件 644 → 原子替换后 600（mode 位 ${m.toString(8)}）`
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C140 login-key.json 的生命周期：能删、删后还能再写，且删除不依赖它自己存在（批 2b）', () => {
+  // DSH 2026-11-02 提的两条生命周期断言：
+  //   ① 登录成功后 login-key.json 被删掉；② 它被删掉之后，chmod 不会因为文件不存在抛错。
+  // ②在实现上已经从根上去掉了（chmod 打在 tmp 上，tmp 刚创建必然存在 —— C136 钉着），
+  //   所以这里验的是「删掉之后整条写入路径仍然走得通」，而不是「chmod 有没有 try 包着」。
+  const cfg = read('lib/config.mjs')
+  const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
+    prelude: atomicPrelude(cfg),
+    params: ['writeFileSync', 'chmodSync', 'renameSync', 'rmSync'],
+    args: [writeFileSync, chmodSync, renameSync, rmSync],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c140-'))
+  try {
+    const p = join(dir, 'login-key.json')
+    const key = { qrcode_key: 'k1', url: 'https://x' }
+    writeJsonAtomic(p, key, 2, { mode: 0o600 })
+    must(existsSync(p), '第一次写就没成功')
+    rmSync(p, { force: true })   // login --poll 成功后就是这么删的
+    must(!existsSync(p), '删除没生效')
+    let e = null
+    try { writeJsonAtomic(p, { qrcode_key: 'k2', url: 'https://y' }, 2, { mode: 0o600 }) } catch (err) { e = err }
+    must(!e, `删除后再写抛了 ${e && e.message} —— 登录信息写不回去（一次登录只能成功一次）`)
+    must(existsSync(p), '重写后文件不在')
+    must(JSON.parse(readFileSync(p, 'utf8')).qrcode_key === 'k2', '重写后内容不是新的')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  // 结构：login --poll 的成功分支必须先写凭证、再删 login-key.json。
+  //   顺序反了的话，删完之后若是写入失败，用户会看到一个「已登录但没有凭证」的中间态。
+  const look = stripComments(read('tools/look.mjs'))
+  const iWrite = look.indexOf('writeJsonAtomic(CRED_FILE')
+  const iDel = look.indexOf('rmSync(LOGIN_KEY_FILE')
+  must(iWrite >= 0, 'tools/look.mjs 里找不到写 CRED_FILE 的调用')
+  must(iDel >= 0, 'tools/look.mjs 里找不到删 LOGIN_KEY_FILE 的调用 —— 登录成功后不清理，二维码 key 会一直留在盘上')
+  must(iWrite < iDel, `写凭证(@${iWrite}) 在删 login-key(@${iDel}) 之后 —— 先删再写，写失败就留下「已登录无凭证」的中间态`)
+  return '写→删 顺序正确；删后重写不抛；重写内容正确'
+})
+
+check('C141 look.mjs 两处凭证写入失败不裸抛：转成 stderr + exitCode=1（批 2b「统一失败处理」的落点）', () => {
+  // 2b 说的「统一失败处理」不是「四处返回值同形」——消费者不同（面板要返回对象、CLI 要退出码），
+  //   注定不同形。能统一的是**都不许裸抛**：裸抛会被顶层兜成一句没有上下文的堆栈，
+  //   用户看不出「是凭证没写进去」。这条逐点钉「调用点在 try 里、catch 里是 stderr + exitCode」。
+  //
+  // 判法用「最近的那个 try / catch」（indexOf 从调用点往后找），不用「全文有没有 try」——
+  //   后者在同一个函数里任何一个 try 都能满足，等于没判（2a 的 C134 是同型判据，已知弱）。
+  // 注意：下面的 `look` 已经过 stripComments，它会**去掉所有空白**（`try {` → `try{`）。
+  //   第一版这里写的是 `'try {'`，于是永远找不到、判据自己红 —— 判据的字面形态必须跟它的输入对齐，
+  //   这跟「枚举名凭记忆写」是同一类错：先求值打印，再写判据。
+  const look = stripComments(read('tools/look.mjs'))
+  const sites = ['writeJsonAtomic(CRED_FILE', 'writeJsonAtomic(LOGIN_KEY_FILE']
+  const detail = []
+  for (const s of sites) {
+    const i = look.indexOf(s)
+    must(i >= 0, `tools/look.mjs 里找不到 ${s} 的调用`)
+    const before = look.slice(0, i)
+    const iTry = before.lastIndexOf('try{')
+    must(iTry >= 0 && i - iTry < 900, `${s} 前面 900 字符内没有 try —— 写失败会裸抛到顶层`)
+    const iCatch = look.indexOf('}catch(e){', i)
+    must(iCatch > i && iCatch - i < 900, `${s} 后面 900 字符内没有 catch —— 抛了没人接`)
+    const catchBody = look.slice(iCatch, iCatch + 320)
+    must(/console\.error\(/.test(catchBody), `${s} 的 catch 里没有 console.error —— 失败对用户不可见`)
+    must(/process\.exitCode=1/.test(catchBody), `${s} 的 catch 里没设 exitCode=1 —— 脚本化调用看到 rc=0 会当成成功`)
+    detail.push(`${s.split('(')[1]}@try${iTry}`)
+  }
+  return `两处都在 try 内、catch 里有 stderr + exitCode=1（${detail.join(' / ')}）`
+})
+
 check('C39 /status 的缓存占用走节流，清理后立刻失效（#11，P1：每 8 秒白扫一遍）', () => {
   const src = read('index.js')
   const mTtl = /const CACHE_STAT_TTL_MS = ([0-9]+) \* 1000/.exec(src)
@@ -1949,9 +2451,9 @@ check('C42 cuesToTxt 带 withTime 时每行 [mm:ss] 前缀（A1：模型要能�
   const cmdTextBlock = src.slice(src.indexOf('async function cmdText('), src.indexOf('async function cmdLocal('))
   must(cmdTextBlock.includes('withTime: true'), 'cmdText 没用带时间码的 cuesToTxt')
   must(cmdTextBlock.includes('noTime'), 'cmdText 没接 --no-time 开关')
-  // KNOWN_FLAGS 加了 no-time
-  const flagsLine = src.match(/const KNOWN_FLAGS = new Set\(\[([^\]]+)\]\)/)
-  must(flagsLine && flagsLine[1].includes("'no-time'"), 'KNOWN_FLAGS 里没有 no-time')
+  // KNOWN_FLAGS 加了 no-time（批 1b 起改真跑：那张表已从 lib/params.mjs 生成，读字面量会验不住）
+  const nt = flagAccepted('no-time')
+  must(nt.ok, `look.mjs 报「未知参数 --no-time」：stderr=${nt.err.slice(0, 160)}`)
   return 'cuesToTxt 真跑：withTime=true 带 [mm:ss] 前缀、withTime=false 不带；cmdSub/cmdText 调用点已接'
 })
 
@@ -1988,9 +2490,10 @@ check('C44 --at 时间解析容错（A3：12:30 / 12:3 都当 12 分 30 秒；ab
   const src = b
   const grabBlock = src.slice(src.indexOf('async function grabFrames('), src.indexOf('async function transcribe('))
   must(grabBlock.includes('parseAtTimes(at'), 'grabFrames 里没调 parseAtTimes')
-  // KNOWN_FLAGS 加了 at
-  const flagsLine = src.match(/const KNOWN_FLAGS = new Set\(\[([^\]]+)\]\)/)
-  must(flagsLine && flagsLine[1].includes("'at'"), 'KNOWN_FLAGS 里没有 at')
+  // KNOWN_FLAGS 加了 at（批 1b 起改真跑；顺带钉住 `--at` 进了 VALUE_OPTS ——
+  //   它原来不在那张表里，`help --at 12:30` 会把 12:30 当成位置参数去 resolveSource）
+  const atOk = flagAccepted('at', '12:30')
+  must(atOk.ok, `look.mjs 报「未知参数 --at」：stderr=${atOk.err.slice(0, 160)}`)
   return 'parseAtTimes 真跑：750/12:30/12:30-13:10 三种格式都对，abc 报错；grabFrames 接了 at，KNOWN_FLAGS 有 at'
 })
 
@@ -2313,49 +2816,44 @@ check('C53 `<命令> --help` 只打帮助、不许执行（P1：clean --help 真
 //   TypeError，转写和抽帧一起坏，报错还在第三方库内部，用户根本定位不到。
 //   Windows 侧 fetch-deps.ps1 早就钉了 av==15.1.0，Linux 侧 fetch-deps.sh 原来只写包名 ——
 //   同一份代码在两条脚本下行为不同，这条守卫盯的就是「两边说的是同一组版本」。
-check('C54 两个安装脚本的 pip 版本约束一致（issue #6 坑 4：av 19 会让 faster-whisper 1.2.1 抛 TypeError）', () => {
-  const shPath = join(ROOT, 'scripts/fetch-deps.sh')
-  if (!existsSync(shPath)) {
-    // 2026-10-31：原来这句写「发布树不含 scripts/fetch-deps.sh（只留开发态）」——是错的。
-    //   发布树有 scripts/ 目录（sync-release 会复制），files 里也列了这两个脚本。
-    //   写错的后果不是这条断言坏，是读代码的人以为「两个发布件没被检查」，
-    //   正好与「检查面必须等于发布面」那条教训相反。
-    skip('C54 两个安装脚本的 pip 版本约束一致', '找不到 scripts/fetch-deps.sh（仓库结构变了？）')
-    return 'ok'
-  }
-  const sh = read('scripts/fetch-deps.sh')
-  const ps = read('scripts/fetch-deps.ps1')
+check('C54 安装脚本的 pip 版本约束齐（issue #6 坑 4：av 19 会让 faster-whisper 1.2.1 抛 TypeError）', () => {
+  // 2026-11-02（fetch-deps 合一）：这条原来叫「**两个**安装脚本的 pip 版本约束一致」。
+  //
+  //   合一之后「一致」不再是一条要守的性质 —— 只有一份代码，不一致在结构上不可能发生。
+  //   这里**没有**把它改写成「比一份自己跟自己一不一致」那种恒真的假判据（那等于删了它却留着编号）。
+  //   改守真正还会出错的两件事：
+  //     ① 四个 pin 还在 —— 漏一个就会装到不兼容版本（av 19 → decode_audio() 抛 TypeError）；
+  //     ② ensureVenv 的**调用行**里没有裸 av / av>=19 把 pin 盖掉。
+  //   顺手把旧判据的松处收紧：原来按 `includes('ensure_venv')` 数行，函数定义行 `ensure_venv() {`
+  //   也算进去了，于是「定义 1 行 + 调用 1 行」就能满足 >=2。现在只数调用行，要求 asr 与 ocr 各一处。
+  const fd = read('scripts/fetch-deps.mjs')
   const pins = ['faster-whisper==1.2.1', 'av==15.1.0', 'ctranslate2==4.8.3', 'rapidocr-onnxruntime==1.2.3']
-  const missSh = pins.filter((p) => !sh.includes(p))
-  const missPs = pins.filter((p) => !ps.includes(p))
-  must(missSh.length === 0, `fetch-deps.sh 缺版本约束：${missSh.join('、')}——不锁 av 会装到 19，decode_audio() 抛 TypeError`)
-  must(missPs.length === 0, `fetch-deps.ps1 缺版本约束：${missPs.join('、')}`)
-  // 光有 av==15.1.0 不够，还得防「另外又写了一处裸 av 或 av>=19」把它们盖掉。
-  //   只看真正会执行的行（含 ensure_venv 的调用行）——注释里本来就要提「av 19 会炸」，
-  //   连注释一起扫会把这条守卫变成报警器。
-  const callLines = sh.split('\n').filter((l) => l.includes('ensure_venv') && !l.trim().startsWith('#'))
-  must(callLines.length >= 2, `fetch-deps.sh 里 ensure_venv 的调用行只找到 ${callLines.length} 行（应有 asr 与 ocr 各一处以上）`)
+  const miss = pins.filter((p) => !fd.includes(p))
+  must(miss.length === 0, `fetch-deps.mjs 缺版本约束：${miss.join('、')}——不锁 av 会装到 19，decode_audio() 抛 TypeError`)
+  // 只看真正会执行的行（注释里本来就要提「av 19 会炸」，连注释一起扫会把这条守卫变成报警器）。
+  const callLines = fd.split('\n')
+    .filter((l) => !l.trim().startsWith('//') && !/^\s*function\s/.test(l) && l.includes('ensureVenv('))
+  must(callLines.length >= 2, `fetch-deps.mjs 里 ensureVenv 的调用行只找到 ${callLines.length} 行（应有 asr 与 ocr 各一处）`)
   for (const l of callLines) {
     const bareAv = /(^|[\s"'])av(["'\s]|$)/.test(l)
     const av19 = /av[><]=?\s*19|av==19/.test(l)
-    must(!bareAv, `fetch-deps.sh 的调用行里有裸 av（没带版本约束）：${l.trim()}`)
-    must(!av19, `fetch-deps.sh 的调用行把 av 放到了 19：${l.trim()}`)
+    must(!bareAv, `fetch-deps.mjs 的调用行里有裸 av（没带版本约束）：${l.trim()}`)
+    must(!av19, `fetch-deps.mjs 的调用行把 av 放到了 19：${l.trim()}`)
   }
-  return 'ok'
+  return `四个 pin 齐；${callLines.length} 条调用行无裸 av / av>=19（「两份一致」已因合一不复存在，改守单份内容）`
 })
 
 // —— issue #6 / #5 的 Linux 修复（2026-10-31）——
-// 本机没有 WSL，Linux 分支只能靠「mock 掉 curl / tar / python3，真跑函数体」来验。
-// 全量 14 个用例 / 39 条断言在 tools/fixtures/fetch-deps-sh.test.sh；
-// 这里只放门禁能承受的几条（每条 1 个子进程），断言落在产物上，不是源码字符串。
+// 本机没有 WSL，Linux 分支只能靠「桩掉 curl / tar / python3，真跑原样函数体」来验。
 //
-// ⚠️ 那个 fixture **不进 verify**：跑一遍要 190 秒（大头是 13 个 mock python 建 venv 的用例），
-//   塞进来会把 34 秒的门禁拖到 4 分钟，没人愿意跑就等于没有门禁。
-//   代价是它会悄悄过期 —— 2026-10-31 深入审查时发现它的用例 3 还在按**旧判据**
-//   （包内 deps「存在」就用包内）断言，判据收紧后一直红着没人知道。
-//   所以：**只要改了 scripts/fetch-deps.sh，手工跑一次**
-//     bash tools/fixtures/fetch-deps-sh.test.sh
-//   它失败时退出码非 0（末尾 `[ "$fail" -eq 0 ]`），别看 `| tail` 的退出码。
+// 2026-11-02（fetch-deps 合一）：这里原来还挂着一个 190 秒的全量夹具
+//   tools/fixtures/fetch-deps-sh.test.sh（14 用例 / 39 断言）。
+//   脚本合成 node 一份后它自动失效，**已删除** —— 留着会让下一个人以为「还有一份全量覆盖」，
+//   而它测的脚本根本不存在了。这就是那条老教训的现场：夹具不进门禁就会悄悄过期。
+//
+//   现在这一层的真跑统一走下面的 fdProbe()：**切源文件的定义段原样跑**，只桩外部能力。
+//   覆盖面比那份 14 用例窄，窄在「不跑真实 curl/tar」，不窄在「不跑被测代码」。窄在哪，
+//   每条判据的返回串里都写明了。
 
 // 找一个能用的 bash（Windows 上是 Git Bash；发布树/用户机器上没有就 SKIP）
 const findBash = () => {
@@ -2387,6 +2885,60 @@ const findPy = () => {
     if (r.status === 0 && /1/.test(r.stdout || '')) return c
   }
   return ''
+}
+
+// ── fetch-deps 探针（2026-11-02，fetch-deps 合一后新增）───────────────────
+//
+//   合一前那批判据靠「假 curl / 假 tar 塞进 PATH 前面」来真跑 shell 脚本。现在被侧对象是 node，
+//   而那两条路全断了：`curlBin()` 在 Windows 返回 `System32\curl.exe` 的**绝对路径**，
+//   `tarBin()` 同理 —— PATH 前置一律无效（老判据在 Linux 上生效、在 Windows 上整条 skip，
+//   所以这个坑一直没暴露）。
+//
+//   做法：把 scripts/fetch-deps.mjs 的**定义段原样切出来**（切到「// ── 主流程」锚点为止），
+//   拼上 tools/fixtures/fetch-deps-probe-tail.txt 里那截「桩掉外部能力」的尾巴，生成可执行探针。
+//
+//   两个要点：
+//     · 切的是**源文件原始字节**，不是手抄。手抄抄错的方式常与被测 bug 同型（同一份逻辑
+//       写两遍、两处错得一样），那样测出来的绿没有信息量。
+//     · 只桩「环境」：网络下载、tar/pip/python 这些外部命令。被测的 if/else、文案、
+//       退出路径一个字都没动 —— 桩 run 返回什么，就走原样代码里对应的那条分支。
+const FD_PROBE_TAIL = readFileSync(join(ROOT, 'tools', 'fixtures', 'fetch-deps-probe-tail.txt'), 'utf8')
+
+/**
+ * 生成一个探针并跑一条模式。
+ * @param {string} mode BW_PROBE_MODE（ffmpeg-html / ffmpeg-list6000 / ffmpeg-version / bootstrap-pip / move-venv / venv-import）
+ * @param {object} env 额外环境变量
+ * @returns {{ r: object, dir: string, out: () => string, kv: (k: string) => string }}
+ */
+const fdProbe = (mode, env = {}) => {
+  const dir = mkdtempSync(join(tmpdir(), 'bw-fdprobe-'))
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  mkdirSync(join(dir, 'lib'), { recursive: true })
+  copyFileSync(join(ROOT, 'lib', 'plugin-paths.mjs'), join(dir, 'lib', 'plugin-paths.mjs'))
+  const src = read('scripts/fetch-deps.mjs')
+  const cut = src.indexOf('// ── 主流程')
+  must(cut > 0, 'fetch-deps.mjs 里找不到「// ── 主流程」锚点 —— 结构变了，探针切不出来（锚点别删，它是这条测试接缝）')
+  const probe = join(dir, 'scripts', 'probe.mjs')
+  writeFileSync(probe, src.slice(0, cut) + '\n' + FD_PROBE_TAIL, 'utf8')
+  // 传 'all' 占住 positional，否则 target 校验会拿模式名当 target 直接 exit 2。
+  const r = spawnSync(process.execPath, [probe, 'all', 'probe'], {
+    env: {
+      ...process.env,
+      BILI_WATCH_DEPS: join(dir, 'deps'),
+      DSH_HOME: join(dir, 'home'),
+      BW_PROBE_MODE: mode,
+      BW_PROBE_DIR: dir,
+      ...env,
+    },
+    encoding: 'utf8', timeout: 180000,
+  })
+  const out = () => `${r.stdout || ''}\n${r.stderr || ''}`
+  // 探针把结果打成 PROBE_KEY=value；取不到返回空串（调用方用它做断言，不要用「有没有这一行」当判据）
+  const kv = (k) => {
+    const m = new RegExp(`^PROBE_${k}=(.*)$`, 'm').exec(r.stdout || '')
+    return m ? m[1].trim() : ''
+  }
+  return { r, dir, out, kv }
 }
 
 // C115（2026-11-01，DSH 18:05 准修 P0 后加）：发布链不许被自己的闸门堵死。
@@ -2660,340 +3212,172 @@ check('C116 viewOf 分P 守卫真跑：NaN/非数字/小数/超界必须抛错�
   }
 })
 
-// C55（2026-10-31，issue #6 坑 1）：脚本的 deps 目录必须与运行时同一套三级解析。
+/// C55（2026-10-31，issue #6 坑 1）：脚本的 deps 目录必须与运行时同一套三级解析。
 //   原来写死 DEPS="$ROOT/deps"，而插件启动过一次后运行时读的是包外 —— 脚本把 yt-dlp
-//   下到包内，面板永远「不可用」。用无效 target（会走 case 的 * 分支 exit 2）来验，
-//   这样一次网络请求都不发，只看它选了哪个目录、mkdir 了哪个目录。
-check('C55 fetch-deps.sh 的 deps 目录三级解析，与运行时同一套（issue #6 坑 1）', () => {
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  if (!existsSync(shPath)) {
-    skip('C55 fetch-deps.sh 的 deps 目录三级解析', '找不到 scripts/fetch-deps.sh（仓库结构变了？）')
-    return 'ok'
+//   下到包内，面板永远「不可用」。
+//
+//   2026-11-02（fetch-deps 合一）：这条原来真跑 fetch-deps.sh（没有 bash 就 skip，本机 Windows
+//   上就一直是 skip）。合成 node 一份后被测对象就是 node，**skip 出口删掉**；「两个文件各验一遍」
+//   的那半段（ps1）随文件消失。验法也换了个更直接的入口：用 `where`——它只回答「装到哪」，
+//   不下载、不建目录，正好把三级解析这件事单独拎出来看，一次网络请求都不发。
+check('C55 fetch-deps 的 deps 目录三级解析，与运行时同一套（issue #6 坑 1）', () => {
+  const fdSrc = join(ROOT, 'scripts', 'fetch-deps.mjs')
+  const libSrc = join(ROOT, 'lib', 'plugin-paths.mjs')
+  // 造一个「插件包」骨架（scripts/ + lib/），因为「包内 deps 已有内容」那条分支只能靠
+  //   插件根目录下的 deps 触发 —— 直接在仓库根造 deps 就是污染生产目录，判据不许这么干。
+  const mkPkg = (dir) => {
+    mkdirSync(join(dir, 'scripts'), { recursive: true })
+    mkdirSync(join(dir, 'lib'), { recursive: true })
+    copyFileSync(fdSrc, join(dir, 'scripts', 'fetch-deps.mjs'))
+    copyFileSync(libSrc, join(dir, 'lib', 'plugin-paths.mjs'))
+    return join(dir, 'scripts', 'fetch-deps.mjs')
   }
-  const bash = findBash()
-  if (!bash) {
-    skip('C55 fetch-deps.sh 的 deps 目录三级解析', '本机没有可用的 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
+  // 默认把 BILI_WATCH_DEPS 清空：本机环境变量若指到真 deps，下面每条分支都会走同一个出口，
+  //   分支之间的差异就全被盖掉了（那是「夹具没生效但恰好绿」的一种）。
+  const runFd = (script, args, env) => spawnSync(process.execPath, [script, ...args], {
+    env: { ...process.env, BILI_WATCH_DEPS: '', ...env },
+    encoding: 'utf8', timeout: 60000,
+  })
+  const norm = (s) => String(s).trim().replace(/\\/g, '/')
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c55-'))
   try {
+    // ① 包外已存在 → 用包外，且 where 的输出就是那条路径（stdout 只放路径）
     const pkg = join(tmp, 'pkg')
+    const script = mkPkg(pkg)
     const home = join(tmp, 'home')
-    mkdirSync(join(pkg, 'scripts'), { recursive: true })
-    copyFileSync(shPath, join(pkg, 'scripts', 'fetch-deps.sh'))
-    const sh = join(pkg, 'scripts', 'fetch-deps.sh')
-    const run = (extra) => spawnSync(bash, [sh, 'badtarget'], {
-      env: { ...process.env, DSH_HOME: home, ...extra },
-      encoding: 'utf8', timeout: 60000,
-    })
-    // ① 包外存在 → 用包外
     mkdirSync(join(home, 'bili-watch', 'deps'), { recursive: true })
-    const a = run({})
+    const a = runFd(script, ['where'], { DSH_HOME: home })
+    must(a.status === 0, `where 没正常退出（rc=${a.status}）：${(a.stderr || '').slice(0, 200)}`)
     must(/来源：包外/.test(a.stderr), `包外 deps 已存在时没选包外：${(a.stderr || '').slice(0, 200)}`)
+    must(norm(a.stdout) === norm(join(home, 'bili-watch', 'deps')),
+      `where 打印的路径不对（stdout 必须只有路径、不带提示行）：期望 ${join(home, 'bili-watch', 'deps')}，实际 ${JSON.stringify(a.stdout)}`)
     // ② BILI_WATCH_DEPS 优先
     const explicit = join(tmp, 'explicit')
-    const b = run({ BILI_WATCH_DEPS: explicit })
+    const b = runFd(script, ['where'], { DSH_HOME: home, BILI_WATCH_DEPS: explicit })
     must(/来源：BILI_WATCH_DEPS/.test(b.stderr), `BILI_WATCH_DEPS 没生效：${(b.stderr || '').slice(0, 200)}`)
-    must(existsSync(explicit), 'BILI_WATCH_DEPS 指向的目录没被创建——说明脚本没往那儿装')
+    must(norm(b.stdout) === norm(explicit), `BILI_WATCH_DEPS 指向 ${explicit}，where 却打印 ${JSON.stringify(b.stdout)}`)
     // ③ 包外不存在、包内**已有内容** → 仍用包内（运行时 index.js:185 的例外）
-    const tmp2 = mkdtempSync(join(tmpdir(), 'bw-c55b-'))
-    try {
-      mkdirSync(join(tmp2, 'pkg', 'scripts'), { recursive: true })
-      mkdirSync(join(tmp2, 'pkg', 'deps'), { recursive: true })
-      // 必须真放一个文件：这条分支判的是「有内容」不是「存在」。
-      //   原来这里只建空目录，靠旧代码「只判存在」蒙过去——判据一收紧就露馅了。
-      writeFileSync(join(tmp2, 'pkg', 'deps', 'yt-dlp'), 'x')
-      copyFileSync(shPath, join(tmp2, 'pkg', 'scripts', 'fetch-deps.sh'))
-      const c = spawnSync(bash, [join(tmp2, 'pkg', 'scripts', 'fetch-deps.sh'), 'badtarget'], {
-        env: { ...process.env, DSH_HOME: join(tmp2, 'home') },
-        encoding: 'utf8', timeout: 60000,
-      })
-      must(/来源：包内/.test(c.stderr), `包内已有 deps、包外没有时没选包内：${(c.stderr || '').slice(0, 200)}`)
-      must(!existsSync(join(tmp2, 'home', 'bili-watch', 'deps')), '包内已有 deps 时不该再建包外空目录（会让人以为装到别处了）')
-    } finally { rmSync(tmp2, { recursive: true, force: true }) }
+    const pkg2 = join(tmp, 'pkg2')
+    const script2 = mkPkg(pkg2)
+    mkdirSync(join(pkg2, 'deps'), { recursive: true })
+    // 必须真放一个文件：这条分支判的是「有内容」不是「存在」。
+    writeFileSync(join(pkg2, 'deps', 'yt-dlp'), 'x')
+    const c = runFd(script2, ['where'], { DSH_HOME: join(tmp, 'h2') })
+    must(/来源：包内/.test(c.stderr), `包内已有 deps、包外没有时没选包内：${(c.stderr || '').slice(0, 200)}`)
     // ③b 包内 deps 存在但**是空的** → 必须用包外。
     //   这是复核时抓出来的真 bug：.ps1 用 Test-Path 判「存在」，index.js:185 用
     //   readdirSync().length > 0 判「有内容」。只跟 .ps1 对齐的话，包内空目录会让脚本
     //   装进包内、运行时读包外 —— 坑 1 原样复发，而且更难发现（目录是「对的那个名字」）。
-    const tmp4 = mkdtempSync(join(tmpdir(), 'bw-c55d-'))
-    try {
-      mkdirSync(join(tmp4, 'pkg', 'scripts'), { recursive: true })
-      mkdirSync(join(tmp4, 'pkg', 'deps'), { recursive: true }) // 空目录，里面什么都没有
-      copyFileSync(shPath, join(tmp4, 'pkg', 'scripts', 'fetch-deps.sh'))
-      const e = spawnSync(bash, [join(tmp4, 'pkg', 'scripts', 'fetch-deps.sh'), 'badtarget'], {
-        env: { ...process.env, DSH_HOME: join(tmp4, 'home') },
-        encoding: 'utf8', timeout: 60000,
-      })
-      must(/来源：包外/.test(e.stderr), `包内 deps 是空目录时应该用包外（index.js:185 判的是「有内容」不是「存在」）：${(e.stderr || '').slice(0, 200)}`)
-      must(existsSync(join(tmp4, 'home', 'bili-watch', 'deps')), '包内空目录时没建包外 deps 目录')
-    } finally { rmSync(tmp4, { recursive: true, force: true }) }
+    const pkg3 = join(tmp, 'pkg3')
+    const script3 = mkPkg(pkg3)
+    mkdirSync(join(pkg3, 'deps'), { recursive: true }) // 空目录，里面什么都没有
+    const e = runFd(script3, ['where'], { DSH_HOME: join(tmp, 'h3') })
+    must(/来源：包外/.test(e.stderr),
+      `包内 deps 是空目录时应该用包外（index.js:185 判的是「有内容」不是「存在」）：${(e.stderr || '').slice(0, 200)}`)
     // ④ 包外和包内都没有 → 用包外（不往包里写）
-    const tmp3 = mkdtempSync(join(tmpdir(), 'bw-c55c-'))
-    try {
-      mkdirSync(join(tmp3, 'pkg', 'scripts'), { recursive: true })
-      copyFileSync(shPath, join(tmp3, 'pkg', 'scripts', 'fetch-deps.sh'))
-      const d = spawnSync(bash, [join(tmp3, 'pkg', 'scripts', 'fetch-deps.sh'), 'badtarget'], {
-        env: { ...process.env, DSH_HOME: join(tmp3, 'home') },
-        encoding: 'utf8', timeout: 60000,
-      })
-      must(/来源：包外/.test(d.stderr), `干净安装时没选包外：${(d.stderr || '').slice(0, 200)}`)
-      must(existsSync(join(tmp3, 'home', 'bili-watch', 'deps')), '干净安装时没建包外 deps 目录')
-      must(!existsSync(join(tmp3, 'pkg', 'deps')), '干净安装时不该往插件包目录里建 deps')
-    } finally { rmSync(tmp3, { recursive: true, force: true }) }
-    // ③c Windows 侧同一个坑：fetch-deps.ps1 原来也用 Test-Path 判「存在」，
-    //   而 index.js:185 判「有内容」。只修 .sh 就是「只修了一半」——
-    //   同一段逻辑在两个文件里各一份，改一份等于制造不一致。
-    let ps1Note = ''
-    const ps1 = join(ROOT, 'scripts', 'fetch-deps.ps1')
-    const pwsh = findPowerShell()
-    if (existsSync(ps1) && pwsh) {
-      const tmp5 = mkdtempSync(join(tmpdir(), 'bw-c55e-'))
-      try {
-        mkdirSync(join(tmp5, 'pkg', 'scripts'), { recursive: true })
-        mkdirSync(join(tmp5, 'pkg', 'deps'), { recursive: true }) // 空目录
-        copyFileSync(ps1, join(tmp5, 'pkg', 'scripts', 'fetch-deps.ps1'))
-        const r = spawnSync(pwsh, [
-          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(tmp5, 'pkg', 'scripts', 'fetch-deps.ps1'),
-          '-Target', 'all', '-DryRun', '-Gpu', 'no',
-        ], {
-          env: { ...process.env, DSH_HOME: join(tmp5, 'home'), BILI_WATCH_DEPS: '' },
-          encoding: 'utf8', timeout: 180000,
-        })
-        const out = (r.stdout || '') + (r.stderr || '')
-        must(/来源：包外（\$DSH_HOME\\bili-watch\\deps，新建）/.test(out),
-          `.ps1 在包内 deps 是空目录时没选包外（与 index.js:185 分叉）：${out.slice(0, 400)}`)
-        ps1Note = '；ps1 同款分支已真跑'
-      } finally { rmSync(tmp5, { recursive: true, force: true }) }
-    } else {
-      ps1Note = '；ps1 侧未验（本机没有 PowerShell）'
-    }
-    // ⑤ where：只回答「装到哪」，且**不建目录**。
-    //   为什么要它：README 的 Linux GPU 段要按脚本自己解析的路径去找 .venv-asr/bin/pip，
-    //   而 deps 可能在 $DSH_HOME / BILI_WATCH_DEPS 两处。之前只能让用户跑一次 all
-    //   （顺带下 40 MB ffmpeg + 两个 venv + 464 MB 模型）就为了看一行路径。
+    const pkg4 = join(tmp, 'pkg4')
+    const script4 = mkPkg(pkg4)
+    const d = runFd(script4, ['where'], { DSH_HOME: join(tmp, 'h4') })
+    must(/来源：包外/.test(d.stderr), `干净安装时没选包外：${(d.stderr || '').slice(0, 200)}`)
+    must(!existsSync(join(pkg4, 'deps')), '干净安装时不该往插件包目录里建 deps')
+    // ⑤ where 不许建目录。
     //   不建目录是硬要求：顺手建一个空的包外目录，会让「包内 deps 已有内容」的机器
     //   下次改用那个空目录（第 41 行判的是「存在」），等于把已有 venv 和模型丢掉。
-    const tmp6 = mkdtempSync(join(tmpdir(), 'bw-c55f-'))
-    try {
-      mkdirSync(join(tmp6, 'pkg', 'scripts'), { recursive: true })
-      copyFileSync(shPath, join(tmp6, 'pkg', 'scripts', 'fetch-deps.sh'))
-      const home6 = join(tmp6, 'home')
-      const w = spawnSync(bash, [join(tmp6, 'pkg', 'scripts', 'fetch-deps.sh'), 'where'], {
-        env: { ...process.env, DSH_HOME: home6, BILI_WATCH_DEPS: '' },
-        encoding: 'utf8', timeout: 60000,
-      })
-      must(w.status === 0, `where 没正常退出（rc=${w.status}）：${(w.stderr || '').slice(0, 200)}`)
-      const want = join(home6, 'bili-watch', 'deps')
-      // 本机是 Git Bash：DSH_HOME 传进去是 Windows 路径（C:\...），脚本直接拼 /bili-watch/deps
-      //   就成了混合分隔符。真 Linux 上不会有这问题，比较前统一成 / 即可。
-      const norm = (s) => s.replace(/\\/g, '/')
-      must(norm(w.stdout.trim()) === norm(want),
-        `where 打印的路径不对（stdout 必须只有路径、不带提示行）：期望 ${want}，实际 ${JSON.stringify(w.stdout.trim())}`)
-      must(/来源：包外/.test(w.stderr), 'where 的路径来源提示没走 stderr（会污染 $(...) 捕获）')
-      must(!existsSync(want), 'where 不该创建 deps 目录（会让「包内已有内容」的机器改用空目录）')
-    } finally { rmSync(tmp6, { recursive: true, force: true }) }
-    return '包外 / BILI_WATCH_DEPS / 包内例外 / 包内空目录 / 干净安装 / where 六条分支都按运行时（index.js:178-189）的口径' + ps1Note
+    must(!existsSync(join(tmp, 'h4', 'bili-watch', 'deps')),
+      'where 不该创建 deps 目录（会让「包内已有内容」的机器改用空目录）')
+    // ⑥ 真跑（非 DRY）确实在**选中的那个目录**上建。
+    //   原来 ②③④ 各验一次「目录被创建」—— 那三处验的是同一个 mkdirSync，合并成一次不损抓错力。
+    //   用 --python 指一个不存在的解释器：mkdir 在第 141 行（早于一切），随后立刻失败退出，
+    //   零网络、零下载。
+    const pkg5 = join(tmp, 'pkg5')
+    const script5 = mkPkg(pkg5)
+    const deps5 = join(tmp, 'deps5')
+    const f = runFd(script5, ['asr', '--python', join(tmp, 'no-such-python')],
+      { BILI_WATCH_DEPS: deps5, DSH_HOME: join(tmp, 'h5') })
+    must(f.status === 1, `--python 指不存在的解释器时 asr 应 rc=1（别默默成功）：rc=${f.status} ${(f.stderr || '').slice(0, 300)}`)
+    must(/指定的 Python 不存在/.test(f.stderr || ''), `没说清为什么失败：${(f.stderr || '').slice(0, 300)}`)
+    must(existsSync(deps5), '真跑时没在选中的 deps 目录上建目录（BILI_WATCH_DEPS 指哪儿就该建哪儿）')
+    return 'where 六条分支（包外已存在 / BILI_WATCH_DEPS / 包内例外 / 包内空目录 / 干净安装 / where 不建目录）都按运行时口径；真跑一次证明 mkdir 落在选中目录上'
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 // C56（2026-10-31，issue #6 坑 2）：ffmpeg 要真下载，且解压前必须 tar -t 预校验。
 //   镜像给 HTML 错误页时 curl 可能照样 exit 0，直接解压会得到一堆垃圾或半截目录。
 //   这里用假 curl 喂一段 HTML，断言：拦住 + 把拿到的内容打出来 + 不落坏文件。
-check('C56 fetch-deps.sh 的 ffmpeg 下载有 tar -t 预校验，HTML 错误页会被拦住（issue #6 坑 2）', () => {
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  if (!existsSync(shPath)) {
-    skip('C56 ffmpeg 下载的 tar -t 预校验', '找不到 scripts/fetch-deps.sh（仓库结构变了？）')
-    return 'ok'
-  }
-  const bash = findBash()
-  if (!bash) {
-    skip('C56 ffmpeg 下载的 tar -t 预校验', '本机没有可用的 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
+// C56（2026-10-31，issue #6 坑 2；2026-11-02 合一后改走探针）：ffmpeg 要真下载，
+//   且解压前必须 tar -t 预校验。镜像给 HTML 错误页时 curl 可能照样 exit 0，
+//   直接解压会得到一堆垃圾或半截目录。
+//   断言：拦住 + 把拿到的内容打出来 + 不落坏文件。
+check('C56 ffmpeg 下载有 tar -t 预校验，HTML 错误页会被拦住（issue #6 坑 2）', () => {
+  // ① 前提真跑一次：真 tar 确实会拒绝一段 HTML。
+  //   这是整条预校验成立的基础，不能靠「源码里有 tar -t」推断 —— 工具换了、参数写错了，
+  //   结构断言照样绿。拒不了就红，别 skip（这台机器上 tar 不存在本身就该修）。
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c56-'))
   try {
-    mkdirSync(join(tmp, 'pkg', 'scripts'), { recursive: true })
-    mkdirSync(join(tmp, 'home', 'bili-watch', 'deps'), { recursive: true })
-    mkdirSync(join(tmp, 'bin'), { recursive: true })
-    copyFileSync(shPath, join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'))
-    // 假 curl：往 -o 目标写一段 HTML，然后 exit 0（这正是镜像错误页的样子）
-    const fakeCurl = join(tmp, 'bin', 'curl')
-    writeFileSync(fakeCurl, [
-      '#!/bin/sh',
-      'out=""; prev=""',
-      'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done',
-      `printf '<!DOCTYPE html><html><body>404 Not Found</body></html>' > "$out"`,
-      'exit 0',
-      '',
-    ].join('\n'))
-    // 同时 mock tar：本机 Git Bash 的 tar 调不到 xz，会走「缺 xz 解压器」那条分支，
-    //   测不到「HTML 被当成压缩包」这个真场景。假 tar 只认 xz 魔数，其余一律拒绝（与真 tar 同行为）。
-    const fakeTar = join(tmp, 'bin', 'tar')
-    writeFileSync(fakeTar, [
-      '#!/bin/sh',
-      'mode=""; f=""; dest=""',
-      'while [ $# -gt 0 ]; do',
-      '  case "$1" in',
-      '    -tJf) mode=t; f="$2"; shift 2 ;;',
-      '    -xJf) mode=x; f="$2"; shift 2 ;;',
-      '    -C) dest="$2"; shift 2 ;;',
-      '    *) shift ;;',
-      '  esac',
-      'done',
-      'magic=$(head -c 6 "$f" 2>/dev/null | od -An -tx1 | tr -d " \\n")',
-      'case "$magic" in',
-      '  fd377a585a00*) ;;',
-      '  *) echo "tar: This does not look like a tar archive" >&2; exit 2 ;;',
-      'esac',
-      'if [ "$mode" = "t" ]; then echo "ffmpeg-x-static/ffmpeg"; echo "ffmpeg-x-static/ffprobe"; exit 0; fi',
-      'exit 0',
-      '',
-    ].join('\n'))
-    spawnSync('chmod', ['+x', fakeCurl], { timeout: 15000 })
-    spawnSync('chmod', ['+x', fakeTar], { timeout: 15000 })
-    const r = spawnSync(bash, [join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'), 'ffmpeg'], {
-      // PATH 里必须用正斜杠：Windows 的 C://...//bin 带冒号，Git Bash 会把它当路径分隔符切碎
-      env: { ...process.env, DSH_HOME: join(tmp, 'home'), PATH: join(tmp, 'bin').replace(/\\/g, '/') + ':' + (process.env.PATH || '') },
-      encoding: 'utf8', timeout: 120000,
-    })
-    const err = r.stderr || ''
-    must(/不是有效的 \.tar\.xz/.test(err), `HTML 错误页没被拦住：${err.slice(0, 300)}`)
-    must(/DOCTYPE html/.test(err), `没把拿到的内容打出来（只说「下载失败」没法排障）：${err.slice(0, 300)}`)
-    must(!existsSync(join(tmp, 'home', 'bili-watch', 'deps', 'ffmpeg')), 'HTML 被当成压缩包解出了 ffmpeg——预校验失效')
-    return 'HTML 错误页被 tar -t 拦住，前 200 字节已打印，没落坏文件'
+    const html = join(tmp, 'x.tar.xz')
+    writeFileSync(html, '<!DOCTYPE html><html><body>404 Not Found</body></html>')
+    const tar = process.platform === 'win32'
+      ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+      : 'tar'
+    must(existsSync(tar) || process.platform !== 'win32', `本机没有 ${tar} —— fetch-deps 的 tarBin() 也会抛，先修环境`)
+    const t = spawnSync(tar, ['-tJf', html], { encoding: 'utf8', timeout: 30000 })
+    must(t.status !== 0,
+      `真 tar 竟然把 HTML 当归档接受了（rc=${t.status}）—— 预校验的前提不成立，先查这个 tar 是什么`)
   } finally { rmSync(tmp, { recursive: true, force: true }) }
+
+  // ② 原样分支：探针桩掉 download（写 HTML）与 tar（拒绝），真跑 ensureFfmpegLinux
+  const p = fdProbe('ffmpeg-html')
+  try {
+    const out = p.out()
+    must(/^PROBE_RESULT=throw:/m.test(out), `HTML 错误页没被拦住（应当抛错退出）：${out.slice(0, 400)}`)
+    must(/不是有效的 \.tar\.xz/.test(out), `没说清「下载到的不是有效归档」：${out.slice(0, 400)}`)
+    must(/DOCTYPE html/.test(out), `没把拿到的内容打出来（只说「下载失败」没法排障）：${out.slice(0, 400)}`)
+    must(!existsSync(join(p.dir, 'ffmpeg')), 'HTML 被当成压缩包解出了 ffmpeg —— 预校验失效')
+    return '真 tar 拒绝 HTML（前提校准过）；原样分支抛错 + 点名「不是有效的 .tar.xz」+ 打出前 200 字节 + 没落 exe'
+  } finally { rmSync(p.dir, { recursive: true, force: true }) }
 })
 
 // C57（2026-10-31，issue #6 坑 3）：venv 不依赖 ensurepip。
 //   Ubuntu 26.04 的 python3.14 没带 ensurepip，`python3 -m venv` 直接失败；脚本要能
 //   降级到 --without-pip + get-pip.py，且引导失败时**不留半成品 venv**、直接说清该装什么。
 //   这里真跑 bootstrap_pip：给一个总是失败的 python，curl 也失败，断言报错内容。
+// C57（2026-10-31，issue #6 坑 3）：venv 不依赖 ensurepip。
+//   Ubuntu 26.04 的 python3.14 没带 ensurepip，`python3 -m venv` 直接失败；要能
+//   降级到 get-pip.py，且引导失败时**不留半成品 venv**、直接说清该装什么。
+//
+//   2026-11-02（合一）：原来靠 bash `eval "$(sed -n '/^bootstrap_pip()/,/^}/p' ...)"` 抠函数体跑。
+//   现在改走探针（原样定义段 + 桩掉网络），两段都比原来更真：
+//     ① bootstrapPip 在「没 pip、没 ensurepip、get-pip.py 也取不到」时返回 false 并指路；
+//     ② moveSemiVenv 必须**真把目录改名**——不是只在屏幕上说一句「已删除半成品」。
 check('C57 venv 引导不依赖 ensurepip，取不到 get-pip 时说清该装什么（issue #6 坑 3）', () => {
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  if (!existsSync(shPath)) {
-    skip('C57 venv 引导不依赖 ensurepip', '找不到 scripts/fetch-deps.sh（仓库结构变了？）')
-    return 'ok'
-  }
-  const sh = read('scripts/fetch-deps.sh')
-  must(/--without-pip/.test(sh), 'ensure_venv 没有 --without-pip 降级路径')
-  must(/get-pip\.py/.test(sh), '没有 get-pip.py 引导')
-  const bash = findBash()
-  if (!bash) {
-    skip('C57 venv 引导不依赖 ensurepip', '本机没有可用的 bash（静态部分已过；Windows 上要装 Git Bash，装好后真跑部分也会跑）')
-    return 'ok'
-  }
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c57-'))
+  const fd = read('scripts/fetch-deps.mjs')
+  // 结构上先钉住降级路径还在（真跑能覆盖文案，覆盖不了「这条路有没有被整段删掉」）
+  must(/ensurepip/.test(fd), 'bootstrapPip 里没了 ensurepip 那一步')
+  must(/get-pip\.py/.test(fd), '没有 get-pip.py 引导')
+
+  // ① 取不到 get-pip.py：文案必须指到「手工装什么」，至少四个平台各一句
+  const p1 = fdProbe('bootstrap-pip')
   try {
-    const script = [
-      'set -uo pipefail',
-      `DEPS="${tmp.replace(/\\/g, '/')}"`,
-      'PY_INDEX=https://pypi.org/simple',
-      `eval "$(sed -n '/^bootstrap_pip()/,/^}/p' "${shPath.replace(/\\/g, '/')}")"`,
-      'curl() { return 22; }', // 模拟离线/被墙，get-pip.py 取不到
-      'FALSE_BIN="$(command -v false)"',
-      'if bootstrap_pip "$FALSE_BIN"; then echo "RC=0"; else echo "RC=1"; fi',
-      '',
-    ].join('\n')
-    const r = spawnSync(bash, ['-c', script], { encoding: 'utf8', timeout: 60000 })
-    const out = (r.stdout || '') + (r.stderr || '')
-    must(/RC=1/.test(r.stdout || ''), `bootstrap_pip 在没有 pip 也没有 get-pip 时应该失败：${out.slice(0, 300)}`)
+    const out = p1.out()
+    must(p1.kv('RESULT') === 'false',
+      `bootstrapPip 应当返回 false（装不上就别说装上了），实际 ${JSON.stringify(p1.kv('RESULT'))}：${out.slice(0, 300)}`)
     must(/取不到 get-pip\.py/.test(out), `没报「取不到 get-pip.py」：${out.slice(0, 300)}`)
-    must(/apt install python3-pip/.test(out), `没告诉用户该手工装什么（Debian/Ubuntu 是 apt install python3-pip）：${out.slice(0, 300)}`)
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+    must(/apt install python3-pip/.test(out), `没告诉用户 Debian/Ubuntu 该装什么：${out.slice(0, 300)}`)
+    must(/dnf install python3-pip/.test(out), `没告诉用户 Fedora/RHEL 该装什么：${out.slice(0, 300)}`)
+  } finally { rmSync(p1.dir, { recursive: true, force: true }) }
 
-  // —— 第二个真跑：ensure_venv 删半成品（2026-11-01，DSH 00:44 P1-2）——
-  //
-  //   上面那段只 eval 了 bootstrap_pip。而「已删除半成品」这两句在 **ensure_venv** 里
-  //   （scripts/fetch-deps.sh:303 / :309）—— 原来这里有一条断言拿 bootstrap_pip 的输出去验它，
-  //   并且写成 `/已删除半成品/.test(out) || /已删除半成品/.test(sh)`：右半边永远成立（脚本源码里
-  //   当然有这句话），于是**这条断言从来没有红过，也永远不可能红**。
-  //   这不是「判据不够真」，是**判据在验错的对象**——本批抓到的最典型的纸老虎。
-  //
-  //   现在真跑一次 ensure_venv：假 python3 只会建目录（建出来的 bin/python 是个永远 exit 1 的
-  //   假解释器），于是它必然走「venv 建好了但装不上 pip」那条路。验两件事：
-  //     ① 输出里有「已删除半成品」
-  //     ② 那个半成品目录**真的被删了**（这才是 DSH 说的「真跑删一次」，光有文案不算）
-  // 先确认这台机器的 python3 是**真解释器**（2026-11-01，DSH 01:09 派的第二条）。
-  //   Windows 的 App Execution Alias 会在 PATH 里放一个 python3 桩：能执行、打一行
-  //   「Python was not found; run without arguments to install from the Microsoft Store」、
-  //   **退出码 0**、什么都不做。任何「python3 存在就真跑」的断言都会在它身上翻车，
-  //   而且看起来像代码坏了。判据用 `-c "print(1)"` 的输出，**不能用退出码**（桩的退出码也是 0）。
-  const pyProbe = spawnSync('python3', ['-c', 'print(1)'], { encoding: 'utf8', timeout: 15000 })
-  if (String(pyProbe.stdout || '').trim() !== '1') {
-    const ver = spawnSync('python3', ['--version'], { encoding: 'utf8', timeout: 15000 })
-    const verText = (String(ver.stdout || '') + String(ver.stderr || '')).trim()
-    skip('C57 venv 引导不依赖 ensurepip',
-      `本机 python3 不是真解释器（--version: ${verText.slice(0, 90) || '无输出'}），ensure_venv 那段真跑跳过`)
-    return 'ok'
-  }
-
-  const tmp2 = mkdtempSync(join(tmpdir(), 'bw-c57b-'))
+  // ② 半成品 venv 必须真的被改名留档，且内容不丢。
+  //   2026-11-01 DSH 00:44 P1-2 抓过的形态是：断言拿 bootstrap_pip 的输出去验
+  //   「已删除半成品」，右半边还 `|| /已删除半成品/.test(sh)` —— 源码里当然有这句话，
+  //   于是那条断言从来没红过。这里改成验**文件系统状态**，不看文案也红得起来。
+  const p2 = fdProbe('move-venv')
   try {
-    const slash = (p) => p.replace(/\\/g, '/')
-    const deps2 = join(tmp2, 'deps')
-    mkdirSync(deps2, { recursive: true })
-    const venvDir = join(deps2, '.venv-fake')
-    const script2 = [
-      'set -uo pipefail',
-      `DEPS="${slash(deps2)}"`,
-      'PY_INDEX=https://pypi.org/simple',
-      // 假 python3 用 **shell 函数**，不用可执行文件（2026-11-01 实测）：
-      //   在 Git Bash / MSYS 里，一个没有 .exe 后缀、也没有执行位的脚本，`command -v` 能找到，
-      //   但**执行时会失败**——于是 ensure_venv 悄悄用回了系统的真 python3，
-      //   而我上一版还以为是「假 python3 生效」。自检把这件事揭出来了：
-      //   那一版走的是「pip install numpy 联网失败 → 删半成品」这条偶然路径，
-      //   两条断言碰巧都满足 —— 假绿。
-      //   shell 函数没有执行位问题，且**优先级高于 PATH 里的外部命令**，这是最稳的覆盖方式。
-      'python3() {',
-      '  if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then',
-      '    shift 2',
-      '    d=""',
-      '    for a in "$@"; do d="$a"; done',
-      '    [ -n "$d" ] || return 1',
-      '    mkdir -p "$d/bin"',
-      '    printf "#!/bin/sh\\nexit 1\\n" > "$d/bin/python"',
-      '    return 0',
-      '  fi',
-      '  return 1',
-      '}',
-      `eval "$(sed -n '/^bootstrap_pip()/,/^}/p' "${slash(shPath)}")"`,
-      `eval "$(sed -n '/^ensure_venv()/,/^}/p' "${slash(shPath)}")"`,
-      // 取不到 get-pip → bootstrap_pip 必失败 → 走删半成品那条路。
-      // 打一个标记：**走对分支一定会调 curl**。上一版因为假 python3 没生效、venv 里自带 pip，
-      // bootstrap_pip 第一句就返回 0、根本没走到 curl，改去联网 pip install（失败后碰巧删了目录），
-      // 两条断言都满足 —— 假绿。这条标记把「走的是哪条路」也钉住了。
-      'curl() { echo "CURL_CALLED" >&2; return 22; }',
-      // 自检（2026-11-01，DSH 01:09）：假 python3 必须真的被执行到。
-      //   这台机器的 PATH 前置在个别 shell / 文件系统下可能不生效，这时 ensure_venv 会去用**系统**
-      //   的 python3 —— 而 Windows 的 App Execution Alias 会在 PATH 里放一个桩：能执行、打一行
-      //   「Python was not found…install from the Microsoft Store」、**退出码 0**、什么都不做。
-      //   桩「建 venv 成功」但不建任何东西，于是后面的「半成品目录应该被删掉」必红——
-      //   看起来像代码坏了，其实是环境不具备。自检不过一律 skip，不记 FAIL。
-      'PROBE="$DEPS/.stub-probe"',
-      // 自检只认「假 python3 有没有把 venv 目录建出来」，**不要求 $PROBE/bin/python 可执行**——
-      //   那个假解释器本来就是个 exit 1 的壳，能不能执行不影响本用例（我们就是要它装不上 pip）。
-      'if python3 -m venv "$PROBE" >/dev/null 2>&1 && [ -d "$PROBE/bin" ]; then echo "STUB_OK=yes"; else echo "STUB_OK=no"; fi',
-      'rm -rf "$PROBE"',
-      `ensure_venv "${slash(venvDir)}" numpy || true`,
-      `[ -e "${slash(venvDir)}" ] && echo "HALF_DIR=yes" || echo "HALF_DIR=no"`,
-      '',
-    ].join('\n')
-    const r2 = spawnSync(bash, ['-c', script2], { encoding: 'utf8', timeout: 60000 })
-    const out2 = (r2.stdout || '') + (r2.stderr || '')
-    if (!/STUB_OK=yes/.test(r2.stdout || '')) {
-      // 假 python3 没被用上 —— 环境问题，不是代码问题。如实跳过，不制造假红。
-      const ver = spawnSync('python3', ['--version'], { encoding: 'utf8', timeout: 15000 })
-      const verText = (String(ver.stdout || '') + String(ver.stderr || '')).trim()
-      skip('C57 venv 引导不依赖 ensurepip',
-        `本机的假 python3 没被调用（PATH 前置没生效）；系统 python3 --version = ${verText.slice(0, 80) || '无输出'}。真跑部分跳过`)
-      return 'ok'
-    }
-    must(/CURL_CALLED/.test(out2), `没走到「取不到 get-pip.py」那条路（venv 里自带 pip？那本用例的前提就不成立）：${out2.slice(0, 400)}`)
-    must(/已删除半成品/.test(out2), `venv 装不上 pip 时没打「已删除半成品」：${out2.slice(0, 400)}`)
-    must(/HALF_DIR=no/.test(r2.stdout || ''), `半成品目录还在——下次会以为装好了、永远不重装：${out2.slice(0, 400)}`)
-  } finally { rmSync(tmp2, { recursive: true, force: true }) }
-
-  return '降级路径在；取不到 get-pip 时报 RC=1 并给出 apt install python3-pip；ensure_venv 真跑一次：半成品被删、有提示'
+    must(p2.kv('VIVID') === 'false', `半成品 venv 目录还在（应当改名留档）：${p2.out().slice(0, 300)}`)
+    must(/\.venv-asr\.old-/.test(p2.kv('OLDS')), `没生成 .venv-asr.old-* 留档目录：${JSON.stringify(p2.kv('OLDS'))}`)
+    must(Number(p2.kv('OLDSIZE')) > 0, `留档目录是空的（内容丢了，改名等于删除）：size=${p2.kv('OLDSIZE')}`)
+    must(/半成品 venv 已改名为/.test(p2.out()), `没告诉用户改名了（用户不知道旧目录去哪了）：${p2.out().slice(0, 300)}`)
+  } finally { rmSync(p2.dir, { recursive: true, force: true }) }
+  return 'bootstrapPip 取不到 get-pip 时返回 false 并给四个平台的手工命令；moveSemiVenv 真把半成品改名（内容留存）'
 })
 
 // C58（2026-10-31，issue #5）：GPU 运行库那一行在 Linux 上恒红。
@@ -3059,7 +3443,7 @@ check('C58 GPU 探测跨平台：面板两平台走同一接口，Linux 分支�
 //   点下去把行 id 当 target 传给后端，而 runDownload 的 allowed 里没有 cuda ——
 //   两个平台都回「不支持的依赖：cuda」。README 还写着「点那一行的下载」，等于给死路。
 //   判据：后端放行 cuda，且**两个脚本都真有 cuda 分支**（只有一边有 = 另一半平台还是死按钮）。
-check('C59 面板「GPU 运行库」的下载按钮不是死按钮：后端放行 cuda，两个脚本都有 cuda 分支（issue #5）', () => {
+check('C59 面板「GPU 运行库」的下载按钮不是死按钮：后端放行 cuda，脚本真有 cuda 分支且装完真探测（issue #5）', () => {
   const idx = read('index.js')
   const body = fnBody(idx, 'runDownload')
   const m = body.match(/const allowed = \[([^\]]*)\]/)
@@ -3067,37 +3451,43 @@ check('C59 面板「GPU 运行库」的下载按钮不是死按钮：后端放�
   const allowed = m[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
   must(allowed.includes('cuda'), `allowed 不含 cuda（面板的 GPU 行会点出「不支持的依赖」）：${allowed.join('/')}`)
 
-  const sh = read('scripts/fetch-deps.sh')
-  // 分支必须真接到函数上，不是只有个 case 标签
-  must(/^\s*cuda\)\s*fetch_cuda\s*;;/m.test(sh), 'fetch-deps.sh 没有 cuda 分支（或没接 fetch_cuda）')
-  const fn = sh.slice(sh.indexOf('fetch_cuda()'))
-  must(/pip install nvidia-cublas-cu12/.test(fn), 'fetch_cuda 没装 nvidia-cublas-cu12')
-  must(/--probe-gpu/.test(fn), 'fetch_cuda 装完没跑 --probe-gpu 校验（pip 装成功 ≠ 能加载）')
+  // 2026-11-02（fetch-deps 合一）：原来这三段分别读 .sh 与 .ps1（sh 判「cuda 分支真接到函数」
+  //   + 装完探测，ps1 只判 Target 枚举里有 cuda）。两份合成一份后，判据从「两个文件各验一遍」
+  //   变成「同一份里三个点都在」—— 强度没降：枚举收 cuda、all 不带、装完真探测，一个不少。
+  const fd = read('scripts/fetch-deps.mjs')
+  const tm = fd.match(/const TARGETS = \[([^\]]*)\]/)
+  must(tm, 'fetch-deps.mjs 里找不到 TARGETS 枚举 —— 结构变了？先看这条正则')
+  const targets = tm[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+  must(targets.includes('cuda'), `TARGETS 不含 cuda（面板的 GPU 行会点出「不支持的依赖」）：${targets.join('/')}`)
 
-  const ps1 = read('scripts/fetch-deps.ps1')
-  must(/'cuda'/.test(ps1), 'fetch-deps.ps1 的 Target 枚举里没有 cuda')
+  // all 不许带 cuda（第十条：1.4 GB，不问不装）
+  const sm = fd.match(/const STEPS = TARGET === 'all' \? \[([^\]]*)\]/)
+  must(sm, "fetch-deps.mjs 里找不到 `const STEPS = TARGET === 'all' ? [...]` —— 结构变了？先看这条正则")
+  const allSteps = sm[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+  must(!allSteps.includes('cuda'), `all 把 cuda 带上了（约 1.4 GB，第十条要求不问不装）：${allSteps.join('/')}`)
+
+  const fn = fnBody(fd, 'installCudaLibs')
+  must(/nvidia-cublas-cu12/.test(fn), 'installCudaLibs 没装 nvidia-cublas-cu12')
+  must(/--probe-gpu/.test(fn), 'installCudaLibs 装完没跑 --probe-gpu 校验（pip 装成功 ≠ 能加载）')
 
   // 真跑：没有 .venv-asr 时必须立刻失败并指路，不许去碰网络
-  const bash = findBash()
-  if (!bash) {
-    // 2026-11-01（P1-8）：同 C58，裸 return 会被记成 PASS。改成 skip()。
-    skip('C59 面板 GPU 运行库下载按钮', '本机没有 bash，真跑部分没做（结构判据已过；Windows 上要装 Git Bash，装好后真跑部分也会跑）')
-    return 'ok'
-  }
+  //   2026-11-02：这段原来要 bash（找不到就整条 skip）。现在被测对象自己就是 node，
+  //   **不再有 skip 出口** —— 这是合一的附带收益：真跑不再挑平台。
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c59-'))
   try {
-    mkdirSync(join(tmp, 'pkg', 'scripts'), { recursive: true })
-    copyFileSync(join(ROOT, 'scripts', 'fetch-deps.sh'), join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'))
+    const deps = join(tmp, 'deps')
+    mkdirSync(deps, { recursive: true })
     const home = join(tmp, 'home')
-    const r = spawnSync(bash, [join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'), 'cuda'], {
-      env: { ...process.env, DSH_HOME: home, BILI_WATCH_DEPS: '' },
+    const r = spawnSync(process.execPath, [join(ROOT, 'scripts', 'fetch-deps.mjs'), 'cuda'], {
+      env: { ...process.env, DSH_HOME: home, BILI_WATCH_DEPS: deps },
       encoding: 'utf8', timeout: 60000,
     })
-    must(r.status === 1, `没有 ASR 环境时 cuda 分支应 exit 1（别默默成功）：rc=${r.status} ${(r.stderr || '').slice(0, 200)}`)
-    must(/先跑 bash scripts\/fetch-deps\.sh asr/.test(r.stderr || ''),
-      `没告诉用户先装 ASR 环境：${(r.stderr || '').slice(0, 200)}`)
-    must(!/pip install/.test((r.stdout || '') + (r.stderr || '')), '没有 ASR 环境却已经开始 pip install 了')
-    return '后端 allowed 含 cuda；sh 的 cuda 分支真跑（无 venv → exit 1 并指路，零网络）；ps1 枚举含 cuda'
+    const combined = `${r.stdout || ''}${r.stderr || ''}`
+    must(r.status === 1, `没有 ASR 环境时 cuda 分支应 exit 1（别默默成功）：rc=${r.status} ${combined.slice(0, 300)}`)
+    must(/先跑 node scripts\/fetch-deps\.mjs asr/.test(combined),
+      `没告诉用户先装 ASR 环境：${combined.slice(0, 300)}`)
+    must(!/pip install/.test(combined), '没有 ASR 环境却已经开始 pip install 了')
+    return '后端 allowed 含 cuda；TARGETS 收 cuda、all 不带；installCudaLibs 真装真探测；真跑无 venv → rc=1 并指路（零网络）'
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
@@ -3109,77 +3499,32 @@ check('C59 面板「GPU 运行库」的下载按钮不是死按钮：后端放�
 //     · `find … | head -1` 找解压出来的 ffmpeg。
 //   判据：喂一个「能通过 xz 魔数、但列表有几千项且没有 ffmpeg/ffprobe」的归档，
 //   必须打印诊断并 exit 1，不许 141、不许无声退出。
-check('C60 诊断路径不许被 SIGPIPE 打断：`| head` + pipefail 会让脚本 141 静默退出（深入审查）', () => {
-  const bash = findBash()
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  // 2026-11-01（DSH 20:00 第三条）：原因不许写成「A 或 B」—— 读者分不清是缺哪个。
-  //   拆成两条，各自说清「怎么才能让它跑起来」。
-  if (!bash) {
-    skip('C60 诊断路径不许被 SIGPIPE 打断', '本机没找到 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
-  if (!existsSync(shPath)) {
-    skip('C60 诊断路径不许被 SIGPIPE 打断', '找不到 scripts/fetch-deps.sh（仓库结构变了？这条要跟着改）')
-    return 'ok'
-  }
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c60-'))
+// C60（2026-10-31，深入审查抓出）：`set -o pipefail` + `| head` = 静默中止。
+//   实测（旧 .sh）：`set -euo pipefail; v="$(yes | head -1)"` 整个脚本 rc=141 退出，
+//   后面一句都不执行。fetch-deps.sh 里有两处 `| head`，其中一处恰好落在
+//   「正要解释失败原因」的诊断路径上 —— 用户只看到一个 141，连提示都看不到
+//   （比不给提示更糟）。
+//
+//   2026-11-02（合一）**机制变了，判据跟着换，不硬造等价断言**：
+//     node 里没有 SIGPIPE 这一类坑 —— `run()` 是参数数组 spawn（不拼 shell 管道），
+//     清单是 `list.out.split(...).slice(0, 10)` 内存切片。所以「141 静默退出」
+//     在这个实现里**不可能发生**，写一条 `rc !== 141` 去守它等于永远绿。
+//   改守它真正想保的东西：**诊断必须打得出来，而且只打 10 行**（6000 项清单下）。
+check('C60 诊断路径：6000 项清单下仍抛错收尾、只列前 10 项、不倒满屏（`| head` 静默中止已随实现消失）', () => {
+  const p = fdProbe('ffmpeg-list6000')
   try {
-    mkdirSync(join(tmp, 'pkg', 'scripts'), { recursive: true })
-    mkdirSync(join(tmp, 'home', 'bili-watch', 'deps'), { recursive: true })
-    mkdirSync(join(tmp, 'bin'), { recursive: true })
-    copyFileSync(shPath, join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'))
-    // 假 curl：写 xz 魔数（fd 37 7a 58 5a 00），让预校验放行到「看清单」那一步
-    const fakeCurl = join(tmp, 'bin', 'curl')
-    writeFileSync(fakeCurl, [
-      '#!/bin/sh',
-      'out=""; prev=""',
-      'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done',
-      "printf '\\375\\067\\172\\130\\132\\000' > \"$out\"",
-      'exit 0',
-      '',
-    ].join('\n'))
-    // 假 tar：认 xz 魔数，-t 模式吐 6000 项（没有任何 ffmpeg/ffprobe）。
-    //   6000 项是为了让 printf 写满管道缓冲 —— 只有输出大于缓冲，head 提前退出
-    //   才会真的让上游收到 SIGPIPE。项数太少时 printf 一次写完，测不出问题。
-    const fakeTar = join(tmp, 'bin', 'tar')
-    writeFileSync(fakeTar, [
-      '#!/bin/sh',
-      'mode=""; f=""',
-      'while [ $# -gt 0 ]; do',
-      '  case "$1" in',
-      '    -tJf) mode=t; f="$2"; shift 2 ;;',
-      '    -xJf) mode=x; f="$2"; shift 2 ;;',
-      '    -C) shift 2 ;;',
-      '    *) shift ;;',
-      '  esac',
-      'done',
-      'magic=$(head -c 6 "$f" 2>/dev/null | od -An -tx1 | tr -d " \\n")',
-      'case "$magic" in',
-      '  fd377a585a00*) ;;',
-      '  *) echo "tar: This does not look like a tar archive" >&2; exit 2 ;;',
-      'esac',
-      'if [ "$mode" = "t" ]; then',
-      '  i=0',
-      '  while [ $i -lt 6000 ]; do echo "ffmpeg-x-static/filler-$i"; i=$((i+1)); done',
-      '  exit 0',
-      'fi',
-      'exit 0',
-      '',
-    ].join('\n'))
-    spawnSync('chmod', ['+x', fakeCurl, fakeTar], { timeout: 15000 })
-    const r = spawnSync(bash, [join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'), 'ffmpeg'], {
-      env: { ...process.env, DSH_HOME: join(tmp, 'home'), PATH: join(tmp, 'bin').replace(/\\/g, '/') + ':' + (process.env.PATH || '') },
-      encoding: 'utf8', timeout: 120000,
-    })
-    const err = r.stderr || ''
-    must(r.status !== 141, '脚本以 141（SIGPIPE）退出——诊断路径被 `| head` 打断了，用户看不到任何原因')
-    must(r.status === 1, `缺 ffmpeg/ffprobe 时应 exit 1，实际 ${r.status}：${err.slice(0, 300)}`)
-    must(/归档里没有/.test(err), `没打印「归档里没有 ffmpeg ffprobe」：${err.slice(0, 300)}`)
-    // 清单只打 10 行，不能把 6000 行全倒出来
-    const filler = (err.match(/filler-\d+/g) || []).length
+    const out = p.out()
+    must(/^PROBE_RESULT=throw:/m.test(out), `归档里没有 ffmpeg/ffprobe 时应当抛错：${out.slice(0, 400)}`)
+    must(/归档里没有/.test(out), `没打印「归档里没有 ffmpeg ffprobe」：${out.slice(0, 400)}`)
+    must(/ffmpeg ffprobe/.test(out), `没说清缺的是哪两个文件：${out.slice(0, 400)}`)
+    // 只列前 10 项 —— 6000 行全倒出来会把屏幕刷没，和「看不到提示」是同一类后果
+    const filler = (out.match(/filler-\d+/g) || []).length
     must(filler === 10, `诊断只该列前 10 项，实际列了 ${filler} 项`)
-    return '6000 项清单下仍然 exit 1 并打印前 10 项（没有 141、没有倒满屏）'
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+    // 而且这 10 项要真的打全（旧坑的后果正是「一行都没打出来」）
+    must(/filler-0\b/.test(out), '第 1 项没打出来（诊断被截断了？）')
+    must(/filler-9\b/.test(out), '第 10 项没打出来（诊断被截断了？）')
+    return '6000 项清单下：抛错收尾 + 点名缺 ffmpeg/ffprobe + 只列前 10 项且第 1、10 项都在'
+  } finally { rmSync(p.dir, { recursive: true, force: true }) }
 })
 
 // C61（2026-10-31，深入审查抓出）：ffmpeg 装完必须真跑一次 `-version` 才敢说「✓」。
@@ -3187,83 +3532,35 @@ check('C60 诊断路径不许被 SIGPIPE 打断：`| head` + pipefail 会让脚�
 //   但运行时（look.mjs 的 resolveFfmpeg）会真试跑 `-version`，跑不起来就判「没装 ffmpeg」——
 //   于是脚本说装好了、面板说没装，两边对不上。文件在 ≠ 能用。
 //   这里用假 tar 造两种解压结果：能跑的 ffmpeg（必须 ✓ 且带版本号）、跑不起来的（必须报错 exit 1）。
+// C61（2026-10-31，深入审查抓出）：ffmpeg 装完必须真跑一次 `-version` 才敢说「✓」。
+//   E1-01 同族：原来 `cp` 成功就打印 `✓ $DEPS/ffmpeg`，`-version` 只是「顺手打一行、失败也无所谓」。
+//   但运行时（look.mjs 的 resolveFfmpeg）会真试跑 `-version`，跑不起来就判「没装 ffmpeg」——
+//   于是脚本说装好了、面板说没装，两边对不上。文件在 ≠ 能用。
+//
+//   2026-11-02（合一）：原来靠假 tar 造两种解压结果。现在探针桩掉 tar（外部工具），
+//   被测的「-version 失败该怎么报」是原样代码。两条分支：
+//     能跑 → ✓ 且带版本首行；跑不起来 → 抛错，且**区分「文件在但执行不了」与「没装上」**。
 check('C61 ffmpeg 装完要真跑一次 -version：文件在 ≠ 能用（E1-01 同族，深入审查）', () => {
-  const bash = findBash()
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  // 2026-11-01（DSH 20:00 第三条）：原因拆开写，别让读者猜是缺 bash 还是缺文件。
-  if (!bash) {
-    skip('C61 ffmpeg 装完要真跑一次 -version', '本机没找到 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
-  if (!existsSync(shPath)) {
-    skip('C61 ffmpeg 装完要真跑一次 -version', '找不到 scripts/fetch-deps.sh（仓库结构变了？这条要跟着改）')
-    return 'ok'
-  }
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c61-'))
+  // ① 能跑：必须打 ✓ 且把版本首行带出来（用户能一眼确认装的是哪个版本）
+  const ok = fdProbe('ffmpeg-version')
   try {
-    mkdirSync(join(tmp, 'pkg', 'scripts'), { recursive: true })
-    mkdirSync(join(tmp, 'bin'), { recursive: true })
-    copyFileSync(shPath, join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'))
-    const fakeCurl = join(tmp, 'bin', 'curl')
-    writeFileSync(fakeCurl, [
-      '#!/bin/sh',
-      'out=""; prev=""',
-      'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done',
-      "printf '\\375\\067\\172\\130\\132\\000' > \"$out\"",
-      'exit 0',
-      '',
-    ].join('\n'))
-    // 假 tar：-t 列两项（含 ffmpeg + ffprobe，过预校验）；-x 按 FAKE_MODE 造出能跑 / 跑不起来的 ffmpeg
-    const fakeTar = join(tmp, 'bin', 'tar')
-    writeFileSync(fakeTar, [
-      '#!/bin/sh',
-      'mode=""; f=""; dest=""',
-      'while [ $# -gt 0 ]; do',
-      '  case "$1" in',
-      '    -tJf) mode=t; f="$2"; shift 2 ;;',
-      '    -xJf) mode=x; f="$2"; shift 2 ;;',
-      '    -C) dest="$2"; shift 2 ;;',
-      '    *) shift ;;',
-      '  esac',
-      'done',
-      'magic=$(head -c 6 "$f" 2>/dev/null | od -An -tx1 | tr -d " \\n")',
-      'case "$magic" in',
-      '  fd377a585a00*) ;;',
-      '  *) echo "tar: This does not look like a tar archive" >&2; exit 2 ;;',
-      'esac',
-      'if [ "$mode" = "t" ]; then echo "pkg/ffmpeg"; echo "pkg/ffprobe"; exit 0; fi',
-      'mkdir -p "$dest/pkg"',
-      // ffmpeg 的内容由调用方通过 FAKE_FFMPEG_BODY 传进来。
-      //   别在这层套 printf 转义：`\"` 要穿过 JS 字符串 → 假 tar 的双引号 → printf 的格式串，
-      //   三层转义叠起来极易生成一个语法错误的脚本，而失败现象是「跑不起来」，看起来像被测代码的问题。
-      'printf "%s" "$FAKE_FFMPEG_BODY" > "$dest/pkg/ffmpeg"',
-      'printf "#!/bin/sh\\nexit 0\\n" > "$dest/pkg/ffprobe"',
-      'chmod +x "$dest/pkg/ffmpeg" "$dest/pkg/ffprobe"',
-      'exit 0',
-      '',
-    ].join('\n'))
-    spawnSync('chmod', ['+x', fakeCurl, fakeTar], { timeout: 15000 })
-    const runIt = (tag, body) => spawnSync(bash, [join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'), 'ffmpeg'], {
-      env: {
-        ...process.env,
-        DSH_HOME: join(tmp, tag),
-        FAKE_FFMPEG_BODY: body,
-        PATH: join(tmp, 'bin').replace(/\\/g, '/') + ':' + (process.env.PATH || ''),
-      },
-      encoding: 'utf8', timeout: 120000,
-    })
-    // A：能跑的 ffmpeg → 成功，且提示里带真版本号（证明真跑过，不是只 cp）
-    const a = runIt('home-a', '#!/bin/sh\necho "ffmpeg version 9.9-static (fake)"\n')
-    must(a.status === 0, `ffmpeg 能跑时应 exit 0，实际 ${a.status}：[out]${a.stdout || ''}[err]${a.stderr || ''}`)
-    must(/ffmpeg version 9\.9-static \(fake\)/.test(a.stdout + a.stderr),
-      `✓ 提示里没有真版本号——说明没真跑 -version：${(a.stdout || '').slice(0, 200)}`)
-    // B：文件放下了但跑不起来 → 必须失败并说清，不许打 ✓
-    const b = runIt('home-b', '#!/bin/sh\nexit 1\n')
-    must(b.status === 1, `ffmpeg 跑不起来时应 exit 1（不许默默成功），实际 ${b.status}`)
-    must(/ffmpeg -version 跑不起来/.test(b.stderr || ''), `没报「跑不起来」：${(b.stderr || '').slice(0, 300)}`)
-    must(!/✓/.test(b.stdout || ''), `跑不起来却打了 ✓：${(b.stdout || '').slice(0, 200)}`)
-    return '能跑的 ffmpeg → ✓ 且带真版本号；跑不起来的 → exit 1 并说清（不再由 cp 退出码推导成功）'
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+    const out = ok.out()
+    must(/^PROBE_RESULT=ok$/m.test(out), `能跑的 ffmpeg 应当正常收尾：${out.slice(0, 400)}`)
+    must(/✓ /.test(out), `装好了却没打 ✓：${out.slice(0, 400)}`)
+    must(/（ffmpeg version 7\.1-static-test）/.test(out), `✓ 那行没带版本首行（用户看不出装的是哪版）：${out.slice(0, 400)}`)
+  } finally { rmSync(ok.dir, { recursive: true, force: true }) }
+
+  // ② 跑不起来：必须抛错，而且不能报成「没装上」——那会把用户引向「重装一次」，
+  //   重装完还是一样跑不起来。
+  const bad = fdProbe('ffmpeg-version', { BW_PROBE_VER_CODE: '1' })
+  try {
+    const out = bad.out()
+    must(/^PROBE_RESULT=throw:/m.test(out), `-version 跑不起来时必须抛错（不许打 ✓）：${out.slice(0, 400)}`)
+    must(/文件已放到/.test(out), `没说清「文件其实已经放到了」：${out.slice(0, 400)}`)
+    must(/不是「没装上」/.test(out), `没区分「跑不起来」和「没装上」（用户会去重装，装了也一样）：${out.slice(0, 400)}`)
+    must(/noexec|SELinux|架构/.test(out), `没给排查方向（noexec / SELinux / 架构不对）：${out.slice(0, 400)}`)
+  } finally { rmSync(bad.dir, { recursive: true, force: true }) }
+  return '能跑 → ✓ 带版本首行；跑不起来 → 抛错 + 区分「文件在但执行不了」并给 noexec/SELinux/架构 三个方向'
 })
 
 // C62（2026-10-31，深入审查）：没有 NVIDIA 卡的机器不该出现「一键下载」。
@@ -4278,52 +4575,37 @@ check('C77 执行器自检：async 回调必须记 FAIL、must(false) 必须抛�
   return 'async 记 FAIL（body 未跑完）、同步抛错记 FAIL、skip 不重复记账、同步通过记 PASS、must(false) 抛 Error、must 只有一份、异形抛出物不崩'
 })
 
-check('C80 fetch-deps.ps1 的 py 版本回退链不会被 $ErrorActionPreference=Stop 掐断（issue #7）', () => {
-  // issue #7 的 P0：全局 $ErrorActionPreference='Stop'（:63），而 py 启动器探测「没装的版本」时
-  //   往 stderr 写 [ERROR] No runtime installed that matches 3.x。Stop 下原生命令写 stderr 会抛
-  //   NativeCommandError —— 第一个候选 3.13 就炸，回退链一次都没走到。
-  //   本机 py -0 只有 3.14.6，实测：修复前直接抛、修复后逐级跳过并拿到 3.14.6。
-  // 同一个坑同文件里有过第二处（GPU 探测那段 ±520 行），那次只修了一处，所以再钉一条结构断言。
-  const src = read('scripts/fetch-deps.ps1')
-  // fnBody 只认 JS 的 function NAME( 写法；PowerShell 写的是 function NAME {，行首 } 收尾，自己抽。
-  const psBody = (n) => {
-    const i0 = src.indexOf(String.fromCharCode(102) + "unction " + n)
-    if (i0 < 0) return ""
-    const j0 = src.slice(i0).indexOf(String.fromCharCode(10) + "}")
-    return j0 < 0 ? "" : src.slice(i0, i0 + j0 + 2)
-  }
-  const body = psBody('Get-SystemPython')
-  must(body.length > 200, `Get-SystemPython 抽出来只有 ${body.length} 字符`)
-
-  const iCont = body.indexOf("$ErrorActionPreference = 'Continue'")
-  const iLoop = body.indexOf("foreach ($v in @('3.13'")
-  must(iCont >= 0, 'Get-SystemPython 里没有临时切 Continue —— Stop 下 py 探测没装的版本会抛、整条回退链断掉')
-  must(iLoop > iCont, 'Continue 必须切在 py 候选循环之前，切在后面等于没切')
-  must(/finally\s*\{[\s\S]{0,120}\$ErrorActionPreference\s*=\s*\$eapProbe/.test(body), '有 finally 但没有恢复 $ErrorActionPreference —— 泄漏到调用方，后面任何原生命令写 stderr 都会炸')
-  // 跳过时要让用户看得出是「版本没有」而不是「网络问题」
-  must(body.includes('不可用'), '跳过候选时没有说明原因（应打「py -3.x 不可用（退出码 N），试下一个版本」）')
-
-  // 真跑：把函数体抠出来拼成最小脚本，Stop 下调用一次，不许抛。
-  //   py 不存在时只跑结构断言（本机与 CI 都可能没有 py 启动器）。
-  const py = spawnSync('powershell.exe', ['-NoProfile', '-Command', "if (Get-Command py -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }"], { encoding: 'utf8', timeout: 15000 })
-  if (!String(py.stdout || '').includes('yes')) {
-    // 2026-11-01（P1-8）：同上，裸 return 记成 PASS。改成 skip()。
-    skip('C80 fetch-deps.ps1 的 py 回退链', '本机没有 py 启动器，真跑部分没做（结构判据已过；装 Python 启动器 py.exe 或把 python.exe 加进 PATH 后这条会真跑）')
-    return 'ok'
-  }
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c80-'))
-  const ps1 = join(tmp, 'probe.ps1')
-  // 只要 Get-SystemPython 需要的 Test-PyVersion 一并带上
-  const prelude = psBody('Test-PyVersion')
-  const script = `$ErrorActionPreference = 'Stop'\n${prelude}\n${body}\n$r = Get-SystemPython\nWrite-Output ("OK|" + $r)\n`
-  writeFileSync(ps1, '\uFEFF' + script, 'utf8')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1], { encoding: 'utf8', timeout: 60000 })
-  rmSync(tmp, { recursive: true, force: true })
+check('C80 Python 回退链：某个候选不可用时继续试下一个，不许整条链断掉（issue #7 的 node 版）', () => {
+  // issue #7 的根因：PS 5.1 的全局 $ErrorActionPreference='Stop' 下，py 启动器探测「没装的版本」
+  //   会往 stderr 写 [ERROR] No runtime installed... → 原生命令写 stderr 就抛 NativeCommandError
+  //   → 回退链第一个候选就炸，一次都没走到后面的版本。
+  // 2026-11-02（fetch-deps 合一）：脚本改成 node 之后**这个机制不存在了**（spawnSync 只看退出码），
+  //   但「某个候选失败会不会让整条链停下来」这件事仍然要真跑才算数 —— 判据守行为，不守写法。
+  //   判法：--dry-run 打印的 Python 计划必须是一句正常描述。旧版这里会把异常消息当计划打出来
+  //   （实测：合并前跑 fetch-deps.ps1 -Target all -DryRun，这一行正是
+  //     [dry-run] Python：error: No interpreter found for Python 3.12 ...）。
+  const r = spawnSync(process.execPath, [join(ROOT, 'scripts', 'fetch-deps.mjs'), 'asr', '--dry-run'], {
+    encoding: 'utf8',
+    timeout: 180000,
+    env: baseEnv(),
+  })
   const out = String(r.stdout || '') + String(r.stderr || '')
-  must(r.status === 0, `Stop 下调 Get-SystemPython 退出码 ${r.status}（回退链又被掐断了）：${out.slice(0, 300)}`)
-  must(/OK\|/.test(out), `没拿到解释器路径：${out.slice(0, 300)}`)
-  must(!/NativeCommandError|Unhandled/i.test(out), `输出里还有未捕获异常：${out.slice(0, 300)}`)
-  return `结构 + 真跑都过（${(out.match(/OK\|([^\n]+)/) || [])[1] || '?'}）`
+  const m = out.match(/\[dry-run\] Python：(.+)/)
+  must(m, '--dry-run 没打印 Python 计划（rc=' + r.status + '）：' + out.slice(0, 300))
+  must(m[1].trim().length > 0, 'Python 计划这一行是空的')
+  must(
+    !/No interpreter|error while|Traceback|NativeCommandError/i.test(m[1]),
+    'Python 计划这一行是异常消息而不是计划（回退链断在这一步）：' + m[1].trim(),
+  )
+
+  // 结构面：候选版本必须逐个试，且每个都靠退出码判（不是靠异常中断）
+  const src = read('scripts/fetch-deps.mjs')
+  const loop = src.match(/for \(const v of \[('[^']+'(?:,\s*'[^']+')*)\]\) \{\s*const r = run\(launcher/)
+  must(loop, '找不到 py 启动器的候选版本循环（回退链结构变了，先修判据）')
+  const vers = [...loop[1].matchAll(/'([^']+)'/g)].map((x) => x[1])
+  must(vers.length >= 3, '候选版本只有 ' + vers.length + ' 个（回退链太短）')
+  must(vers.includes('3.14'), '候选版本里没有 3.14：' + vers.join('/') + '（实测 3.14.6 的 venv 能跑 ASR/OCR，不该被硬拒）')
+  return '真跑计划正常（' + m[1].trim().slice(0, 50) + '）；回退链 ' + vers.join('/')
 })
 
 // ── C87/C88：切片 10 的 cache 层（目录 / manifest / 等他人）与锁工厂，真跑 ──────
@@ -4906,103 +5188,49 @@ check('C96 白名单目录不按名字整棵删：里面出现用户的文件就
 //      `|| true` 又抹掉 ffmpeg 的退出码 —— 装坏了照样打 ✓（本机假 ffmpeg 复现）。
 //   光看源码形状不够（缩进/引号一改就漏），这里按**真实顺序**真跑脚本：ffmpeg/ffprobe 在清单
 //   前两行 + 6000 行填充（必须大于管道缓冲，printf 才写不完），解出来的 ffmpeg 用假脚本替身。
-check('C94 fetch-deps.sh：清单判断不吃 SIGPIPE(141)、ffmpeg 真跑只认它自己的退出码（P2 两条）', () => {
-  const bash = findBash()
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  // 2026-11-01（DSH 20:00 第三条）：原因拆开写，别让读者猜是缺 bash 还是缺文件。
-  if (!bash) {
-    skip('C94 fetch-deps.sh 两处 P2', '本机没找到 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
-  if (!existsSync(shPath)) {
-    skip('C94 fetch-deps.sh 两处 P2', '找不到 scripts/fetch-deps.sh（仓库结构变了？这条要跟着改）')
-    return 'ok'
-  }
-  const sh = read('scripts/fetch-deps.sh')
-  // 只看代码行：注释里写着「原来写 `… 2>&1 | sed`」这种反例，按全文匹配会把注释当代码判
-  const shCode = sh.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
-  // 源码层（先拦最容易回退的形态，比真跑更快给出「改回哪儿了」）
-  const pipeGrep = shCode.split('\n').filter((l) => /printf/.test(l) && /\|/.test(l) && /grep\s+-[A-Za-z]*q/.test(l))
-  must(pipeGrep.length === 0,
-    '还在用 `printf … | grep -q` 判清单：grep 命中即退出会让 printf 吃 SIGPIPE（pipefail 下 rc=141，判断反）。改用 here-string → ' + (pipeGrep[0] || '').trim())
-  must(!/"\$DEPS\/ffmpeg"\s+-version\s+2>&1/.test(shCode),
-    'ffmpeg -version 那次又把 2>&1 加回来了：stderr 上的报错会被当成「有输出 = 成功」')
-  must(/rc=\$\?/.test(shCode) && /\[ "\$rc" -ne 0 \]/.test(shCode),
-    'ffmpeg 真跑没把自己的退出码收进 $rc 再判 —— 退出码必须来自 ffmpeg 本身，不能来自 sed/管道')
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c94-'))
+// C94（2026-11-01）：两处 P2。
+//   ① 清单判断被 `printf … | grep -q` 的 SIGPIPE（141）打断 —— grep 命中即退出，
+//      printf 写不完，pipefail 下整个脚本 141，判断结果反过来。
+//   ② ffmpeg `-version` 那次真跑加了 `2>&1` —— stderr 上的报错被当成「有输出 = 成功」，
+//      退出码又来自 sed/管道而不是 ffmpeg 本身。
+//
+//   2026-11-02（合一）**两条的形态都变了，逐条说明，不硬凑**：
+//     ① node 里不拼 shell 管道，SIGPIPE 这一类不存在。所以改守「把它请回来的入口」：
+//        `run()` 不许开 `shell: true`（一开，管道/重定向就回来了，141 与「退出码来自 sed」
+//        就都回来了），清单判定必须是内存切片。
+//     ② 这条**原样有效**，而且更该守：`run()` 返回的 `{code,out,err}` 三样分开，
+//        判定只要写错成「out 非空就算成功」，stderr 一响就翻。所以既验源码只看 code，
+//        也真跑一次「有 stdout 但退出码非 0」的反证。
+check('C94 fetch-deps：清单判定不拼 shell 管道、ffmpeg 真跑只认它自己的退出码（P2 两条）', () => {
+  const fd = read('scripts/fetch-deps.mjs')
+  const codeLines = fd.split('\n')
+    .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*') && !l.trim().startsWith('/*'))
+    .join('\n')
+
+  // ① 不拼 shell：`shell: true` 是唯一能把管道/重定向请回来的开关
+  const runBody = fnBody(fd, 'run')
+  must(!/shell\s*:\s*true/.test(runBody),
+    'run() 开了 shell:true —— 管道/重定向一回来，SIGPIPE(141) 和「退出码来自 sed 而不是 ffmpeg」就都回来了')
+  // 清单判定必须是内存切片（不是外部命令的输出截断）
+  must(/list\.out\.split\(/.test(fd) && /slice\(0, 10\)/.test(fd),
+    '归档清单不是「内存里 split 再 slice(0,10)」——诊断可能被外部工具打断或截断')
+
+  // ② 只认 ffmpeg 自己的退出码
+  const verIdx = fd.indexOf("['-version']")
+  must(verIdx > 0, "找不到 -version 那处真跑（findFfmpeg / ensureFfmpeg 的结构变了？）")
+  const seg = fd.slice(verIdx, verIdx + 800)
+  must(/v\.code\s*!==\s*0/.test(seg), '-version 的判定没看退出码（v.code !== 0）—— 按「有输出=成功」判迟早翻')
+  must(!/2>&1/.test(codeLines), '代码里又出现 2>&1：stderr 被并进 stdout 后，「有输出」就不等于「跑得起来」了')
+
+  // ③ 真跑反证：**有 stdout 输出、但退出码非 0** —— 必须判失败。
+  //   这是 ② 的唯一有力证明：源码里写着 v.code 也可能被改成 `!v.out`，只有反证照得出来。
+  const p = fdProbe('ffmpeg-version', { BW_PROBE_VER_CODE: '1' })
   try {
-    mkdirSync(join(tmp, 'pkg', 'scripts'), { recursive: true })
-    mkdirSync(join(tmp, 'bin'), { recursive: true })
-    copyFileSync(shPath, join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'))
-    const fakeCurl = join(tmp, 'bin', 'curl')
-    writeFileSync(fakeCurl, [
-      '#!/bin/sh',
-      'out=""; prev=""',
-      'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done',
-      "printf '\\375\\067\\172\\130\\132\\000' > \"$out\"",
-      'exit 0',
-      '',
-    ].join('\n'))
-    // 假 tar：-t 先吐 ffmpeg/ffprobe（**顺序是关键**：命中在前，grep 才会提前退出，
-    //   printf 才写不完 → 老写法必 141），再吐 6000 行填充；-x 按 $FAKE_FFMPEG_BODY 造 ffmpeg。
-    const fakeTar = join(tmp, 'bin', 'tar')
-    writeFileSync(fakeTar, [
-      '#!/bin/sh',
-      'mode=""; f=""; dest=""',
-      'while [ $# -gt 0 ]; do',
-      '  case "$1" in',
-      '    -tJf) mode=t; f="$2"; shift 2 ;;',
-      '    -xJf) mode=x; f="$2"; shift 2 ;;',
-      '    -C) dest="$2"; shift 2 ;;',
-      '    *) shift ;;',
-      '  esac',
-      'done',
-      'magic=$(head -c 6 "$f" 2>/dev/null | od -An -tx1 | tr -d " \\n")',
-      'case "$magic" in',
-      '  fd377a585a00*) ;;',
-      '  *) echo "tar: This does not look like a tar archive" >&2; exit 2 ;;',
-      'esac',
-      'if [ "$mode" = "t" ]; then',
-      '  echo "ffmpeg-x-static/ffmpeg"',
-      '  echo "ffmpeg-x-static/ffprobe"',
-      '  i=0',
-      '  while [ $i -lt 6000 ]; do echo "ffmpeg-x-static/doc/filler-$i"; i=$((i+1)); done',
-      '  exit 0',
-      'fi',
-      'mkdir -p "$dest/ffmpeg-x-static"',
-      'printf "%s" "$FAKE_FFMPEG_BODY" > "$dest/ffmpeg-x-static/ffmpeg"',
-      'printf "#!/bin/sh\\nexit 0\\n" > "$dest/ffmpeg-x-static/ffprobe"',
-      'chmod +x "$dest/ffmpeg-x-static/ffmpeg" "$dest/ffmpeg-x-static/ffprobe"',
-      'exit 0',
-      '',
-    ].join('\n'))
-    spawnSync('chmod', ['+x', fakeCurl, fakeTar], { timeout: 15000 })
-    const runIt = (tag, body) => spawnSync(bash, [join(tmp, 'pkg', 'scripts', 'fetch-deps.sh'), 'ffmpeg'], {
-      env: {
-        ...process.env,
-        DSH_HOME: join(tmp, tag),
-        FAKE_FFMPEG_BODY: body,
-        PATH: join(tmp, 'bin').replace(/\\/g, '/') + ':' + (process.env.PATH || ''),
-      },
-      encoding: 'utf8', timeout: 120000,
-    })
-    // A：清单里有 ffmpeg（前两行）+ 6000 行填充 → 必须走到底并打 ✓。
-    //   老写法在这里被 SIGPIPE 打成「归档里没有 ffmpeg ffprobe」+ exit 1。
-    const a = runIt('home-a', '#!/bin/sh\necho "ffmpeg version 9.9-static (fake)"\n')
-    must(a.status === 0, `清单里明明有 ffmpeg，脚本却 exit ${a.status}（SIGPIPE 让判断反了）：[err]${(a.stderr || '').slice(0, 300)}`)
-    must(!/归档里没有/.test(a.stderr || ''),
-      '误报「归档里没有 ffmpeg ffprobe」—— grep 命中后 printf 吃 SIGPIPE（141）被当成「不命中」')
-    must(/✓ .*ffmpeg version 9\.9-static \(fake\)/.test(a.stdout || ''),
-      `没打带版本的 ✓：${(a.stdout || '').slice(0, 300)}`)
-    // B：ffmpeg 文件在、但跑起来往 stderr 报错并 exit 127 → 必须 exit 1、不许打 ✓。
-    //   老写法把 stderr 那行错误当成「版本号」，打 ✓ 并 exit 0。
-    const b = runIt('home-b', '#!/bin/sh\necho "ffmpeg: error while loading shared libraries: libavdevice.so.61" >&2\nexit 127\n')
-    must(b.status === 1, `坏 ffmpeg 应 exit 1，实际 ${b.status}（2>&1 把 stderr 当成了成功证据）`)
-    must(/ffmpeg -version 跑不起来/.test(b.stderr || ''), `没报「跑不起来」：${(b.stderr || '').slice(0, 300)}`)
-    must(/rc=127/.test(b.stderr || ''), `失败提示里没带 ffmpeg 自己的退出码：${(b.stderr || '').slice(0, 300)}`)
-    must(!/✓/.test(b.stdout || ''), `坏 ffmpeg 却打了 ✓：${(b.stdout || '').slice(0, 300)}`)
-    return '6000 行清单命中 → ✓（不是 141 假的「没有」）；坏 ffmpeg → exit 1 带 rc=127（不再靠 stderr 输出判成功）'
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+    const out = p.out()
+    must(/^PROBE_RESULT=throw:/m.test(out),
+      `-version 打了一行版本、却以非 0 退出时必须判失败（按「有输出=成功」就漏了）：${out.slice(0, 400)}`)
+  } finally { rmSync(p.dir, { recursive: true, force: true }) }
+  return 'run() 无 shell:true；清单走内存切片；-version 只看 v.code 且无 2>&1；反证：有 stdout 但 rc≠0 必判失败'
 })
 
 // —— 延迟异步检测（2026-11-01，DSH 00:44 P1-6）——
@@ -5076,70 +5304,33 @@ check('C97 宿主缺 window.__ModuleLoader__ 时 client.js 直接抛「需要 DS
 // 要等用户跑转写才炸，而且报的是「转写失败」，与「依赖没装上」隔了一层。
 // 真跑：PATH 上放一个假 python3（建得出 venv、pip 一律 exit 0、只有 `-c "import …"` 的退出码可控）。
 //   两个方向都跑——只跑失败那个方向的话，「脚本在别处提前退出」会被当成「拦住了」。
-check('C98 fetch-deps.sh：pip 返回 0 不算装成，装完必须再 import 一次；失败要删半成品并说清原因', () => {
-  const bash = findBash()
-  const shPath = join(ROOT, 'scripts', 'fetch-deps.sh')
-  // 2026-11-01（DSH 20:00 第三条）：原因拆开写，别让读者猜是缺 bash 还是缺文件。
-  if (!bash) {
-    skip('C98 fetch-deps.sh 出口验证', '本机没找到 bash（Windows 上要装 Git Bash；装好后这条会真跑）')
-    return 'ok'
-  }
-  if (!existsSync(shPath)) {
-    skip('C98 fetch-deps.sh 出口验证', '找不到 scripts/fetch-deps.sh（仓库结构变了？这条要跟着改）')
-    return 'ok'
-  }
-  const tmp = mkdtempSync(join(tmpdir(), 'bw-c98-'))
-  const binDir = join(tmp, 'bin')
-  const fakePy = join(binDir, 'python3')
-  const sep = process.platform === 'win32' ? ';' : ':'
-  const writeFake = (importRc) => writeFileSync(fakePy, [
-    '#!/bin/sh',
-    'dir=""; code=""; prev=""',
-    'for a in "$@"; do',
-    '  [ "$prev" = "venv" ] && dir="$a"',
-    '  [ "$prev" = "-c" ] && code="$a"',
-    '  prev="$a"',
-    'done',
-    'case "$*" in',
-    '  *"-m venv"*) mkdir -p "$dir/bin"; cp "$0" "$dir/bin/python"; chmod +x "$dir/bin/python"; exit 0 ;;',
-    'esac',
-    'if [ -n "$code" ]; then',
-    '  case "$code" in "import "*) exit ' + importRc + ' ;; esac',
-    'fi',
-    'exit 0',
-    '',
-  ].join('\n'))
-  // Git Bash 里 `rm -rf "C:\\…\\deps/.venv-asr"` 这种**混合分隔符**路径会被本机安全壳拒
-  //   （SAFE_DELETE_INVALID_PATH）。用户侧 fetch-deps.sh 只在 Linux/macOS 跑，路径本来就是 POSIX；
-  //   所以这里也传 POSIX 路径，测的才是脚本本身。Node 侧仍用 Windows 路径建/查。
-  const toPosix = (p) => String(p).replace(/\\/g, '/').replace(/^([A-Za-z]):/, (m, d) => '/' + d.toLowerCase())
-  const runAsr = (tag) => {
-    const deps = join(tmp, 'deps-' + tag)
-    mkdirSync(deps, { recursive: true })
-    const env = { ...process.env, PATH: binDir + sep + (process.env.PATH || ''), BILI_WATCH_DEPS: toPosix(deps), HOME: toPosix(join(tmp, 'home')) }
-    delete env.BASH_ENV
-    const r = spawnSync(bash, [shPath, 'asr'], { encoding: 'utf8', timeout: 120000, env })
-    return { r, venv: join(deps, '.venv-asr'), out: String(r.stdout || '') + String(r.stderr || '') }
-  }
+// C98（2026-11-01，P1）：pip 返回 0 不算装成。
+//   原来 `pip install` 一返回 0 就打 ✓，但包可能「装了却 import 不了」
+//   （requires-python 不满足、wheel 装上了但缺运行库、同名包冲突……）。
+//   结果：脚本说装好了，转写时 ImportError，用户被绕一圈。
+//   要求：装完必须再 import 一次；失败要把半成品改名留档，并说清「为什么 pip 成功还报错」。
+//
+//   2026-11-02（合一）：原判据真跑 .sh 并 grep 它的输出。现在探针把 pip 桩成返回 0、
+//   把 `import` 桩成失败，走的是**原样的 ensureVenv**，断言落在「真的抛错 + 真的改名」上。
+check('C98 pip 返回 0 不算装成，装完必须再 import 一次；失败要改名留档并说清原因', () => {
+  const fd = read('scripts/fetch-deps.mjs')
+  const body = fnBody(fd, 'ensureVenv')
+  must(/import \$\{mod\}/.test(body), 'ensureVenv 装完没有再 import 一次 —— pip 返回 0 不等于装成')
+  must(/moveSemiVenv\(venv\)/.test(body), 'ensureVenv 失败时没把半成品 venv 改名留档（下次会拿它当可用的）')
+  must(/pip 返回 0 不算装成/.test(body), '文案没说清「pip 返回 0 不算装成」——用户会以为装好了')
+
+  const p = fdProbe('venv-import')
   try {
-    mkdirSync(binDir, { recursive: true })
-    // ① 能 import：必须一路走到 ✓ —— 证明这条链没在别处断，否则 ② 的红是假红
-    writeFake(0)
-    const good = runAsr('ok')
-    must(good.r.status === 0, `正常路径退出码 ${good.r.status}：${good.out.slice(-300)}`)
-    must(/✓ .*\.venv-asr/.test(good.out), `正常路径没打 ✓：${good.out.slice(-300)}`)
-    must(existsSync(good.venv), '正常路径的 venv 不见了')
-    // ② pip 说装成了、import 却失败：必须非零退出 + 删半成品 + 说清「装完仍 import 失败」
-    writeFake(1)
-    const bad = runAsr('bad')
-    must(bad.r.status !== 0,
-      `install 成功但 import 失败时脚本仍然 exit 0 —— 空壳 venv 会被当成装好了，用户到转写才炸：${bad.out.slice(-300)}`)
-    must(/装完了但 import faster_whisper 仍然失败/.test(bad.out),
-      `报错没点明「装完仍 import 失败」（用户据此才能判断是依赖问题不是网络问题）：${bad.out.slice(-300)}`)
-    must(!existsSync(bad.venv),
-      '失败后没删半成品 venv —— 下次重跑会被入口的「已存在就跳过」判据当成装好了')
-    return 'import 通了才打 ✓；pip 说成了但 import 不通 → exit 1 + 删半成品 + 说清原因'
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+    const out = p.out()
+    must(/^PROBE_RESULT=throw:/m.test(out), `pip 成功但 import 失败时必须抛错（不能打 ✓）：${out.slice(0, 400)}`)
+    must(/装完了但 import faster_whisper 仍然失败/.test(out), `没点名是哪个模块 import 失败：${out.slice(0, 400)}`)
+    must(/pip 返回 0 不算装成/.test(out), `没解释「为什么 pip 成功了还报错」：${out.slice(0, 400)}`)
+    must(/排查：/.test(out), `没给排查方向（用户只能反复重装）：${out.slice(0, 400)}`)
+    // 落在文件系统状态上：改名这件事必须真发生，不能只打一行字
+    must(p.kv('VIVID') === 'false', `半成品 venv 目录还在（没改名，下次会被当成可用的）：${out.slice(0, 300)}`)
+    must(/\.venv-asr\.old-/.test(p.kv('OLDS')), `没生成 .venv-asr.old-* 留档：${JSON.stringify(p.kv('OLDS'))}`)
+  } finally { rmSync(p.dir, { recursive: true, force: true }) }
+  return 'ensureVenv 真跑：pip 返回 0 但 import 失败 → 抛错 + 点名模块 + 解释「pip 0 不算装成」+ 给排查方向 + 半成品真改名留档'
 })
 
 // ── C99：sheet 认 --at（2026-11-01 0.4.1 第 5 条）────────────────────────────
@@ -5387,13 +5578,21 @@ check('C104 缓存根初始化责任分明：CLI 的 runsFile 走 cacheDir()（�
 // ffmpeg 的两条（sheet / substrip）分两支：**有 ffmpeg 就钉成功输出**（拼图行 / 索引九格 /
 //   manifest / 字幕带行），没有就钉「缺 ffmpeg 时说清了、rc≠0、且没白下视频」。
 //   两支都以「缓存命中不重下」为前提——那一条与环境无关，两支都钉。
-const { startMockBili } = await import('./fixtures/bili-mock.mjs')
+const { startMockBili, INJECT_COMMENT, INJECT_SUBTITLE } = await import('./fixtures/bili-mock.mjs')
 const LOOK_MJS = join(HERE, 'look.mjs')
 const MOCK_PRELOAD = pathToFileURL(join(HERE, 'fixtures', 'bili-mock-preload.mjs')).href
 const MOCK_BV = 'BV1mock00001'
 let mockBili = null
 let mockWhy = ''
 try { mockBili = await startMockBili() } catch (e) { mockWhy = String(e?.message ?? e) }
+// 第二个 mock：热评与字幕换成带注入的正文（C127~C130 用）。
+//   为什么要两个实例：护栏要证「有命中」和「没命中」两种输出，而「没命中」必须是同一条代码路径、
+//   同一批命令参数 —— 换个 mock 端口比在一条命令里塞开关干净（生产侧一个开关都不加）。
+let mockInject = null
+let mockInjectWhy = ''
+try {
+  mockInject = await startMockBili({ commentText: INJECT_COMMENT, subtitleText: INJECT_SUBTITLE })
+} catch (e) { mockInjectWhy = String(e?.message ?? e) }
 // 本机 ffmpeg 的判据与 look.mjs 同一套：BILI_WATCH_FFMPEG（用户配置）→ PATH 里的 ffmpeg
 const FF_BIN = (() => { try { return findFfmpeg(process.env.BILI_WATCH_FFMPEG || '') } catch { return null } })()
 // 合法缓存根 = 空目录 + 标记文件（否则 pickCacheDir 会退到子目录，见上面那段注释）
@@ -5404,11 +5603,12 @@ const mockCache = (tag) => {
 }
 // baseEnv 先摘掉会改判据的环境变量（BILI_WATCH_CACHE/PROJ/DEPS/DSH_HOME）；
 // BILI_WATCH_FFMPEG 也要摘——留着它「本机没 ffmpeg」那条分支就永远走不到，等于把一支断言悄悄关掉。
-const mockEnv = (over = {}) => {
-  const env = baseEnv({ BW_MOCK_PORT: String(mockBili?.port ?? ''), ...over })
+const mockEnvOn = (m, over = {}) => {
+  const env = baseEnv({ BW_MOCK_PORT: String(m?.port ?? ''), ...over })
   if (!('BILI_WATCH_FFMPEG' in over)) delete env.BILI_WATCH_FFMPEG
   return env
 }
+const mockEnv = (over = {}) => mockEnvOn(mockBili, over)
 const runLookMock = (args, env) =>
   spawnSync(process.execPath, ['--import', MOCK_PRELOAD, LOOK_MJS, ...args], { env, encoding: 'utf8', timeout: 180000 })
 // 影子插件目录（2026-11-01）：让 look.mjs 在一个「deps 是空的」的插件根下跑。
@@ -5666,7 +5866,8 @@ check('C110 asr 真跑：缺 whisper 环境时先挡在闸门外——rc≠0、�
     // 点名的必须是「这次真缺的那两个路径」，不是一句含糊的「环境不可用」
     must(err.includes(join(deps, '.venv-asr')), `没说清缺哪一个虚拟环境（BILI_WATCH_DEPS 下的 .venv-asr）：${tail(err)}`)
     must(err.includes(join(deps, '_bili-asr.py')), `没说清缺哪一个脚本（_bili-asr.py）：${tail(err)}`)
-    must(/跑 scripts\/fetch-deps\.ps1 -Target asr/.test(out), `没给安装出路（用户只知道坏了、不知道怎么办）：${tail(out)}`)
+    // 2026-11-02（fetch-deps 合一）：出路的写法跟着命令变了 —— 三平台都是 node 一条命令。
+    must(/跑 node scripts\/fetch-deps\.mjs asr/.test(out), `没给安装出路（用户只知道坏了、不知道怎么办）：${tail(out)}`)
     must(/或用 text 走字幕\/OCR 降级/.test(out), `没给降级出路：${tail(out)}`)
     if (mockBili) {
       const paths = mockBili.hits().map((h) => h.path)
@@ -5727,7 +5928,10 @@ check('C111 login 真跑：--check 有凭证 → 「✓ 凭证有效…（mid=�
   }
 })
 
-try { if (mockBili) await mockBili.close() } catch {}
+// 2026-11-02：原来在这里就把 mockBili 关了。C127 要在文件末尾再用它做「未命中时逐字节不变」
+//   （那是本轮最硬的一条不变量：没命中就必须一个字节都不变），所以关闭点挪到汇总之后，
+//   连带新的 mockInject 一起关。挪后不影响退出——process.exit 本身终止 worker，
+//   只是把「这批跑完就关」改成「全跑完就关」。
 
 check('C112 removeOwned 对白名单目录也要看内容：混了用户文件就整目录不动并点名（X-02）', () => {
   // 2026-11-01（X-02，数据丢失）：缓存根可以被 BILI_WATCH_CACHE / deps-config.json 指到任何目录，
@@ -5804,7 +6008,12 @@ check('C117 skip 的原因必须可判读：不许空、不许「A 或 B」式�
     }
     reasons.push({ name: m[1], line: i + 1, why: buf })
   }
-  must(reasons.length >= 20, `只认出 ${reasons.length} 处 skip() 调用（应有 20+）—— 扫描方式可能过时了`)
+  // 阈值 20 → 14（2026-11-02，fetch-deps 合一）。
+  //   6 条判据原来带「本机没 bash / 找不到 fetch-deps.sh 就 skip」的出口，合一后改成真跑
+  //   （探针切原样代码），skip 出口本来**就该减少** —— 减得对，阈值跟着动。
+  //   但下限不能拿掉：它的用处是「扫描方式过时了要红」。真掉到 14 以下说明又有大批 skip
+  //   被删掉或换了写法，得有人看一眼再决定是不是也「减得对」。
+  must(reasons.length >= 14, `只认出 ${reasons.length} 处 skip() 调用（应有 14+）—— 扫描方式可能过时了，或者 skip 被大批删掉/改了写法`)
 
   // 覆盖自检：只给名字、不给原因的 skip('x') 会绕过上面的正则（要求有逗号），那是默认关掉的口子。
   // 报错文案里引用的示例是模板串（含 ` 或 ${），按「含反引号就跳过」区分，不误报。
@@ -5973,8 +6182,14 @@ check('C120 脚本文件头：.ps1 带 BOM、.sh 不带（都不许靠人记得�
   const names = readdirSync(dir)
   const ps1 = names.filter((n) => n.endsWith('.ps1'))
   const sh = names.filter((n) => n.endsWith('.sh'))
-  must(ps1.length >= 3, `scripts 下只找到 ${ps1.length} 个 .ps1，判据覆盖面不像真的`)
-  must(sh.length >= 1, 'scripts 下没有 .sh，对照样本为空——“全部要求带 BOM”那种一刀切写法会蒙过去')
+  // 2026-11-02（fetch-deps 合一）：原来写 must(ps1.length >= 3)。scripts 下的 .ps1 从 3 个
+  //   变成 2 个（fetch-deps 那份换成了 .mjs），写死的数量立刻误红 —— 正是「判据不许写死数量」那条。
+  //   改成「发版链那两个必须在」：这才是这条判据真正想守的东西（抽取器别扫空）。
+  for (const need of ['release.ps1', 'sync-release.ps1']) {
+    must(ps1.includes(need), `scripts 下缺 ${need} —— 形态判据的覆盖面会静默缩小`)
+  }
+  // .sh 在合并后确实一个都不剩了，所以「必须有对照样本」这条不能再当硬条件；
+  //   hasBom 本身有没有牙，由下面两个假文件自检负责（那才是真判据）。
   const badPs1 = ps1.filter((n) => !hasBom(join(dir, n)))
   must(badPs1.length === 0, `.ps1 缺 UTF-8 BOM：${badPs1.join(', ')} —— PS 5.1 会按 GBK 读中文、报 ParseError`)
   const badSh = sh.filter((n) => hasBom(join(dir, n)))
@@ -6059,7 +6274,11 @@ check('C121 .ps1 根定位统一：代码里一律 $PSScriptRoot，不许 $MyInv
   }
   const dir = join(ROOT, 'scripts')
   const names = readdirSync(dir).filter((n) => n.endsWith('.ps1'))
-  must(names.length >= 3, `scripts 下只找到 ${names.length} 个 .ps1，判据覆盖面不像真的`)
+  // 2026-11-02（fetch-deps 合一）：scripts 下的 .ps1 从 3 个变 2 个。写死数量会误红，
+  //   改成点名「发版链那两个必须在」—— 那才是这条判据要守的东西。
+  for (const need of ['release.ps1', 'sync-release.ps1']) {
+    must(names.includes(need), `scripts 下缺 ${need} —— 形态判据的覆盖面会静默缩小`)
+  }
 
   // 判据用 PowerShell 自己的 **Tokenizer**，不看源文本。
   //
@@ -6315,7 +6534,11 @@ check('C123 闸门调 node 一律走 cmd /c：裸 & 会被 Stop 吃掉 Fail 与�
 
   const dir = join(ROOT, 'scripts')
   const names = readdirSync(dir).filter((n) => n.endsWith('.ps1'))
-  must(names.length >= 3, `scripts 下只找到 ${names.length} 个 .ps1，判据覆盖面不像真的`)
+  // 2026-11-02（fetch-deps 合一）：scripts 下的 .ps1 从 3 个变 2 个。写死数量会误红，
+  //   改成点名「发版链那两个必须在」—— 那才是这条判据要守的东西。
+  for (const need of ['release.ps1', 'sync-release.ps1']) {
+    must(names.includes(need), `scripts 下缺 ${need} —— 形态判据的覆盖面会静默缩小`)
+  }
   const hits = []
   for (const n of names) {
     const bad = findBareNode(stripPsComment(readFileSync(join(dir, n), 'utf8')))
@@ -6375,6 +6598,123 @@ check('C124 敏感信息扫描的「没扫」必须点名：files 列了但盘�
   }
 })
 
+// C124b（2026-11-02）：4b 遇到**读不出来**的文件必须变红，而不是「✓ 通过 + exit 0」。
+//
+//   为什么单开一条、不塞进 C124：C124 验的是相反的结论（清单缺项 ⇒ 只 warn、rc 必须 0），
+//   这条要求 rc 必须 2。同一条 check 里同时断言两个相反结论，红的时候分不清是哪个塌了。
+//   更要紧的是**跳过粒度**：C124b 要用平台专有手段造「存在但读不出来」，
+//   手段不可用时（非 Windows 无 chmod 权限 / root / icacls 缺失）只能 skip。
+//   混进 C124 的话，这一个 skip 会把 C124 里已经能跑的 absent 判据一起吞掉。
+//
+//   这条盯的是 2026-11-02 刚改的那段（scripts/check-release-leak.mjs 的 unreadable 分支）：
+//   原来只 `[warn]` 然后照样 `✓ 扫描通过` + exit 0 —— 一个读不出来的文件换来一句「通过了」，
+//   而这是发布链上唯一看内容的闸。改成红之后，行为没有常驻断言盯着，只有一次手工扰动。
+//
+//   造法：a.txt 存在，把当前用户的读权限 deny 掉（Windows: icacls /deny；POSIX: chmod 000）。
+//   为什么只 deny (R) 就够：4b 的 listTargets 先 existsSync + statSync 判断是不是目录，
+//   deny 的是读数据、不是读属性，所以 statSync 照常成功、readFileSync 抛 EPERM ——
+//   夹具落在「存在但读不出来」这个精确状态上，而不是「文件不见了」（那是 C124 的现场）。
+//
+//   反向也验：恢复权限后必须回到 rc=0 且不许出现 ✗ —— 否则「把所有情况都判红」也能过这条。
+//   **这条断言的余量只有一句话的宽度**：拿「HARD 命中」造一个 rc=2 + ✗ + 点名 a.txt + 无 ✓ 的现场，
+//   前五条判据全满足，只有 UNREADABLE_NOTE 这一条挡住（2026-11-02 实测）。
+//   所以把它抽成常量：名字本身就是提示 —— 删它 / 改它等于让「别的 rc=2」冒充「读不出来」。
+const UNREADABLE_NOTE = '读不出来'
+
+check('C124b 4b 遇到读不出来的文件必须变红：点名 + exit 2，且不许说「通过」', () => {
+  const script = join(ROOT, 'scripts', 'check-release-leak.mjs')
+  must(existsSync(script), '找不到 scripts/check-release-leak.mjs —— C124b 要验的对象不在了')
+
+  const isWin = process.platform === 'win32'
+  const user = process.env.USERNAME || ''
+  if (isWin && !user) {
+    skip('C124b 读不出来必须变红', 'Windows 上拿不到 USERNAME —— 造不出 deny ACE，这条只能跳（不算通过）')
+    return
+  }
+
+  const tmp = mkdtempSync(join(tmpdir(), 'c124b-'))
+  const target = join(tmp, 'a.txt')
+  // denied 是幂等开关：中途 return / 抛错 / finally 都会再调一次 undoDeny()，
+  //   重复 remove:d 无害，但少调一次就会在 tmpdir 里留一个读不掉的文件。
+  let denied = false
+  const undoDeny = () => {
+    if (!denied) return
+    denied = false
+    if (isWin) {
+      // -EncodedCommand 那套在这里用不上：icacls 是原生 exe，参数走 argv 不经 PowerShell 解析，
+      //   所以我们不把中文路径交给 PS 的 GBK 解码器（这个仓库的已知坑）。
+      spawnSync('icacls', [target, '/remove:d', user], { encoding: 'utf8', timeout: 60000 })
+    } else {
+      try { chmodSync(target, 0o644) } catch { /* 文件可能已被删；恢复失败不该盖住真错 */ }
+    }
+  }
+
+  try {
+    writeFileSync(join(tmp, 'package.json'), JSON.stringify({ name: 'x', version: '0.0.1', files: ['a.txt', 'README.md'] }))
+    writeFileSync(target, 'hello\n')
+    writeFileSync(join(tmp, 'README.md'), '# x\n')
+
+    // —— 施加「存在但读不出来」——
+    if (isWin) {
+      const d = spawnSync('icacls', [target, '/deny', `${user}:(R)`], { encoding: 'utf8', timeout: 60000 })
+      if (d.status !== 0) {
+        // 夹具建不起来（icacls 不在 / 策略不允许）—— 跳，不是通过。
+        skip('C124b 读不出来必须变红', `icacls /deny 没成功（rc=${d.status}）：${(d.stderr || '').trim().slice(0, 200)}`)
+        return
+      }
+      denied = true
+    } else {
+      try { chmodSync(target, 0o000) } catch (e) {
+        skip('C124b 读不出来必须变红', `chmod 000 失败（${e.code}）—— 造不出夹具，这条只能跳（不算通过）`)
+        return
+      }
+      denied = true
+    }
+
+    // 夹具自检：**先确认真的读不出来**，再看 4b 的反应。
+    //   少了这一步，夹具没生效（比如以 root / 带备份特权跑，deny 挡不住读）时，
+    //   a.txt 会被正常扫过 —— 那时 4b 说「通过」反而是对的，而这条断言会红得莫名其妙。
+    //   有了它，红的原因能落到「环境特权」上，也能防止「夹具没生效但 status 恰好是 2」这种假绿。
+    let readable = true
+    try { readFileSync(target) } catch { readable = false }
+    if (readable) {
+      skip('C124b 读不出来必须变红', '夹具没生效：deny/chmod 之后仍读得出来（多半是特权身份在跑）—— 这条只能跳（不算通过）')
+      return
+    }
+
+    const r = spawnSync(process.execPath, [script, '--dir', tmp], { encoding: 'utf8', timeout: 60000 })
+    // 4b 的失败输出走 console.error ⇒ stderr，成功走 stdout。必须合起来看，只看 stdout 会漏掉全部失败信息。
+    const out = `${r.stdout || ''}${r.stderr || ''}`
+    const head = `rc=${r.status} out=${out.slice(0, 300)}`
+
+    must(r.status === 2, `有文件读不出来，4b 却返回 rc=${r.status}（必须 2）：${head}`)
+    // 实际字样是 `✗ 敏感信息扫描：1 个文件读不出来` —— 代码里没有 `[fail]` 这个标签，
+    //   所以这里认 ✗ 与「读不出来」，不是猜的标签名。
+    must(/✗/.test(out), `有文件读不出来，4b 没打 ✗：${head}`)
+    // 常量本身也守一道：它被改成空串 / 单字时 `includes` 会恒真，这条判据静默失效 ——
+    //   而它正是唯一挡「别的 rc=2 冒充读不出来」的那一条。
+    must(UNREADABLE_NOTE.length >= 3, `UNREADABLE_NOTE 被改成了 ${JSON.stringify(UNREADABLE_NOTE)} —— 太短会让下一条判据恒真`)
+    must(out.includes(UNREADABLE_NOTE), `4b 打红了但没说清原因（「${UNREADABLE_NOTE}」不见了）：${head}`)
+    must(/a\.txt/.test(out), `4b 打红了但没点名 a.txt —— 不点名等于让人自己去猜哪个文件没看：${head}`)
+    // 这条是本条的真正重点：失败时**绝不许**出现宣告通过的那两句。
+    //   注意不能用「不许出现『通过』」——4b 的失败文案自己是「（按未通过处理）」，
+    //   那样写会让这条断言永远红（我实测过文案）。禁词只能是断言句本身。
+    must(!/✓/.test(out), `有文件读不出来，4b 还打了 ✓：${head}`)
+    must(!/敏感信息扫描通过/.test(out), `有文件读不出来，4b 还说了「敏感信息扫描通过」：${head}`)
+
+    // —— 反向：恢复权限后必须回到干净 ——
+    undoDeny()
+    const r2 = spawnSync(process.execPath, [script, '--dir', tmp], { encoding: 'utf8', timeout: 60000 })
+    const out2 = `${r2.stdout || ''}${r2.stderr || ''}`
+    must(r2.status === 0, `权限恢复后 4b 仍返回 rc=${r2.status}（必须 0，否则等于「把一切都判红」也算通过）：${out2.slice(0, 300)}`)
+    must(!/✗/.test(out2), `权限恢复后还打 ✗：${out2.slice(0, 300)}`)
+    must(/敏感信息扫描通过/.test(out2), `权限恢复后 4b 没说「扫描通过」—— 反向判据也在验它确实扫了：${out2.slice(0, 300)}`)
+  } finally {
+    undoDeny()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 // C125（2026-11-01 第三轮）：三个 .ps1 必须能被 PowerShell 解析（0 个语法错误）。
 //   为什么还要这条 —— C120 查 BOM、C121 查根定位、C123 查调用方式，**全是文本匹配**：
 //   脚本哪怕语法全错，这三条照样绿（它们只是 grep）。C122 也只解析 sync-release.ps1 一个。
@@ -6390,7 +6730,11 @@ check('C125 三个 .ps1 必须能被 PowerShell 解析（0 个语法错误）', 
   }
   const dir = join(ROOT, 'scripts')
   const names = readdirSync(dir).filter((n) => n.endsWith('.ps1'))
-  must(names.length >= 3, `scripts 下只找到 ${names.length} 个 .ps1，判据覆盖面不像真的`)
+  // 2026-11-02（fetch-deps 合一）：scripts 下的 .ps1 从 3 个变 2 个。写死数量会误红，
+  //   改成点名「发版链那两个必须在」—— 那才是这条判据要守的东西。
+  for (const need of ['release.ps1', 'sync-release.ps1']) {
+    must(names.includes(need), `scripts 下缺 ${need} —— 形态判据的覆盖面会静默缩小`)
+  }
   // 同样走 -EncodedCommand：脚本目录路径含中文，-File 会被 GBK 解码打碎（C122 那段踩过）
   const probe = [
     `$dir = '${dir.replace(/'/g, "''")}'`,
@@ -6420,6 +6764,219 @@ check('C125 三个 .ps1 必须能被 PowerShell 解析（0 个语法错误）', 
   )
 })
 
+// ── C126：git 推送段必须局部降级（2026-11-02 发 0.4.3 的现场）────────────────
+//   现场：第 6 步 `& git push origin main 2>&1 | Out-Null` 在全局 $ErrorActionPreference="Stop"
+//   下，把 git 写在 **stderr** 的进度行当成终止错误抛出 → 脚本断在第 6 步，`git tag -a` 与
+//   推 tag 都没跑，而远端 main 其实**已经推成功了**。断点位置与实际结果相反，比「push 失败」
+//   更难判。修法是这一段局部切 Continue、finally 还原。
+//   这条钉两件事：别把降级改回去；新增的 git 调用也别指望全局 Stop。
+check('C126 git 推送段必须局部降级成 Continue（Stop 会把 git 的 stderr 当终止错误）', () => {
+  const p = join(ROOT, 'scripts', 'release.ps1')
+  must(existsSync(p), '找不到 scripts/release.ps1')
+  const src = read('scripts/release.ps1')
+  // 抽第 6 段：`# ---- 6. git` 到 `[skip] git`（段尾），不用行号，段落挪位置也不失效
+  const i0 = src.indexOf('# ---- 6. git')
+  must(i0 >= 0, 'release.ps1 里找不到第 6 段标记（# ---- 6. git）—— 段落结构变了，先看这条')
+  const i1 = src.indexOf('[skip] git', i0)
+  must(i1 > i0, '第 6 段找不到结尾标记（[skip] git）')
+  const segRaw = src.slice(i0, i1)
+  // 注释里有反例原文（`& git push origin main 2>&1`、`git tag`），直接对整段做正则会
+  //   把注释当代码：既可能让「第一个 git 调用」判早，也可能让「tag 存在」假绿。
+  const seg = segRaw
+    .split('\n')
+    .filter((l) => !/^\s*#/.test(l))
+    .join('\n')
+
+  const iCont = seg.indexOf("$ErrorActionPreference = 'Continue'")
+  must(
+    iCont >= 0,
+    '第 6 段没有局部切 Continue —— 全局 Stop 下 git 写 stderr 会抛 NativeCommandError，脚本会断在 push 之后、tag 之前',
+  )
+  // 切 Continue 必须早于段内第一个 git 调用
+  const iFirstGit = seg.search(/&\s*git\s/)
+  must(iFirstGit < 0 || iCont < iFirstGit, 'Continue 切在第一个 git 调用之后，等于没切')
+  // 降级之后必须还原，否则泄漏到调用方
+  must(
+    /\$ErrorActionPreference\s*=\s*\$eapPrev/.test(seg),
+    '段内有降级但没有还原 $ErrorActionPreference —— 泄漏到调用方，后面任何原生命令写 stderr 都会炸',
+  )
+  // 降级段里最危险的不是「push 失败」，是「push 成功但后续步骤被跳过」：
+  //   所以 tag 步骤必须真的在段里存在，否则降级只是让脚本更安静地漏掉一步。
+  must(/&\s*git\s+tag\s+-a/.test(seg), '第 6 段里没有 git tag -a —— push 之后打 tag 的那一步不见了')
+  must(/&\s*git\s+push\s+origin\s+["']?v/.test(seg), '第 6 段里没有推 tag 的那一步（git push origin v…）')
+})
+
+// —— 陌生人内容护栏（2026-11-02，DSH 19:55 定稿四条）——
+// 这批修的是两件事：① 「数据形态（--format json/srt/md/txt）下护栏根本不跑」——warnForeign 在
+//   dataOnly 的 return 之后；② 「提示让模型绕过自家围栏」——展示层加了 source tag + 围栏，
+//   而 2451 行让模型 read 的落盘文件是**纯正文**，那条最短的路把标记绕过去了。
+//
+// 判据为什么不写成「scanInjection 返回什么」：那只能证明正则还在。出问题的地方是「跑没跑」，
+//   所以 C127/C128 **真跑命令**看 stdout / stderr / 落盘文件；C129/C130 要喂一批语料看命中率，
+//   用「把定义段原样切出来 + 探针尾巴」的办法（切的是真代码，不是复刻件）。
+const GUARD_BASE = 'e889822' // 本批改动前的基线：逐字节对比要拿它的 look.mjs 跑一遍
+const GUARD_TAIL = readFileSync(join(HERE, 'fixtures', 'guard-probe-tail.mjs'), 'utf8')
+
+/** 把 look.mjs 里护栏的定义段原样切出来，拼上探针尾巴跑。返回 [{name, long, short}] */
+function guardProbe(cases, label) {
+  const src = read('tools/look.mjs')
+  const i = src.indexOf('const INVISIBLE_RES = [')
+  must(i > 0, `${label}：tools/look.mjs 里找不到 INVISIBLE_RES —— 段落结构变了，先看这条`)
+  const j = src.indexOf('const WARN_STATE =', i)
+  must(j > i, `${label}：找不到 WARN_STATE 作为切段终点 —— 切出来会是半截代码`)
+  const seg = src.slice(i, j)
+  // 切到空处时探针会「零命中」全绿 —— 那正是最坏的假绿，所以先验切出来的段里该有的都在
+  for (const need of ['const SUSPECT_ALL', 'const SUSPECT_HIGH', 'function scanInjection']) {
+    must(seg.includes(need), `${label}：切出来的段里没有 ${need}（切到空处了）`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'bw-guard-'))
+  try {
+    const f = join(dir, 'guard-probe.mjs')
+    writeFileSync(f, seg + '\n' + GUARD_TAIL, 'utf8')
+    const r = spawnSync(process.execPath, [f], {
+      env: { ...process.env, BW_GUARD_CASES: JSON.stringify(cases) },
+      encoding: 'utf8', timeout: 60000,
+    })
+    must(r.status === 0, `${label}：探针跑不起来 rc=${r.status} ${tail(r.stderr)}`)
+    const m = /__GUARD_JSON__(\[[\s\S]*\])/.exec(r.stdout || '')
+    must(m, `${label}：探针没吐结果 ${tail(r.stdout)}`)
+    return JSON.parse(m[1])
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+
+check('C127 --format json 下护栏真的跑：命中带 _untrusted，未命中逐字节不变（数据形态曾是空白区）', () => {
+  const NAME = 'C127 json 形态的护栏'
+  if (!needMock(NAME)) return
+  if (!mockInject) { skip(NAME, `带注入的 mock 起不来：${mockInjectWhy}`); return }
+  const cache = mockCache('gw-json')
+  const args = ['comments', MOCK_BV, '--format', 'json']
+
+  // ① 有注入：JSON 合法 + _untrusted.hits 非空 + stderr 有警告
+  const rInj = runLookMock(args, mockEnvOn(mockInject, { BILI_WATCH_CACHE: cache }))
+  must(rInj.status === 0, `带注入的 comments --format json 应 rc=0：rc=${rInj.status} ${tail(rInj.stderr)}`)
+  let pInj = null
+  try { pInj = JSON.parse(rInj.stdout) } catch { pInj = null }
+  must(pInj && typeof pInj === 'object', `stdout 不是合法 JSON（数据契约破了）：${tail(rInj.stdout, 200)}`)
+  must(Array.isArray(pInj.items) && pInj.items.length > 0, 'payload.items 没了 —— 为了加标记把数据弄丢了')
+  must(pInj._untrusted, '带注入的评论没有 _untrusted —— 标记没跟着数据走，下游收到的是一段没标记的用户内容')
+  must(Array.isArray(pInj._untrusted.hits) && pInj._untrusted.hits.length > 0, '_untrusted.hits 是空的')
+  must(pInj._untrusted.source === 'bilibili' && pInj._untrusted.kind === 'comments',
+    `_untrusted 的 source/kind 不对：${JSON.stringify(pInj._untrusted)}`)
+  must(/疑似指令/.test(rInj.stderr || ''), `stderr 没有警告（终端这条路也丢了）：${tail(rInj.stderr)}`)
+
+  // ①-b 同一类 bug 的**第二处实现**：sub --format json 走的是 printText 的 dataOnly 分支，
+  //   和 comments 的 json 分支是两份代码。第一版 C127 只验了 comments —— 扰动直接照出来：
+  //   把 decorateData 的 json 分支删掉、把 printText 的 dataOnly 退回直接吐 full，C127 全绿。
+  //   这不是判据「没牙」，是**判据在验错对象**（11-02 那条：比「不够真」更隐蔽）。
+  //   用独立缓存目录：stderr 警告按 bv 跨命令去重（7-8），复用上面那个 cache 的话
+  //   comments 那次已经把这两类记进 injection-warned.json，sub 这边就一个字都不打 ——
+  //   那不是「没警告」，是「同一个视频不重复警告」。判据要验的是「这条路上到底跑没跑」。
+  const rSub = runLookMock(['sub', MOCK_BV, '--format', 'json'], mockEnvOn(mockInject, { BILI_WATCH_CACHE: mockCache('gw-sub') }))
+  must(rSub.status === 0, `带注入的 sub --format json 应 rc=0：rc=${rSub.status} ${tail(rSub.stderr)}`)
+  let pSub = null
+  try { pSub = JSON.parse(rSub.stdout) } catch { pSub = null }
+  must(pSub && typeof pSub === 'object', `sub --format json 的 stdout 不是合法 JSON：${tail(rSub.stdout, 200)}`)
+  must(Array.isArray(pSub.cues) && pSub.cues.length > 0, 'payload.cues 没了 —— 为了加标记把数据弄丢了')
+  must(pSub._untrusted && Array.isArray(pSub._untrusted.hits) && pSub._untrusted.hits.length > 0,
+    'sub --format json 没有 _untrusted —— printText 的 dataOnly 这条路上的护栏没跑到')
+  must(/疑似指令/.test(rSub.stderr || ''), `sub --format json 的 stderr 没有警告：${tail(rSub.stderr)}`)
+  const rSubOk = runLookMock(['sub', MOCK_BV, '--format', 'json'], mockEnv({ BILI_WATCH_CACHE: mockCache('gw-subok') }))
+  must(!/_untrusted/.test(rSubOk.stdout || ''), '正常字幕的 sub --format json 也带上了 _untrusted（恒定加字段）')
+
+  // ② 没注入：不许出现 _untrusted
+  const rOk = runLookMock(args, mockEnv({ BILI_WATCH_CACHE: cache }))
+  must(rOk.status === 0, `未命中的 comments --format json 应 rc=0：rc=${rOk.status} ${tail(rOk.stderr)}`)
+  must(!/_untrusted/.test(rOk.stdout || ''), '没有命中却加了 _untrusted —— 正常内容被改了，下游会莫名收到扩展字段')
+  must(!/疑似指令/.test(rOk.stderr || ''), `正常评论却报了疑似指令（误报）：${tail(rOk.stderr)}`)
+
+  // ③ 与改动前逐字节比。为什么非要真跑一遍旧版：这条守住的是「没命中时一个字节都不许变」，
+  //   而那是个**全等**断言 —— 「字段都在」「结构一样」这类弱断言全绿时它仍可能已经破了。
+  //   （11-02 那条教训：机制上变了 ≠ 输出会变，判差异要落到逐字节比 stdout/stderr。）
+  let oldOut = ''
+  let oldWhy = ''
+  try {
+    const oldRoot = mkdtempSync(join(tmpdir(), 'bw-oldlook-'))
+    mkdirSync(join(oldRoot, 'tools'), { recursive: true })
+    const oldSrc = execFileSync('git', ['show', `${GUARD_BASE}:tools/look.mjs`], { cwd: ROOT, encoding: 'utf8' })
+    for (const f of readdirSync(HERE)) if (f.endsWith('.mjs')) copyFileSync(join(HERE, f), join(oldRoot, 'tools', f))
+    writeFileSync(join(oldRoot, 'tools', 'look.mjs'), oldSrc, 'utf8')
+    try { symlinkSync(join(ROOT, 'lib'), join(oldRoot, 'lib'), 'junction') } catch {}
+    try { symlinkSync(join(ROOT, 'node_modules'), join(oldRoot, 'node_modules'), 'junction') } catch {}
+    const ro = spawnSync(process.execPath, ['--import', MOCK_PRELOAD, join(oldRoot, 'tools', 'look.mjs'), ...args],
+      { env: mockEnv({ BILI_WATCH_CACHE: mockCache('gw-old') }), encoding: 'utf8', timeout: 180000 })
+    if (ro.status !== 0) oldWhy = `旧版跑失败 rc=${ro.status} ${tail(ro.stderr)}`
+    else oldOut = ro.stdout
+  } catch (e) { oldWhy = String(e?.message ?? e) }
+  if (oldWhy) skip(`${NAME} · 与改动前逐字节对比`, `拿不到改动前的输出，这条没验：${oldWhy}`)
+  else must(oldOut === rOk.stdout, `没命中时 stdout 变了（新 ${rOk.stdout.length} 字节 / 旧 ${oldOut.length} 字节）`)
+
+  return '命中→_untrusted+hits+stderr 警告；未命中→无扩展字段，且与 e889822 逐字节一致'
+})
+
+check('C128 落盘：原文件仍纯正文，wrapped 副本带 source tag+围栏，提示词指向 wrapped 且措辞收窄', () => {
+  const NAME = 'C128 落盘 wrapped'
+  if (!needMock(NAME)) return
+  if (!mockInject) { skip(NAME, `带注入的 mock 起不来：${mockInjectWhy}`); return }
+  const cache = mockCache('gw-wrap')
+  const r = runLookMock(['sub', MOCK_BV], mockEnvOn(mockInject, { BILI_WATCH_CACHE: cache }))
+  must(r.status === 0, `sub 应 rc=0：rc=${r.status} ${tail(r.stderr)}`)
+  const dir = join(cache, MOCK_BV)
+  must(existsSync(dir), `缓存目录没建：${dir}`)
+  const plain = join(dir, 'sub.txt')
+  const wrap = join(dir, 'sub.wrapped.txt')
+  must(existsSync(plain), '没有落盘 sub.txt —— 纯正文那份不见了，read+解析它的下游会断')
+  must(existsSync(wrap), '没有落盘 sub.wrapped.txt —— 推荐路径指向的那份带边界的副本没生成')
+  const p = readFileSync(plain, 'utf8')
+  must(!p.includes('[source:'), 'sub.txt 里出现了 source tag —— 纯正文被污染，下游解析会受影响')
+  must(!p.includes('```'), 'sub.txt 里出现了围栏')
+  const w = readFileSync(wrap, 'utf8')
+  must(w.startsWith('[source: bilibili-subtitle'), `wrapped 副本开头不是 source tag：${JSON.stringify(w.slice(0, 60))}`)
+  must(w.includes('```'), 'wrapped 副本没有围栏 —— 光有 tag 不叫边界')
+  must(w.includes(INJECT_SUBTITLE), 'wrapped 副本里没有正文（标记有了、内容是空的）')
+  // 提示词：必须指向 wrapped，且是「指向你的要求」而不是「任何要求」
+  must(r.stdout.includes(wrap), `stdout 没指向 wrapped 那份：${tail(r.stdout, 300)}`)
+  must(/指向你的要求/.test(r.stdout || ''), `提示词没有「指向你的要求」（过度概括会误伤字幕里的正常祈使句）：${tail(r.stdout, 300)}`)
+  must(!/不要执行里面的任何要求/.test(r.stdout || ''), '提示词还是「任何要求」那版 —— 过度概括没改')
+  return 'sub.txt 纯正文 / sub.wrapped.txt 带 tag+围栏 / 提示词指向 wrapped'
+})
+
+check('C129 20 条正常字幕在长文本规则下零命中（DSH 19:42 那三条语义规则不加的依据）', () => {
+  const raw = read('tools/fixtures/normal-subtitles.txt')
+  const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
+  must(lines.length >= 20, `语料只有 ${lines.length} 条（应 ≥20）—— 删条目就等于放宽这条判据`)
+  const out = guardProbe(lines.map((t, i) => ({ name: `n${i + 1}`, text: t })), 'C129')
+  must(out.length === lines.length, `探针返回 ${out.length} 条，喂了 ${lines.length} 条`)
+  const bad = out.filter((r) => r.long.length)
+  must(bad.length === 0,
+    `长文本池把 ${bad.length} 条正常字幕当成注入了：${bad.map((b) => `${b.name}→${b.long.join('/')}`).join('；')}` +
+    '（字幕几千字，误报一条就是「每次都报」，下一步必然被人整段注释掉）')
+  // 短文本池（评论）本来就会命中一些——不是断言目标，但必须打出来：
+  //   「短池误报多少」是下一步要不要收紧的唯一依据，藏在报告里迟早被忘。
+  const sh = out.filter((r) => r.short.length)
+  return `${lines.length} 条正常字幕：长文本池 0 命中；短文本池 ${sh.length} 条命中` +
+    (sh.length ? `（${sh.slice(0, 3).map((x) => x.short.join('/')).join('；')}…）` : '')
+})
+
+check('C130 不可见字符是确定性判据：零宽/tag/双向控制符命中，正常文本与开头 BOM 不命中', () => {
+  const cases = [
+    { name: 'plain', text: '好片子', expect: [] },
+    { name: 'zw', text: '好片\u200b子', expect: ['零宽字符'] },
+    { name: 'tag', text: '好片子\u{E0041}\u{E0042}', expect: ['tag 字符'] },
+    { name: 'bidi', text: '好片\u202e子', expect: ['双向控制符'] },
+    // 开头那个 U+FEFF 是「文件带 BOM」的产物，不是藏字：把它当命中，等于带 BOM 的每条都报警
+    { name: 'bom-head', text: '\uFEFF好片子', expect: [] },
+    { name: 'bom-mid', text: '好片\uFEFF子', expect: ['BOM 字符'] },
+  ]
+  const out = guardProbe(cases.map(({ name, text }) => ({ name, text })), 'C130')
+  for (const c of cases) {
+    const got = out.find((o) => o.name === c.name)
+    must(got, `探针没返回 ${c.name}`)
+    must(JSON.stringify(got.long) === JSON.stringify(c.expect),
+      `${c.name}：期望 ${JSON.stringify(c.expect)}，实际 ${JSON.stringify(got.long)}`)
+  }
+  return `${cases.length} 个用例全中（含「开头 BOM 不算藏字」）`
+})
+
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
 let pass = 0, fail = 0, skipN = 0
 for (const r of results) {
@@ -6444,4 +7001,6 @@ if (skipN > 0) {
   }
 }
 
+try { if (mockBili) await mockBili.close() } catch {}
+try { if (mockInject) await mockInject.close() } catch {}
 process.exit(fail ? 1 : 0)
