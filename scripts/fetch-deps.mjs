@@ -142,6 +142,81 @@ if (!DRY) {
   } catch {}
 }
 
+// ── 跨进程锁 ────────────────────────────────────────────────────
+// issue #10 问题 3（2026-11-03）：宿主侧的 DOWNLOADING 表只在**一个进程的内存**里，
+//   两个窗口 / 两个宿主实例各有一份，挡不住并发。所以锁必须落到磁盘：
+//   deps\.fetch-deps.lock 写 {pid, startedAt, target}；pid 还活着且没过期 = 别人在跑。
+const LOCK_FILE = join(DEPS, '.fetch-deps.lock')
+// 2026-11-03 自审改的：原来 1 小时，且**先看时间再看 pid** —— 一个跑满 1 小时的下载
+//   （模型 1 GB 起，慢线路 + 镜像限速很常见）会被判成「残留锁」，后来者直接删锁接管，
+//   两个进程同时动 venv，正好是 issue #10 要修的那件事。现在 pid 活着就是 held，
+//   时间只兜「pid 被复用」这一个极端：6 小时够任何一次 all 跑完。
+const LOCK_STALE_MS = 6 * 60 * 60 * 1000
+/**
+ * 纯函数：现有锁算不算「有人正在跑」。抽出来是为了能真跑断言（C145），不靠读源码猜。
+ * 判定顺序：没有 pid -> free；pid 活着 -> held（超过 6 小时才翻成 stale，兜 pid 复用）；
+ *   pid 不在了 -> stale（崩溃残留，立刻可接管）。
+ * @param {{pid?:number, startedAt?:number}|null} cur 读到的锁内容（没有锁传 null）
+ * @param {{now?:number, staleMs?:number, alive?:(pid:number)=>boolean}} opts 测试可注入
+ * @returns {'free'|'stale'|'held'}
+ */
+function lockState(cur, opts = {}) {
+  if (!cur || !Number.isFinite(cur.pid)) return 'free'
+  const now = opts.now ?? Date.now()
+  const staleMs = opts.staleMs ?? LOCK_STALE_MS
+  const startedAt = Number.isFinite(cur.startedAt) ? cur.startedAt : 0
+  const alive = opts.alive ?? ((pid) => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (e) {
+      // EPERM = 进程在、只是没权限问；其它（ESRCH）才算不在了
+      return e && e.code === 'EPERM'
+    }
+  })
+  if (!alive(cur.pid)) return 'stale'
+  // 活着 + 超时 = 只可能是 pid 被别的进程复用了（下载再慢也不该跑 6 小时）
+  if (startedAt && now - startedAt > staleMs) return 'stale'
+  return 'held'
+}
+function readLock() {
+  try {
+    return JSON.parse(readFileSync(LOCK_FILE, 'utf8'))
+  } catch {
+    return null
+  }
+}
+/** 只删自己写的锁：别人的锁不能顺手清掉。 */
+function releaseLock() {
+  try {
+    const cur = readLock()
+    if (cur && cur.pid === process.pid) rmSync(LOCK_FILE, { force: true })
+  } catch {}
+}
+function acquireLock() {
+  const cur = readLock()
+  const st = lockState(cur)
+  if (st === 'held') {
+    const since = cur.startedAt ? new Date(cur.startedAt).toLocaleString() : '未知时间'
+    console.error(`✗ 已经有一个安装进程在跑（pid=${cur.pid}，目标 ${cur.target || '?'}，开始于 ${since}）`)
+    console.error('  等它结束再重试。确认它已经不在了的话，删掉这个文件后重来：')
+    console.error(`  ${LOCK_FILE}`)
+    process.exit(3)
+  }
+  if (st === 'stale') {
+    try {
+      rmSync(LOCK_FILE, { force: true })
+    } catch {}
+    console.log('    清掉了上次残留的锁')
+  }
+  try {
+    writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: Date.now(), target: TARGET }), 'utf8')
+  } catch {}
+  process.on('exit', releaseLock)
+}
+// dry-run 不抢锁：它不写盘，也不该被别人的下载挡住（否则「只想看一眼」就跑不了）
+if (!DRY) acquireLock()
+
 // ── 日志 ────────────────────────────────────────────────────────
 const LOG_FILE = join(DEPS, 'download.log')
 function log(msg) {
@@ -713,6 +788,13 @@ function moveSemiVenv(venv) {
     console.log(`    半成品 venv 已改名为 ${dst}（确认无用后可手动删）`)
   } catch (e) {
     console.log(`    ! 半成品 venv 改名失败：${e.message}`)
+    // issue #10 问题 3：目录被占着（另一个进程还在写）时**不许继续在原目录上建 venv**。
+    //   原来这里只打一行就往下走，而 `python -m venv` 不会清掉已有文件 —— 最后留下一个
+    //   装了一半的环境，用户看到的是「import faster_whisper 失败」，与真实原因隔了一层。
+    //   EPERM / EBUSY 单拎出来：这俩就是「现在别动」，直接把话说到位。
+    if (e && (e.code === 'EPERM' || e.code === 'EBUSY')) {
+      throw new Error(`venv 目录正被占用（${e.code}），可能有另一个安装进程还在跑。等它结束后重试，不要在这个状态下继续装`)
+    }
     console.log(`      可手动删除：${venv}`)
   }
 }
@@ -788,7 +870,12 @@ function newVenv(venv) {
     log(`uv venv 失败（退出码 ${r.code}），回退系统 Python`)
     moveSemiVenv(venv)
   }
-  const sys = systemPython()
+  // discussion #9（2026-11-03）：原来这里无条件 `systemPython()`，而 `--python` 指定的解释器
+  //   只记在 `plan.exe`（见 pyPlan），**从头到尾没被用过**。用户机器上 PATH 里排前面的
+  //   `python.exe` 是 WindowsApps 存根，结果永远撞在存根上，报「只找到应用商店的 Python 存根」，
+  //   手改成优先 plan.exe 后一次跑通。所以这里必须先认 plan.exe。
+  //   uv 分支失败回退时 plan.exe 是空串（uv 模式不填 exe），仍然落到 systemPython()，行为不变。
+  const sys = plan.exe || systemPython()
   console.log(`    建 venv："${sys}" -m venv "${venv}"`)
   log(`python -m venv ${venv}（${sys}）`)
   let r = run(sys, ['-m', 'venv', venv], { timeout: 0 })

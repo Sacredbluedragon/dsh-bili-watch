@@ -61,8 +61,17 @@ function fmtSkippedNote(d) {
 //   在**没有 NVIDIA 卡**的机器上也有按钮 —— 点下去会装 2.2 GB 运行库，装完照样走 CPU。
 //   后端给行带 installable:false 时不显示按钮（没这个字段的行照旧显示，向后兼容）。
 //   抽成顶层纯函数是为了能被 verify 真跑断言（C62），而不是「源码里有这句话」。
+/** 这一行现在该不该禁用「下载」：刚点的那个还没回来，或者宿主说它正在跑。
+ *  issue #10 问题 3 建议 1 的后半句「面板把按钮置灰」——原来 busy 在 POST 返回后
+ *  立刻清空，用户 15 秒后再点一次，服务端虽然有互斥，但面板看上去完全可点。 */
+function rowBusy(id, clickedId, downloading) {
+  if (clickedId && clickedId === id) return true
+  return Array.isArray(downloading) && downloading.indexOf(id) >= 0
+}
+
 function canDownloadRow(d) {
   if (!d || d.ok) return false
+  if (d.na) return false // 不适用（没卡时的 GPU 运行库）：装了也用不上
   if (d.id === 'credential') return false // 凭证走「去扫码登录」，不是下载
   return d.installable !== false
 }
@@ -72,7 +81,7 @@ function canDownloadRow(d) {
 //   —— 用户点完还是那句「缺 1 个依赖」，只能去点「不再提示」。
 //   注意：凭证行**仍然计入**（它确实「没配好」），这是原有行为，这次没动它。
 function missingDeps(deps) {
-  return (deps || []).filter((d) => d && !d.ok && d.installable !== false)
+  return (deps || []).filter((d) => d && !d.ok && !d.na && d.installable !== false)
 }
 
 // #10（2026-10-30，P1）：轮询回包 → 下一步动作。抽成纯函数，便于真跑断言（C36）。
@@ -178,6 +187,10 @@ MODULE_LOADER.load({
 [data-bl-dot]{width:8px;height:8px;border-radius:50%;flex:none;}
 [data-bl-dot="ok"]{background:#3c9a5f;}
 [data-bl-dot="bad"]{background:#d9534f;}
+/* issue #10 问题 1（2026-11-03）：没卡的机器上 GPU 运行库这行是「不适用」，不是「坏」。
+   灰点 + 灰字，既不算缺依赖，也不给下载按钮。 */
+[data-bl-dot="na"]{background:#9aa0a6;}
+[data-bl-dot="na"]~[data-bl-detail]{opacity:.7;}
 [data-bl-name]{min-width:150px;flex:none;}
 [data-bl-detail]{flex:1;min-width:140px;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;word-break:break-all;}
 [data-bl-size]{flex:none;color:var(--dsw-alias-label-tertiary,#8a9099);font-size:12px;min-width:64px;text-align:right;}
@@ -364,11 +377,14 @@ MODULE_LOADER.load({
 
     function DepRow({ d, busy, onDownload, onDelete }) {
       const canDownload = canDownloadRow(d)
+      // issue #10 问题 1：na = 这台机器上不适用（目前只有「没有 NVIDIA 卡时的 GPU 运行库」）。
+      //   它是灰的，不是红的；也不挂 data-bl-bad（那会让它看起来像故障）。
+      const dot = d.na ? 'na' : (d.ok ? 'ok' : 'bad')
       return h('div', { 'data-bl-row': '' },
-        h('span', { 'data-bl-dot': d.ok ? 'ok' : 'bad' }),
+        h('span', { 'data-bl-dot': dot }),
         h('span', { 'data-bl-name': '' }, d.name),
-        h('span', { 'data-bl-detail': '' }, d.ok ? d.detail : h('span', { 'data-bl-bad': '' }, d.detail)),
-        h('span', { 'data-bl-size': '' }, d.ok ? fmtBytes(d.size) : d.estimate),
+        h('span', { 'data-bl-detail': '' }, (d.ok || d.na) ? d.detail : h('span', { 'data-bl-bad': '' }, d.detail)),
+        h('span', { 'data-bl-size': '' }, d.na ? '—' : (d.ok ? fmtBytes(d.size) : d.estimate)),
         d.id === 'credential'
           ? h('button', { 'data-bl-btn': '', onClick: () => onDownload('login') }, d.ok ? '重新扫码' : '去扫码登录')
           : canDownload
@@ -443,9 +459,12 @@ MODULE_LOADER.load({
       const dirtyRef = React.useRef(false)
       const markDirty = () => { dirtyRef.current = true }
 
-      const load = React.useCallback(async () => {
+      // fresh=true 只由手点「刷新」传（服务端据此跳过 GPU 5 分钟缓存与 import 探针 30 秒缓存）。
+      //   8 秒轮询、保存后回读、删依赖后回读都不传 —— 那些路径刚改过的东西各有自己的 reset，
+      //   没必要每 8 秒起两个 python 子进程。
+      const load = React.useCallback(async (fresh) => {
         try {
-          const j = await jget('/status')
+          const j = await jget(fresh ? '/status?fresh=1' : '/status')
           if (j.ok) {
             setSt(j.data)
             setErr('')
@@ -819,7 +838,7 @@ MODULE_LOADER.load({
             h('span', { 'data-bl-sec-title': '' }, '运行依赖'),
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('download') }, '批量下载'),
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
-          ...deps.map((d) => h(DepRow, { key: d.id, d, busy: busy === d.id, onDownload: download, onDelete: delOne })),
+          ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), onDownload: download, onDelete: delOne })),
           h('div', { 'data-bl-note': '' },
             '下载由内置 fetch-deps 脚本执行，需保持面板打开（宿主退出会中断）；体积为预估值，实际以完成后为准。')),
         dlg
@@ -1048,7 +1067,7 @@ MODULE_LOADER.load({
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, lastRun.command || '—'),
             h('span', { 'data-bl-detail': '' }, lastRun.time ? `${fmtTime(lastRun.time)}（${lastRun.ok ? '成功' : '失败'}）` : '还没有记录'),
-            h('button', { 'data-bl-btn': '', onClick: load }, '刷新'))),
+            h('button', { 'data-bl-btn': '', onClick: () => load(true) }, '刷新'))),
         msg ? h('div', { 'data-bl-note': '' }, msg) : null,
       )
     }

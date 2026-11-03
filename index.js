@@ -973,10 +973,19 @@ function nextGpuCache(cache, res, now = Date.now()) {
   if (!res || res.confident !== true || !res.val) return cache
   return { at: now, val: res.val }
 }
-function gpuStatus() {
-  // 没有 force 形参：强刷统一走 resetGpuCache()。留一个没人传的 force 会让下一个人
-  //   以为「传 true 能强刷」，而实际刷新路径已经改成 resetGpuCache()，两套机制并存会分叉。
-  if (_gpuCache.val && Date.now() - _gpuCache.at < GPU_CACHE_MS) return Promise.resolve(_gpuCache.val)
+/** 这次 /status 要不要直接吃 5 分钟的 GPU 缓存。
+ *  2026-11-03 自审：原来没有这个判断，注释还写着「刷新路径已经改成 resetGpuCache()」——
+ *  实际上 resetGpuCache 只在删依赖后调用，**手点刷新根本不跳缓存**，用户刚装完运行库
+ *  点刷新，最多还要看 5 分钟的红点。抽成纯函数是为了能真跑断言（C148）。 */
+function gpuCacheHit(cache, now, ttl, fresh) {
+  if (fresh) return false
+  if (!cache || !cache.val) return false
+  return now - cache.at < ttl
+}
+
+function gpuStatus(fresh) {
+  // fresh 只由面板手点「刷新」传（/status?fresh=1）；8 秒轮询永远不带，否则每轮都起两个子进程。
+  if (gpuCacheHit(_gpuCache, Date.now(), GPU_CACHE_MS, fresh)) return Promise.resolve(_gpuCache.val)
   if (_probePromise) return _probePromise // 在飞就复用，并发 5 次也只起一套 nvidia-smi
   const mySeq = ++_gpuSeq
   _probePromise = probeGpu()
@@ -1014,6 +1023,59 @@ function probeWhy(r) {
   if (tail) out.push(tail)
   return out.length ? out.join(' ') : String(e.message ?? e).slice(0, 120)
 }
+/** nvidia-smi 的候选路径：先裸名（走 PATH），再试绝对路径。
+ *  2026-11-03 自审（issue #10 问题 1 的回归）：ENOENT 只说明「PATH 里找不到这个命令」，
+ *  不等于「机器上没有卡」。宿主进程的 PATH 被裁剪（打包分发、启动器只给最小环境、
+ *  安全加固脚本把 System32 摘掉）时，有卡的机器也会 ENOENT —— 原来的早退会把这种机器
+ *  判成「本机无 NVIDIA 显卡」，既谎报事实，又把「一键下载」按钮灰掉，比修之前更糟
+ *  （修之前至少还会继续探 venv 里的 nvidia 包，有库就能显示绿）。
+ *  绝对路径兜底一次 existsSync 的成本，换掉一整类误判。 */
+function nvidiaSmiCands() {
+  const out = ['nvidia-smi']
+  if (process.platform === 'win32') {
+    const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows'
+    out.push(join(root, 'System32', 'nvidia-smi.exe'))
+  } else {
+    out.push('/usr/bin/nvidia-smi', '/usr/local/nvidia/bin/nvidia-smi')
+  }
+  return out
+}
+
+async function probeNvidiaSmi() {
+  let last = { ok: false, stdout: '', err: { code: 'ENOENT' } }
+  for (const cand of nvidiaSmiCands()) {
+    const r = await execFileP(cand, ['-L'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
+    if (r.ok) return r
+    last = r
+    // 只有「这个候选不存在」才值得换下一个路径。超时/权限/驱动报错是确定的观察，
+    //   换个路径重试只会把 8 秒轮询拖成两三倍超时。
+    if (r.err?.code !== 'ENOENT') return r
+  }
+  return last
+}
+
+/** ASR 环境里 pip 装的 nvidia 运行库占多少字节（0 = 没装）。
+ *  抽成函数有两个用处：depRows 用它算可删体积，probeGpu 用它区分「没卡」与「smi 被藏了」。
+ *  刻意不跑 python（只 walk 目录），所以随便调都不会阻塞事件循环。 */
+function cudaLibsBytes() {
+  try {
+    const py = venvAsr().find((p) => existsSync(p)) || ''
+    if (!py) return 0
+    const venvRoot = dirname(dirname(py))
+    // 2026-10-31（issue #5 同族）：原来只认 Windows 布局 <venv>\Lib\site-packages，
+    //   Linux 的 site-packages 在 <venv>/lib/pythonX.Y/site-packages，这里原来恒 0。
+    if (process.platform === 'win32') return dirStat(join(venvRoot, 'Lib', 'site-packages', 'nvidia')).bytes
+    const libDir = join(venvRoot, 'lib')
+    if (!existsSync(libDir)) return 0
+    let total = 0
+    for (const e of readdirSync(libDir)) {
+      if (!e.startsWith('python')) continue
+      total += dirStat(join(libDir, e, 'site-packages', 'nvidia')).bytes
+    }
+    return total
+  } catch { return 0 }
+}
+
 async function probeGpu() {
   const notes = []
   let confident = true // 探测过程没被超时/异常打断，结论可信 → 才允许写缓存
@@ -1022,12 +1084,37 @@ async function probeGpu() {
   //   不能用 deviceCount === 0 代替 —— nvidia-smi 超时/异常时也是 0，那时我们并不知道有没有卡，
   //   把按钮藏起来会让有卡的人无从下手。只有 ENOENT（确实没这个命令）才算确定没卡。
   let noCard = false
-  const smi = await execFileP('nvidia-smi', ['-L'], { timeout: GPU_PROBE_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
+  // 有库但拿不到 nvidia-smi → 不知道有没有卡（第三种状态，见下面的 ENOENT 分支）
+  let noCardUnknown = false
+  const smi = await probeNvidiaSmi()
   if (smi.ok) {
     deviceCount = smi.stdout.split('\n').filter((l) => /^\s*GPU\s+\d+:/.test(l)).length
   } else if (smi.err?.code === 'ENOENT') {
-    noCard = true
-    notes.push('没有 nvidia-smi（未装 NVIDIA 驱动，或不是 NVIDIA 卡）')
+    // 所有候选路径都没有 nvidia-smi。**这仍然不等于「没有卡」**：
+    //   PATH 被裁剪、System32 被移出搜索路径、驱动装在非标准位置，都会得到 ENOENT。
+    //   所以先看一个硬事实：venv 里有没有已经装好的运行库。有 → 用户装过 CUDA，
+    //   继续往下探（`--probe-gpu` 才能答「DLL 到底能不能加载」）；没有 → 才是真的
+    //   「没卡也没库」，这时早退才有意义（issue #10 原话：别再报一条假的「加载失败」）。
+    const libs = cudaLibsBytes()
+    if (libs > 0) {
+      // 第三种状态：库在、但没有 nvidia-smi 能证明「有没有卡」。
+      //   issue #10 建议 1 要的是「没卡就灰」，我的上一版把它做成了「ENOENT 就灰」——
+      //   那会把「PATH 里没有这个命令」误判成「没有卡」（有卡的人看到假话）。
+      //   这里改成：能探出加载能力就照常（绿），探不出就标 unknown 走灰，不报「加载失败」。
+      noCardUnknown = true
+      notes.push(`找不到 nvidia-smi（PATH 与常见绝对路径都没有），但 venv 里已有运行库 ${Math.round(libs / 1048576)} MiB；无法确认显卡，已按 CPU 处理`)
+    } else {
+      noCard = true
+      // issue #10 问题 1（2026-11-03）：确定没卡（也没库）就到此为止。
+      //   原来继续往下走：venv 里 find_spec("nvidia")、跑 _bili-asr.py --probe-gpu、再记一条
+      //   「cublas64_12.dll 加载失败」，最后把两条拼成 note。用户看到的是
+      //   「没有 nvidia-smi；cublas64_12.dll 加载失败」——后半句像故障，其实只是没卡。
+      return {
+        val: { deviceCount: 0, dllReady: false, cudaLibs: false, noCard: true, note: '本机无 NVIDIA 显卡，ASR 走 CPU' },
+        // ENOENT 是确定结论（不是超时/异常），可以放心写缓存，不必每 8 秒重探
+        confident: true,
+      }
+    }
   } else {
     confident = false
     notes.push(`nvidia-smi 探测失败：${probeWhy(smi)}`)
@@ -1061,14 +1148,18 @@ async function probeGpu() {
       if (!dllReady) {
         // 超时 = 不知道结果（不确定，不写缓存）；正常非 0 退出 = 确定没装/不在搜索路径
         if (dll.err?.killed) confident = false
-        notes.push(`${process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12'} 加载失败：${probeWhy(dll)}`)
+        // unknown（拿不到 nvidia-smi，连有没有卡都不知道）时不写「加载失败」：
+        //   这句话会把「没法验证」说成「库坏了」，正是 issue #10 问题 1 的原文。
+        if (!noCardUnknown) {
+          notes.push(`${process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12'} 加载失败：${probeWhy(dll)}`)
+        }
       }
     }
   } else {
     // venv 确实不存在 = 确定的「明确没环境」，可缓存（不必每 8 秒重探）
     notes.push('ASR 环境还没装，装完才能判断 GPU 运行库')
   }
-  return { val: { deviceCount, dllReady, cudaLibs, noCard, note: notes.join('；') }, confident }
+  return { val: { deviceCount, dllReady, cudaLibs, noCard, unknown: noCardUnknown, note: notes.join('；') }, confident }
 }
 
 // C-04（2026-10-29）：面板以前只看 venv 里的 python.exe 在不在就标绿。缺 VC++ Redist 时
@@ -1077,6 +1168,10 @@ async function probeGpu() {
 //   而 /status 每 8 秒轮询一次，不能每次都跑，所以按「python 路径 + 它自己的 mtime + 探针代码」缓存 5 分钟；
 //   venv 重装（python.exe 的 mtime 变）会立刻重探。
 const IMPORT_TTL_MS = 5 * 60 * 1000
+// issue #10 问题 2（2026-11-03）：失败结果也缓存 5 分钟，于是「下载刚装完」之后那 5 分钟里
+//   面板照旧红着，用户以为没装上。失败是「现在可能已经不成立」的那种结论，只给 30 秒。
+//   成功仍 5 分钟：装好了不会自己坏。
+const IMPORT_TTL_FAIL_MS = 30 * 1000
 let importCache = {}
 // OCR 的模块名 1.x 是 rapidocr_onnxruntime、2.x 是 rapidocr，两个都试；
 // 真 __import__ 才能暴露 onnxruntime 的 DLL 问题，find_spec 只查得到包在不在。
@@ -1087,13 +1182,16 @@ const OCR_IMPORT_CODE =
   '        __import__(m)\n' +
   '        sys.exit(0)\n' +
   'sys.exit(1)\n'
-function pyProbe(py, code) {
+function pyProbe(py, code, opts = {}) {
   if (!py) return { ok: false, why: '没有 python 环境' }
   let stamp = 0
   try { stamp = statSync(py).mtimeMs } catch {}
   const key = `${py}|${stamp}|${code}`
   const hit = importCache[key]
-  if (hit && Date.now() - hit.at < IMPORT_TTL_MS) return { ok: hit.ok, why: hit.why, cached: true }
+  const ttl = hit && hit.ok ? IMPORT_TTL_MS : IMPORT_TTL_FAIL_MS
+  // fresh 只由面板手点「刷新」传（/status?fresh=1）：用户刚在终端里 pip install 完，
+  //   凭什么还要等 30 秒缓存过期。8 秒轮询永远不带 fresh。
+  if (!opts.fresh && hit && Date.now() - hit.at < ttl) return { ok: hit.ok, why: hit.why, cached: true }
   let ok = false
   let why = ''
   try {
@@ -1114,9 +1212,45 @@ function pyProbe(py, code) {
   if (Object.keys(importCache).length > 8) importCache = { [key]: importCache[key] }
   return { ok, why }
 }
+/**
+ * 丢掉某些解释器名下的 import 探针缓存。key 的形状是 `${py}|${mtime}|${code}`。
+ * issue #10 问题 2：下载刚结束就去复查时，探针可能是在 venv 写完之前跑的，那条 false
+ *   还躺在缓存里（现在 30 秒，仍可能正好命中）。判失败之后按目标 venv 精确清一次再重探。
+ * 抽成纯函数（只依赖传入的缓存表）是为了能真跑断言（C144），不靠「源码里有这行」。
+ * @param {Record<string,unknown>} cache 缓存表（就地删）
+ * @param {Array<string>} pys 解释器绝对路径
+ * @returns {number} 删掉的条数
+ */
+function dropImportCacheUnder(cache, pys) {
+  const list = (pys || []).filter(Boolean)
+  if (!list.length || !cache) return 0
+  let n = 0
+  for (const k of Object.keys(cache)) {
+    if (list.some((p) => k.startsWith(`${p}|`))) {
+      delete cache[k]
+      n++
+    }
+  }
+  return n
+}
+/** 某个下载目标会碰到的 venv 解释器（只有 asr / ocr 有 import 探针）。 */
+function pysForTarget(target) {
+  const out = []
+  if (target === 'asr' || target === 'all') out.push(venvAsr().find((p) => existsSync(p)))
+  if (target === 'ocr' || target === 'all') out.push(venvOcr().find((p) => existsSync(p)))
+  return out.filter(Boolean)
+}
 
 /** 面板上的依赖行：一条依赖一个状态 + 体积 + 是否需要下载。 */
-async function depRows(gpuVal) {
+/** cuda 行该不该「不适用」（灰）。三种情况都要灰：
+ *  真没卡、以及「有库但找不找得到 nvidia-smi 都不知道」——
+ *  后者不给灰就只能给红，而红的文案是「加载失败」，正是 issue #10 问题 1 抱怨的那句。 */
+function cudaRowNa(gpu) {
+  const g = gpu || {}
+  return Boolean(g.noCard || (g.unknown && !g.dllReady))
+}
+
+async function depRows(gpuVal, opts = {}) {
   // W-57：用 resolveFfmpeg()（同 CLI 口径，含 PATH 试跑）而不是 existsSync 硬查文件
   const ffmpeg = resolveFfmpeg()
   const ffmpegOnPath = ffmpeg === 'ffmpeg'
@@ -1133,8 +1267,9 @@ async function depRows(gpuVal) {
   const ocrPython = venvOcr().find((p) => existsSync(p)) || ''
   const model = hfHomes().find((d) => existsSync(d)) || ''
   // C-04：python.exe 在 ≠ 环境能用。真 import 一次（5 分钟缓存），失败就把原因写进 detail。
-  const asrProbe = asrPython ? pyProbe(asrPython, 'import faster_whisper') : { ok: false, why: '' }
-  const ocrProbe = ocrPython ? pyProbe(ocrPython, OCR_IMPORT_CODE) : { ok: false, why: '' }
+  // opts.fresh 由面板手点「刷新」透传（/status?fresh=1），8 秒轮询不带；见 pyProbe 的注释
+  const asrProbe = asrPython ? pyProbe(asrPython, 'import faster_whisper', opts) : { ok: false, why: '' }
+  const ocrProbe = ocrPython ? pyProbe(ocrPython, OCR_IMPORT_CODE, opts) : { ok: false, why: '' }
   const rows = [
     {
       id: 'ffmpeg',
@@ -1208,33 +1343,27 @@ async function depRows(gpuVal) {
   //   ——包可能在 site-packages 里而 DLL 在别处（或反之）。removable 只认 pip 装的那份
   //   （系统装的 CUDA Toolkit 不归我们管，面板不给删）。
   const gpu = gpuVal || (await gpuStatus())
-  const cudaSize = (() => {
-    try {
-      const py = venvAsr().find((p) => existsSync(p)) || ''
-      if (!py) return 0
-      const venvRoot = dirname(dirname(py))
-      // 2026-10-31（issue #5 同族）：原来只认 Windows 布局 <venv>\Lib\site-packages，
-      //   Linux 的 site-packages 在 <venv>/lib/pythonX.Y/site-packages，这里原来恒 0。
-      if (process.platform === 'win32') return dirStat(join(venvRoot, 'Lib', 'site-packages', 'nvidia')).bytes
-      const libDir = join(venvRoot, 'lib')
-      if (!existsSync(libDir)) return 0
-      let total = 0
-      for (const e of readdirSync(libDir)) {
-        if (!e.startsWith('python')) continue
-        total += dirStat(join(libDir, e, 'site-packages', 'nvidia')).bytes
-      }
-      return total
-    } catch { return 0 }
-  })()
+  // 抽成 cudaLibsBytes()：probeGpu 判「没卡」时也要用同一份事实（见 nvidiaSmiCands 的注释）
+  const cudaSize = cudaLibsBytes()
   rows.push({
     id: 'cuda',
     name: 'GPU 运行库（cuBLAS + cuDNN）',
     ok: gpu.dllReady,
+    // issue #10 问题 1：没 NVIDIA 卡的机器上，这一行不是「坏」，是「不适用」。
+    //   面板据此灰显、不给下载按钮（installable:false 同时管住按钮与「缺 N 个依赖」的计数），
+    //   也不再往 detail 里塞「加载失败」这种像故障的话。
+    // unknown（有库、但找不到 nvidia-smi 证明显卡）：探出加载能力就是绿，探不出就走灰，
+    //   不报「加载失败」——那是 issue #10 问题 1 的原话，不能换台机器又犯一次。
+    na: cudaRowNa(gpu),
     // 2026-10-31（issue #5）：文案按平台分开 —— Linux 上照 Windows 说「装上快 2-8 倍」
     //   等于给了个不存在的手工路径（README 那段只写 PowerShell 脚本）。
     //   「2-8 倍」也改成「约 2 倍」：issue 作者同机多次实测 1.96–2.24×，
     //   量级差一档会让复测的人直接怀疑数据。
-    detail: gpu.dllReady
+    detail: gpu.noCard
+      ? '不适用：本机无 NVIDIA 显卡，转写走 CPU'
+      : (gpu.unknown && !gpu.dllReady)
+      ? '找不到 nvidia-smi，无法确认是否有显卡；运行库已装但没能验证加载，转写走 CPU'
+      : gpu.dllReady
       ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 卡）` : ''}，转写走 GPU`
       : (gpu.deviceCount
         ? (process.platform === 'win32'
@@ -1247,8 +1376,12 @@ async function depRows(gpuVal) {
     //   探测超时/异常时 deviceCount 也是 0，那时藏按钮会让有卡的人无从下手。
     //   client.js 的 canDownloadRow 认这个字段（缺省 = 可下载，向后兼容）。
     installable: !gpu.noCard,
-    removable: gpu.cudaLibs,
-    removableWhy: gpu.cudaLibs ? '' : '还没装（或装在系统里，不归插件管），没什么可删的',
+    // issue #10 问题 1 的副作用（2026-11-03 自审）：无卡早退之后 cudaLibs 恒为 false，
+    //   于是「拔了卡但 pip 装的运行库还在」的机器上，这一行会失去「删除」按钮 ——
+    //   那些文件白占 1.4 GB 还没法从面板清。cudaSize 是查目录得到的（不跑 python），
+    //   拿它当第二个判据：目录里有东西就允许删。
+    removable: gpu.cudaLibs || cudaSize > 0,
+    removableWhy: gpu.cudaLibs || cudaSize > 0 ? '' : '还没装（或装在系统里，不归插件管），没什么可删的',
     size: cudaSize,
     estimate: ESTIMATES.cuda,
   })
@@ -1279,6 +1412,27 @@ async function depRows(gpuVal) {
 //   PR#4 修的是同一个功能的另一面（detached:true 让脚本一行都不执行），两个方向都没对——
 //   因为真正的错在于「用退出码当成功判据」，而不是 detached 该怎么设。
 //   现在：退出码 0 之后回查 depRows()（真跑 resolveFfmpeg、venv 里真 import），那一行 ok 才算成功。
+// issue #10 问题 3（2026-11-03，最严重）：连点两次「一键下载」会把 venv 弄成半成品。
+//   原来 runDownload 没有任何 inflight 检查，两个子进程同时「改名旧 venv + 在原目录建新的」，
+//   第二个撞 EBUSY/EPERM；改名失败后脚本继续在原目录建，留下半成品。
+//   这里只做进程内的互斥（够用且零外部状态）；跨进程用 deps\.fetch-deps.lock（脚本自己抢）。
+const DOWNLOADING = new Set()
+/**
+ * 纯函数：这次点击该不该拒。抽出来是为了能真跑断言（C145），而不是「源码里有这行」。
+ * @param {string} target 本次目标
+ * @param {Iterable<string>} running 正在跑的目标
+ * @returns {string} 空串 = 放行；非空 = 拒绝理由
+ */
+function downloadConflict(target, running) {
+  const set = Array.from(running || [])
+  if (!set.length) return ''
+  if (set.includes(target)) return '这个依赖正在下载中，等这次结束再点'
+  // all 与单项必须互相排斥：两者会动同一批 venv，第二个必然撞 EBUSY/EPERM。
+  if (target === 'all' || set.includes('all')) {
+    return `已有下载在跑（${set.includes('all') ? '一键装全部' : set[0]}），等它结束再点`
+  }
+  return ''
+}
 const DOWNLOAD_TARGET_DEPS = {
   ytdlp: ['ytdlp'],
   ffmpeg: ['ffmpeg'],
@@ -1306,9 +1460,20 @@ function downloadVerdict(target, code, signal, rows) {
   if (!Array.isArray(rows)) return { ok: false, note: `退出码 0，但没能复查产物（depRows 失败）` }
   const miss = ids.filter((id) => !((rows.find((r) => r && r.id === id) || {}).ok))
   if (miss.length) {
-    return { ok: false, note: `退出码 0，但 ${miss.join('、')} 仍不可用（宿主被关掉时下载进程会被连带杀掉）` }
+    // issue #10 问题 2：原来这里把原因写死成「宿主被关掉时下载进程会被连带杀掉」，
+    //   但用户日志里那条失败是「退出码 0、时间戳对不上」，真因是探针跑在 venv 写完之前。
+    //   不写死的判据：只陈述「退出码 0 但 X 仍不可用」，把已知几种可能并列，让日志读者自己判。
+    return { ok: false, note: `退出码 0，但 ${miss.join('、')} 仍不可用（可能装到一半被中断、装到了别的解释器，或包装上了但 import 仍失败；详见 deps\\download.out.log）` }
   }
   return { ok: true, note: `退出码 0，产物已复查` }
+}
+
+/** 下载结束、复查之前必须做的事。2026-11-03 自审（issue #10 问题 2 的同族，漏在 GPU 行上）：
+ *  cuda 装完后，面板那一行仍由 gpuStatus 的 5 分钟缓存给出 —— 于是「装完了」这段时间里
+ *  复查照样判失败、download.log 还会写一行假失败。import 探针那套（dropImportCacheUnder）
+ *  管不到 GPU 行，必须单独作废。hooks 注入是为了能真跑断言（C147），这段逻辑在事件回调里测不到。 */
+function beforeRecheck(target, hooks = {}) {
+  if (target === 'cuda' && typeof hooks.resetGpu === 'function') hooks.resetGpu()
 }
 
 /** 一键下载：异步拉起插件自带的 fetch-deps 脚本，立刻返回日志路径（不等下载结束）。 */
@@ -1321,6 +1486,10 @@ function runDownload(target) {
   //   现在脚本有 cuda 分支，这里放行。
   const allowed = ['ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda', 'all']
   if (!allowed.includes(target)) return { started: false, why: `不支持的依赖：${target}` }
+  // issue #10 问题 3：同一目标（或与 all 交叉）重复点击必须直接拒，不能让两个子进程同时动 venv。
+  const conflict = downloadConflict(target, DOWNLOADING)
+  if (conflict) return { started: false, why: conflict }
+  DOWNLOADING.add(target)
   try {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
   } catch {}
@@ -1360,6 +1529,7 @@ function runDownload(target) {
     })
   } catch (e) {
     if (outFd !== null) try { closeSync(outFd) } catch {}
+    DOWNLOADING.delete(target)
     return { started: false, why: String(e?.message ?? e) }
   }
   try {
@@ -1375,6 +1545,9 @@ function runDownload(target) {
     if (outClosed) return
     outClosed = true
     if (outFd !== null) { try { closeSync(outFd) } catch {} outFd = null }
+    // 三个出口（error / exit / 复查完）都从这里走，互斥标志必须在这放掉，
+    //   否则一次失败之后这个目标就永远点不动了。
+    DOWNLOADING.delete(target)
   }
   // 非 detached 的子进程同样会异步报 spawn 失败（ENOENT/EACCES），必须接 error，否则带崩宿主
   child.on('error', (e) => {
@@ -1401,7 +1574,23 @@ function runDownload(target) {
       closeOut()
     }
     if ((code ?? 0) !== 0 || signal) { finish(null); return }
-    depRows().then(finish).catch(() => finish(null))
+    // 先作废「装完就过期」的缓存，再复查：cuda 走 GPU 缓存，asr/ocr 走 import 探针缓存
+    beforeRecheck(target, { resetGpu: resetGpuCache })
+    depRows()
+      .then((rows) => {
+        const v = downloadVerdict(target, code, signal, rows)
+        if (v.ok) return finish(rows)
+        // issue #10 问题 2：判失败先清掉目标 venv 的 import 探针缓存，再复查一次。
+        //   探针可能在 venv 写完之前就跑过（用户日志：21:18:31 复查、python.exe mtime 21:19:50），
+        //   那条 false 会被缓存挡住真正的重探。
+        const dropped = dropImportCacheUnder(importCache, pysForTarget(target))
+        if (!dropped) return finish(rows)
+        try {
+          appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] ${target} 复查失败，已清 ${dropped} 条探针缓存后重探\n`, 'utf8')
+        } catch {}
+        return depRows().then(finish).catch(() => finish(rows))
+      })
+      .catch(() => finish(null))
   })
   child.unref()
   return { started: true, log: DOWNLOAD_LOG, outLog }
@@ -2001,13 +2190,20 @@ function registerPanelRoute(ctx) {
               const url = new URL(req.url, 'http://127.0.0.1')
               if (req.method === 'GET' && url.pathname === '/api/bili-watch/status') {
                 const cleaned = autoCleanCache()
+                // 2026-11-03 自审：?fresh=1 只由面板手点「刷新」带（8 秒轮询不带），
+                //   用它跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存 —— 用户刚在终端里
+                //   装完东西点刷新，不该看到 5 分钟前的结论。
+                const fresh = url.searchParams.get('fresh') === '1'
                 // GPU 探测一次就够：depRows 的 cuda 行与 data.gpu 用同一份结果，别各探一遍
-                const gpuNow = await gpuStatus()
+                const gpuNow = await gpuStatus(fresh)
                 return sendJson(res, 200, {
                   ok: true,
                   data: {
                     credential: credState(),
-                    deps: await depRows(gpuNow),
+                    deps: await depRows(gpuNow, { fresh }),
+                    // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
+                    //   这张表，暴露出去面板才知道该灰哪几行。只列目标名，不含 pid/路径。
+                    downloading: Array.from(DOWNLOADING),
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,

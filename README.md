@@ -271,7 +271,7 @@ node scripts/fetch-deps.mjs where                  # 只回答「装到哪」，
 |---|---|---|
 | 有 NVIDIA 卡 + 已装运行库 | 绿点，显示 `cublas64_12.dll`（Linux 是 `libcublas.so.12`） | 走 GPU，比 CPU 约快 2 倍 |
 | 有 NVIDIA 卡 + 没装运行库 | 红点，提示装上约快 2 倍 | 走 CPU（功能一样，只是慢些） |
-| 没有 NVIDIA 卡 | 红点，说明没有 `nvidia-smi`，**不显示「下载」按钮** | 走 CPU |
+| 没有 NVIDIA 卡 | 灰点「不适用」（本机没 `nvidia-smi`），**不显示「下载」按钮**，也不计入「缺 N 个依赖」 | 走 CPU |
 
 （「约 2 倍」是实测口径：同一台机器 5 分钟音频 GPU 13.6–14.7 s vs CPU 27.2–32.9 s，多次测量 1.96–2.24×，随 CPU 负载波动。）
 

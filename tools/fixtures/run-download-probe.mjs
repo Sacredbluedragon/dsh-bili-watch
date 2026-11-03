@@ -36,9 +36,21 @@ if (end < 0 || end < start) { console.error('PROBE-BROKEN: 没找到函数结尾
 const body = src.slice(start, end + 3)
 if (!body.includes('function runDownload')) { console.error('PROBE-BROKEN: 切出来的函数体不对'); process.exit(2) }
 
+// 2026-11-03（issue #10 问题 3）：runDownload 新增了进程内互斥 downloadConflict(target, DOWNLOADING)。
+//   桩里必须把这两个名字一起带进来，否则本探针会因为「引用未声明变量」而红 ——
+//   那是探针没跟上函数的新依赖，不是被测代码坏了。切片方式与上面同一套。
+const cStart = src.indexOf('function downloadConflict(target, running) {')
+if (cStart < 0) { console.error('PROBE-BROKEN: 没找到 downloadConflict 定义'); process.exit(2) }
+const cEnd = src.indexOf('\n}\n', cStart)
+if (cEnd < 0) { console.error('PROBE-BROKEN: downloadConflict 没有行首 } 收尾'); process.exit(2) }
+const conflictBody = src.slice(cStart, cEnd + 3)
+if (!conflictBody.includes('function downloadConflict')) { console.error('PROBE-BROKEN: 切出来的 downloadConflict 不对'); process.exit(2) }
+
 // 桩只做一件事：让函数一路走到 spawn。existsSync 恒 true（跳过「脚本缺失」早退），
 // target 传 'asr'（在 allowed 白名单里，跳过「不支持」早退）。
 const stub = `
+  const DOWNLOADING = new Set()
+  ${conflictBody}
   const SCRIPTS = '/stub/scripts'
   const DEPS = '/stub/deps'
   const DOWNLOAD_LOG = '/stub/download.log'

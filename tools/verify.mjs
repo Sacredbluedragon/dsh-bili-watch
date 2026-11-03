@@ -2637,8 +2637,15 @@ check('C49 GPU 探测失败必须说真因（P1：stdio:ignore 让面板只剩�
   const src = read('index.js')
   const body = fnBody(src, 'probeGpu')
   must(!/stdio:\s*'ignore'/.test(body), "probeGpu 里还有 stdio:'ignore'——子进程输出全丢，失败只剩笼统文案")
-  const utf8 = (body.match(/encoding:\s*'utf8'/g) || []).length
-  must(utf8 >= 3, `probeGpu 只有 ${utf8} 处收输出，nvidia-smi / spec / --probe-gpu 三处都要（否则看不出真因）`)
+  // 2026-11-03 自审：nvidia-smi 那次调用被抽进了 probeNvidiaSmi（多路径候选），
+  //   判据跟着量两处函数体，总数仍是 3。分开量比合并量更严：哪一边少了都能指出来。
+  const smiBody = fnBody(src, 'probeNvidiaSmi')
+  const utf8Smi = (smiBody.match(/encoding:\s*'utf8'/g) || []).length
+  const utf8Py = (body.match(/encoding:\s*'utf8'/g) || []).length
+  const utf8 = utf8Smi + utf8Py
+  must(utf8Smi >= 1, 'probeNvidiaSmi 里没收到 utf8 输出——nvidia-smi 失败就只剩笼统文案')
+  must(utf8Py >= 2, `probeGpu 只剩 ${utf8Py} 处收输出，spec 与 --probe-gpu 两处都要（否则看不出真因）`)
+  must(utf8 >= 3, `三处子进程收输出的总数只有 ${utf8}，应为 3`)
   must(body.includes('probeWhy('), 'probeGpu 失败时没调 probeWhy——真因（超时/退出码/stderr）没进 note')
   must(!body.includes('cublas64_12.dll 加载失败（GPU 运行库未装'), '旧的笼统文案还在')
   must(/const GPU_PROBE_TIMEOUT_MS = 10000/.test(src), 'GPU_PROBE_TIMEOUT_MS 不是 10000（3 秒偏紧，机器忙时被当成「没装」）')
@@ -6994,6 +7001,82 @@ check('C142 runDownload 函数体能求值并真的拉起进程（引用未声�
   must(r.status !== 2, `探针自身失效（rc=2，说明切不出函数体，不是被测代码的问题）：${detail}`)
   must(r.status === 0, `runDownload 跑不通：${detail}`)
   return '函数体求值通过，started=true，spawn 收到 detached=false'
+})
+
+// ── C143–C146：issue #10 / discussion #9 的四条（2026-11-03）──────────────────
+// 四条都走同一个探针，按节名分开跑。为什么要分四节而不是一条：
+//   一节的绿会盖住另一节的红 —— 派单要求「四个分开改、分开给判据」。
+// 为什么必须是子进程：C143 测的 probeGpu 是 async，await 进 check() 会被记成 PASS
+//   （老账：async 的返回值没人等，check 直接返回 undefined 判绿）。fixture 内部 await，
+//   check 只读退出码。
+// 每条的红法写在 fixture 头部注释里，交付报告也逐条列了。
+const depsProbe = (section) => {
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures/deps-guards-probe.mjs'), section], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env },
+  })
+  const detail = `${(r.stdout || '') + (r.stderr || '')}`.trim().slice(0, 300)
+  must(r.status !== 2, `探针自身失效（rc=2，切不出函数体，不是被测代码的问题）：${detail}`)
+  must(r.status === 0, `${section} 节红：${detail}`)
+  return detail
+}
+
+check('C143 无 NVIDIA 卡时 probeGpu 必须早退，不再报「运行库加载失败」（issue #10 问题 1）', () => {
+  depsProbe('A')
+  return 'python 侧 0 次调用，note 只有「本机无 NVIDIA 显卡，ASR 走 CPU」'
+})
+
+check('C144 失败探针缓存 30 秒过期、成功缓存 5 分钟，且失败文案不写死原因（issue #10 问题 2）', () => {
+  depsProbe('B')
+  return '失败 60 秒后重探、成功 60 秒内命中；文案不再写「宿主被关掉」'
+})
+
+check('C145 连点两次不会起两个安装进程：进程内互斥 + 跨进程锁 + 改名撞 EPERM 直接放弃（issue #10 问题 3）', () => {
+  depsProbe('C')
+  return '同目标连点被拒、all 与单项互斥；锁 held/stale/free 正确；EPERM/EBUSY 抛出放弃'
+})
+
+check('C146 --python 指定的解释器必须真的用于建 venv（discussion #9）', () => {
+  depsProbe('D')
+  return '`-m venv` 用的是 plan.exe，不再无条件摸系统 Python'
+})
+
+// ── C147–C150：0.4.6 自审（2026-11-03 第二轮）────────────────────────────────
+// 这一轮审的是上一轮那四条改动**自己会怎么坏**，所以每条都配了「回退到修复前就变红」的扰动。
+// 与 C143–C146 的区别：那四条守的是 issue 原文要的行为，这四条守的是「修完没顺手引入新洞」。
+const reviewProbe = (section) => {
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures/deps-review-probe.mjs'), section], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env },
+  })
+  const detail = `${(r.stdout || '') + (r.stderr || '')}`.trim().slice(0, 300)
+  must(r.status !== 2, `自审探针自身失效（rc=2，切不出函数体，不是被测代码的问题）：${detail}`)
+  must(r.status === 0, `${section} 节红：${detail}`)
+  return detail
+}
+
+check('C147 「没卡」判定三态：绝对路径兜底认卡、已有运行库时不谎称无卡、真无卡才早退', () => {
+  reviewProbe('E')
+  return 'PATH 里没有 nvidia-smi 时仍能靠 System32 认到卡；有库时不写「本机无 NVIDIA 显卡」；真没卡时 python 侧 0 次调用'
+})
+
+check('C148 手点「刷新」必须跳过 GPU 5 分钟缓存与 import 探针 30 秒缓存', () => {
+  reviewProbe('F')
+  return 'gpuCacheHit(fresh) 与 pyProbe({fresh}) 都绕过缓存，8 秒轮询路径仍吃缓存'
+})
+
+check('C149 cuda 装完先作废 GPU 缓存再复查（否则红点挂满 5 分钟、日志写一行假失败）', () => {
+  reviewProbe('G')
+  return 'beforeRecheck 对 cuda 调一次 resetGpuCache，asr/ocr/all 不动它'
+})
+
+check('C150 清探针缓存按解释器精确匹配；下载互斥两个方向都拒', () => {
+  reviewProbe('H')
+  return '同解释器多条键全清、兄弟目录不动；all 与单项互斥双向拒绝且理由指明是谁在跑'
+})
+
+// C151 是「照 issue 原文逐条对」的那条：不是守我的实现，是守 issue 作者写下来的要求。
+check('C151 issue #10 的三条建议逐条对上：不适用判定、无法确认时不报加载失败、下载中面板禁用', () => {
+  reviewProbe('I')
+  return '没卡→不适用（有卡时不许）；有库但没 smi、验不出加载→不适用且不写「加载失败」；宿主说在下的行按钮禁用'
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
