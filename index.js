@@ -1330,6 +1330,12 @@ function runDownload(target) {
   //   同一个解释器；用户机器上 'node' 未必在 PATH 里（尤其是 DSH 打包分发的情况）。
   const cmd = process.execPath
   const args = [script, target]
+  // 回归修复（0.4.4）：本行是 PR #4 加上的声明，「fetch-deps 合一」重写这段时丢了它，
+  //   而下面 spawn 选项里的 `detached,` 与日志里的 `${detached}` 都还在 ——
+  //   结果每次「一键下载」都在 spawn 之前抛 ReferenceError: detached is not defined。
+  //   口径与 PR #4 一致：win32 必须 false（G-04：detached:true 会让脚本一行都不执行），
+  //   非 win32 保持 detached（与合并前一致）。
+  const detached = process.platform !== 'win32'
   // G-04（2026-10-29）：那条「win32 下 detached:true 会让 powershell.exe 启动后 0.5 秒内
   //   以 exit code 0 退出、脚本一行都不执行」的坑随 powershell 一起消失了，但这一行**不因合并而改**：
   //   本轮只换解释器，不顺带动进程生命周期。非 win32 仍用 detached（与合并前一致）。
