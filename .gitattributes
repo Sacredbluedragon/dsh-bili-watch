@@ -1,8 +1,9 @@
-# 统一换行：脚本在 Windows 检出也要能执行
+# 统一行尾，防止 core.autocrlf 在 Windows 上把 LF 文件转成 CRLF
+# （发版校验按字节比 md5，行尾一变就挂）
 * text=auto eol=lf
-*.sh text eol=lf
-*.ps1 text eol=crlf
-*.cmd text eol=crlf
-*.exe binary
-*.py text eol=lf
 *.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ps1 text eol=lf
