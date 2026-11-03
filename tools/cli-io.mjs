@@ -1,4 +1,4 @@
-// CLI 侧的输出层与参数层（2026-10-31 切片 7）。
+// CLI 侧的输出层与参数层（2026-10-31）。
 //
 // 放 tools/ 不放 lib/：index.js（面板）不用这一层——面板没有命令行参数，也不往 stdout 打给人看的东西。
 // 放这儿是给 tools/commands 目录下那批命令文件用的：15 个 cmd 全都要 say() / opt() / flag() / track()，
@@ -10,7 +10,7 @@
 
 import { mkdirSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
-// 2026-11-02 批 1b：VALUE_OPTS 的唯一来源。lib/params.mjs 没有任何 IO 与副作用，
+// 2026-11-02：VALUE_OPTS 的唯一来源。lib/params.mjs 没有任何 IO 与副作用，
 //   也不 import 本文件，所以不构成循环依赖。
 import { VALUE_FLAG_NAMES } from '../lib/params.mjs'
 
@@ -40,11 +40,11 @@ function track(...a) {
 // --format 输出结构化数据时，过程说明一律走 stderr，保证 stdout 能被 jq / 管道直接消费
 let QUIET = false
 const say = (...a) => (QUIET ? console.error : console.log)(...a)
-// A3（2026-10-27 批次8）：warn() 专门给「值得让用户看见的警告」——不管 QUIET 与否，
+// A3（2026-10-27）：warn() 专门给「值得让用户看见的警告」——不管 QUIET 与否，
 //   永远走 stderr 且带 ⚠ 前缀。工具层（index.js）在成功分支里读 stderr，把含 ⚠ 的行拼到结果末尾。
 const warn = (...a) => console.error('⚠', ...a)
 
-// 2026-10-31 切片 7：QUIET 搬进模块后，写只能走函数（import 到的 let 是只读绑定）。
+// 2026-10-31：QUIET 搬进模块后，写只能走函数（import 到的 let 是只读绑定）。
 export function setQuiet(v) { QUIET = Boolean(v) }
 export function isQuiet() { return QUIET }
 
@@ -90,7 +90,7 @@ const cmd = argv[0]
 // B33：工具层（index.js）无条件带 --quiet——此时 [track]/进度类走 say() 一律进 stderr，stdout 只留正文
 if (argv.includes('--quiet')) setQuiet(true)
 // 带值的选项：解析位置参数时必须跳过它们的值，否则 `hot --limit 2` 会把 "2" 当成 BV。
-// 2026-11-02 批 1b：改为从 lib/params.mjs 生成。原来这里手写 13 项，与 look.mjs 的
+// 2026-11-02：改为从 lib/params.mjs 生成。原来这里手写 13 项，与 look.mjs 的
 //   KNOWN_FLAGS 是两张各自维护的表 —— 结果 `at` 只进了 KNOWN_FLAGS、没进这张表，
 //   于是 `frames --at 12:30 BV1xx` 里那个 12:30 被当成第一个位置参数（BV 落到了 pos[2]）。
 //   两张表合成一张之后，这类「一边有一边没有」在结构上不会再有。
@@ -163,5 +163,5 @@ function emitFailureJson(why) {
 }
 
 // 统一在这里导出，而不是给上面每一行加 export：搬运的块保持与 look.mjs 原样逐字相同，
-//   diff 才能证明「一行没改」（DSH 的判据：真搬运 = 新增只来自函数声明头 + 调用行 + import）。
+//   diff 才能证明「一行没改」（判据：真搬运 = 新增只来自函数声明头 + 调用行 + import）。
 export { DIAG, TRACK_BUF, argv, cmd, pos, opt, flag, positional, say, warn, track, recordDiag, checkOutDir, emitFailureJson }

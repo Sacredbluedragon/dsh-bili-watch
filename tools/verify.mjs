@@ -17,44 +17,44 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 // C97（2026-11-01 0.4.1 第 2 条）：client.js 是给宿主加载的浏览器脚本，要验它「宿主太老时抛不抛」，
 //   只能在假 window 里真求值——用 vm 而不是 new Function，才与宿主的脚本执行语义一致。
 import vm from 'node:vm'
-// 2026-10-31 切片 1：被测函数搬进 lib/ 之后，断言可以直接 import 真跑——
+// 2026-10-31：被测函数搬进 lib/ 之后，断言可以直接 import 真跑——
 //   不必再「读整份源码 → 正则抠函数体 → new Function 重编译」三件套。
 //   这不是「放松」：原来的 C7/C25 是「比两处函数体是否相等」，只证明两边写得一样，不证明写得对；
 //   现在是喂对抗输入看输出。函数被改坏时，旧断言只会在「两处不同步」时红，新断言会在「行为错了」时红。
 import { cleanKey, bvOf } from '../lib/keys.mjs'
-// 2026-10-31 切片 2：锁判据与「目录能不能认领」搬进 lib/ 之后，C6/C23 也改成 import 真跑。
+// 2026-10-31：锁判据与「目录能不能认领」搬进 lib/ 之后，C6/C23 也改成 import 真跑。
 import { hasAnyLock, isAdoptableDir, lockExpired, pidAlive, readLock } from '../lib/locks.mjs'
 import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned } from '../lib/cache-own.mjs'
-// 2026-10-31 切片 3：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
+// 2026-10-31：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
-// 2026-10-31 切片 3-C：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
+// 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
 import { appendJsonLine } from '../lib/runs.mjs'
-// 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为只剩 lib/config.mjs 一份，C38 直接 import 真跑。
+// 2026-10-31：坏配置留档 + 回默认值的行为只剩 lib/config.mjs 一份，C38 直接 import 真跑。
 import { readJsonOrBackup } from '../lib/config.mjs'
-// 2026-10-31 切片 4：缓存根的状态搬进 lib/cache-path.mjs。这里只 import 两个**无状态**的动作
+// 2026-10-31：缓存根的状态搬进 lib/cache-path.mjs。这里只 import 两个**无状态**的动作
 //   （路径推导 / 落盘探测）真跑；有状态的那半（initCachePath / cacheDir）必须另起进程验——
 //   本进程一旦 init 过，C65 的「未初始化必抛」就永远绿不起来了。
 import { pickCacheDir, resolveCacheDir } from '../lib/cache-path.mjs'
-// 2026-10-31 切片 5：凭证的位置 / 四字段判据 / 旧路径迁移只剩 lib/cred.mjs 一份，C16 直接 import 真跑。
+// 2026-10-31：凭证的位置 / 四字段判据 / 旧路径迁移只剩 lib/cred.mjs 一份，C16 直接 import 真跑。
 import { adoptLegacyCred, credPaths, missingCredFields, readCred } from '../lib/cred.mjs'
 import { claimRoute, releaseRoute, claimedPaths } from '../lib/route-claim.mjs'
 import { checkOutDir } from './cli-io.mjs'
-// 2026-10-31 切片 9 第一步：media 的两个原语搬进 lib/media.mjs，C81/C82 直接 import 真跑。
-// 切片 9 第二步：四个纯判据（parseAtTimes / atDirTag / framesCacheHit / autoStep）与
+// 2026-10-31 第一步：media 的两个原语搬进 lib/media.mjs，C81/C82 直接 import 真跑。
+// 四个纯判据（parseAtTimes / atDirTag / framesCacheHit / autoStep）与
 //   downloadTo / cachedMp4 / sceneTimes / pickEvenly 也搬过去了，于是 C44/C47 从
 //   「读 look.mjs → 正则抠函数体 → new Function 重编译」改成直接 import 真跑。
 import {
   atDirTag, autoStep, cachedMp4, downloadTo, ffExec, findFfmpeg,
   framesCacheHit, parseAtTimes, pickEvenly, sceneTimes,
 } from '../lib/media.mjs'
-// 2026-10-31 切片 10：cache 层（目录 / manifest / 等他人）搬进 lib/frames.mjs；
+// 2026-10-31：cache 层（目录 / manifest / 等他人）搬进 lib/frames.mjs；
 //   抢锁放锁搬进 lib/locks.mjs 的 makeLocks。C47/C87/C88 直接 import 真跑。
 import { ensureDir, frameFilesToKeep, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest } from '../lib/frames.mjs'
 import { makeLocks } from '../lib/locks.mjs'
-// 2026-10-31 三审：C90 的三条守卫需要 logRun（切片 5）与缓存根推导（切片 4）的真跑。
+// 2026-10-31 三审：C90 的三条守卫需要 logRun与缓存根推导的真跑。
 import { logRun } from '../lib/runs.mjs'
 import { defaultCacheRoot } from '../lib/cache-path.mjs'
-// 2026-11-01（DSH 00:44 P0-3）：must 也跟着 makeChecker 搬进 check-run.mjs。
+// 2026-11-01（P0-3）：must 也跟着 makeChecker 搬进 check-run.mjs。
 //   它是 700 多处断言的失败信号，却原来只是本文件的局部常量——外面碰不到，也就没有一条断言验过它。
 //   C77 现在 import 同一个绑定，直接喂 false 验「必须抛」。**别在这里再写一份**（那就又成了「验的不是用的」）。
 import { makeChecker, must } from './check-run.mjs'
@@ -64,10 +64,10 @@ const ROOT = join(HERE, '..')
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8')
 
 /**
- * 2026-11-02 批 1b：`look.mjs` 认不认某个 flag —— **真跑**，不读源码。
+ * 2026-11-02：`look.mjs` 认不认某个 flag —— **真跑**，不读源码。
  *
  * 原来 C9 / C42 / C44 是「读 look.mjs，找 `const KNOWN_FLAGS = new Set([...])` 里有没有这个词」。
- * 批 1b 把 KNOWN_FLAGS 改成从 lib/params.mjs 生成，那三处同时红 —— 不是代码坏了，
+ * 第二步把 KNOWN_FLAGS 改成从 lib/params.mjs 生成，那三处同时红 —— 不是代码坏了，
  * 是判据在验「字面量长什么样」而不是「运行时认不认」。
  *
  * 改成真跑之后判据更强：谁把 KNOWN_FLAGS 打空、或者生成链断了，这里立刻红；
@@ -82,12 +82,12 @@ function flagAccepted(flag, val) {
 }
 
 const results = []
-// 2026-10-31 切片 8（DSH 18:48）：执行器搬进 tools/check-run.mjs，就为了让它**自己可被断言**——
+// 2026-10-31：执行器搬进 tools/check-run.mjs，就为了让它**自己可被断言**——
 //   它是「所有断言是否真跑」的唯一开关，原来却是唯一没有断言的代码。C77 直接 import 它喂 async 回调。
 const check = makeChecker(results)
 // must 从 ./check-run.mjs import（2026-11-01 P0-3）。它原来就在这一行，是文件局部常量。
 // 依赖网络的断言默认跳过：网络抖动不该让守卫变红（静态断言永远可跑）。VERIFY_ONLINE=1 才联网验。
-// C1（2026-10-27 批次8）：skip 以前记成 ok:true——汇总把跳过当通过，「8/8 通过」是虚的。
+// C1（2026-10-27）：skip 以前记成 ok:true——汇总把跳过当通过，「8/8 通过」是虚的。
 //   现在记成 ok:false + skip:true，汇总时单独数跳过，不再混进通过数，也不算失败。
 const skip = (name, why) => results.push({ name, ok: false, skip: true, detail: why })
 const online = process.env.VERIFY_ONLINE === "1"
@@ -100,7 +100,7 @@ check('版本号不是 0.2.22（P0：sync-release 会把新版覆盖成旧版）
 })
 
 check('lib/cache-path.mjs 的 videoDir 复用「BV_标题」目录（P0：同一视频两个兄弟目录）', () => {
-  // 2026-10-31 切片 4：videoDir 搬进 lib/cache-path.mjs（它读缓存根，而缓存根住在那边），
+  // 2026-10-31：videoDir 搬进 lib/cache-path.mjs（它读缓存根，而缓存根住在那边），
   //   原来这条盯的是 index.js——现在盯那份唯一实现。
   const t = read('lib/cache-path.mjs')
   must(t.includes("d.startsWith(base + '_')"), 'videoDir 没有复用逻辑')
@@ -134,7 +134,7 @@ check('数据模式短路还在（P0：--format json 不许被提示污染）', 
 
 // 取某个顶层函数的函数体：从 `function NAME(` 到行首第一个 `}`（嵌套块都带缩进，不会误判）
 //
-// 2026-10-31（切片 0.1）：**取到了不等于取对了**。这个函数有两个洞，都会返回一段
+// 2026-10-31：**取到了不等于取对了**。这个函数有两个洞，都会返回一段
 //   「看起来像函数、其实是垃圾」的片段，而下游全是字符串断言（indexOf / 正则 / 哈希），
 //   拿到垃圾照样跑完，红和绿都不代表真事：
 //   ① `indexOf('function NAME(')` 会命中**注释里**的同名声明。实测在 index.js 第 10 行插
@@ -250,7 +250,7 @@ check('C113 T38-8 守卫的判据有牙：把 fresh 块挪到 tryLock 之前必�
   return `扰动生效：fresh@${iFreshBroken} < lock@${iLockBroken}（真·锁外删），原守卫会红`
 })
 
-// C114（2026-11-01，DSH 18:05 准修 P0 后加）：闸门不许把自己的身份写死在源码里。
+// C114（2026-11-01，准修 P0 后加）：闸门不许把自己的身份写死在源码里。
 //
 //   背景（实测出来的 P0）：scripts/check-public-text.mjs 曾把本机身份
 //   （用户名 / 昵称 / mid）写死在自己的正则里，而它在 sync-release.ps1 的
@@ -360,7 +360,7 @@ check('W-07 所有命令的 --out 都过黑名单（P0：原来只有 frames 一
   }
 })
 
-// 2026-10-31 切片 2：原来这里还有一条「hasAnyLock 在 index.js 与 tools/look.mjs 逐字一致」的哈希断言。
+// 2026-10-31：原来这里还有一条「hasAnyLock 在 index.js 与 tools/look.mjs 逐字一致」的哈希断言。
 //   函数搬进 lib/locks.mjs 之后，物理上只剩一份，「两处一致」不再是判据（永远真）——留着只会永远红。
 //   删掉不是放松：一致性是搬家的**结果**，行为正确性由下面的 C6 真跑负责。
 
@@ -437,7 +437,7 @@ check('W-33 printText 的 tmp 名带 pid+序号（P1：两路 text 共用同一 
 
 check('W-28 credState 与 loadCred 用同一套四字段判据（P1：残缺凭证报 ok，面板打勾但实际走匿名）', () => {
   // 阶段 A 的 A-4 只修了 CLI 侧的 loadCred，面板侧的 credState 是同一件事的另一半。
-  // 2026-10-31 切片 5：四字段清单搬进 lib/cred.mjs 的 CRED_FIELDS——原来「两边各写一段字面量、
+  // 2026-10-31：四字段清单搬进 lib/cred.mjs 的 CRED_FIELDS——原来「两边各写一段字面量、
   //   靠断言比对一致」的做法失效了（找不到字面量，红在错的地方）。现在判据物理上只有一份，
   //   断言改成「清单在 lib 且只有一份 + 两个入口都调它 + 面板仍把残缺说成 incomplete」。
   const lib = read('lib/cred.mjs')
@@ -487,7 +487,7 @@ if (!online) {
 }
 
 // —— 阶段 C（2026-10-28 全量检查）新增断言 ——
-// 每一条对应一处本轮修掉的问题。原则同前：断言要盯「调用面」而不是「点位」——
+// 每一条对应一处这次修掉的问题。原则同前：断言要盯「调用面」而不是「点位」——
 // 例如 W-27 的 ffmpeg 不许只断言某一个调用行，否则明天新增一条命令忘了传照样绿。
 
 check('C1 失败原因不再写 stdout（P1：--format json 时错误行会让 JSON.parse 直接失败）', () => {
@@ -495,7 +495,7 @@ check('C1 失败原因不再写 stdout（P1：--format json 时错误行会让 J
   const bad = t.match(/console\.log\(\s*['"`]✗/g) || []
   must(bad.length === 0, `还有 ${bad.length} 处 console.log('✗ …') 走 stdout`)
   const good = t.match(/console\.error\(\s*['"`]✗/g) || []
-  must(good.length >= 19, `console.error('✗ …') 只有 ${good.length} 处，少于本轮的 19 处`)
+  must(good.length >= 19, `console.error('✗ …') 只有 ${good.length} 处，少于预期的 19 处`)
   return `stdout 0 处 / stderr ${good.length} 处`
 })
 
@@ -522,7 +522,7 @@ check('C3 local 的 --out 不再被静默忽略（P1：rc=0 却不生成文件�
 })
 
 check('C4 --out 黑名单：真喂路径看拦/放（P1：`C:\\Windows.\\` 原来能过）', () => {
-  // 2026-10-31 切片 7：checkOutDir 搬进 tools/cli-io.mjs，于是这条从「compile 抽函数体」
+  // 2026-10-31：checkOutDir 搬进 tools/cli-io.mjs，于是这条从「compile 抽函数体」
   //   改成「直接 import 生产模块真跑」——比抽源码编译更接近真实调用（模块级依赖由 import 解析）。
   const src = read('tools/cli-io.mjs')
   const body = fnBody(src, 'checkOutDir')
@@ -617,7 +617,7 @@ check('C14 /status 也过同源闸，所以路径遮罩退化成直通是安全�
 })
 
 check('C6 锁判据真跑：活锁算占用、残留锁不算、坏锁当没有（P1：残留 .lock 会让 clean 永久拒绝）', () => {
-  // 2026-10-31 切片 2：4 个函数搬进 lib/locks.mjs，原来「两处函数体逐字一致」的判据作废（只剩一份）。
+  // 2026-10-31：4 个函数搬进 lib/locks.mjs，原来「两处函数体逐字一致」的判据作废（只剩一份）。
   //   改成喂真实锁文件看返回值：ttl 比反、EPERM 当死、坏 JSON 当活、owner.ttlMs 被忽略——任何一条都会红。
   const dir = mkdtempSync(join(tmpdir(), 'bw-c6-'))
   const f = join(dir, '.lock')
@@ -655,8 +655,8 @@ check('C6 锁判据真跑：活锁算占用、残留锁不算、坏锁当没有�
     write({ pid: 123 })
     must(readLock(f)?.pid === 123, '合法锁文件读不出来')
 
-    // ⑥ TTL 换算：算式收在 lib/tuning.mjs 的 lockTtlMsOf（切片 3）。
-    //   按 DSH 2026-10-31 16:14 的判据：**同一份配置，两个入口算出的 TTL 必须完全相同**。
+    // ⑥ TTL 换算：算式收在 lib/tuning.mjs 的 lockTtlMsOf。
+    //   按 2026-10-31 16:14 的判据：**同一份配置，两个入口算出的 TTL 必须完全相同**。
     //   做法：把两个入口（index.js 的 readTuning / look.mjs 的 tuning）真编译出来，
     //   只桩「配置从哪来」（depsCfg / readDepsCfg），钳制与换算是生产代码。
     //   字段名写错（比如 tuning 里读 cfg.lockTtlMinX）→ 那一侧回落默认 30 分钟 → 两边不等 → 红。
@@ -712,7 +712,7 @@ check('C6 锁判据真跑：活锁算占用、残留锁不算、坏锁当没有�
 })
 
 check('C7 cleanKey 挡路径逃逸与 Windows 保留名（P2：尾部点号会被系统吃掉、con.txt 仍是设备名）', () => {
-  // 2026-10-31 切片 1：原来是「比两处函数体的 md5」——那是结构断言，函数搬进 lib/ 后必然失效，
+  // 2026-10-31：原来是「比两处函数体的 md5」——那是结构断言，函数搬进 lib/ 后必然失效，
   //   而且它只证明「两边写得一样」，不证明「写得对」（两边一起改错照样绿）。
   //   现在函数只有一份，直接 import 真跑，喂对抗输入看输出。
   const cases = [
@@ -739,7 +739,7 @@ check('C7 cleanKey 挡路径逃逸与 Windows 保留名（P2：尾部点号会�
 })
 
 check('C8 pickCacheDir 建根 + 真写可写探针，正常/回退都返回 { dir, fallback }（#18，P1：形状不同会让缓存根变成 [object Object]）', () => {
-  // 2026-10-31 切片 4：pickCacheDir 只剩 lib/cache-path.mjs 一份（原来两个入口各一份，靠本条的
+  // 2026-10-31：pickCacheDir 只剩 lib/cache-path.mjs 一份（原来两个入口各一份，靠本条的
   //   「两处逐字一致」绑住）。搬家之后「一致」自动成立，所以改成**行为断言**：
   //   真造两种目录形态，看它建了什么、探针有没有删干净、回退换到哪个根、回退根有没有标记。
   //   #18 那条坑（一侧返回字符串、另一侧返回对象）现在只可能出现在「有人又抄一份实现」时，
@@ -799,7 +799,7 @@ check('C8 pickCacheDir 建根 + 真写可写探针，正常/回退都返回 { di
 
 
 check('C9 KNOWN_FLAGS 两处都认识 --asr-max（P2：真生效却被报「未知参数已忽略」）', () => {
-  // index.js 侧仍是数组字面量，读源码；look.mjs 侧改真跑（批 1b：那边已改成从参数表生成，
+  // index.js 侧仍是数组字面量，读源码；look.mjs 侧改真跑（第二步：那边已改成从参数表生成，
   //   再读字面量就是验「长什么样」而不是「认不认」）。
   const a = read('index.js')
   const iA = a.indexOf('const KNOWN_FLAGS')
@@ -811,14 +811,14 @@ check('C9 KNOWN_FLAGS 两处都认识 --asr-max（P2：真生效却被报「未�
 })
 
 check('C10 clean 把「删除失败」与「不是我们的数据」分开报（P2：原来 EPERM 被说成「没动」且 rc=0）', () => {
-  // 2026-10-31 切片 2：removeOwned 搬进 lib/cache-own.mjs，「删除失败」与「不是我们的数据」分开报这件事
+  // 2026-10-31：removeOwned 搬进 lib/cache-own.mjs，「删除失败」与「不是我们的数据」分开报这件事
   //   只剩一处实现；后半段仍盯 look.mjs 的 clean 分支（读 cleared.failed 并改退出码）。
   //
   // 前半段改真跑（反向验证 R7 抓出来的）：原来只断言「函数体里出现过 failed.push」——
   //   三个分支里删掉两处它照样绿，牙不齐。现在用一个会抛错的假 fs，看它把「删不掉」记进
   //   failed 还是混进 skipped，并且这条条目不能被算成「已清理」。
   //
-  // 2026-10-31 切片 3（DSH 16:14 要求）：先试「真占用」，造不出来才用假 fs。
+  // 2026-10-31：先试「真占用」，造不出来才用假 fs。
   //   本机实测三种方式**都删得掉**（不抛）：
   //     ① openSync(f,'r+') 持有写句柄后 rmSync(f)                    → 未抛
   //     ② 文件 chmod 0o444 后 rmSync(f)                              → 未抛
@@ -875,7 +875,7 @@ check('C10 clean 把「删除失败」与「不是我们的数据」分开报（
   must(!r.skipped.some((s) => s.name === 'frames'), '删不掉的条目混进了 skipped（就是这条坑）')
   must(r.files === 0 && r.bytes === 0, `删失败却把体积算成已清理（files=${r.files} bytes=${r.bytes}）`)
 
-  // DSH 16:14：Windows 上删被占用文件常见的是 EBUSY 不是 EPERM。生产代码 catch 一切错误，
+  // Windows 上删被占用文件常见的是 EBUSY 不是 EPERM。生产代码 catch 一切错误，
   //   但断言要证明「换个码也照样进 failed」——否则只测过一个码，换台机器可能红。
   if (realCode !== 'EBUSY') {
     const r2 = mkRemove('EBUSY')('/fake-root')
@@ -926,7 +926,7 @@ check('C13 package.json 的 files 是显式列表，且不含内部脚本（P1�
   //   把 deps/credential.json（真凭证 584B）、deps/.anon-buvid3（设备指纹）、
   //   deps/yt-dlp.exe（17.8MB）、deps/ui-config.json 一起复制进发布树 ——
   //   而「deps 现在是单文件 deps/_bili-asr.py」正是「__pycache__ 不会进包」这个结论
-  //   所依赖的前提（DSH 2026-11-01 派的那条核查）。前提没人守 = 迟早被改。
+  //   所依赖的前提（2026-11-01 那条核查）。前提没人守 = 迟早被改。
   //
   //   注意这里**不是**「一律禁止目录项」：`lib/` 本来就是目录项，是合法设计（lib 下全是
   //   发布件，没有本机产物）。真正的危险是「目录里混着工作区状态/运行时产物」——
@@ -946,7 +946,7 @@ check('C13 package.json 的 files 是显式列表，且不含内部脚本（P1�
       `yt-dlp.exe、__pycache__ 这类本机产物一起带进包。请逐个列文件（像 deps/_bili-asr.py 那样）。`)
   }
 
-  // 2026-11-01（DSH 20:45 拍板的第三条）：补上标题里早就承诺、但一直没实体判据的那半句
+  // 2026-11-01（拍板的第三条）：补上标题里早就承诺、但一直没实体判据的那半句
   //   —— C13 的标题写着「P1：tools/ 目录通配会把 verify 两个文件发出去」，但原来只有
   //   「files 里不许出现 tools/verify.mjs 这个字符串」的点名判据，**没有任何一条拦通配符本身**。
   //   标题承诺了、判据没跟上，就是「判据在验错对象」的另一种形态。
@@ -982,7 +982,7 @@ check('C16 凭证只认自己那份：不再跟随同机其它工具（B 方案�
     must(!/PANEL_CRED|PANEL_SMALL|CRED_CLEARED/.test(src), `${name} 里还有同机其它工具的凭证常量`)
   }
   // 两处的凭证解析都只能出现 SHARED / LEGACY 两个路径
-  // 2026-10-31 切片 5：迁移判据搬进 lib/cred.mjs 之后，两个入口只剩「拿结果」这一步。
+  // 2026-10-31：迁移判据搬进 lib/cred.mjs 之后，两个入口只剩「拿结果」这一步。
   //   原来这里 compile 抽 resolveCredPath 的函数体去跑——搬走以后那份函数体只剩一行，
   //   再抽就是「用空壳验空壳」。改成：结构上钉「两个入口都在用 lib」，行为上直接跑 lib。
   const r1 = fnBody(idx, 'resolveCredPath')
@@ -1064,7 +1064,7 @@ check('C16 凭证只认自己那份：不再跟随同机其它工具（B 方案�
 })
 
 check('C17 TUNING_DEFS 只有一份（lib/tuning.mjs），18 项齐全，两个入口不许再各写一份（面板改了 CLI 没效果）', () => {
-  // 2026-10-31 切片 3：原来这里比「index.js 与 tools/look.mjs 两份表逐键一致」。
+  // 2026-10-31：原来这里比「index.js 与 tools/look.mjs 两份表逐键一致」。
   //   表搬进 lib 之后只剩一份，「两处一致」自动成立——继续比就是恒真断言。
   //   留下的判据：① 表只有一份且 18 项齐全；② 两个入口真的从 lib 引；③ 钳制真跑。
   const grab = (src) => {
@@ -1119,7 +1119,7 @@ check('C18 --fresh 只删 manifest.files 记过的文件，绝不按文件名猜
 
 // 第十条（2026-10-29）：GPU 加速面板
 check('C19 asrDevice 是枚举项：lib/tuning.mjs 写 kind:enum 且钳制跳过它（Math.floor(\'auto\') = NaN）', () => {
-  // 2026-10-31 切片 3：表从两份变一份，检查对象从「两个文件」变成「lib 一处 + 真跑」。
+  // 2026-10-31：表从两份变一份，检查对象从「两个文件」变成「lib 一处 + 真跑」。
   const lib = read('lib/tuning.mjs')
   must(/asrDevice:\s*\{\s*def:\s*'auto',\s*kind:\s*'enum',\s*values:\s*\['auto',\s*'cpu'\]\s*\}/.test(lib),
     'lib/tuning.mjs 的 asrDevice 定义不对（要 def:\'auto\' + kind:\'enum\' + values [\'auto\',\'cpu\']）')
@@ -1161,7 +1161,7 @@ check('C20 GPU 依赖行 + 删除走 pip uninstall + -Target cuda 在、all 不�
 //   W-04 与 C10 原来都只读源码找子串——实测「…→...」「变量改名但注释留旧名」都能让断言照绿。
 //   这里造合法缓存根（.bili-watch-root + BV 目录里的 meta.json；否则 pickCacheDir 会另建
 //   bili-watch-cache 子目录，测到的是空目录、什么也证明不了），再真跑一次 clean。
-// 2026-10-31 切片 4 补丁（DSH 17:26 复核抓到的脆断言）：C64 断的是「默认缓存根」，但它的 env 是
+// 2026-10-31 补丁（复核抓到的脆断言）：C64 断的是「默认缓存根」，但它的 env 是
 //   {...process.env}——于是这条断言能不能过，取决于**跑它的人 shell 里有没有 BILI_WATCH_CACHE**。
 //   DSH 自己带着这个变量跑就 78/1/2，红的正是 C64，报「默认根不对」，其实是外部变量生效了。
 //   假红比不红更坏：人会开始不信这条断言，下次真红也就顺手改绿了。
@@ -1233,14 +1233,14 @@ check('C22 clean 遇到残留锁照清：rc=0 且 BV 目录被移除（别把死
 
 // 2026-10-29 追加（删除面 / 新增断言，不改任何老断言）：
 //   isOurCacheRoot 是「删之前先问一句这是不是我们的根」的唯一判据。
-//   2026-10-31 切片 2：它和 isAdoptableDir 都搬进 lib/（各只剩一份），「两处逐字一致」不再是判据——
+//   2026-10-31：它和 isAdoptableDir 都搬进 lib/（各只剩一份），「两处逐字一致」不再是判据——
 //   改成「真跑判据 + 钉住四个入口都还在调用」。剩下要防的不再是「两份分叉」，而是
 //   「改 lib 时把判据改坏」与「重构调用点时把闸拆了」。
 //   编号 C23：C21/C22 已被 dev 517d6bf 占用（clean 遇活锁 rc≠0 / 残留锁照清），合流时留位不撞。
 check('C23 删除面守卫真跑：根标记 / 认领判据都对，四个入口都先问一句（P0）', () => {
   const a = read('index.js')
-  // 2026-10-31 切片 4：look.mjs 侧不再单独读——认领判据只剩 lib/cache-path.mjs 一份，在下面真跑。
-  // 2026-10-31 切片 2：isOurCacheRoot 已搬进 lib/cache-own.mjs（只剩一份），「两处一致」作废——改成真跑。
+  // 2026-10-31：look.mjs 侧不再单独读——认领判据只剩 lib/cache-path.mjs 一份，在下面真跑。
+  // 2026-10-31：isOurCacheRoot 已搬进 lib/cache-own.mjs（只剩一份），「两处一致」作废——改成真跑。
   const own = read('lib/cache-own.mjs')
   const t0 = mkdtempSync(join(tmpdir(), 'bw-c23-root-'))
   try {
@@ -1254,7 +1254,7 @@ check('C23 删除面守卫真跑：根标记 / 认领判据都对，四个入口
   } finally {
     rmSync(t0, { recursive: true, force: true })
   }
-  // 2026-10-31 切片 2：isAdoptableDir 已搬进 lib/locks.mjs（只剩一份），改成真跑四种目录形态。
+  // 2026-10-31：isAdoptableDir 已搬进 lib/locks.mjs（只剩一份），改成真跑四种目录形态。
   const t = mkdtempSync(join(tmpdir(), 'bw-c23-'))
   try {
     const fresh = join(t, 'nope')
@@ -1273,12 +1273,12 @@ check('C23 删除面守卫真跑：根标记 / 认领判据都对，四个入口
   } finally {
     rmSync(t, { recursive: true, force: true })
   }
-  // 2026-10-31 切片 2：removeOwned 搬进 lib/cache-own.mjs，闸还在不在要看 lib 那份（不再看两个入口）。
+  // 2026-10-31：removeOwned 搬进 lib/cache-own.mjs，闸还在不在要看 lib 那份（不再看两个入口）。
   must(/if \(!isOurCacheRoot\(dir\)\) return/.test(fnBody(own, 'removeOwned')), 'removeOwned 没先判 isOurCacheRoot（删之前不问这是不是我们的根）')
   must(/if \(!isOurCacheRoot\(cacheDir\(\)\)\) return/.test(fnBody(a, 'autoCleanCache')), 'autoCleanCache 没先判 isOurCacheRoot')
   must(/if \(!isOurCacheRoot\(root\)\) return/.test(fnBody(a, 'pruneEmptyDirs')), 'pruneEmptyDirs 没先判 isOurCacheRoot')
   // 认领判据：有内容又没有标记的用户目录，绝不能当成缓存根（否则本次运行就把标记写进去，守卫空转）
-  // 2026-10-31 切片 4：resolveCacheDir 搬进 lib/cache-path.mjs（只剩一份）。结构上钉「还在用
+  // 2026-10-31：resolveCacheDir 搬进 lib/cache-path.mjs（只剩一份）。结构上钉「还在用
   //   isAdoptableDir」，行为上真跑三种目录形态——只钉字符串的话，把判据反过来写照样绿。
   must(/!isAdoptableDir\(dir\)/.test(fnBody(read('lib/cache-path.mjs'), 'resolveCacheDir')), 'lib 的 resolveCacheDir 没用 isAdoptableDir 判认领')
   const userDir = mkdtempSync(join(tmpdir(), 'bw-c23-user-'))
@@ -1335,7 +1335,7 @@ check('C24 旧缓存提示：有内容无标记才提示，且用户文件一个
 // 追加五（2026-10-30）：E6-02 的两侧分叉——抽 BV 的防护原先只在插件侧，
 // CLI 的 positional 是原样接的（模型把整条链接传进来更常见），会把 http 开头的串当目录名。
 check('C25 bvOf 从整条链接抽 BV（E6-02，P0：不许造出 http 开头的目录名）', () => {
-  // 2026-10-31 切片 1：原来比「两处 bvOf 函数体相等」，再手工跑一次正则——
+  // 2026-10-31：原来比「两处 bvOf 函数体相等」，再手工跑一次正则——
   //   前者函数搬进 lib/ 后必然失效；后者是「用另一份实现验证这份实现」，等于自证。
   //   现在直接 import 真跑，并把「抽出来再进 cleanKey 会不会还是 http 开头」也钉住。
   const cases = [
@@ -1353,7 +1353,7 @@ check('C25 bvOf 从整条链接抽 BV（E6-02，P0：不许造出 http 开头的
   const k = cleanKey(bvOf('https://www.bilibili.com/video/BV1xx411c7mD?p=1&t=3'))
   must(!/^http/i.test(k), `整条链接经过 bvOf→cleanKey 后仍是 http 开头：${k}`)
   must(k === 'BV1xx411c7mD', `整条链接经 bvOf→cleanKey 后应等于 BV1xx411c7mD，实际 ${k}`)
-  // 2026-10-31 切片 4：videoDir 搬进 lib/cache-path.mjs，两处变一处——盯那份唯一实现
+  // 2026-10-31：videoDir 搬进 lib/cache-path.mjs，两处变一处——盯那份唯一实现
   must(/cleanKey\(bvOf\(/.test(fnBody(read('lib/cache-path.mjs'), 'videoDir')), 'lib/cache-path.mjs 的 videoDir 没走 bvOf')
   return `${cases.length} 条输入 + 端到端不落 http 名 + videoDir 走 bvOf`
 })
@@ -1361,7 +1361,7 @@ check('C25 bvOf 从整条链接抽 BV（E6-02，P0：不许造出 http 开头的
 // #1（2026-10-30 E8 总表）：删除面有两个入口——用户点清理走 removeOwned，自动清理走 autoCleanCache → walkEntries
 //   → isOwnedEntry。removeOwned 早就改成「名字 + meta.json」，isOwnedEntry 却还按 /^BV…/ 名字直接认领，
 //   于是用户在缓存根放一个自己的 BV1234567890/ 会被自动清理连文件一起删。
-//   2026-10-31 切片 2：两个入口的实现搬进 lib/cache-own.mjs，物理上只剩一份——「两处一致」不再需要断言，
+//   2026-10-31：两个入口的实现搬进 lib/cache-own.mjs，物理上只剩一份——「两处一致」不再需要断言，
 //   但「判据本身对不对」更要紧（只剩一份时改坏一处就是两个入口一起坏）。所以保留「必须走 isOwnBvDir」
 //   的结构钉，其余全部改成 import 真跑。
 check('C26 自动清理与手点清理同一认领判据：BV 目录必须有 meta.json 或为空（#1，P0：别按名字删）', () => {
@@ -1672,7 +1672,7 @@ check('C34 符号链接口径统一：dirStat 按 lstat 计、walkEntries 也按
   // 文件 100 B、链接自身 7 B；stat 会跟到目标（9999 B）——用它就说明口径错了
   const lstatSync = (p) => ({ size: String(p).endsWith('link') ? 7 : 100, mtimeMs: 1 })
   const statSync = () => { throw new Error('用了 statSync（会跟到链接目标）') }
-  // 2026-10-31 切片 2：dirStat 搬进 lib/cache-own.mjs，只剩一处实现——「两处口径统一」不再是判据，
+  // 2026-10-31：dirStat 搬进 lib/cache-own.mjs，只剩一处实现——「两处口径统一」不再是判据，
   //   但「口径本身对不对」仍要钉：喂同一个假 fs，看它怎么算链接。
   for (const [label, src] of [['lib/cache-own.mjs', read('lib/cache-own.mjs')]]) {
     const { dirStat } = compile(src, ['dirStat'], {
@@ -1771,7 +1771,7 @@ check('C37 外层超时必须覆盖内层可调的 ASR 超时上限（#12，P1�
 //   会备份，而真正被读得最多的是两处裸 parse。坏文件只打一句 warning 就返回 {}，
 //   下一次任何写入口整份写回，用户手改坏的配置就永久没了。
 check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否则下次写回就永久覆盖）', () => {
-  // 2026-10-31 切片 3-B：行为搬进 lib/config.mjs，直接 import 真跑（返回 {value, problem}）。
+  // 2026-10-31：行为搬进 lib/config.mjs，直接 import 真跑（返回 {value, problem}）。
   //   原来这条靠 compile 抽 index.js 的 readJsonOrBackup + 一个 `let cfgWarning` 的 prelude——
   //   那是「编译一份影子实现」，搬走之后就抽不到了。
   const src = read('index.js')
@@ -1835,9 +1835,9 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
 //   这条不能写成「等 30 秒再问一次」：慢、脆，机器一慢就假绿。改成注入假时钟 + 计数桩替掉 dirStat，
 //   数「真 walk 了几次」。TTL 从源码读出来当参数传进去，不在断言里另抄一份常量
 //   （另抄一份就是第二个真相源，改源码不改正则时这条会绿得毫无意义——E6-08 说的正是这个）。
-// ── 批 2a：五处状态写入的原子化（2026-11-02）────────────────────────────────
+// ── 五处状态写入的原子化（2026-11-02）────────────────────────────────
 // 换掉的是 index.js 里五个写函数：writeTuning / writeDepsCfg / writeUiCfg / writeLastRun / writeCacheCfg。
-//   这五个名字在 verify.mjs 里原来是**零命中**（DSH 20:20 手工列表、我复了一遍 grep），下面是新覆盖。
+//   这五个名字在 verify.mjs 里原来是**零命中**（手工列表、我复了一遍 grep），下面是新覆盖。
 // 五条分工：C131 正常路径与格式 / C132 写失败路径 / C133 跨进程并发（不变量）/
 //   C135 rename 重试逻辑（确定性桩）/ C134 失败语义没被顺手改掉。
 //   C135 排在这里而不是文件末尾，因为它就是从 C133 拆出来的那半（见 C133 头注释），
@@ -1857,7 +1857,7 @@ const declOf = (src, name) => {
 const atomicPrelude = (src) =>
   [declOf(src, 'WRITE_SEQ'), declOf(src, 'RENAME_RETRY_MS'), declOf(src, 'RENAME_RETRY_CODES'), declOf(src, 'sleepSync')].join('\n')
 
-check('C131 五处状态写入走原子写，且原有两种格式逐字节不变（批 2a）', () => {
+check('C131 五处状态写入走原子写，且原有两种格式逐字节不变', () => {
   const cfg = read('lib/config.mjs')
   const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
     prelude: atomicPrelude(cfg),
@@ -1873,7 +1873,7 @@ check('C131 五处状态写入走原子写，且原有两种格式逐字节不�
     //     writeFileSync(p, JSON.stringify(cur, null, 2), 'utf8')          // writeTuning   :294
     //     writeFileSync(UI_CFG, JSON.stringify(next, null, 2), 'utf8')    // writeUiCfg     :433
     //     writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')         // writeDepsCfg   :763
-    //   下面这行就是它原样跑一次（DSH 20:28 的要求：不是断言「看起来一样」，是真拿旧版跑一遍比）。
+    //   下面这行就是它原样跑一次（不是为了断言「看起来一样」，是真拿旧版跑一遍比）。
     const baseA = join(dir, 'base-a.json')
     writeFileSync(baseA, JSON.stringify(obj, null, 2), 'utf8')
     writeJsonAtomic(p, obj)
@@ -1916,7 +1916,7 @@ check('C131 五处状态写入走原子写，且原有两种格式逐字节不�
   return '基线 = 96feae6 三处写入表达式真跑结果：缩进 2 / 紧凑两种格式逐字节一致 + 覆盖完整 + 零残留 tmp + 五处都走原子写'
 })
 
-check('C132 写 tmp 中途失败：目标文件逐字节不变、不留残留 tmp（批 2a）', () => {
+check('C132 写 tmp 中途失败：目标文件逐字节不变、不留残留 tmp', () => {
   const cfg = read('lib/config.mjs')
   let stubCalls = 0
   // 桩：**先真写半截到盘，再抛 ENOSPC**。写半截是故意的 —— 如果 catch 里忘了删 tmp，
@@ -1955,7 +1955,7 @@ check('C132 写 tmp 中途失败：目标文件逐字节不变、不留残留 tm
   }
 })
 
-check('C133 一个进程密集读、另一个进程持续写：读到的永远是完整 JSON（批 2a 核心）', () => {
+check('C133 一个进程密集读、另一个进程持续写：读到的永远是完整 JSON（核心）', () => {
   // 为什么是独立探针而不是在 check 里 await：check() 是同步收集，async 函数直接 await 进来
   //   会被记成 PASS（2026-11-01 踩过）。所以并发逻辑丢给 fixtures/atomic-race.mjs，
   //   它自己 spawn 两个子进程，把结论打成一行 JSON 回来。
@@ -1988,7 +1988,7 @@ check('C133 一个进程密集读、另一个进程持续写：读到的永远�
     must(out.reader?.bad === 0, `读到 ${out.reader?.bad} 次半截 JSON —— 原子写没起作用（改前的裸写在这个规模下会读到 6–12 次）`)
     must(out.reader?.weird === 0, `读到 ${out.reader?.weird} 次结构不完整的对象（能 parse 但字段缺），共 ${out.reader?.ok} 次正常`)
     must(out.reader?.ok >= 500, `正常读只成功 ${out.reader?.ok} 次（应接近 1000）—— 探针多半空转了，这条等于没测`)
-    // 「另一个进程能读到**新值**」——这是 DSH 20:28 判据 2 的核心（跨进程可见）。
+    // 「另一个进程能读到**新值**」——这是判据 2 的核心（跨进程可见）。
     //   只断言 >0 不断言具体值：重试偶尔会漏一次（hardFail=1 不是错误，见上面那段），
     //   但要 100 次写里连一次都没被读到，说明写根本没生效或读方解析不了。
     must((out.reader?.sawMax ?? -1) > 0, `读进程从没读到过新值（最大 seq=${out.reader?.sawMax}）—— 原子写之后另一个进程读不到更新，配置改了不生效`)
@@ -2091,13 +2091,13 @@ check('C134 五处写函数的失败语义没被 2a 顺手改掉（抛 / 吞 / o
     if (n === 'writeTuning') {
       must(/code:\s*400/.test(b), 'writeTuning 的 code: 400 没了（参数非法要能区分出 4xx）')
     } else {
-      must(!/code:\s*\d+/.test(b), `${n} 多了 code 字段 —— code 只在 HTTP 层加（DSH 20:20 拍的口径）`)
+      must(!/code:\s*\d+/.test(b), `${n} 多了 code 字段 —— code 只在 HTTP 层加（定下的口径）`)
     }
   }
   return 'writeUiCfg 仍抛 / writeLastRun 仍吞 / 三个仍返回 ok:false（code 只在 writeTuning）'
 })
 
-// ── 批 2b：四处 0600 凭证写入点（2026-11-02）──────────────────────────────────
+// ── 四处 0600 凭证写入点（2026-11-02）──────────────────────────────────
 //
 // 四处 = index.js 面板扫码 / lib/cred.mjs 的 adoptLegacyCred / tools/look.mjs 的 --poll 与 login。
 // 前三处写同一个 deps/credential.json（`CRED_FILE = SHARED_CRED`），第四处写 deps/login-key.json
@@ -2107,10 +2107,10 @@ check('C134 五处写函数的失败语义没被 2a 顺手改掉（抛 / 吞 / o
 //   lib/config.mjs 注释里，结果人和工具互相引用、`login-key.json` 整条漏掉。数字写进注释会腐化，
 //   现在注释里留的是可 grep 的标记「0600 点」。
 
-check('C136 writeJsonAtomic 的 mode：tmp 建时带 0600、chmod 只打 tmp、且在 rename 之前（批 2b）', () => {
+check('C136 writeJsonAtomic 的 mode：tmp 建时带 0600、chmod 只打 tmp、且在 rename 之前', () => {
   // 为什么用桩判顺序、不真跑 stat：Windows 上 mode/chmod 全是空操作（2026-11-02 实测 stat 恒 666），
   //   真跑只能在 POSIX 上验（那条交给 C139，Windows skip）。而「顺序」这个事在 Windows 上
-  //   一点症状都没有，却正是 DSH 指出的风险来源：先 rename 再 chmod 目标，目标若已被删就 ENOENT，
+  //   一点症状都没有，却正是要防的风险来源：先 rename 再 chmod 目标，目标若已被删就 ENOENT，
   //   于是「写成功了却报失败」——tools/look.mjs 的 login 分支写完马上删 login-key.json，正好有这个窗口。
   const cfg = read('lib/config.mjs')
   const calls = []
@@ -2163,7 +2163,7 @@ check('C136 writeJsonAtomic 的 mode：tmp 建时带 0600、chmod 只打 tmp、�
   return 'tmp 建时带 0600 / chmod 恰好 1 次且只打 tmp / chmod 在 rename 前 / 不传 mode 零 chmod / chmod 失败删 tmp 并抛原码'
 })
 
-check('C137 四处凭证写入点都改走 writeJsonAtomic 带 mode，没有残留的裸写与「写完再 chmod」（批 2b）', () => {
+check('C137 四处凭证写入点都改走 writeJsonAtomic 带 mode，没有残留的裸写与「写完再 chmod」', () => {
   // 数实际出现次数，不认「有一处改了就算过」：漏改一处时那种写法照样绿 ——
   //   这正是 2a 那轮「五处实现只验了三处」的同型坑，这次换到 0600 上。
   const files = { 'index.js': read('index.js'), 'lib/cred.mjs': read('lib/cred.mjs'), 'tools/look.mjs': read('tools/look.mjs') }
@@ -2184,7 +2184,7 @@ check('C137 四处凭证写入点都改走 writeJsonAtomic 带 mode，没有残�
   return 'index 1 / cred 1 / look 2 处 mode；裸写 0、回潮 chmod 0；标记在'
 })
 
-check('C138 四处写出的字节与旧写法逐字节相同（indent 2、无尾换行、中文不转义）（批 2b）', () => {
+check('C138 四处写出的字节与旧写法逐字节相同（indent 2、无尾换行、中文不转义）', () => {
   const cfg = read('lib/config.mjs')
   const { writeJsonAtomic } = compile(cfg, ['writeJsonAtomic', 'renameWithRetry'], {
     prelude: atomicPrelude(cfg),
@@ -2212,7 +2212,7 @@ check('C138 四处写出的字节与旧写法逐字节相同（indent 2、无尾
   }
 })
 
-check('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip 不假绿）（批 2b）', () => {
+check('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip 不假绿）', () => {
   // 这条是唯一真跑权限的判据，所以 Windows 上必须 skip 而不是「跑一遍说通过」：
   //   实测 Windows 上 mode/chmod 都是空操作（stat 恒 666），真跑也只能得出结论「666」，
   //   把它判成 PASS 就是拿一个必然成立的观察冒充判据。
@@ -2241,8 +2241,8 @@ check('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip
   }
 })
 
-check('C140 login-key.json 的生命周期：能删、删后还能再写，且删除不依赖它自己存在（批 2b）', () => {
-  // DSH 2026-11-02 提的两条生命周期断言：
+check('C140 login-key.json 的生命周期：能删、删后还能再写，且删除不依赖它自己存在', () => {
+  // 2026-11-02 的两条生命周期断言：
   //   ① 登录成功后 login-key.json 被删掉；② 它被删掉之后，chmod 不会因为文件不存在抛错。
   // ②在实现上已经从根上去掉了（chmod 打在 tmp 上，tmp 刚创建必然存在 —— C136 钉着），
   //   所以这里验的是「删掉之后整条写入路径仍然走得通」，而不是「chmod 有没有 try 包着」。
@@ -2279,7 +2279,7 @@ check('C140 login-key.json 的生命周期：能删、删后还能再写，且�
   return '写→删 顺序正确；删后重写不抛；重写内容正确'
 })
 
-check('C141 look.mjs 两处凭证写入失败不裸抛：转成 stderr + exitCode=1（批 2b「统一失败处理」的落点）', () => {
+check('C141 look.mjs 两处凭证写入失败不裸抛：转成 stderr + exitCode=1（「统一失败处理」的落点）', () => {
   // 2b 说的「统一失败处理」不是「四处返回值同形」——消费者不同（面板要返回对象、CLI 要退出码），
   //   注定不同形。能统一的是**都不许裸抛**：裸抛会被顶层兜成一句没有上下文的堆栈，
   //   用户看不出「是凭证没写进去」。这条逐点钉「调用点在 try 里、catch 里是 stderr + exitCode」。
@@ -2320,7 +2320,7 @@ check('C39 /status 的缓存占用走节流，清理后立刻失效（#11，P1�
   let walks = 0
   let now = 1_000_000
   const { cacheStat, invalidateCacheStat } = compile(src, ['cacheStat', 'invalidateCacheStat'], {
-    // 切片 4：cacheStat 里读的是 cacheDir()（缓存根状态搬进 lib 之后，本文件不再有 CACHE 值）
+    // cacheStat 里读的是 cacheDir()（缓存根状态搬进 lib 之后，本文件不再有 CACHE 值）
     prelude: `const cacheDir = () => 'X:/fake-cache'\nlet cacheStatAt = 0\nlet cacheStatVal = null`,
     params: ['dirStat', 'Date', 'CACHE_STAT_TTL_MS'],
     // dirStat 换成一个只数调用次数的桩：它被调几次 = 真 walk 了几次
@@ -2451,7 +2451,7 @@ check('C42 cuesToTxt 带 withTime 时每行 [mm:ss] 前缀（A1：模型要能�
   const cmdTextBlock = src.slice(src.indexOf('async function cmdText('), src.indexOf('async function cmdLocal('))
   must(cmdTextBlock.includes('withTime: true'), 'cmdText 没用带时间码的 cuesToTxt')
   must(cmdTextBlock.includes('noTime'), 'cmdText 没接 --no-time 开关')
-  // KNOWN_FLAGS 加了 no-time（批 1b 起改真跑：那张表已从 lib/params.mjs 生成，读字面量会验不住）
+  // KNOWN_FLAGS 加了 no-time（第二步起改真跑：那张表已从 lib/params.mjs 生成，读字面量会验不住）
   const nt = flagAccepted('no-time')
   must(nt.ok, `look.mjs 报「未知参数 --no-time」：stderr=${nt.err.slice(0, 160)}`)
   return 'cuesToTxt 真跑：withTime=true 带 [mm:ss] 前缀、withTime=false 不带；cmdSub/cmdText 调用点已接'
@@ -2476,7 +2476,7 @@ check('C43 peek 先走 videoshot，失败回落抽帧（A2：省流量，别只�
 
 check('C44 --at 时间解析容错（A3：12:30 / 12:3 都当 12 分 30 秒；abc 报错）', () => {
   const b = read('tools/look.mjs')
-  // 切片 9 第二步：parseAtTimes 搬进 lib/media.mjs，直接从 import 的那份真跑（不再 compile 抠函数体）。
+  // parseAtTimes 搬进 lib/media.mjs，直接从 import 的那份真跑（不再 compile 抠函数体）。
   //   这一步顺带证明「搬走的是同一份」：下面五条期望值一个字没改，仍然全过。
   // 真跑：三种格式都对
   must(JSON.stringify(parseAtTimes('750', 936, 2)) === '[750]', '750（秒）解析错了')
@@ -2490,7 +2490,7 @@ check('C44 --at 时间解析容错（A3：12:30 / 12:3 都当 12 分 30 秒；ab
   const src = b
   const grabBlock = src.slice(src.indexOf('async function grabFrames('), src.indexOf('async function transcribe('))
   must(grabBlock.includes('parseAtTimes(at'), 'grabFrames 里没调 parseAtTimes')
-  // KNOWN_FLAGS 加了 at（批 1b 起改真跑；顺带钉住 `--at` 进了 VALUE_OPTS ——
+  // KNOWN_FLAGS 加了 at（第二步起改真跑；顺带钉住 `--at` 进了 VALUE_OPTS ——
   //   它原来不在那张表里，`help --at 12:30` 会把 12:30 当成位置参数去 resolveSource）
   const atOk = flagAccepted('at', '12:30')
   must(atOk.ok, `look.mjs 报「未知参数 --at」：stderr=${atOk.err.slice(0, 160)}`)
@@ -2541,7 +2541,7 @@ check('C46 peek 索引时刻透传全链路：videoshot 返回 times、peekFrame
 //   喂真输入看真输出，不是 grep 源码里有没有某段字。
 check('C47 frames --at 换时刻不许撞缓存（P0：--at 460 与 --at 750 都叫 at-1p，第二次 rc=0 返回 07:40）', () => {
   const b = read('tools/look.mjs')
-  // 切片 9 第二步：atDirTag / framesCacheHit 搬进 lib/media.mjs，直接 import 真跑。
+  // atDirTag / framesCacheHit 搬进 lib/media.mjs，直接 import 真跑。
   //   原来要根据 createHash 注入（compile 的 prelude/params），现在 lib 自己那份 import 了 crypto。
   // 1. 目录名必须带上时刻指纹
   const d460 = atDirTag([460])
@@ -2559,7 +2559,7 @@ check('C47 frames --at 换时刻不许撞缓存（P0：--at 460 与 --at 750 都
   must(framesCacheHit({ ok: true, step: 20, scene: false }, 20, false, [460], 1) === false, '老 manifest 没有 times 却命中了 at 请求')
   must(framesCacheHit(m460, 20, false, [460], 0) === false, '零张 jpg 也判成命中——残帧被当完整结果')
   // 3. manifest 往返：times 真的写进去、真读回来
-  // 2026-10-31 切片 10：manifest 读写搬进 lib/frames.mjs —— 直接 import 真跑。
+  // 2026-10-31：manifest 读写搬进 lib/frames.mjs —— 直接 import 真跑。
   //   原来用 compile 从 look.mjs 抠函数体，搬家后抠不到，判据就变成「找不到 function writeManifest」假红。
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c47-'))
   let backTimes
@@ -2941,7 +2941,7 @@ const fdProbe = (mode, env = {}) => {
   return { r, dir, out, kv }
 }
 
-// C115（2026-11-01，DSH 18:05 准修 P0 后加）：发布链不许被自己的闸门堵死。
+// C115（2026-11-01，准修 P0 后加）：发布链不许被自己的闸门堵死。
 //
 //   为什么 C114（静态查字面量）还不够：
 //   P0 的真实形态是「闸门跑不起来」，而不是「某个文件里有个字符串」。
@@ -2993,7 +2993,7 @@ check('C115 发布链真跑一遍 sync（不许被自己的闸门堵死——P0 
     //
     //   为什么必须这样（2026-11-01 实测踩出来的，这条判据自己假绿过一次）：
     //   原来这里是硬编码的 need 清单，写的是 package.json / scripts / tools / lib / index.js …
-    //   唯独漏了 docs/。而 DSH 在 35d78ee 把 docs/*.png 加进了 files 白名单 ——
+    //   唯独漏了 docs/。而 35d78ee 把 docs/*.png 加进了 files 白名单 ——
     //   副本里没有 png，sync 的 Test-Path 判假就 continue，于是**这条端到端判据一直绿着**，
     //   真跑 sync 却红（png 的压缩数据里随机字节 `p:\` 撞上盘符规则）。
     //   实测：同一份 need 清单，加一个 docs 就 rc 1→0 反转（探针见提交说明）。
@@ -3030,7 +3030,7 @@ check('C115 发布链真跑一遍 sync（不许被自己的闸门堵死——P0 
       if (!existsSync(s)) continue
       copyTree(s, join(src, rel1))
     }
-    // 副本必须覆盖扫描面 —— 这条是本轮补的，堵的就是「判据自己假绿」那个洞。
+    // 副本必须覆盖扫描面 —— 这条是这次补的，堵的就是「判据自己假绿」那个洞。
     //
     //   2026-11-01 实测：need 硬编码漏了 docs/，副本里没有 png，sync 的 Test-Path 判假
     //   就 continue，于是 C115 一直绿着，真跑 sync 却红。**判据在验错对象比判据不够真更隐蔽** ——
@@ -3079,7 +3079,7 @@ check('C115 发布链真跑一遍 sync（不许被自己的闸门堵死——P0 
     //
     //   判据只能认 ASCII：PowerShell 5.1 的控制台输出是 GBK 字节，spawnSync 用 utf8
     //   解码 → 中文全是乱码（实测输出是「[DryRun] �� 27 ���ļ�」）。
-    //   拿中文当判据等于永远匹配不上 —— 这是本轮真踩到的坑。
+    //   拿中文当判据等于永远匹配不上 —— 这是真踩到的坑。
     //
     //   认得出来的 ASCII 痕迹：
     //     · DryRun 清单里的每行是相对路径（纯 ASCII）
@@ -3367,7 +3367,7 @@ check('C57 venv 引导不依赖 ensurepip，取不到 get-pip 时说清该装什
   } finally { rmSync(p1.dir, { recursive: true, force: true }) }
 
   // ② 半成品 venv 必须真的被改名留档，且内容不丢。
-  //   2026-11-01 DSH 00:44 P1-2 抓过的形态是：断言拿 bootstrap_pip 的输出去验
+  //   2026-11-01（P1-2）那次的形态是：断言拿 bootstrap_pip 的输出去验
   //   「已删除半成品」，右半边还 `|| /已删除半成品/.test(sh)` —— 源码里当然有这句话，
   //   于是那条断言从来没红过。这里改成验**文件系统状态**，不看文案也红得起来。
   const p2 = fdProbe('move-venv')
@@ -3410,7 +3410,7 @@ check('C58 GPU 探测跨平台：面板两平台走同一接口，Linux 分支�
   //   正好等价于「Linux 上库没装」。要验的是「不抛 AttributeError（WinDLL）、返回 1」。
   const pyBin = findPy()
   if (!pyBin) {
-    // 2026-11-01（DSH 00:44 P1-8）：原来是裸 `return '静态判据全过（本机没有 python，…）'`，
+    // 2026-11-01（P1-8）：原来是裸 `return '静态判据全过（本机没有 python，…）'`，
     //   执行器把它记成一笔 PASS —— 「本机没跑」就这样变成了「验过了」，通过数虚高。
     //   正解照 C55：先 skip() 记一笔（不算通过也不算失败），再 return。
     skip('C58 GPU 探测跨平台', '本机没有 python，Linux 分支没真跑（结构判据已过；把 python3 装进 PATH 后这条会真跑）')
@@ -3612,10 +3612,10 @@ check('C62 无卡机器不显示 GPU 行的「一键下载」（深入审查，�
   return 'canDownloadRow 真跑 7 种行 + missingDeps 真跑（不可安装的行不计入「缺 N 个」）；GPU 行的 installable 由 noCard（仅 ENOENT）决定'
 })
 
-// 2026-10-31 切片 3-C：appendRunLine 的轮转与追加搬进 lib/runs.mjs，两个入口各一行调用。
+// 2026-10-31：appendRunLine 的轮转与追加搬进 lib/runs.mjs，两个入口各一行调用。
 //   搬之前这段逻辑没有任何断言（grep appendRunLine 在 verify.mjs 里是 0 条）——
 //   也就是说「日志无限涨」「写日志把调用搞挂」两条都不设防。搬进 lib 正好补上。
-check('C63 appendJsonLine 真跑：自动建目录、满 2000 行 / 5 MB 轮转成 .1、写失败不抛（切片 3-C）', () => {
+check('C63 appendJsonLine 真跑：自动建目录、满 2000 行 / 5 MB 轮转成 .1、写失败不抛', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bw-c63-'))
   try {
     // ① 嵌套目录自动创建 + 单行 JSON
@@ -3651,14 +3651,14 @@ check('C63 appendJsonLine 真跑：自动建目录、满 2000 行 / 5 MB 轮转�
   }
 })
 
-// ── 切片 4：缓存根的**状态与时序**（2026-10-31）────────────────────────────
-// DSH 2026-10-31 16:58 定的三条硬要求，这里逐条落成断言：
+// ── 缓存根的**状态与时序**（2026-10-31）────────────────────────────
+// 2026-10-31 16:58 定的三条硬要求，这里逐条落成断言：
 //   ① 真起两个进程，比对 stdout/stderr 里的**实际路径**——不比源码；
 //   ② 删掉初始化调用必须红，而且要红在「路径不对」；
 //   ③ 未初始化就调 cacheDir() 必须抛。
-// 为什么这一片不能沿用前三个切片的 compile 套路：那三片搬的是纯函数（输入 → 输出），
+// 为什么这一片不能沿用前三次的 compile 套路：那三次搬的是纯函数（输入 → 输出），
 //   抽出来跑等价于真跑；这一片搬的是可变模块状态 + 「谁先调」，compile 抽不出状态，抽出来的
-//   函数体看着对、跑起来照样错——正是 DSH 说的「唯一一步 compile 会骗人」。
+//   函数体看着对、跑起来照样错——正是「唯一一步 compile 会骗人」。
 const CACHE_PROBE = [
   "const mod = await import(process.argv[2])",
   'let route = null',
@@ -3680,7 +3680,7 @@ const CACHE_PROBE = [
   'process.exit(0)',
 ].join('\n')
 
-check('C64 两个入口各起真进程，算出同一个缓存根（切片 4：状态与时序 compile 验不出来）', () => {
+check('C64 两个入口各起真进程，算出同一个缓存根（状态与时序 compile 验不出来）', () => {
   const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c64-'))
   const probe = join(tmp, 'probe.mjs')
@@ -3701,7 +3701,7 @@ check('C64 两个入口各起真进程，算出同一个缓存根（切片 4：�
     return { root, home, user }
   }
   // 本断言验的是「默认根」，所以 env 必须先摘掉 BILI_WATCH_CACHE（baseEnv）；
-  //   自定义场景再按需补回来——否则跑的人 shell 里带着这个变量就一定假红（DSH 2026-10-31 踩到）。
+  //   自定义场景再按需补回来——否则跑的人 shell 里带着这个变量就一定假红（2026-10-31 踩到）。
   const envOf = (s) => baseEnv({ DSH_HOME: s.home, ...(s.user ? { BILI_WATCH_CACHE: s.user } : {}) })
   const runCli = (s) => {
     const r = spawnSync(process.execPath, [join(ROOT, 'tools', 'look.mjs'), 'clean'], { env: envOf(s), encoding: 'utf8' })
@@ -3742,7 +3742,7 @@ check('C64 两个入口各起真进程，算出同一个缓存根（切片 4：�
   return `两个真进程两套场景（${cases.join('；')}）路径逐段相同`
 })
 
-check('C65 未初始化就调 cacheDir() 必须抛，且点名 initCachePath（切片 4：不许返回「看着能用」的默认值）', () => {
+check('C65 未初始化就调 cacheDir() 必须抛，且点名 initCachePath（不许返回「看着能用」的默认值）', () => {
   const url = pathToFileURL(join(ROOT, 'lib', 'cache-path.mjs')).href
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c65-'))
   const f = join(tmp, 'probe.mjs')
@@ -3764,7 +3764,7 @@ check('C65 未初始化就调 cacheDir() 必须抛，且点名 initCachePath（�
   }
 })
 
-check('C66 缓存根的状态与推导只剩 lib/cache-path.mjs 一份（切片 4：两个入口都不许再自己存 CACHE）', () => {
+check('C66 缓存根的状态与推导只剩 lib/cache-path.mjs 一份（两个入口都不许再自己存 CACHE）', () => {
   const lib = read('lib/cache-path.mjs')
   for (const rel of ['index.js', 'tools/look.mjs']) {
     const src = read(rel)
@@ -3800,10 +3800,10 @@ check('C66 缓存根的状态与推导只剩 lib/cache-path.mjs 一份（切片 
   return '五个函数 + 可变状态只在 lib；两个入口零残留'
 })
 
-// ── 切片 4 补丁：面板侧 logRun 落盘的真跑证据（2026-10-31）────────────────────
-// 切片 4 收尾时留了一处「靠推断」：index.js 侧 logRun → videoDir → runsFile() 这条链只验了
+// ── 补丁：面板侧 logRun 落盘的真跑证据（2026-10-31）────────────────────
+// 收尾时留了一处「靠推断」：index.js 侧 logRun → videoDir → runsFile() 这条链只验了
 //   CLI 那半边（CLI 跑一条坏命令 → runs.jsonl 有行），面板侧从没真跑过。
-//   DSH 17:26 指出的手法与 C64 同源：probe 里真调 apply()，拿它注册的 handler，喂一条必失败的命令。
+//   这个手法与 C64 同源：probe 里真调 apply()，拿它注册的 handler，喂一条必失败的命令。
 // 这里选 `view BV0000000000`（不存在的 BV）：请求必然失败 → code≠0 → 走 logRun 的 !ok 分支，
 //   于是「写 runs.jsonl」和「写 BV 目录下的 last-error.json」两件事同时被逼出来——
 //   一处不写就红，不用读源码猜它写不写。
@@ -3833,7 +3833,7 @@ const RUNLOG_PROBE = [
   'process.exit(0)',
 ].join('\n')
 
-check('C67 面板侧 logRun 真写盘：跑一条必失败的命令，runs.jsonl 有行、BV 目录有 last-error.json（切片 4 唯一「靠推断」的那处）', () => {
+check('C67 面板侧 logRun 真写盘：跑一条必失败的命令，runs.jsonl 有行、BV 目录有 last-error.json（唯一「靠推断」的那处）', () => {
   const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c67-'))
   const home = join(tmp, 'home')
@@ -3889,12 +3889,12 @@ check('C67 面板侧 logRun 真写盘：跑一条必失败的命令，runs.jsonl
   }
 })
 
-// ── 切片 5：凭证的位置与迁移（2026-10-31）────────────────────────────────
+// ── 凭证的位置与迁移（2026-10-31）────────────────────────────────
 // 验收「凭证路径两入口一致」不能只靠读源码：路径是算出来的，两个进程各算一次才是证据。
 // 这里走 /status 的真实路径（credState → resolveCredPath → adoptLegacyCred），
 // 用「旧 deps 凭证有没有被搬到 $DSH_HOME」这个副作用来判断它算到了哪——面板侧不打印路径
 // （/status 里那份是遮罩过的），所以只能看落点。
-check('C68 面板侧的凭证也认 lib 的路径：旧 deps 凭证被迁到 $DSH_HOME，旧文件不删（切片 5）', () => {
+check('C68 面板侧的凭证也认 lib 的路径：旧 deps 凭证被迁到 $DSH_HOME，旧文件不删', () => {
   const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c68-'))
   const home = join(tmp, 'home')
@@ -3930,12 +3930,12 @@ check('C68 面板侧的凭证也认 lib 的路径：旧 deps 凭证被迁到 $DS
   }
 })
 
-// ── 切片 5 的判据 #2：两个入口的同名函数必须归零（可执行化）────────────
+// ── 判据 #2：两个入口的同名函数必须归零（可执行化）────────────
 // 计划里写的是「同名 23 → 0」。实测收到 1（ensureCache），它不是逻辑重复：
 //   两侧各 1 行，只差「pushWarn(maskAbs(...))」与「console.error(...)」——这是 lib 不产文案的必然结果
 //   （面板要进 /status.warnings，CLI 要打 ASCII 前缀的 stderr）。
 // 所以判据不追求字面 0，而是把「允许剩下哪些」写成白名单，并约束它的体量：
-//   以后谁再复制粘贴一个函数过去，这条立刻红——这正是切片 5 要守的。
+//   以后谁再复制粘贴一个函数过去，这条立刻红——这正是这条判据要守的。
 const topFunctions = (src) => {
   const out = new Map()
   const re = /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm
@@ -3955,7 +3955,7 @@ const topFunctions = (src) => {
 const codeLines = (s) => s.split('\n').map((l) => l.trim())
   .filter((l) => l && !l.startsWith('//') && !l.startsWith('/*') && !l.startsWith('*'))
 
-check('C69 两个入口的同名顶层函数只剩文案薄壳：白名单之外一个都不许有（切片 5 的判据 #2）', () => {
+check('C69 两个入口的同名顶层函数只剩文案薄壳：白名单之外一个都不许有（判据 #2）', () => {
   const ALLOW = ['ensureCache']
   const a = topFunctions(read('index.js'))
   const b = topFunctions(read('tools/look.mjs'))
@@ -3973,8 +3973,8 @@ check('C69 两个入口的同名顶层函数只剩文案薄壳：白名单之外
   return `同名 ${common.length} 对（${common.join(',') || '无'}），白名单外 0 个`
 })
 
-// ── 切片 6 前置：apply(ctx) / 路由 / sendJson 在 78 条断言里出现 0 次（2026-10-31）──
-// DSH 18:02 派的活：先在**没有任何断言覆盖**的这段代码上补三条真跑，再动刀。
+// ── 前置：apply(ctx) / 路由 / sendJson 在 78 条断言里出现 0 次（2026-10-31）──
+// 先在**没有任何断言覆盖**的这段代码上补三条真跑，再动刀。
 //   「真跑」的口径沿用 C67：断言要能证明「这段代码是我这方执行的」，不是「有没有返回值」。
 // 三条都走同一个探针：import index.js → apply(ctx) → 拿它注册的 route.handler 真调，
 //   假 res 记录 writeHead 的 code/headers 与 end 的 body——sendJson 的三个分支因此全部经过真实实现。
@@ -4012,7 +4012,7 @@ const ROUTE_PROBE = [
   // 分支三：兜底 catch → 500。req.url 取一次就抛，异常发生在 handler 的 try 里，
   //   于是必然落到 catch 那条 sendJson(res, 500, { ok:false, why })——这是最容易漏的分支。
   "const boom = await call({ get url() { throw new Error('boom-url') }, method: 'GET', headers: { host: '127.0.0.1:1' }, socket: { remoteAddress: '127.0.0.1' } })",
-  // 分支四：写端点 /cache/clear 真跑（DSH 18:24：这六条会删用户文件，不该一直靠人工审）。
+  // 分支四：写端点 /cache/clear 真跑（这六条会删用户文件，不该一直靠人工审）。
   //   沙箱就是探针自己的 BILI_WATCH_CACHE：造一个本插件的 BV 目录 + 一个用户自己的文件，
   //   调完之后断言「BV 没了、用户文件在、skipped 里点了它的名」。
   'const fs = await import("node:fs")',
@@ -4063,7 +4063,7 @@ const runRouteProbe = (tag) => {
 let routeProbeCache = null
 const routeProbe = () => (routeProbeCache ??= runRouteProbe('c70'))
 
-check('C70 /status 真跑：apply() 注册的 handler 喂进去，回 200 + ok:true + 面板要的字段一个不少（切片 6 前置）', () => {
+check('C70 /status 真跑：apply() 注册的 handler 喂进去，回 200 + ok:true + 面板要的字段一个不少', () => {
   const d = routeProbe()
   const s = d.status
   must(s.code === 200, `/status 回的不是 200：${s.code}（body=${String(s.body).slice(0, 200)}）`)
@@ -4078,7 +4078,7 @@ check('C70 /status 真跑：apply() 注册的 handler 喂进去，回 200 + ok:t
   return `200 / ok:true / 字段齐（warnings ${data.warnings.length} 条）`
 })
 
-check('C71 sendJson 三个分支真跑：200 带 Content-Type、ok:false 走 404、抛错兜底 500（切片 6 前置）', () => {
+check('C71 sendJson 三个分支真跑：200 带 Content-Type、ok:false 走 404、抛错兜底 500', () => {
   const d = routeProbe()
   // ① 正常 200：状态码 + 头（Content-Type 写错，面板 fetch 拿到的就是 text/plain，res.json() 直接抛）
   must(d.status.code === 200, `① 正常分支不是 200：${d.status.code}`)
@@ -4096,7 +4096,7 @@ check('C71 sendJson 三个分支真跑：200 带 Content-Type、ok:false 走 404
   return '200/json 头、404/ok:false、500 兜底三支都真跑过'
 })
 
-check('C72 claimRoute 真跑：同路径重复 apply 只注册一次，dispose 后必须能再注册（切片 6 前置，T41-P0-1）', () => {
+check('C72 claimRoute 真跑：同路径重复 apply 只注册一次，dispose 后必须能再注册（T41-P0-1）', () => {
   const d = routeProbe()
   // ② 同进程再 apply 一次（fiber 重放）：必须被挡住，否则同一个路径挂两个 handler
   must(d.afterTwice === 1, `同一路径 apply 两次注册了 ${d.afterTwice} 个——claimRoute 没挡住重放，两个 handler 会抢同一个 res`)
@@ -4106,11 +4106,11 @@ check('C72 claimRoute 真跑：同路径重复 apply 只注册一次，dispose �
   return `apply×2 → 1 个注册；dispose 后再 apply → ${d.afterDispose} 个（release 生效）`
 })
 
-// 切片 6 把 apply(ctx) 从 429 行拆成 5 个子系统 + 8 行调度。这条断言盯两件事：
-//   ① apply 本身不许再长回去（上限 120 是 DSH 定的）；
+// apply(ctx) 已从 429 行拆成 5 个子系统 + 8 行调度。这条断言盯两件事：
+//   ① apply 本身不许再长回去（上限 120 是定下的）；
 //   ② 五个子系统必须还在、必须有实质内容，且 apply 真的调它们——
 //      否则「拆」可以靠「把内容删掉」通过，那不是拆。
-check('C73 apply(ctx) 只剩调度：五个子系统各在其位，加起来的量级没缩水（切片 6：429 → 8 行）', () => {
+check('C73 apply(ctx) 只剩调度：五个子系统各在其位，加起来的量级没缩水（429 → 8 行）', () => {
   const fn = topFunctions(read('index.js'))
   must(fn.has('apply'), '找不到 apply')
   const body = fn.get('apply')
@@ -4119,7 +4119,7 @@ check('C73 apply(ctx) 只剩调度：五个子系统各在其位，加起来的�
   //   把 `registerTool(ctx)` 注释掉，`/registerTool\(ctx\)/` 仍然匹配到那行注释，
   //   于是「不接线」也能全绿。注释里提到的名字不算接线。
   const code = la.join('\n')
-  must(la.length <= 120, `apply 又长回来了：${la.length} 行（上限 120，切片 6 已拆成调度）`)
+  must(la.length <= 120, `apply 又长回来了：${la.length} 行（上限 120，已拆成调度）`)
   must(la.length >= 5, `apply 只剩 ${la.length} 行——子系统被删了？`)
   // 调度形状：五条 ctx 调用一条不少
   const SUBS = { bootCache: 10, registerSlashCommand: 10, registerAutoHint: 25, registerTool: 60, registerPanelRoute: 100 }
@@ -4139,7 +4139,7 @@ check('C73 apply(ctx) 只剩调度：五个子系统各在其位，加起来的�
 
 check('C74 路由守卫（lib/route-claim.mjs）：同路径被拒、不同路径不冲突、release 后可重登记', () => {
   // 为什么要单开一条：C72 只能黑盒验「apply 两次只注册 1 个」，
-  //   而 DSH 18:02 点名的第三支「不同路径不冲突」黑盒根本测不到（面板只有一个路径）。
+  //   而名单里的第三支「不同路径不冲突」黑盒根本测不到（面板只有一个路径）。
   //   搬进 lib 之后它是导出函数，这件事才能直接断言——不是为了测试改生产代码，是搬到能测的位置。
   const idx = read('index.js')
   must(!/^const ROUTE_PATHS = new Set\(\)/m.test(idx), 'index.js 里又有了本地 ROUTE_PATHS——两套登记表会各记各的')
@@ -4194,7 +4194,7 @@ check('C75 注释剥离器（verify-todo 的 stripComments）不会把 // 注释
   return '四类输入都对：行注释/块注释剥净，注释里的 /* 不开新块，字符串里的 // 不动'
 })
 
-check('C76 /cache/clear 真跑：删本插件的 BV 目录、不碰用户自己放的文件、skipped 里点名（DSH 18:24）', () => {
+check('C76 /cache/clear 真跑：删本插件的 BV 目录、不碰用户自己放的文件、skipped 里点名', () => {
   // 这条盯的是「会删用户文件的端点」里唯一大面积删除的那条。
   //   今天一整天在修的 isOwnedEntry / isOwnBvDir / removeOwned 全在这条链上，而它们的入口
   //   （HTTP 路由）此前一条真跑断言都没有——删错了只有用户会发现。
@@ -4217,7 +4217,7 @@ check('C76 /cache/clear 真跑：删本插件的 BV 目录、不碰用户自己�
   return `403 闸有效且未删；200 + ok；BV 目录已删、用户文件保留且在 skipped 里点名；removed=${data.removed}`
 })
 
-// ── C78：jget 的五个特殊分支（切片 8 搬进 lib/bili-api.mjs 时的真跑证据）──────
+// ── C78：jget 的五个特殊分支（搬进 lib/bili-api.mjs 时的真跑证据）──────
 // 为什么现在才有：输出基线只覆盖成功路径——412/200+HTML/-352/5xx 这几支要么抛错要么返回
 //   兜底对象，19 条命令一条都碰不到。搬到 lib 时任何一支被搬丢，基线也是全绿。
 // 怎么跑：本地 http 服务器（127.0.0.1，随机端口），七种响应各来一次，探针在子进程里跑。
@@ -4258,7 +4258,7 @@ check('C78 jget 五支真跑：412 风控、200+HTML 风控、-352 翻译、5xx 
 })
 
 // ── C79：verify-todo 的 fnBody（预处理函数）自检 ─────────────────────────
-// DSH 18:48 定的规矩：**凡是「先预处理再匹配」的断言，预处理函数本身要有用例**（B5 那次
+// 定下的规矩：**凡是「先预处理再匹配」的断言，预处理函数本身要有用例**（B5 那次
 //   从 67 行吃到 304 行就是预处理出错，判据没错）。verify-todo 的 B 系列全靠 fnBody 取函数体，
 //   它取错时那些断言会给出与事实相反的结论，而它们自己看不出来。
 check('C79 verify-todo 的 fnBody 自检：export 前缀要认、注释里的同名声明不许认、截断落在行首括号', () => {
@@ -4292,7 +4292,7 @@ check('C79 verify-todo 的 fnBody 自检：export 前缀要认、注释里的同
   return 'export 认、ghost 不认、截断在行首 } 之前、半截垃圾返回 null'
 })
 
-// ── C81/C82：ffExec 与 findFfmpeg 真起进程（切片 9 第一步，DSH 20:05 点名）─────────
+// ── C81/C82：ffExec 与 findFfmpeg 真起进程（不是桩）─────────
 // 为什么必须真跑而不是断源码里有这行：ffExec 的第三参数两种形状（数字=超时 / 对象=options），
 //   写错的后果是**静默错**——只按数字处理，调用方的 encoding 丢了，sceneTimes 拿到 Buffer、
 //   matchAll 抛错被 catch 成 []，「场景检测永远没结果」，不红不报。断源码有这行救不了这个。
@@ -4362,7 +4362,7 @@ check('C82 findFfmpeg 真起进程：arg → extra → PATH 的顺序，跑不�
 
 // ── C83/C84：下载与「缓存里有没有 mp4」两条真跑 ──────────────────────────────
 // 为什么值得单独一轮：这两条的**每一条分支都只在出错时走到**，输出基线（57 个文件）只覆盖
-//   成功下载那两条，任何一支被搬丢、被改坏，基线一个字都不会变。切片 9 第二步把 downloadTo
+//   成功下载那两条，任何一支被搬丢、被改坏，基线一个字都不会变。后来把 downloadTo
 //   搬进 lib 时顺带把「上限」文案从写死的 512 MB 改成跟 maxBytes 走，这里把新文案钉住。
 check('C83 downloadTo 八支真跑（本地 http）：风控 HTML/JSON、404、两条超限、过小、网络层、原子写不留 .part', () => {
   const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures/download-probe.mjs')], {
@@ -4506,7 +4506,7 @@ check('C77 执行器自检：async 回调必须记 FAIL、must(false) 必须抛�
   makeChecker(r4)('selftest-ok', () => 'ok-detail')
   must(r4.length === 1 && r4[0].ok === true && r4[0].detail === 'ok-detail', `同步通过记成了 ${JSON.stringify(r4)}`)
 
-  // ⑥ must 自己必须会抛（2026-11-01，DSH 00:44 P0-3）
+  // ⑥ must 自己必须会抛（2026-11-01，P0-3）
   //
   //   它原来在 verify.mjs 第 64 行是文件局部常量，外面碰不到 —— 于是「700 多处断言全靠它把
   //   不成立变成异常」的这个东西，自己一条断言都没有。实测把它打空（`const must = () => {}`）：
@@ -4552,7 +4552,7 @@ check('C77 执行器自检：async 回调必须记 FAIL、must(false) 必须抛�
     throw new Error("verify.mjs 没有从 ./check-run.mjs import must")
   }
 
-  // ⑧ 抛出物转不成字符串时，执行器也不许崩（2026-11-01，DSH 00:44 P1-7）
+  // ⑧ 抛出物转不成字符串时，执行器也不许崩（2026-11-01，P1-7）
   //   原来 catch 里写 `e?.message ?? String(e)` —— `String(Object.create(null))` 会抛
   //   TypeError（Cannot convert object to primitive value）。那是**在 catch 里**，
   //   于是「记录一条失败」这一步自己失败，验证器崩在做记录这一行：
@@ -4608,7 +4608,7 @@ check('C80 Python 回退链：某个候选不可用时继续试下一个，不�
   return '真跑计划正常（' + m[1].trim().slice(0, 50) + '）；回退链 ' + vers.join('/')
 })
 
-// ── C87/C88：切片 10 的 cache 层（目录 / manifest / 等他人）与锁工厂，真跑 ──────
+// ── C87/C88：cache 层（目录 / manifest / 等他人）与锁工厂，真跑 ──────
 // 这两层原来是 tools/look.mjs 里的局部函数，verify 只能靠「抠函数体 + new Function」碰它们，
 // 抠不到就假红、抠到了也只是「看起来像」。搬进 lib 之后可以 import 真跑。
 check('C87 cache 层真跑：manifest 往返、坏 manifest 当没有、等他人命中/超时、目录名形状', () => {
@@ -4741,8 +4741,8 @@ check('C88 抢锁放锁真跑：抢不到不放别人的锁、owner 校验、过
   }
 })
 
-// ── C89：切片 11 的三稿复制提示词（正文逐字节一致 + 按钮位置 + 不带内部东西）──────
-// DSH 21:05 的验收是「把三个按钮实际复制出的文本各贴一份原样出来」——靠人眼比不行，
+// ── C89：三稿复制提示词（正文逐字节一致 + 按钮位置 + 不带内部东西）──────
+// 验收口径是「把三个按钮实际复制出的文本各贴一份原样出来」——靠人眼比不行，
 // 改成可执行断言：把 client.js 里 `const COPY_XXX = String.raw`...`` 当浏览器里那样求值，
 // 与基准文件（`tools/fixtures/copy-texts.md`）里的三个代码块逐字节比。
 // 任何人改了稿子忘了同步、或改坏了转义，这条都会红。
@@ -4761,7 +4761,7 @@ check('C89 三稿复制提示词：正文与基准文件逐字节一致、三稿
   //   2026-11-01 0.4.1 第 12 条（一）：原来文件不在时只往 mdNote 写一句「跳过」就继续，整条仍 PASS。
   //   这是 C89 自己犯的毛病——判据依赖仓库外的文件时，**要么红要么 skip，不许静默通过**。
   //   2026-11-01 0.4.1 第 12 条（二，用户拍板）：基准从仓库外搬进 `tools/fixtures/copy-texts.md`。
-  //   原来那条路径是 `../../项目/bili-watch/审查/…`，是工作区里的文件——vendor 出去或 CI 上
+  //   原来那条路径指向工作区里的审查记录（在仓库外），vendor 出去或 CI 上
   //   必然缺、必然红；更根本的是，断言的价值在于「期望值独立于被测代码」，基准只在
   //   我这台机器上，等于这条断言对外不存在。
   //   基准不进 npm 包（`tools/` 不在 package.json 的 files 里），发布出去的是 client.js 里的正身。
@@ -4806,7 +4806,7 @@ check('C89 三稿复制提示词：正文与基准文件逐字节一致、三稿
   }
   must(cli.includes("const ORIGIN = (typeof window !== 'undefined'"), 'client.js 里没有 ORIGIN 常量')
   must(cli.includes('window.location.origin'), 'ORIGIN 没取 window.location.origin')
-  // ⑥ 按钮位置：稿一稿二在「遇到问题」区，稿三在「面板打不开」区（DSH 21:58 的结构建议）
+  // ⑥ 按钮位置：稿一稿二在「遇到问题」区，稿三在「面板打不开」区（结构建议）
   const secDeps = cli.slice(cli.indexOf("'遇到问题'"), cli.indexOf("'面板打不开'"))
   const secPanel = cli.slice(cli.indexOf("'面板打不开'"), cli.indexOf("'抽帧缓存'"))
   must(secDeps.includes('text: COPY_DEPS') && secDeps.includes('text: COPY_ASR'),
@@ -4816,7 +4816,7 @@ check('C89 三稿复制提示词：正文与基准文件逐字节一致、三稿
   must(cli.indexOf("'遇到问题'") > cli.indexOf("'运行依赖'"), '「遇到问题」区跑到「运行依赖」区前面了')
   must(cli.indexOf("'遇到问题'") < cli.indexOf("'抽帧缓存'"), '「遇到问题」区跑到「抽帧缓存」区后面了')
   // 按钮标签必须是**症状本身**，三稿不能同名 ——
-  //   DSH 21:58 原话：「统一叫『复制排查提示词』等于把三稿当一份用，正是参考实现踩过的坑」。
+  //   原话：「统一叫『复制排查提示词』等于把三稿当一份用，正是参考实现踩过的坑」。
   //   这条单列，是因为它不在正文里（正文一致也救不了它），扰动测试实测漏过一次。
   const labels = [...cli.matchAll(/h\(CopyButton, \{ text: COPY_\w+, label: '([^']+)' \}\)/g)].map((m) => m[1])
   must(labels.length === 3, `CopyButton 按钮是 ${labels.length} 个，应为 3 个`)
@@ -4830,7 +4830,7 @@ check('C89 三稿复制提示词：正文与基准文件逐字节一致、三稿
   return `${mdNote}；三稿互斥；五段格式齐全；无内部编号与 HTML；地址用 {{ORIGIN}}；按钮分区正确`
 })
 
-// ── C90：三审抓出的三条 P0 的守卫（2026-10-31 三审 / 切片 4、5）──────────────────
+// ── C90：三审抓出的三条 P0 的守卫（2026-10-31 三审）──────────────────
 // 这三条都是「verify 全绿但行为已经变了」的类型，所以每条都要能红：
 //   ① code=null 被记成成功 → ok:true 且不写 last-error.json（被信号杀死的运行）
 //   ② runsFile() 求值点外移 → 面板侧异常从 child.on('close') 里冒出来
@@ -4874,7 +4874,7 @@ check('C90 三审三条 P0 的守卫：code=null 记失败、runsFile 惰性求�
     // ── ② runsFile() 必须惰性求值（求值点在 logRun 的 try 内部）──
     //  基线是在 logRun 内部（try 里）调 runsFile() 求值的，那个函数会走 ensureCache()，
     //  缓存根没初始化时**会抛**；基线把它包在 try 里 → 抛了只是日志写不进去，插件继续跑。
-    //  切片 5 把它变成实参后求值点跑到调用点（try 之外）→ 面板侧 index.js 的
+    //  把它变成实参后求值点跑到调用点（try 之外）→ 面板侧 index.js 的
     //  runLogRecord → finish 没有 try，异常会一路冒到 child.on('close') 的回调里。
     let threw = false
     try {
@@ -4936,7 +4936,7 @@ check('C90 三审三条 P0 的守卫：code=null 记失败、runsFile 惰性求�
 })
 
 // ── C91：lib 的导出在两个入口里不许有「第二份逻辑」（2026-10-31 三审）──────────
-// C69 只查「同名顶层 function」——但切片 8/9 搬完之后的薄壳大多是
+// C69 只查「同名顶层 function」——但搬完之后剩下的薄壳大多是
 //   `const jget = (url, headers, timeoutMs) => jgetRaw(url, {...})` 这种**箭头函数形式**，
 //   C69 看不见它们。搬走的东西在入口里留一份真逻辑 = 两处判据（E6-02 的老坑）。
 // 所以这条补上：lib 的每一个导出名，在 index.js / tools/look.mjs 里如果还出现，
@@ -5055,7 +5055,7 @@ check('C92 复制按钮：button 绑了 onClick、writeText 收到 props.text、
 })
 
 // ── C93：凭证「降级到旧位置」这条路必须留痕（P0-1，2026-11-01）───────────────────
-// 现场：切片 5 把 [cred] 提示绑在 a.moved 上，于是「新位置写不了 → 退回用 deps/ 里那份旧凭证」
+// 现场：[cred] 提示绑在 a.moved 上时，于是「新位置写不了 → 退回用 deps/ 里那份旧凭证」
 //   一句话都没有。用户以为自己用的是刚在本插件里扫的凭证，实际用的是发布包里别人的。
 // 判据：按「这次用的是不是新位置那份」而不是某一个分支，所以三条都真跑：
 //   ① 写不了（$DSH_HOME/bili-watch 被一个同名文件占住）→ 必须说「写不了 / 仍用旧那份」；
@@ -5123,14 +5123,14 @@ check('C93 凭证降级必须留痕：新位置写不了要说、搬成了要说
 })
 
 check('C95 「本机没装所以没跑」必须走 skip()，不许直接 return 说明串（否则算成 PASS）', () => {
-  // 2026-11-01（DSH 00:44 P1-8）：C58 / C59 / C80 原来是「工具不在就 return 一句说明」。
+  // 2026-11-01（P1-8）：C58 / C59 / C80 原来是「工具不在就 return 一句说明」。
   //   执行器收下那个字符串，记成一笔 **PASS** —— 「本机没跑」被算成「验过了」：
   //   通过数虚高，而且**越缺依赖的机器看起来越绿**（缺 python 的 CI 反而全过）。
   //   正解是 C55 的写法：先 skip() 记一笔（不算通过也不算失败），再 return。
   //
   //   这条守卫只扫一种形状：`if` 取反一个标识符之后直接跟 `return '...'`。
   //   多行形状（`if (!String(x).includes(...)) { return '...' }`）它扫不到 —— 那种要人看，
-  //   本批 C80 那处就是多行形状，是我手改的。
+  //   C80 那处就是多行形状，是我手改的。
   //
   //   注意：正则在**全文**上跑，注释也算。所以本段注释里刻意不写出完整形状，
   //   以免这条守卫被自己命中（那种误报一眼能看出来，但没必要留个坑）。
@@ -5146,7 +5146,7 @@ check('C95 「本机没装所以没跑」必须走 skip()，不许直接 return 
 })
 
 check('C96 白名单目录不按名字整棵删：里面出现用户的文件就不认领（P1-5）', () => {
-  // 2026-11-01（DSH 00:44 P1-5）：`OWN_CACHE_DIRS.has(name)` 原来一票通过——**只看名字**。
+  // 2026-11-01（P1-5）：`OWN_CACHE_DIRS.has(name)` 原来一票通过——**只看名字**。
   //   缓存根能被 BILI_WATCH_CACHE 指到任何目录（只要有我们的标记文件），用户在那种根下
   //   自建一个 frames/ 放素材，点「清除」就被整棵删。现在要求「顶层每个条目都像我们的产物」。
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c96-'))
@@ -5180,7 +5180,7 @@ check('C96 白名单目录不按名字整棵删：里面出现用户的文件就
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
-// ── C94：fetch-deps.sh 两处「判断反了」的 P2（2026-11-01，DSH 派单，两条都本机复现过）──
+// ── C94：fetch-deps.sh 两处「判断反了」的 P2（2026-11-01，两条都本机复现过）──
 //   ① `printf '%s\n' "$list" | grep -Eq …`：grep -q 一命中就退出，上游 printf 还在灌几千行
 //      → SIGPIPE → pipefail 把整条管道判成 141 → `||` 把 miss 写上 →「官方静态包」被报成
 //      「归档里没有 ffmpeg ffprobe」并 exit 1（本机实测命中场景 rc=141）。
@@ -5233,7 +5233,7 @@ check('C94 fetch-deps：清单判定不拼 shell 管道、ffmpeg 真跑只认它
   return 'run() 无 shell:true；清单走内存切片；-version 只看 v.code 且无 2>&1；反证：有 stdout 但 rc≠0 必判失败'
 })
 
-// —— 延迟异步检测（2026-11-01，DSH 00:44 P1-6）——
+// —— 延迟异步检测（2026-11-01，P1-6）——
 //
 //   C77 的 thenable 守卫只看 `fn()` 的**返回值**：`check('X', async () => …)` 返回 Promise，拦得住。
 //   但这一种拦不住：回调**同步返回 undefined**，异步体是它自己起的——
@@ -5241,7 +5241,7 @@ check('C94 fetch-deps：清单判定不拼 shell 管道、ffmpeg 真跑只认它
 //   异步体在 check() 返回之后才跑：它记的结果要么赶在汇总之前（偶发、看运气），要么赶不上
 //   （永远不显示）；里面要是抛错，直接 uncaughtException 把进程带走，一条汇总都不打。
 //
-//   做法照 DSH 给的第二个选项：汇总之前让出两轮事件循环（setImmediate + setTimeout 0），
+//   做法照第二个选项：汇总之前让出两轮事件循环（setImmediate + setTimeout 0），
 //   把排队的任务放完，期间任何 unhandledRejection / uncaughtException 都记成 FAIL。
 //   判据是「两轮之后有没有新结果冒出来 / 有没有异常」，不去猜是哪条断言起的异步。
 //
@@ -5619,7 +5619,7 @@ const runLookMock = (args, env) =>
 // 管不到 legacy 那条路径）。于是：
 //   · 在没有凭证的干净 checkout 里跑 → 断言绿
 //   · 在装了插件、deps/ 下有真凭证的机器上跑 → 命令读到真凭证 → rc=0 → **断言假红**
-// 实测就是这个：主树 DSH-插件/dsh-bili-watch/deps/credential.json 是真凭证
+// 实测就是这个：主树里 deps/credential.json 是真凭证
 // （10 月 20 日那份），合并到 main 后 C111 从绿变红。
 //
 // 做法：把要跑的两个 .mjs 拷进临时目录的 tools/，lib/ 用 junction 指回真仓库，
@@ -5929,7 +5929,7 @@ check('C111 login 真跑：--check 有凭证 → 「✓ 凭证有效…（mid=�
 })
 
 // 2026-11-02：原来在这里就把 mockBili 关了。C127 要在文件末尾再用它做「未命中时逐字节不变」
-//   （那是本轮最硬的一条不变量：没命中就必须一个字节都不变），所以关闭点挪到汇总之后，
+//   （那是最硬的一条不变量：没命中就必须一个字节都不变），所以关闭点挪到汇总之后，
 //   连带新的 mockInject 一起关。挪后不影响退出——process.exit 本身终止 worker，
 //   只是把「这批跑完就关」改成「全跑完就关」。
 
@@ -5974,9 +5974,9 @@ check('C112 removeOwned 对白名单目录也要看内容：混了用户文件�
   return '混用户文件→整目录不动并点名；纯产物→照常清；空壳→清'
 })
 
-// C117（2026-11-01，DSH 20:00 第三条）：skip 的原因必须可判读。
+// C117（2026-11-01，第三条）：skip 的原因必须可判读。
 //
-//   背景：DSH 派「那 3 条 skip 补原因」，说「现在只打「跳过」，看不出为什么」。
+//   背景：「那 3 条 skip 补原因」，说「现在只打「跳过」，看不出为什么」。
 //   实测下来**前提不成立** —— 当时 24 处 skip() 调用**全都有原因**，SKIP 行本来就会打
 //   detail（`SKIP  名字  —  原因`）。但顺着这条查，发现两个真问题：
 //     ① 4 处写成「本机没有 bash 或找不到 scripts/fetch-deps.sh」—— 「A 或 B」的复合原因，
@@ -6065,7 +6065,7 @@ check('C117 skip 的原因必须可判读：不许空、不许「A 或 B」式�
   return `${reasons.length} 处 skip：原因都非空、无「A 或 B」复合、缺环境类都给了补救办法`
 })
 
-// C118（2026-11-01，DSH 21:20 判 P0）：64 KB 闸之后，请求必须正常结束。
+// C118（2026-11-01，判 P0）：64 KB 闸之后，请求必须正常结束。
 //   旧写法 `if (raw.length > 65536) req.destroy()` 一了百了，真测出来两个后果：
 //     ① `IncomingMessage.destroy()` 不带 error 参数时**不 emit 'error'**，'end' 也不来
 //        → Promise 永远 pending，闭包里那份 raw 跟着泄漏（每个超限请求一份）；
@@ -6210,10 +6210,10 @@ check('C120 脚本文件头：.ps1 带 BOM、.sh 不带（都不许靠人记得�
 
 // —— 2026-11-01 第三轮复核：三条「形态兄弟」断言（C121–C123） ——
 //
-// 由来：这一轮派单本来是两处小改动（`.ps1` 根定位统一、二进制判定兜底方向），
+// 由来：这次改动本来是两处小改动（`.ps1` 根定位统一、二进制判定兜底方向），
 //   但改的过程中撞出「同一个坑只修了一半」的活例——4b 早就从裸 `& node` 改成 `cmd /c`，
 //   同一个文件下一段 4b-2 还是裸 `&`，注释里甚至写着「4c 早用同一写法绕过了这个坑」。
-//   这就是第 7 条铁律（修一处形态问题必须顺着找兄弟）的现场。三条断言把这一轮的
+//   这就是第 7 条铁律（修一处形态问题必须顺着找兄弟）的现场。三条断言把这次的
 //   三个形态约束钉住，而不是只改完算数。
 
 // 剥 PowerShell 注释（**字符串感知**）。
@@ -6372,7 +6372,7 @@ check('C122 二进制判定三态：文本 / 二进制 / 读不出来必须分�
     mkdirSync(dirPath)
 
     // 探针用 -EncodedCommand 传（UTF-16LE + base64），**不用 -File**。
-    //   教训（2026-11-01 本轮亲自踩的）：-File 跑一个 UTF-8 **无 BOM** 的临时 .ps1 时，
+    //   教训（2026-11-01 亲自踩的）：-File 跑一个 UTF-8 **无 BOM** 的临时 .ps1 时，
     //   PS 5.1 按系统 ANSI（中文 Windows = GBK）解码，本仓库路径里含中文（`007 Dsh工作区`），
     //   于是 ParseFile 拿到的是被 GBK 打碎的路径 → 报「文件不存在」→ AST 为空 → 断言体拿到
     //   0 个函数、报的却是「找不到 Test-IsBinaryFile」。看着像产品缺陷，其实是**测试脚手架**的错。
@@ -6445,7 +6445,7 @@ check('C122 二进制判定三态：文本 / 二进制 / 读不出来必须分�
     )
     must(gotMissing === 'unreadable', `不存在的文件被判成 ${gotMissing}（应为 unreadable）`)
 
-    // 结果二：真仓库全量 —— **按族判，不按文件名**（DSH 2026-11-02 00:13）。
+    // 结果二：真仓库全量 —— **按族判，不按文件名**（2026-11-02 00:13 定的）。
     //
     //   原来写的是 `wantBins = ['docs/architecture.png', 'docs/workflow.png']` 并要求**恰好相等**。
     //   那是一条会**误红**的判据：以后往 files 里加任何二进制（再放一张图、一个字体、一个 wasm）
@@ -6479,7 +6479,7 @@ check('C122 二进制判定三态：文本 / 二进制 / 读不出来必须分�
     must(unread.n === 0, `进包文件里有 ${unread.n} 个读不出来：${unread.list.join(', ')} —— 读不出来就没扫，按未通过处理`)
 
     // 族定义：多列的扩展名只会更严，不会误红（下面两条各自验的就是「这一族全对」）。
-    //   .py / .yml 是 DSH 清单之外补的：它们同样是文本，进包里确实有（tools/ocr.py、cordis.patch.yml）。
+    //   .py / .yml 是清单之外补的：它们同样是文本，进包里确实有（tools/ocr.py、cordis.patch.yml）。
     const BIN_EXT = /\.(png|jpe?g|gif|webp|woff2?|wasm|pdf)$/i
     const TEXT_EXT = /\.(mjs|js|json|md|txt|ps1|sh|py|yml|yaml)$/i
     const badBin = seen.filter((p) => BIN_EXT.test(p) && !bins.list.includes(p))
@@ -6718,7 +6718,7 @@ check('C124b 4b 遇到读不出来的文件必须变红：点名 + exit 2，且�
 // C125（2026-11-01 第三轮）：三个 .ps1 必须能被 PowerShell 解析（0 个语法错误）。
 //   为什么还要这条 —— C120 查 BOM、C121 查根定位、C123 查调用方式，**全是文本匹配**：
 //   脚本哪怕语法全错，这三条照样绿（它们只是 grep）。C122 也只解析 sync-release.ps1 一个。
-//   本轮的现场：改 sync-release.ps1 时我一度以为改坏了语法，跑到 PowerShell 里 ParseFile 才发现
+//   这次的现场：改 sync-release.ps1 时我一度以为改坏了语法，跑到 PowerShell 里 ParseFile 才发现
 //   是探针自己的编码问题 —— 那一刻仓库里**没有任何断言**能回答「这个脚本还能不能跑」。
 //   这条是**结果**判据：让 PS 自己说能不能解析。BOM 缺失（按 GBK 解出乱码 → 引号被吞）、
 //   括号不配对、字符串未闭合，它全抓得住；而 C120 只是它的一个（更早报警的）手段。
@@ -6806,7 +6806,7 @@ check('C126 git 推送段必须局部降级成 Continue（Stop 会把 git 的 st
   must(/&\s*git\s+push\s+origin\s+["']?v/.test(seg), '第 6 段里没有推 tag 的那一步（git push origin v…）')
 })
 
-// —— 陌生人内容护栏（2026-11-02，DSH 19:55 定稿四条）——
+// —— 陌生人内容护栏（2026-11-02 定稿四条）——
 // 这批修的是两件事：① 「数据形态（--format json/srt/md/txt）下护栏根本不跑」——warnForeign 在
 //   dataOnly 的 return 之后；② 「提示让模型绕过自家围栏」——展示层加了 source tag + 围栏，
 //   而 2451 行让模型 read 的落盘文件是**纯正文**，那条最短的路把标记绕过去了。
@@ -6814,7 +6814,7 @@ check('C126 git 推送段必须局部降级成 Continue（Stop 会把 git 的 st
 // 判据为什么不写成「scanInjection 返回什么」：那只能证明正则还在。出问题的地方是「跑没跑」，
 //   所以 C127/C128 **真跑命令**看 stdout / stderr / 落盘文件；C129/C130 要喂一批语料看命中率，
 //   用「把定义段原样切出来 + 探针尾巴」的办法（切的是真代码，不是复刻件）。
-const GUARD_BASE = 'e889822' // 本批改动前的基线：逐字节对比要拿它的 look.mjs 跑一遍
+const GUARD_BASE = 'e889822' // 加这组护栏之前的基线：逐字节对比要拿它的 look.mjs 跑一遍
 const GUARD_TAIL = readFileSync(join(HERE, 'fixtures', 'guard-probe-tail.mjs'), 'utf8')
 
 /** 把 look.mjs 里护栏的定义段原样切出来，拼上探针尾巴跑。返回 [{name, long, short}] */
@@ -6940,7 +6940,7 @@ check('C128 落盘：原文件仍纯正文，wrapped 副本带 source tag+围栏
   return 'sub.txt 纯正文 / sub.wrapped.txt 带 tag+围栏 / 提示词指向 wrapped'
 })
 
-check('C129 20 条正常字幕在长文本规则下零命中（DSH 19:42 那三条语义规则不加的依据）', () => {
+check('C129 20 条正常字幕在长文本规则下零命中（三条语义规则不加的依据）', () => {
   const raw = read('tools/fixtures/normal-subtitles.txt')
   const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
   must(lines.length >= 20, `语料只有 ${lines.length} 条（应 ≥20）—— 删条目就等于放宽这条判据`)
@@ -6977,6 +6977,25 @@ check('C130 不可见字符是确定性判据：零宽/tag/双向控制符命中
   return `${cases.length} 个用例全中（含「开头 BOM 不算藏字」）`
 })
 
+// ── C142：runDownload 函数体可求值（PR #8 那次回归的守门人）─────────────────
+// 为什么必须有一条：e889822 把 `const detached = ...` 删了，但 spawn 选项与 download.log
+//   模板还在引用它 → 对象字面量求值抛 ReferenceError → 被函数自己的 try/catch 收成
+//   {started:false} → 用户点「一键下载」回 HTTP 400。当时 154 条断言**一条都没红**，
+//   因为它们只验「函数存在」，没验「函数体能不能跑完」。
+// 为什么判据不能看 throw：这个错被 runDownload 自己 catch 了，根本不往外抛。
+//   第一版探针写成「捕获 ReferenceError」，在坏代码上输出 OK / rc=0 —— 一条没牙的判据。
+//   现在落在 ret.started === true 与 spawn 收到的 detached 值上。
+// 探针自带「自身失效」保护：切不出函数体就 rc=2，本 check 先判 2 再判 0，不静默 PASS。
+check('C142 runDownload 函数体能求值并真的拉起进程（引用未声明变量必须红）', () => {
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures/run-download-probe.mjs')], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env },
+  })
+  const detail = `${(r.stdout || '') + (r.stderr || '')}`.trim().slice(0, 300)
+  must(r.status !== 2, `探针自身失效（rc=2，说明切不出函数体，不是被测代码的问题）：${detail}`)
+  must(r.status === 0, `runDownload 跑不通：${detail}`)
+  return '函数体求值通过，started=true，spawn 收到 detached=false'
+})
+
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
 let pass = 0, fail = 0, skipN = 0
 for (const r of results) {
@@ -6989,7 +7008,7 @@ for (const r of results) {
 }
 console.log(`\n${pass} 通过 / ${fail} 失败 / ${skipN} 跳过`)
 
-// 跳过明细（2026-11-01，DSH 20:00 第三条）：汇总行只有一个数字，只看结尾的人不知道
+// 跳过明细（2026-11-01，第三条）：汇总行只有一个数字，只看结尾的人不知道
 //   「跳过了哪几条、为什么、怎么才能让它跑」。跳过是最容易被当成「没问题」的状态，
 //   所以在这里再列一遍：名字 + 原因。零跳过时不打这一块（不制造噪声）。
 if (skipN > 0) {

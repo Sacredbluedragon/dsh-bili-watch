@@ -14,44 +14,44 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSy
 import { tmpdir, homedir } from 'node:os'
 import { dirname, join, relative, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-// 2026-10-31 切片 1：cleanKey / bvOf / cutCp / looksLikeOwnUrlDir 原来在本文件有一份、
+// 2026-10-31：cleanKey / bvOf / cutCp / looksLikeOwnUrlDir 原来在本文件有一份、
 //   tools/look.mjs 里也有一份（逐字相同）。搬进 lib/keys.mjs 后物理上只剩一份，两个进程各 import。
 //   依赖只有一个只读常量 OWN_CACHE_DIRS（lib/consts.mjs），不碰可变状态，可以放心共用。
-// 2026-10-31 切片 2：锁判据（pidAlive / readLock / lockExpired / hasAnyLock / isAdoptableDir）
+// 2026-10-31：锁判据（pidAlive / readLock / lockExpired / hasAnyLock / isAdoptableDir）
 //   同理搬进 lib/locks.mjs；CACHE_MARK 从 lib/consts.mjs 拿。
-// 2026-10-31 切片 4：consts 里的两个常量在本文件已经没人读了——CACHE_MARK 只被 pickCacheDir 用、
+// 2026-10-31：consts 里的两个常量在本文件已经没人读了——CACHE_MARK 只被 pickCacheDir 用、
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进 lib/cache-path.mjs 了。
 //   留着 import 会让人以为本文件还在判根标记/子目录归属。
-// 切片 4：isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
+// isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
 import { hasAnyLock } from './lib/locks.mjs'
-// 2026-10-31 切片 2：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
-//   切片 4 起 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
+// 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
+//   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
 import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned } from './lib/cache-own.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
 //   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
 //   本文件里只用于扫码登录那三处（QR_GEN / QR_POLL / fillBuvids）。
 import { UA } from './lib/consts.mjs'
-// 2026-10-31 切片 3：调优表与钳制/换算搬进 lib/tuning.mjs。
+// 2026-10-31：调优表与钳制/换算搬进 lib/tuning.mjs。
 //   原来本文件与 tools/look.mjs 各写一份 TUNING_DEFS，靠 C17 逐键比对绑在一起；
 //   现在物理上只有一份，两个入口只负责「把配置读出来」（depsCfg / readDepsCfg）。
 import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults, tuningRanges } from './lib/tuning.mjs'
-// 2026-10-31 切片 3-C：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
+// 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
 import { depsPaths, readPluginVersion, resolveDepsDir } from './lib/plugin-paths.mjs'
-// 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
+// 2026-10-31：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
 import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/config.mjs'
-// 2026-10-31 切片 4：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
-//   前三个切片搬的是纯函数，compile 抽出来跑等于真跑；这一片搬的是可变模块状态 + 「谁先调」，
+// 2026-10-31：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
+//   前三次搬的是纯函数，compile 抽出来跑等于真跑；这一次搬的是可变模块状态 + 「谁先调」，
 //   所以判据也换了（C64 真起两个进程比对实际路径 / C65 未初始化必抛，见 tools/verify.mjs）。
 import { cacheAdoptNotice, cacheDir, initCachePath, previewCacheDir, videoDir } from './lib/cache-path.mjs'
-// 2026-10-31 切片 5：凭证的位置 / 完整性判据 / 旧路径迁移搬进 lib/cred.mjs。
+// 2026-10-31：凭证的位置 / 完整性判据 / 旧路径迁移搬进 lib/cred.mjs。
 //   本文件与 tools/look.mjs 原来各有一份迁移逻辑，四字段清单更是散在三处；
 //   现在只有一份，两个入口各自把结构化结果翻译成自己的文案（面板静默 → /status，CLI 打 stderr）。
 import { adoptLegacyCred, credPaths, fillBuvids, missingCredFields, pickLoginCookies } from './lib/cred.mjs'
-// 2026-10-31 切片 7：路由守卫搬进 lib/route-claim.mjs（原样不改，只是从私有变导出，
+// 2026-10-31：路由守卫搬进 lib/route-claim.mjs（原样不改，只是从私有变导出，
 //   好让 C74 直接断言「同路径被拒 / 不同路径不冲突 / release 后可重登记」）。
 import { claimRoute, releaseRoute } from './lib/route-claim.mjs'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
@@ -63,13 +63,13 @@ import { claimRoute, releaseRoute } from './lib/route-claim.mjs'
 const toolTextCap = () => readTuning().toolTextCap
 const toolTextHead = () => readTuning().toolHead
 
-// 进程级路由守卫已搬到 lib/route-claim.mjs（2026-10-31 切片 7）——收进 lib 后可以直接
+// 进程级路由守卫已搬到 lib/route-claim.mjs（2026-10-31）——收进 lib 后可以直接
 //   import 断言「不同路径不冲突 / release 后可重登记」，不必为了测试给生产代码开口子。
 
-// cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31 切片 1）——两处逐字相同的实现只留一份。
-// videoDir 已搬到 lib/cache-path.mjs（2026-10-31 切片 4）——它读缓存根，而缓存根现在住在那个模块里。
+// cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31）——两处逐字相同的实现只留一份。
+// videoDir 已搬到 lib/cache-path.mjs（2026-10-31）——它读缓存根，而缓存根现在住在那个模块里。
 
-// cutCp 已搬到 lib/keys.mjs（2026-10-31 切片 1）。
+// cutCp 已搬到 lib/keys.mjs（2026-10-31）。
 
 let TOOL_FILE_SEQ = 0
 /** 长文本 → 落盘 + 摘要；短文本原样返回（不论长短都先落一份到缓存）。
@@ -77,7 +77,7 @@ let TOOL_FILE_SEQ = 0
  *  也会被模型误读成坏 JSON。直接告诉模型「全文已整体落盘，去 read 那个文件」。 */
 function trimForModel(text, tag = 'out', bv = '', jsonMode = false, opts = {}) {
   const s = String(text ?? '')
-  // A8（2026-10-27 批次8）：--full 时工具层不要再把已放大的文本切回 800——
+  // A8（2026-10-27）：--full 时工具层不要再把已放大的文本切回 800——
   //   full 走 20000 上限；用户给的 --head N 优先于默认 800；不传 full 仍 ≤2000。
   const full = !!opts.full
   const cap = full ? 20000 : toolTextCap()
@@ -197,7 +197,7 @@ function scheduleDepsMigration() {
 // 配置文件不进包（deps 只留空目录），发布时无需脱敏。
 // 解析失败不写 stdout/stderr（会污染 --format json 与 PowerShell 管道），
 // 而是攒进 cfgWarnings，由 /status 的 warnings 带给面板；ENOENT（没配过）不算异常。
-// 2026-10-31 切片 3-B：原来是 `let cfgWarning = null`，谁后读谁覆盖——两个配置文件同时坏，
+// 2026-10-31：原来是 `let cfgWarning = null`，谁后读谁覆盖——两个配置文件同时坏，
 //   面板只看得到最后一条。现在攒成数组（去重，同一条不重复堆），读盘行为本身搬进 lib/config.mjs。
 const cfgWarnings = []
 const pushWarn = (msg) => { if (msg && !cfgWarnings.includes(msg)) cfgWarnings.push(msg) }
@@ -212,7 +212,7 @@ function depsCfg() {
   return readDepsCfgFile(join(DEPS, 'deps-config.json'))
 }
 // 参数分层（2026-10-28 阶段B）：面板可调的数值全部并进 deps\deps-config.json，不新开第四份配置文件。
-// 表与钳制已搬到 lib/tuning.mjs（2026-10-31 切片 3）——原来这里与 tools/look.mjs 各写一份，
+// 表与钳制已搬到 lib/tuning.mjs（2026-10-31）——原来这里与 tools/look.mjs 各写一份，
 //   靠 C17 逐键比对绑在一起；现在物理上只剩一份，面板与 CLI 不可能再各读各的默认值。
 /** 每次调用都读盘（照 cacheCfg 的写法）：index.js 是常驻进程，存闭包就是「面板改了插件还是老的」。 */
 function readTuning() {
@@ -308,7 +308,7 @@ function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEP
 //   现在规则只有一条：$DSH_HOME/bili-watch/credential.json；没有就从 deps/credential.json
 //   （更旧的 legacy）迁移一次；都没有就是未登录（匿名请求）。
 const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
-// 迁移与校验搬进 lib/cred.mjs（2026-10-31 切片 5）：这里只要「这次该读哪个路径」。
+// 迁移与校验搬进 lib/cred.mjs（2026-10-31）：这里只要「这次该读哪个路径」。
 //   面板侧原本就静默（不打印），所以这里对 problem 一律不翻译——凭证状态由 /status 的 credState 解释。
 function resolveCredPath() {
   return adoptLegacyCred({ shared: SHARED_CRED, legacy: LEGACY_CRED }).path
@@ -316,37 +316,37 @@ function resolveCredPath() {
 const LAST_RUN = join(DEPS, 'last-run.json')
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > $DSH_HOME/bili-watch/cache。发布版不含本机路径。
 // 自定义目录不可写时不让功能哑掉：回退到默认路径（$DSH_HOME/bili-watch/cache），并把原因挂进 /status.warnings。
-// 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31 切片 2）——两处同名同值的「身份凭证」只留一份。
-// OWN_CACHE_DIRS 已搬到 lib/consts.mjs（2026-10-31 切片 1）——两处同名同值的常量只留一份。
-// isOwnedEntry 已搬到 lib/cache-own.mjs（2026-10-31 切片 2），签名变成 isOwnedEntry(root, p)——
-//   缓存根由调用方传入（切片 4 把 CACHE 搬进状态模块时，这里只换实参）。
+// 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31）——两处同名同值的「身份凭证」只留一份。
+// OWN_CACHE_DIRS 已搬到 lib/consts.mjs（2026-10-31）——两处同名同值的常量只留一份。
+// isOwnedEntry 已搬到 lib/cache-own.mjs（2026-10-31），签名变成 isOwnedEntry(root, p)——
+//   缓存根由调用方传入（CACHE 搬进状态模块时，这里只换实参）。
 //   #1（2026-10-30 E8）：BV 目录不能只认名字，否则自动清理会把用户的 BV1234567890/ 连文件一起删；
 //   现在的判据与 removeOwned 完全同一套（isOwnBvDir），同族说明见 lib/cache-own.mjs 文件头。
 // A-3（2026-10-28 阶段A）：清理前确认「没有任何会写盘的子目录在被占用」。
-//   实现已搬到 lib/locks.mjs（2026-10-31 切片 2）——面板与 CLI 的判据物理上只留一份。
+//   实现已搬到 lib/locks.mjs（2026-10-31）——面板与 CLI 的判据物理上只留一份。
 //   判活 + 判过期两条判据的由来见那边的文件头与 hasAnyLock 注释。
 // 2026-10-28 高级设置放开：与 tools/look.mjs 同源，从 readTuning().lockTtlMin 取（默认 30 分钟）
 // X-14（2026-10-29）：TTL 还必须覆盖一次最长转写——asrTimeoutSec 上限 60 分钟 > 默认 TTL 30 分钟，
 //   转写跑满时锁先被判过期、别的进程抢进来 → 双持。所以取两者的较大值（与 CLI 同一判据）。
-//   切片 2 时它没跟着锁判据搬走（它读盘，而 CLI 侧的对应物叫 tuning()，两个名字），于是
-//   lib/locks.mjs 只能收一个 ttlMs 参数。切片 3 把算式收到 lib/tuning.mjs 的 lockTtlMsOf：
+//   锁判据搬走时它没跟着走（它读盘，而 CLI 侧的对应物叫 tuning()，两个名字），于是
+//   lib/locks.mjs 只能收一个 ttlMs 参数。算式后来收到 lib/tuning.mjs 的 lockTtlMsOf：
 //   这里只剩「读配置」，两个入口喂给 lockTtlMsOf 的都是 normalizeTuning 的结果，算式不再有第二份。
 const lockTtlMs = () => lockTtlMsOf(readTuning())
-// pidAlive / readLock / lockExpired / hasAnyLock 已搬到 lib/locks.mjs（2026-10-31 切片 2）。
+// pidAlive / readLock / lockExpired / hasAnyLock 已搬到 lib/locks.mjs（2026-10-31）。
 //   注意签名变了：lockExpired(owner, ttlMs)、hasAnyLock(root, ttlMs)——TTL 由调用方算好传入。
-// looksLikeOwnUrlDir 已搬到 lib/keys.mjs（2026-10-31 切片 1）——两处逐字相同的实现只留一份。
-// isAdoptableDir 已搬到 lib/locks.mjs（2026-10-31 切片 2）。它守住的那条线没变：
+// looksLikeOwnUrlDir 已搬到 lib/keys.mjs（2026-10-31）——两处逐字相同的实现只留一份。
+// isAdoptableDir 已搬到 lib/locks.mjs（2026-10-31）。它守住的那条线没变：
 //   能认领的只有三种——不存在（我们会新建）/ 空的 / 已经带我们的标记；
 //   有内容又没有标记 = 用户自己的目录（素材库、下载目录），绝不认领，否则 pickCacheDir 这次就把标记写进去，
 //   紧接着 removeOwned 看到标记就开始按名字删，守卫等于空转（实测：指向素材库跑 clean 会删掉 4 个用户文件）。
-// isOurCacheRoot / isOwnBvDir / removeOwned / dirStat 已搬到 lib/cache-own.mjs（2026-10-31 切片 2）。
+// isOurCacheRoot / isOwnBvDir / removeOwned / dirStat 已搬到 lib/cache-own.mjs（2026-10-31）。
 //   搬的动机就是「删除面判据只能有一份」：历史上两次删到用户文件（2026-10-29 素材库、
 //   2026-10-30 E8 #1 自动清理），根因都是两处判据不同步。三道闸与由来见那边的文件头。
-// removeOwned 见上：已搬到 lib/cache-own.mjs（2026-10-31 切片 2）。
+// removeOwned 见上：已搬到 lib/cache-own.mjs（2026-10-31）。
 // D98（2026-10-29）：推导缓存根拆成两步——resolveCacheDir() 纯算路径（不 mkdir、不写探针），
 //   pickCacheDir() 才落盘 + 可写探测。拆开是因为 pickCacheDir 会往根目录写 .write-test-<pid> 探针，
 //   建目录、写探针、删探针三件事都会改根目录 mtime；而「只加载模块、还没真读缓存」的那段时间不该有痕迹。
-// 2026-10-31 切片 4：这两步、以及 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
+// 2026-10-31：这两步、以及 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
 //   本文件只剩三个薄壳：读配置 → 交给 lib → 处理回退文案。为什么状态必须搬走：
 //   两个入口原来各有一份 `let CACHE` + 各自的 `CACHE_READY`，判据靠人肉对齐——
 //   runsFile 在 index.js 里走 ensureCache()、在 look.mjs 里走 cacheDir()，就是这种分叉的产物。
@@ -469,7 +469,7 @@ const PLUGIN_VERSION = readPluginVersion(HERE)
 // D98：缓存根是懒初始化的（ensureCache），这里必须现算——顶层常量会把「未初始化时算出的纯路径」固化下来，
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个用不上的旧路径。
 const runsFile = () => join(ensureCache(), '_logs', 'runs.jsonl')
-// 轮转、追加、失败现场三件一起搬进 lib/runs.mjs（2026-10-31 切片 3-C 搬了追加，切片 5 补齐 logRun）。
+// 轮转、追加、失败现场三件一起搬进 lib/runs.mjs（2026-10-31 搬了追加，随后补齐 logRun）。
 //   两处原来逐字相同（18 行 × 2）；真正的差异用参数表达：面板侧没有 diag/trackTail（不传 extra），
 //   缓存根由本文件的 ensureCache 决定（传 videoDirOf）。
 function runLogRecord(args, code, err, ms) {
@@ -478,7 +478,7 @@ function runLogRecord(args, code, err, ms) {
   // runsFile 传**惰性函数**而不是字符串：真要抛的时候，抛点必须在 logRun 的 try 里。
   //   传字符串 = 求值点在调用点（logRun 的 try 之外）→ 异常会冒到 child.on('close') 里。
   //   传函数 = 求值点回到 logRun 内部（try 里）→ 抛了只是日志写不进去，插件继续跑（基线行为）。
-  //   2026-10-31 三审（切片 5）抓出并修。
+  //   2026-10-31 三审抓出并修。
   //   注意：本文件这条路径**平时不会抛** —— `ensureCache()` 是 initCachePath(cacheWant).dir，
   //   幂等，没初始化就当场初始化（见 index.js 的 ensureCache 定义与 lib/cache-path.mjs 头注释）。
   //   会抛的是 lib/cache-path.mjs 的 cacheDir()，那是 tools/look.mjs 走的路径。
@@ -511,7 +511,7 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
     let child
     let timer
     // F组（T43）：Windows 上 child.kill() 只杀直接子进程，ffmpeg/python 变孤儿；用 taskkill /T /F 杀进程树
-    // A4（2026-10-27 批次8）：按平台分流——win32 走 taskkill /T /F，否则 process.kill(-pid,'SIGKILL')；
+    // A4（2026-10-27）：按平台分流——win32 走 taskkill /T /F，否则 process.kill(-pid,'SIGKILL')；
     //   catch 不再静默吞（原来杀不掉子进程会让 ffmpeg/yt-dlp 变孤儿空跑），至少打一行。
     const killTree = (c) => {
       if (!c?.pid) return
@@ -584,7 +584,7 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
 }
 
 // ── 面板内扫码登录 ─────────────────────────────────────────────────────────
-// pickLoginCookies / fillBuvids 已搬到 lib/cred.mjs（2026-10-31 切片 5）——两个入口逐字相同，
+// pickLoginCookies / fillBuvids 已搬到 lib/cred.mjs（2026-10-31）——两个入口逐字相同，
 //   只有 fillBuvids 的超时值不同，那属于各侧的节奏（面板侧与 QR_GEN / QR_POLL 对齐 8 秒）。
 
 /** 生成扫码登录二维码：返回 qrcode_key 与可直接插进页面的 SVG。 */
@@ -685,7 +685,7 @@ function credState() {
   }
 }
 
-// dirStat 已搬到 lib/cache-own.mjs（2026-10-31 切片 2）——面板「当前占用」与 clean「已清理 X MB」
+// dirStat 已搬到 lib/cache-own.mjs（2026-10-31）——面板「当前占用」与 clean「已清理 X MB」
 //   必须同一口径（跳过标记与 _logs、一律 lstat），两处各写一份就是口径对不上的老病根。
 
 // #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就按 10 分钟节流了，
@@ -824,7 +824,7 @@ function autoCleanCache(opts = {}) {
   if (!isOurCacheRoot(cacheDir())) return { removed: 0, bytes: 0, skipped: true, noMark: true, failed: [] }
   // W-04（2026-10-28 阶段B-①）：有正在跑的转写/抽帧（任何子目录有 .lock）就不自动清，
   //   否则会删掉正在写的 asr/sheet 产物（转写白跑且无提示）。与 /cache/clear 同判据。
-  // 切片 2：TTL 由这里算好传进去（lib 里的判据不读配置）
+  // TTL 由这里算好传进去（lib 里的判据不读配置）
   if (hasAnyLock(cacheDir(), lockTtlMs())) return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [] }
   const { days, maxMb } = cacheCfg()
   const cutoff = Date.now() - days * 86400000
@@ -1332,9 +1332,15 @@ function runDownload(target) {
   const args = [script, target]
   // G-04（2026-10-29）：那条「win32 下 detached:true 会让 powershell.exe 启动后 0.5 秒内
   //   以 exit code 0 退出、脚本一行都不执行」的坑随 powershell 一起消失了，但这一行**不因合并而改**：
-  //   本轮只换解释器，不顺带动进程生命周期。非 win32 仍用 detached（与合并前一致）。
+  //   这次只换解释器，不顺带动进程生命周期。非 win32 仍用 detached（与合并前一致）。
   //   注意：不管 detached 与否，宿主在带 KILL_ON_JOB_CLOSE 的 Job Object 里，宿主一退出内核就把
   //   下载进程一起回收。所以面板文案只说「已开始」，不许承诺能跨宿主存活。
+  // 2026-11-03（PR #8 回归修复）：这行在 fetch-deps 合一（e889822）时被删掉了，
+  //   但下面 spawn 的选项与 download.log 的模板两处还在引用它 → 对象字面量求值就抛
+  //   ReferenceError，被 try/catch 收成 {started:false}，路由回 HTTP 400。
+  //   口径与 PR #4 一致：win32 必须 false，非 win32 保持 detached。
+  //   154 条断言一条都没红 —— 因为它们只验"函数存在"，没验"函数体能求值"。
+  const detached = process.platform !== 'win32'
   // A-下载黑洞（2026-10-29 二次修正）：子进程输出不再 stdio:'ignore'，也不再和宿主事件挤同一个文件——
   //   脚本自己的逐行输出写 deps\download.out.log；deps\download.log 只留宿主侧结构化事件
   //   （开始 / pid / detached / 退出码）。fetch-deps 脚本自己也会往 download.log 写关键节点和失败原因，
@@ -1630,7 +1636,7 @@ function parseCommandLine(raw) {
     } else if (t === '--fresh' || t === '--ocr' || t === '--poll' || t === '--check' || t === '--fast' || t === '--scene' || t === '--mark-seen') {
       extra.push(t)
     } else if (t.startsWith('--')) {
-      // 2026-10-26 批次5（8-15）：未知 flag 不再静默吞，收集后给拼写提示（与终端 look.mjs 对齐）
+      // 2026-10-26：未知 flag 不再静默吞，收集后给拼写提示（与终端 look.mjs 对齐）
       unknownFlags.push(t)
     } else {
       // 非选项 token 都当位置参数收着：BV / 搜索词 / 评论条数都可能出现在选项前后
@@ -1694,7 +1700,7 @@ async function lookup({ command, bv, positionals = [], extra = [], badOut = fals
     const m = err.match(/✓\s*已写入\s*(.+)/)
     if (m) outWrittenPath = m[1].trim()
   }
-  // A3（2026-10-27 批次8）：成功分支里也读 stderr，把含 ⚠ 的警告行拼到结果末尾（一行「警告：…」）；
+  // A3（2026-10-27）：成功分支里也读 stderr，把含 ⚠ 的警告行拼到结果末尾（一行「警告：…」）；
   //   不含 ⚠ 的进度/日志行照旧丢弃，不污染给模型的正文。
   let warnLines = []
   if (!failed && err) {
@@ -1718,7 +1724,7 @@ async function lookup({ command, bv, positionals = [], extra = [], badOut = fals
   return { ok: !failed, text: parts.join(String.fromCharCode(10)) }
 }
 
-// ── apply() 的五个子系统（2026-10-31 切片 6）─────────────────────────────
+// ── apply() 的五个子系统（2026-10-31）─────────────────────────────
 // 原来是一个 425 行的函数：启动动作、斜杠命令、单链提示、工具注册、设置页端点全在里面。
 // 拆的时候只搬不改——块内每一行都是原样搬过来的（缩进都没动）。
 //   depsCfg() / readTuning() / readDepsCfg() 这些调用仍然在原来那一层，没顺手改成注入参数：
@@ -1731,7 +1737,7 @@ function bootCache(ctx) {
   try {
     ensureCache()
   } catch (e) {
-    // 切片 4：这里**不能**调 cacheDir()——正因为初始化失败才走到这条分支，它一定会抛。
+    // 这里**不能**调 cacheDir()——正因为初始化失败才走到这条分支，它一定会抛。
     //   用 previewCacheDir 打「本来打算用的路径」，与原来「保留 CACHE 的纯路径」同一个意思。
     ctx.logger?.warn?.(`[dsh-bili-watch] 缓存目录初始化失败，继续用 ${previewCacheDir(cacheWant())}：${String(e?.message || e)}`)
   }
@@ -2012,10 +2018,10 @@ function registerPanelRoute(ctx) {
                     lastRun: readLastRun(),
                     ui: uiCfg(),
                     // 追加四（2026-10-29）：旧缓存提示走 warnings，与 CLI clean 的那行同源。
-                    // 切片 3-B：配置告警改成数组（坏文件 / 缓存回退各一条，不再互相覆盖）。
+                    // 配置告警改成数组（坏文件 / 缓存回退各一条，不再互相覆盖）。
                     warnings: [...cfgWarnings, toolsWarning, depsWarning,
                       ...(() => {
-                        // 切片 4：走节流壳（lib 里那份是纯函数，每 8 秒轮询都全盘 walk 会顶穿面板超时）
+                        // 走节流壳（lib 里那份是纯函数，每 8 秒轮询都全盘 walk 会顶穿面板超时）
                         const a = adoptNoticeThrottled()
                         if (!a) return []
                         return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删）。`]
@@ -2054,7 +2060,7 @@ function registerPanelRoute(ctx) {
                   )
                   if (!wc.ok) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${wc.why || '未知错误'}` })
                 }
-                // A7（2026-10-27 批次8）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
+                // A7（2026-10-27）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
                 //   不再像以前那样「先删完再补一句 warning」（锁外删会跟运行中的抽帧抢目录）。
                 //   锁可能在 frames/.lock 根，也可能在每个抽帧子目录 frames/<bv>-pN-<step>s/.lock。
                 // A-3（2026-10-28 阶段A）：原来只查 frames 一层锁，漏掉 sheet-tmp / substrip-tmp /
@@ -2118,7 +2124,7 @@ function registerPanelRoute(ctx) {
                 if (typeof body?.showInSettings === 'boolean') patch.showInSettings = body.showInSettings
                 if (typeof body?.autoHint === 'boolean') patch.autoHint = body.autoHint
                 const next = writeUiCfg(patch)
-                // A2（2026-10-27 批次8）：面板「保存规则」把 days/maxMb POST 到这里，以前被静默丢。
+                // A2（2026-10-27）：面板「保存规则」把 days/maxMb POST 到这里，以前被静默丢。
                 //   落到 cache-config.json（与 /cache/clear 同源），不写进 ui-config.json。
                 let rule = null
                 let cacheErr = null

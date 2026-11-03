@@ -37,15 +37,15 @@ import { createRequire } from 'node:module'
 import { join, dirname, basename, relative, isAbsolute, resolve, extname } from 'node:path'
 import { homedir, freemem, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
-// 2026-10-31 切片 1：cleanKey / bvOf / cutCp / looksLikeOwnUrlDir 与 index.js 共用一份实现
+// 2026-10-31：cleanKey / bvOf / cutCp / looksLikeOwnUrlDir 与 index.js 共用一份实现
 //   （原来两边各一份逐字相同）。相对路径 `../lib/`——tools/ 的上一级才是插件根。
-// 2026-10-31 切片 2：锁判据与「这目录能不能认领」搬进 lib/locks.mjs；CACHE_MARK 进 lib/consts.mjs。
-// 切片 4：isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
-// 2026-10-31 切片 2：锁判据搬进 lib/locks.mjs。切片 10 起 pidAlive / readLock / lockExpired
+// 2026-10-31：锁判据与「这目录能不能认领」搬进 lib/locks.mjs；CACHE_MARK 进 lib/consts.mjs。
+// isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
+// 2026-10-31：锁判据搬进 lib/locks.mjs。此后 pidAlive / readLock / lockExpired
 //   在本文件已无人直接调用（都进了 makeLocks 内部），只剩 hasAnyLock 与 makeLocks。
 import { hasAnyLock, makeLocks } from '../lib/locks.mjs'
 // 删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
-//   切片 4 起 dirStat / isOurCacheRoot / isOwnBvDir 在本文件已无人直接调用（都在 lib 内部用），
+//   此后 dirStat / isOurCacheRoot / isOwnBvDir 在本文件已无人直接调用（都在 lib 内部用），
 //   只留 removeOwned；同理上面的 consts 两项也不再需要 import（CACHE_MARK 只被 pickCacheDir 用，
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进了 lib/cache-path.mjs）。
 import { removeOwned } from '../lib/cache-own.mjs'
@@ -57,26 +57,26 @@ import { readPluginVersion, resolveDepsDir } from '../lib/plugin-paths.mjs'
 //   默认请求头要用同一份，而 lib 不能反向 import 入口。原来本文件与 index.js 各写一份、
 //   逐字相同；REF_VIDEO 与 REF 的值也一直完全一样（都是站点根），合并成一个 REF。
 import { REF, UA } from '../lib/consts.mjs'
-// 2026-10-31 切片 3：调优表 / 钳制 / TTL 换算搬进 lib/tuning.mjs。
+// 2026-10-31：调优表 / 钳制 / TTL 换算搬进 lib/tuning.mjs。
 //   与 index.js 共用同一份 TUNING_DEFS，「面板改了 CLI 没生效」这一类的分叉从物理上消失。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
-// 2026-10-31 切片 3-C：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数）。
+// 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数）。
 import { logRun } from '../lib/runs.mjs'
-// 2026-10-31 切片 3-B：坏配置留档 + 回默认值的行为搬进 lib/config.mjs（与 index.js 同一份）。
+// 2026-10-31：坏配置留档 + 回默认值的行为搬进 lib/config.mjs（与 index.js 同一份）。
 import { readJsonOrBackup, writeJsonAtomic } from '../lib/config.mjs'
-// 2026-10-31 切片 4：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
+// 2026-10-31：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
 //   这一片搬的不是函数是状态，compile 抽函数验不出来，所以判据换成真起进程（见 tools/verify.mjs C64/C65）。
 import { cacheAdoptNotice, cacheDir, initCachePath, previewCacheDir, videoDir } from '../lib/cache-path.mjs'
-// 2026-10-31 切片 5：凭证位置 / 四字段判据 / 旧路径迁移搬进 lib/cred.mjs（与 index.js 同一份）。
+// 2026-10-31：凭证位置 / 四字段判据 / 旧路径迁移搬进 lib/cred.mjs（与 index.js 同一份）。
 //   lib 只返回结构化结果，stderr 那几行提示留在这里——PS 5.1 管道按当前代码页解码，中文会变问号。
 import { adoptLegacyCred, credPaths, fillBuvids, pickLoginCookies, readCred } from '../lib/cred.mjs'
-// 2026-10-31 切片 7：CLI 侧的输出层（say/warn/track/QUIET）与参数层（argv/opt/flag/positional）、
+// 2026-10-31：CLI 侧的输出层（say/warn/track/QUIET）与参数层（argv/opt/flag/positional）、
 //   --out 黑名单 checkOutDir、失败兜底 emitFailureJson 搬进 tools/cli-io.mjs。
 //   搬的理由是 15 个 cmd 要搬去 tools/commands 目录下（每个命令一个文件），它们全用这几样，
 //   先得有公共的一份。
 //   QUIET 变成模块内状态：写走 setQuiet()，读走 isQuiet()（import 到的 let 是只读绑定）。
 import { DIAG, TRACK_BUF, argv, cmd, pos, opt, flag, positional, say, warn, track, recordDiag, setQuiet, isQuiet, checkOutDir, emitFailureJson } from './cli-io.mjs'
-// 2026-10-31 切片 9 第一步：起外部进程的两个原语（ffExec / findFfmpeg）搬进 lib/media.mjs。
+// 2026-10-31 第一步：起外部进程的两个原语（ffExec / findFfmpeg）搬进 lib/media.mjs。
 //   media 这片剩下的（downloadTo / cachedMp4 / sceneTimes / peekFrames / grabFrames）下一轮搬，
 //   它们全建在这两个之上，所以先搬底层、先给底层补真跑断言。
 import {
@@ -108,7 +108,7 @@ import {
   wbiKeys as wbiKeysApi,
   wbiSign as wbiSignApi,
 } from '../lib/bili-api.mjs'
-// 2026-11-02 批 1b：参数表的唯一来源。KNOWN_FLAGS 与「参数值校验」都从这里来，
+// 2026-11-02：参数表的唯一来源。KNOWN_FLAGS 与「参数值校验」都从这里来，
 //   不再在本文件手写一份 —— 原来 KNOWN_FLAGS 手写 27 项、cli-io 的 VALUE_OPTS 另手写 13 项、
 //   README 再写一份，三处各自漂移（--at 就不在 VALUE_OPTS 里，`help --at 12:30` 会把 12:30
 //   当成位置参数）。加一个 flag 只改 lib/params.mjs。
@@ -127,7 +127,7 @@ const DEPS = resolveDepsDir({ pluginRoot: join(HERE, '..') })
 //   readDepsCfgFile 会备份，而真正被读得最多的是这两处裸 parse。现在两边同口径。
 function readDepsCfg() {
   const p = join(DEPS, 'deps-config.json')
-  // 2026-10-31 切片 3-B：读盘与留档行为搬进 lib/config.mjs（与 index.js 同源），
+  // 2026-10-31：读盘与留档行为搬进 lib/config.mjs（与 index.js 同源），
   //   这里只把 problem 翻成英文打 stderr。
   const { value, problem } = readJsonOrBackup(p, {})
   if (problem) {
@@ -161,17 +161,17 @@ const FFMPEG_HINT =
   '跑 node scripts/fetch-deps.mjs ffmpeg，或设 BILI_WATCH_FFMPEG，或用 --ffmpeg 传路径'
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > $DSH_HOME/bili-watch/cache（与 index.js 同一口径）。
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
-// 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31 切片 2）——两处同名同值的「身份凭证」只留一份，从那边 import。
-// OWN_CACHE_DIRS 已搬到 lib/consts.mjs（2026-10-31 切片 1）——两处同名同值的常量只留一份。
-// dirStat / isOurCacheRoot / isOwnBvDir / removeOwned 已搬到 lib/cache-own.mjs（2026-10-31 切片 2）。
+// 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31）——两处同名同值的「身份凭证」只留一份，从那边 import。
+// OWN_CACHE_DIRS 已搬到 lib/consts.mjs（2026-10-31）——两处同名同值的常量只留一份。
+// dirStat / isOurCacheRoot / isOwnBvDir / removeOwned 已搬到 lib/cache-own.mjs（2026-10-31）。
 //   删除面判据只能有一份：历史上两次删到用户文件都是「两处判据不同步」造成的（见那边的文件头）。
-// isAdoptableDir 已搬到 lib/locks.mjs（切片 2）；look.mjs 不需要 isOwnedEntry（它只走 removeOwned）。
+// isAdoptableDir 已搬到 lib/locks.mjs；look.mjs 不需要 isOwnedEntry（它只走 removeOwned）。
 
 // D98（2026-10-29）：推导缓存根拆成两步——resolveCacheDir() 纯算路径（不 mkdir、不写探针、不搬目录），
 //   pickCacheDir() 才落盘 + 可写探测。为什么要拆：pickCacheDir 会往缓存根写一个 .write-test-<pid>
 //   探针再删掉，建目录与写/删探针三件事都会改根目录 mtime；而 `--help` 这类只想看用法的调用
 //   根本用不上缓存，不该留下任何痕迹。
-// 2026-10-31 切片 4：这两步、加上 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
+// 2026-10-31：这两步、加上 CACHE 这个可变状态本身，全部搬进 lib/cache-path.mjs。
 //   本文件只剩一个薄壳：读配置 → 交给 lib → 打回退文案。读取一律走 cacheDir()，
 //   没初始化就抛（原来这里 `let CACHE = resolveCacheDir()` 会让「忘了初始化」看起来一切正常，
 //   runsFile() 就是直接读它的——日志会写进一棵没探测过可写性的树里）。
@@ -193,7 +193,7 @@ const require = createRequire(import.meta.url)
 // 凭证（2026-10-30 B 方案）：与 index.js 同一套——只认自己这一份。
 //   以前这里有「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁与单向复制，用户拍板整套拿掉：
 //   那个目录只在特定机器上存在，用户侧是死分支，却把本机概念写进了公开源码。
-//   2026-10-31 切片 5：两个常量与迁移判据搬进 lib/cred.mjs，这里只留「拿到路径」这一步。
+//   2026-10-31：两个常量与迁移判据搬进 lib/cred.mjs，这里只留「拿到路径」这一步。
 const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
 const CRED_FILE = SHARED_CRED
 const LOGIN_KEY_FILE = join(DEPS, 'login-key.json')
@@ -224,9 +224,9 @@ const H = { 'User-Agent': UA, Referer: REF, get Cookie() { return anonCookie() }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ── 9-1：网络错误友好化 / 9-4：B 站错误码翻译 ──
-// 2026-10-31 切片 8（api）：三个「错误怎么说人话」的函数搬进 lib/bili-api.mjs。
+// 2026-10-31（api）：三个「错误怎么说人话」的函数搬进 lib/bili-api.mjs。
 //   它们是纯字符串映射、没有 I/O、也不需要入口的知识——搬走之后 media / asr 两层
-//   可以直接用同一份文案，不必各自再抄一遍（这就是 DSH 那条依赖链要的「共享层先」）。
+//   可以直接用同一份文案，不必各自再抄一遍（这就是那条依赖链要的「共享层先」）。
 //   注意：netCauseCode 只被 friendlyNetError 用，两者一起搬，这里**不再留壳**——
 //   留一个没人调用的薄壳，下次有人会以为它还有本地逻辑。
 const friendlyNetError = (e, url) => friendlyNetErrorApi(e, url)
@@ -262,14 +262,14 @@ function classifyYtDlpError(errText) {
   return '下载失败：' + t.slice(-160)
 }
 
-// 2026-10-31 切片 8（api）：请求本体搬进 lib/bili-api.mjs。这里只剩「把 CLI 的三个老参数
+// 2026-10-31（api）：请求本体搬进 lib/bili-api.mjs。这里只剩「把 CLI 的三个老参数
 //   摊成选项对象」——recordDiag 是 CLI 侧的失败现场记录（last-error.json），面板那边不需要，
 //   所以它属于入口，不属于 lib。
 const jget = (url, headers = H, timeoutMs = 30000) => jgetRaw(url, { headers, timeoutMs, onDiag: recordDiag })
 
 
 // ── 可选凭证（显式 --cred 才用；只读，仍然不写任何东西）───────────────
-// 2026-10-31 切片 5：判据与读盘搬进 lib/cred.mjs 的 readCred（与 index 的 credState 同一份四字段清单），
+// 2026-10-31：判据与读盘搬进 lib/cred.mjs 的 readCred（与 index 的 credState 同一份四字段清单），
 //   这里只剩「把结构化结果翻成 stderr 的一句话」。
 function loadCred(path) {
   if (!path) return null
@@ -289,10 +289,10 @@ function credFor(explicit) {
   //   以前这里有一层「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁（外加一个单向复制），
   //   用户拍板整套拿掉：那个目录只在特定机器上存在，用户侧是死分支，
   //   却把本机概念写进了公开源码。E6-01 当初判的「两处有意不同」也随之整段消失。
-  // 2026-10-31 切片 5：迁移判据搬进 lib/cred.mjs，这里只按结果说话，四种情形一一对应：
+  // 2026-10-31：迁移判据搬进 lib/cred.mjs，这里只按结果说话，四种情形一一对应：
   const a = adoptLegacyCred({ shared: SHARED_CRED, legacy: LEGACY_CRED })
   // 降级提示的判据是「这次用的不是新位置那份凭证」（a.cred 非空），不是某一个分支（P0-1，2026-11-01）。
-  //   切片 5 把提示绑在 a.moved 上，漏掉了同样会退回旧凭证的第二条路：新位置写不了（$DSH_HOME
+  //   提示绑在 a.moved 上时漏掉了同样会退回旧凭证的第二条路：新位置写不了（$DSH_HOME
   //   指向只读盘、或 $DSH_HOME/bili-watch 被同名文件占住）时 adoptLegacyCred 返回
   //   problem:'write-failed' + 旧那份 cred，原来的 `if (a.cred) return a.cred` 一句话都没有——
   //   用户以为自己用的是刚在本插件里扫的凭证，实际用的是发布包 deps/credential.json 里别人的。
@@ -323,27 +323,27 @@ function credFor(explicit) {
   //   （原来就是静默的：没登录不是错误，login 命令会告诉用户该扫码）。
   return a.sharedExists ? loadCred(SHARED_CRED) : null
 }
-// 2026-10-31 切片 8（api）：UA / Referer / 匿名头都在本文件（它们依赖 DEPS 与 anonymous buvid3 落盘），
+// 2026-10-31（api）：UA / Referer / 匿名头都在本文件（它们依赖 DEPS 与 anonymous buvid3 落盘），
 //   所以这里只把这份匿名头交给 lib——lib 不知道 DSH_HOME 是什么。
 const headersFor = (cred) => headersForApi(cred, { ua: UA, ref: REF, anon: H })
 
 // ── wbi 签名（字幕主通道 x/player/wbi/v2 必需）──────────────────────────
-// 2026-10-31 切片 8（api）：MIXIN_KEY_ENC_TAB / getMixinKey / wbiKeys / wbiSign 全部搬进 lib/bili-api.mjs。
+// 2026-10-31（api）：MIXIN_KEY_ENC_TAB / getMixinKey / wbiKeys / wbiSign 全部搬进 lib/bili-api.mjs。
 
 const wbiKeys = (headers = H) => wbiKeysApi({ get: jget }, headers)
 const wbiSign = (params, imgKey, subKey) => wbiSignApi(params, imgKey, subKey)
 
 // ── 元数据 ─────────────────────────────────────────────────────────────
 // p = 第几个分P（从 1 起）。多 P 视频的 duration 是全部 P 的总和，必须按 pages[p-1] 取单 P 时长。
-// 2026-10-31 切片 8（api）：viewOf 搬进 lib/bili-api.mjs，get 由这里注入（带 recordDiag 的那份）。
+// 2026-10-31（api）：viewOf 搬进 lib/bili-api.mjs，get 由这里注入（带 recordDiag 的那份）。
 const viewOf = (bv, p = 1) => viewOfApi({ get: jget }, bv, p)
 
-// 2026-10-31 切片 8（api）：topComments 搬进 lib/bili-api.mjs。截断规则（clipLen）留在本文件，
+// 2026-10-31（api）：topComments 搬进 lib/bili-api.mjs。截断规则（clipLen）留在本文件，
 //   因为上限来自 tuning()——那是输出策略，lib 不该认识 tuning 表。
 const topComments = (aid, want = 10) => topCommentsApi({ get: jget, clip: clipLen }, aid, want)
 
 // ── 字幕 + 三判据 ──────────────────────────────────────────────────────
-// 2026-10-31 切片 8（api）：fetchSubtitle 搬进 lib/bili-api.mjs（它只由 wbiKeys/wbiSign/jget 三样组成）。
+// 2026-10-31（api）：fetchSubtitle 搬进 lib/bili-api.mjs（它只由 wbiKeys/wbiSign/jget 三样组成）。
 const fetchSubtitle = (aid, cid, headers = H) => fetchSubtitleApi({ get: jget, ua: UA }, aid, cid, headers)
 
 function extractKeywords(...texts) {
@@ -448,13 +448,13 @@ function credibility(v, text) {
 }
 
 // ── 抽帧 ──────────────────────────────────────────────────────────────
-// 切片 9 第二步：sceneTimes / pickEvenly 搬进 lib/media.mjs（纯函数：一个只调 ffExec、一个是取点）。
+// sceneTimes / pickEvenly 搬进 lib/media.mjs（纯函数：一个只调 ffExec、一个是取点）。
 //   老名字保留成别名，grabFrames 里 5 处调用一行没动。
 const sceneTimes = sceneTimesIn
 const pickEvenly = pickEvenlyIn
 
 // 下载先写 .part 再原子改名：中断/并发都不会留下「看起来像完整的半截文件」。
-// 切片 9 第二步：downloadTo 搬进 lib/media.mjs。三样入口知识走参数——
+// downloadTo 搬进 lib/media.mjs。三样入口知识走参数——
 //   headers（UA/Referer/Cookie）、maxBytes（tuning().downloadMaxMB）、onNetError（friendlyNetError）。
 //   顺带修一处文案分叉：lib 里的「上限」由 maxBytes 算出来，原来写死 512 MB，
 //   用户把 downloadMaxMB 调小之后报错仍在说 512 MB。
@@ -475,13 +475,13 @@ const downloadTo = (url, dest) =>
 // X-14（2026-10-29）：TTL 还必须覆盖一次最长转写——asrTimeoutSec 上限 60 分钟 > 默认 TTL 30 分钟，
 //   转写跑满时锁先被判过期、别的进程抢进来 → 双持。所以取两者的较大值。
 // 用函数而不是模块级 const——tuning() 每次读盘，面板改完下次调用即生效。
-// 切片 3：算式收到 lib/tuning.mjs 的 lockTtlMsOf，两个入口喂给它的都是 normalizeTuning 的结果。
+// 算式收到 lib/tuning.mjs 的 lockTtlMsOf，两个入口喂给它的都是 normalizeTuning 的结果。
 const lockTtlMs = () => lockTtlMsOf(tuning())
-// pidAlive / readLock / lockExpired 已搬到 lib/locks.mjs（2026-10-31 切片 2）。
+// pidAlive / readLock / lockExpired 已搬到 lib/locks.mjs（2026-10-31）。
 //   签名变了：lockExpired(owner, ttlMs)——TTL 由调用方算好传入（lib 里的判据不读配置）。
 //   lockTtlMs 留在这里：它读 tuning()，而 index.js 侧的对应物叫 readTuning()，
-//   统一到切片 3 的 tuning 模块之前不能进 lib。
-// 2026-10-31 切片 10：抢锁 / 放锁整套搬进 lib/locks.mjs 的 makeLocks。
+//   统一到 tuning 模块之前不能进 lib。
+// 2026-10-31：抢锁 / 放锁整套搬进 lib/locks.mjs 的 makeLocks。
 //   搬的理由不是「行数」，是 peekFrames / grabFrames / grabFramesLocal 三处都靠它，
 //   而它们的目录/manifest/等待也一起搬（lib/frames.mjs）——cache 层得先能单独站着。
 //   TTL 传的是**取值函数** lockTtlMs（不是算好的值）：面板改完设置，下一把锁立刻用新 TTL。
@@ -491,36 +491,36 @@ const { tryLockSync, tryLock, unlock, heartbeat } = makeLocks({ ttlMs: lockTtlMs
 //   原实现只查 frames/.lock 与 frames/<子>/.lock，漏掉 sheet-tmp / substrip-tmp / CACHE 根的 .meta-*.lock / asr。
 //   递归扫（深度 ≤3），只认文件名以 .lock 结尾（覆盖 .lock / .BV-p1-2s.lock / .meta-xx.lock / .BV-grid.lock）。
 //   与 index.js 的同名函数必须逐字一致（面板与 CLI 判据不能分叉）。
-// 2026-10-31 切片 2：已搬到 lib/locks.mjs，签名变成 hasAnyLock(root, ttlMs)——TTL 由调用方算好传入。
+// 2026-10-31：已搬到 lib/locks.mjs，签名变成 hasAnyLock(root, ttlMs)——TTL 由调用方算好传入。
 
-// P0（2026-10-30）：atDirTag / framesCacheHit 两个判据**原样**搬进 lib/media.mjs（切片 9 第二步）。
+// P0（2026-10-30）：atDirTag / framesCacheHit 两个判据**原样**搬进 lib/media.mjs。
 //   它们是纯函数，搬走之后 verify 可以直接 import 真跑，不必再用 new Function 抠函数体。
 //   老名字保留成别名，调用点（grabFrames 里 6 处）一行都不用改。
 const atDirTag = atDirTagIn
 const framesCacheHit = framesCacheHitIn
 
 // manifest 记录「这批帧确实抽完了」，防止把残帧当完整结果复用。
-// 2026-10-31 切片 10：读写搬进 lib/frames.mjs（连同目录构造、jpg 清单、等待他人）。
+// 2026-10-31：读写搬进 lib/frames.mjs（连同目录构造、jpg 清单、等待他人）。
 //   三处抽帧入口（peekFrames / grabFrames / grabFramesLocal）共用这一份，
 //   「等别人做完」那段 for 循环也搬成 waitManifest——原来三处各抄一遍，只有次数不同。
 import {
   ensureDir, frameFilesToKeep, framesDir, framesDirName, framesRoot, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest,
 } from '../lib/frames.mjs'
 
-// 2026-10-31 切片 9 第一步：ffExec / findFfmpeg 搬进 lib/media.mjs。
+// 2026-10-31 第一步：ffExec / findFfmpeg 搬进 lib/media.mjs。
 //   ffExec 原样搬（第三参数两种形状都收这条不能动）；findFfmpeg 只把候选列表变成参数——
 //   「BILI_WATCH_FFMPEG / deps 目录 / PATH」谁先谁后是入口的知识，lib 不该知道。
 const findFfmpeg = (arg) =>
   findFfmpegIn(arg, [FFMPEG_CAND, join(DEPS, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')])
 
-// A3：--at 参数解析原样搬进 lib/media.mjs（切片 9 第二步）——纯字符串解析，没有任何入口知识。
+// A3：--at 参数解析原样搬进 lib/media.mjs——纯字符串解析，没有任何入口知识。
 //   搬走之后 verify 直接 import 它真跑（原来靠 compile 抠函数体，函数体一搬就抠不到了）。
 const parseAtTimes = parseAtTimesIn
 // 抽帧间隔按视频时长自适应：short→密、long→疏。纯函数，搬进 lib（同上）。
 const autoStep = autoStepIn
 
 // 便宜的预判：标题/简介/热评 + 均匀 5 帧（按时间点 seek，不逐帧解码）
-// 切片 9 第二步：cachedMp4 搬进 lib/media.mjs，base（缓存根的 frames 子目录）走参数。
+// cachedMp4 搬进 lib/media.mjs，base（缓存根的 frames 子目录）走参数。
 //   老名字保留成薄壳，peekFrames 里那处调用一行没动。
 const cachedMp4 = (bv, page = 1) => cachedMp4In(framesRoot(cacheDir()), bv, page)
 
@@ -602,7 +602,7 @@ async function peekFrames(bv, v, { ffmpeg, fresh = false } = {}) {
   if (!fresh && m0?.ok && jpgs().length >= 5) return { dir, cached: true, times: m0.times ?? null }
   const lock = await tryLock(dir)
   if (!lock) {
-    // 抢不到锁 = 另一个实例正在这目录里抽帧。等它的 manifest（切片 10：等待逻辑搬进 lib/frames.mjs）
+    // 抢不到锁 = 另一个实例正在这目录里抽帧。等它的 manifest（等待逻辑搬进 lib/frames.mjs）
     const m = await waitManifest(dir, (mm) => Boolean(mm?.ok) && jpgs().length >= 5, { tries: 30, sleep })
     if (m) return { dir, cached: true }
     throw new Error('同目录有另一个实例正在抽帧，等不到结果')
@@ -744,7 +744,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   }
   const useStep = step > 0 ? step : autoStep(v.dur)
   // T34-P0-2：时长拿不到（0/异常）时别用 2 秒间隔——3 小时视频会抽几千帧
-  // （2026-10-26 批次2 修复：原写法 `? safeStep : Math.max(safeStep,10)` 在 const 初始化里自引用，TDZ 必抛 ReferenceError）
+  // （2026-10-26 修复：原写法 `? safeStep : Math.max(safeStep,10)` 在 const 初始化里自引用，TDZ 必抛 ReferenceError）
   const safeStep = (v.dur > 0) ? useStep : Math.max(useStep, 10)
   // A3：--at 模式下目录名带 at 标记，不按 step
   // P0（2026-10-30）：原来是 `at-${atTimes.length}p`，只带点数 —— --at 460 与 --at 750 都是 at-1p，
@@ -765,7 +765,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   if (estFrames > maxFrames) throw new Error(`抽帧数超上限（预计 ${estFrames} 帧，上限 ${maxFrames}）：请改大 --step`)
   const lock = await tryLock(dir)
   if (!lock) {
-    // 抢不到锁 = 另一个实例正在这目录里抽帧，等它的 manifest（切片 10：等待逻辑搬进 lib/frames.mjs）
+    // 抢不到锁 = 另一个实例正在这目录里抽帧，等它的 manifest（等待逻辑搬进 lib/frames.mjs）
     const m = await waitManifest(dir, (mm) => framesCacheHit(mm, safeStep, scene, atTimes, jpgs().length), { tries: 60, sleep })
     if (m) return { dir, mp4, cached: true, frames: jpgs().length, times: m?.times ?? null }
     throw new Error('同目录有另一个实例在抽帧，等不到结果')
@@ -797,7 +797,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
           try { unlinkSync(join(dir, f)) } catch {}
         }
       } else {
-        // A5（2026-10-27 批次8）+ X-01（2026-10-28）：没有 manifest，或 manifest 里没有 files 清单，
+        // A5（2026-10-27）+ X-01（2026-10-28）：没有 manifest，或 manifest 里没有 files 清单，
         //   都说明「这目录不是本工具这一次跑出来的」——绝不能按文件名猜着删。
         //   原来老 manifest（有文件、无 files）走命名兜底删 数字.jpg 与 peek-NN.jpg，
         //   用户的 1.jpg / 2.jpg 正好被第一条命中：`--fresh --out <用户目录>` 实测会把它们删掉。
@@ -881,7 +881,7 @@ const PLUGIN_VERSION = readPluginVersion(join(HERE, '..'))
 // D98：缓存根改成懒初始化（ensureCache），这里必须现算。写成顶层常量会把「未初始化时的纯路径」固化下来：
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个已经用不上的旧路径。
 const runsFile = () => join(cacheDir(), '_logs', 'runs.jsonl')
-// 轮转、追加、失败现场三件都在 lib/runs.mjs（2026-10-31 切片 3-C 搬追加，切片 5 补齐 logRun）。
+// 轮转、追加、失败现场三件都在 lib/runs.mjs（2026-10-31 搬追加，随后补齐 logRun）。
 //   CLI 侧与面板侧的差异只有两处，都用参数表达：
 //     ① 失败 entry 额外挂 diag / trackTail（面板进程里没有这两个概念）；
 //     ② 缓存根来自 cacheDir()，以 videoDirOf 传进去。
@@ -1584,7 +1584,7 @@ async function cmdComments(bv, ps = 10, opts = {}) {
 const dmBucketSec = () => tuning().dmBucketSec
 const dmTop = () => tuning().dmTop
 
-// 2026-10-31 切片 8（api）：弹幕 XML 的取与解压（deflate 流的四种兜底）搬进 lib/bili-api.mjs。
+// 2026-10-31（api）：弹幕 XML 的取与解压（deflate 流的四种兜底）搬进 lib/bili-api.mjs。
 const fetchDanmakuXml = (cid) => fetchDanmakuXmlApi({ ua: UA }, cid)
 
 async function cmdDanmaku(bv, p = 1, opts = {}) {
@@ -1818,7 +1818,7 @@ async function cmdAsr(bv, p = 1, ffmpeg = '') {
   }
 }
 
-// W-32（2026-10-27 批次8）：--out 黑名单——系统目录 / 磁盘根一律拒绝；
+// W-32（2026-10-27）：--out 黑名单——系统目录 / 磁盘根一律拒绝；
 //   其余绝对路径与相对路径（含 `..\out` 这类上级目录，桌面、用户自己的普通文件夹）放行。规范化后大小写不敏感比对。
 // P1（2026-10-30）：--at 模式下该列哪些帧。只列「本次请求的时刻」，别扫整个目录——
 //   `--out` 指向同一个用户目录、上一轮不同时刻的帧还留在那儿时，扫目录会把旧帧一并列出
@@ -1931,7 +1931,7 @@ function frameSecOf(file, i, stepUsed) {
   return stepUsed > 0 ? Math.max(0, (n2 - 1) * stepUsed) : null
 }
 
-// ── 宫格挂台词（批 A，2026-11-02）─────────────────────────────────
+// ── 宫格挂台词（2026-11-02）─────────────────────────────────
 // 需求来自借鉴清单 P0-1：sheet 早就有格子编号和时段、字幕 cues 也早就能拿到，两者没拼在一起，
 //   于是模型拿到九宫格图还得回去翻字幕文件对时间。
 //
@@ -2021,7 +2021,7 @@ async function cmdSheet(bv, opts = {}) {
     try {
       writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, at: at || null, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
     } catch {}
-    // 2026-11-02 批 A：--cues 挂台词。**放在拼图成功之后** —— 拼图是本命令的主功能，
+    // 2026-11-02：--cues 挂台词。**放在拼图成功之后** —— 拼图是本命令的主功能，
     //   不能因为字幕取不到就让它失败；反过来取不到也必须说一句（warn 走 stderr，不污染 stdout），
     //   不能让用户看着一张没台词的图以为「这视频没台词」。
     let cues = []
@@ -2098,7 +2098,7 @@ const qrPoll = (k) =>
 const SPI = 'https://api.bilibili.com/x/frontend/finger/spi'
 const NAV = 'https://api.bilibili.com/x/web-interface/nav'
 
-// pickLoginCookies / fillBuvids 已搬到 lib/cred.mjs（2026-10-31 切片 5）——两个入口逐字相同，
+// pickLoginCookies / fillBuvids 已搬到 lib/cred.mjs（2026-10-31）——两个入口逐字相同，
 //   只有 fillBuvids 的超时值不同：CLI 侧是 --poll 循环里每轮一次，统一 15 秒（M-04）。
 
 async function loginPoll(key) {
@@ -2247,9 +2247,9 @@ function markSeen(bv, title) {
 /** 四级链：字幕 → ASR → 抽帧 OCR。输出最可信的一份文本。 */
 // 2026-10-28 高级设置放开：文本层上限改从 tuning().textLimit 取（默认 800）
 
-// cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31 切片 1）——两处逐字相同的实现只留一份。
+// cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31）——两处逐字相同的实现只留一份。
 /** 按视频分目录：CACHE/<BV>/<kind>.txt —— 同一个视频识别到的各层都收在同一个文件夹里 */
-// videoDir 已搬到 lib/cache-path.mjs（2026-10-31 切片 4）——它读缓存根，而缓存根现在住在那个模块里。
+// videoDir 已搬到 lib/cache-path.mjs（2026-10-31）——它读缓存根，而缓存根现在住在那个模块里。
 //   look.mjs 这里原本用的是 `CACHE`（模块级可变值），index.js 那边用的也是同名值但初始化方式不同；
 //   现在两边都调 lib 的同一个 videoDir()，判据物理上只有一份。
 
@@ -2495,7 +2495,7 @@ function markAndWarn(text, kind, bv) {
   return decorateData(text, kind, bv, hits)
 }
 
-// cutCp 已搬到 lib/keys.mjs（2026-10-31 切片 1）。
+// cutCp 已搬到 lib/keys.mjs（2026-10-31）。
 
 let TMP_SEQ = 0 // W-33：同一进程内多次落盘的 tmp 名要唯一（进程间靠 pid 区分）
 /**
@@ -2930,7 +2930,7 @@ async function cmdLocal(filePath, opts = {}) {
       track('[track] 抽帧: skip（缺 ffmpeg）')
     } else {
       const step = (opts.step ?? 0) > 0 ? Number(opts.step) : (dur > 0 ? Math.max(2, Math.round(dur / 20)) : 5)
-      // 目录构造搬进 lib/frames.mjs（切片 10）。局部变量改名 frameDir——与 import 的 framesDir 同名会撞车。
+      // 目录构造搬进 lib/frames.mjs。局部变量改名 frameDir——与 import 的 framesDir 同名会撞车。
       const frameDir = framesDir(cacheDir(), `${tag}-${step}s`)
       mkdirSync(frameDir, { recursive: true })
       const bin = findFfmpeg(opts.ffmpeg) // W-27
@@ -2991,7 +2991,7 @@ async function cmdLocal(filePath, opts = {}) {
 }
 
 // ── 参数分层（2026-10-28 任务#2）：优先级 flag > deps-config > 常量默认 ──
-//   表与钳制已搬到 lib/tuning.mjs（2026-10-31 切片 3）：原来这里与 index.js 各写一份 TUNING_DEFS，
+//   表与钳制已搬到 lib/tuning.mjs（2026-10-31）：原来这里与 index.js 各写一份 TUNING_DEFS，
 //   靠 C17 逐键比对绑在一起；现在物理上只剩一份，CLI 与面板不可能再各读各的默认值。
 //   每次调用都读 deps-config.json（面板改完不必重启 look.mjs 子进程）；范围校验静默回落，不抛错。
 function tuning() {
@@ -3176,7 +3176,7 @@ async function resolveSource(input) {
     }
     return { type: 'generic', url: stripTailPunct(s) }
   }
-  // A1（2026-10-27 批次8）：整串既不是纯 BV/纯 av/纯 URL 时（移动端分享文案「【标题】 https://...」），
+  // A1（2026-10-27）：整串既不是纯 BV/纯 av/纯 URL 时（移动端分享文案「【标题】 https://...」），
   //   ③先从整串抽出 http(s) 链接走 URL 分支（b23.tv 短链会在递归顶部被展开）；④抽不到链接再抓整串里的 BV 号。
   const urlInText = s.match(/https?:\/\/\S+/)
   if (urlInText) return resolveSource(stripTailPunct(urlInText[0]))
@@ -3353,7 +3353,7 @@ async function grabFramesLocal(mp4, tag, dur, { step = 0, ffmpeg = '' } = {}) { 
   if (m0?.ok && m0.step === useStep && jpgs().length > 0) return { dir, frames: jpgs().length, cached: true }
   const lock = await tryLock(dir)
   if (!lock) {
-    // 同上：等另一个实例把 manifest 写出来（切片 10：等待逻辑搬进 lib/frames.mjs）
+    // 同上：等另一个实例把 manifest 写出来（等待逻辑搬进 lib/frames.mjs）
     const m = await waitManifest(dir, (mm) => Boolean(mm?.ok) && mm.step === useStep && jpgs().length > 0, { tries: 60, sleep })
     if (m) return { dir, frames: jpgs().length, cached: true }
     throw new Error('同目录有另一个实例在抽帧，等不到结果')
@@ -3455,17 +3455,17 @@ try {
   srcErr = e?.message ?? String(e)
 }
 // --cred 在各命令处就地 opt('cred')，**不设中间常量**。
-//   2026-11-02 批 A：原来这里是 `const CRED = opt('cred')`，分派链用 CRED 传下来。
+//   2026-11-02：原来这里是 `const CRED = opt('cred')`，分派链用 CRED 传下来。
 //   语义没错，但 verify-params 的契约-8 是从分派链抽 `opt('x')` / `flag('x')` 字面形态，
 //   经一层变量就抽不到 → 参数表里 sub / text 的 cred 声明被漏抄、sheet 的声明被判「没传」。
 //   表面看是判据抠字面，实际是**中间层让「表 ↔ 代码」的对应关系在人眼下也断了**：
 //   读 `cred: CRED` 看不出它来自哪个 flag。就地取，两边都看得见。
-// 2026-11-02 批 1b：这两个 `Number()` 原来没有任何域校验，`--step abc` 得到 NaN、
+// 2026-11-02：这两个 `Number()` 原来没有任何域校验，`--step abc` 得到 NaN、
 //   `NaN > 0` 为假 → 落进「按视频时长自动」分支，用户以为设了步长、实际按自动抽。
 //   现在非法的数值参数在分派前统一拒绝（见下面的 ARG_ERRORS），这里保留原写法不动。
 const STEP = opt('step') ? Number(opt('step')) : 0
 const P = opt('p') ? Number(opt('p')) : 1
-// 参数值校验（批 1b）：只判「值本身有没有意义」（非数字 / 负数 / 该整数却给了小数）。
+// 参数值校验：只判「值本身有没有意义」（非数字 / 负数 / 该整数却给了小数）。
 //   不判「这个命令认不认它」—— 那判不了：index.js 的 execute 会按模型入参下发
 //   --step / --p / --limit，命令收到不属于自己的参数是正常路径，不是错误。
 const ARG_ERRORS = checkFlagValues(argv)
@@ -3542,7 +3542,7 @@ process.on('uncaughtException', (e) => {
 })
 
 // 8-15：未知 flag 给拼写提示（--headd → 你是想用 --head 吗）
-// 2026-11-02 批 1b：清单改为从 lib/params.mjs 生成（原来在这里手写 27 项）。
+// 2026-11-02：清单改为从 lib/params.mjs 生成（原来在这里手写 27 项）。
 //   那句「宁可多收」的判断没变，只是「清单」不再是一处手写的地方。
 //   下面三条历史注释保留，因为它们是「为什么这张表不能漏项」的现场记录：
 //   · 2026-10-30 补 help 与 frames —— 两者在实现里真生效，却不在这张表里，
@@ -3578,7 +3578,7 @@ try {
 
 let RUN_T0 = Date.now()
 let RUN_ERR_TAIL = ''
-// D98（2026-10-29）：是否允许碰磁盘，先按「这一轮会不会真跑命令」定下来（默认不碰）。
+// D98（2026-10-29）：是否允许碰磁盘，先按「这次会不会真跑命令」定下来（默认不碰）。
 //   要注意这里必须判在 exit 钩子之前，否则钩子里的 logRun 会往 cache/_logs 建目录、把缓存根 mtime 改掉。
 let USAGE_ONLY = true
 const CACHE_COMMANDS = new Set(['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'local', 'clean', 'login'])
@@ -3591,11 +3591,11 @@ try {
 } catch (e) {
   // 建根/迁移失败不该拦住命令本身：initCachePath 内部的 pickCacheDir 已自带回退，
   // 这里只兜「迁移过程意外抛错」——用 previewCacheDir 打本来打算用的路径。
-  //   切片 4 之前这里读的是 CACHE（模块级纯路径）；现在读取必须走 cacheDir()，而它此刻一定抛，
+  //   缓存根搬进状态模块之前这里读的是 CACHE（模块级纯路径）；现在读取必须走 cacheDir()，而它此刻一定抛，
   //   所以只能用 previewCacheDir——它不是「降级值」，只是日志里那句话的依据。
   console.error(`⚠ 缓存目录初始化失败（继续用 ${previewCacheDir(cacheWant())}）：${String(e?.message || e)}`)
 }
-// T25-P0-1：无论成功失败，退出时把这一轮写进 runs.jsonl（成功一行，失败带 stderr 尾巴 + 视频目录 last-error.json）
+// T25-P0-1：无论成功失败，退出时把这次写进 runs.jsonl（成功一行，失败带 stderr 尾巴 + 视频目录 last-error.json）
 process.on('exit', (code) => {
   try {
     // D98：help / 裸跑 / 缺参这几条路径没有初始化缓存，也就不该凭这一行日志凭空建出 _logs/
@@ -3660,7 +3660,7 @@ try {
   } else if (cmd === 'help' || cmd === '--help') {
     console.log(HELP)
   } else if (ARG_ERRORS.length) {
-    // 批 1b：参数值非法是用法错误，和「缺目标」同级 —— 提示走 stderr、rc=2。
+    // 参数值非法是用法错误，和「缺目标」同级 —— 提示走 stderr、rc=2。
     //   放在 --help 拦截之后：`view --help --step abc` 应该打帮助，不该先报参数错。
     for (const e of ARG_ERRORS) console.error(`✗ ${e}`)
     console.error('（跑 node look.mjs help 看参数说明）')
@@ -3698,7 +3698,7 @@ try {
   } else if (cmd === 'sheet') {
     // 2026-11-01（0.4.1 第 5 条）：sheet 原来不认 --at，而 frames 认。同一个「要这几秒的画面」需求，
     //   用户在两处得到两种结果（sheet 静默按 --step 抽），补上，走同一套 parseAtTimes。
-    // 2026-11-02（批 A）：加 --cues（宫格挂台词）与 --cred（拉字幕要凭证）。
+    // 2026-11-02：加 --cues（宫格挂台词）与 --cred（拉字幕要凭证）。
     //   --cred 以前只在 sub/text 显式传，sheet 走的是 credFor(null) 自动找本地凭证；
     //   既然 --cues 要请求字幕，就把「用哪份凭证」显式接到分派链上，跟 sub 同一套。
     await cmdSheet(BV, { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), at: opt('at'), cues: flag('cues'), cred: opt('cred') })
@@ -3718,7 +3718,7 @@ try {
   } else if (cmd === 'clean') {
     // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames、sheets 等白名单），
     // 共享目录里别人的文件一概不碰
-    // A7（2026-10-27 批次8）：先查锁——frames 下有正在跑的抽帧锁就拒绝清理，跟面板 /cache/clear 同口径
+    // A7（2026-10-27）：先查锁——frames 下有正在跑的抽帧锁就拒绝清理，跟面板 /cache/clear 同口径
     // A-3（2026-10-28 阶段A）：同上，递归扫所有会写盘子目录的锁，不只看 frames 一层。
     // 追加四（2026-10-29）：清之前先把「旧目录还留在原地」这件事说出来——只说，不动它。
     const adopt = cacheAdoptNotice(cacheWant())

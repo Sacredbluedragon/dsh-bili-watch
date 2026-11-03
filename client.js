@@ -70,7 +70,7 @@ function canDownloadRow(d) {
 // 顶部「缺 N 个依赖」的口径，必须与 canDownloadRow 一致：
 //   不可安装的行（没有 NVIDIA 卡时的 GPU 运行库）不算缺，否则「去安装」永远清不掉这个计数
 //   —— 用户点完还是那句「缺 1 个依赖」，只能去点「不再提示」。
-//   注意：凭证行**仍然计入**（它确实「没配好」），这是原有行为，这一轮没动它。
+//   注意：凭证行**仍然计入**（它确实「没配好」），这是原有行为，这次没动它。
 function missingDeps(deps) {
   return (deps || []).filter((d) => d && !d.ok && d.installable !== false)
 }
@@ -647,7 +647,7 @@ MODULE_LOADER.load({
           setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
           if (j?.ok !== false) { dirtyRef.current = false; await load() }
         } catch (e) {
-          // A2（2026-10-27 批次8）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
+          // A2（2026-10-27）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
           setMsg('保存失败：' + String(e?.message || e))
         }
       }

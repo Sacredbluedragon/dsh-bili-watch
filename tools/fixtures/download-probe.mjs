@@ -5,7 +5,7 @@
 //
 // 为什么值得测：downloadTo 的五个分支（非 200 / 200+HTML 风控 / 超上限 / 小于 1 KB / 网络层）
 //   全是**只有出错才走到**的路径，输出基线只覆盖成功下载（frames/sheet 那两条），
-//   任何一支被搬丢都不会在基线上留下痕迹。切片 9 第二步把它搬进 lib/media.mjs 时，
+//   任何一支被搬丢都不会在基线上留下痕迹。把它搬进 lib/media.mjs 时，
 //   上限文案还从写死的「512 MB」改成由 maxBytes 算出来——这里顺手把「上限=2 MB」钉住。
 import http from 'node:http'
 import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'

@@ -42,7 +42,7 @@ for (let i = 0; i < argv.length; i += 1) {
  *   ② 仓库根 .leak-ids（一行一个，# 开头是注释，已 gitignore）
  *   ③ 环境里的用户名（USERNAME / USER）
  *
- * 三个来源都取不到时的口径（DSH 2026-11-01 明确要求）：
+ * 三个来源都取不到时的口径（2026-11-01 定的）：
  *   **放行，但必须明说少扫了什么** —— 不许静默通过。
  *   输出里会打「身份项 0 个（…没扫）」，让人一眼看出昵称/mid 那两类没被覆盖。
  *
@@ -146,7 +146,7 @@ const soft = hits.filter((h) => h.level === 'soft')
 
 console.log(`\n扫描 ${scanned} 份文本（${repo}${bodyFiles.length ? ` + ${bodyFiles.length} 个附加文件` : ''}）\n`)
 
-// 身份扫描覆盖度（DSH 2026-11-01 要求）：三个来源全空时**放行但必须明说少扫了什么**。
+// 身份扫描覆盖度（2026-11-01 定的）：三个来源全空时**放行但必须明说少扫了什么**。
 // 不许静默通过 —— 静默就等于「看起来扫过了」，而实际上昵称/mid 那两类根本没覆盖。
 const idNote = IDENTITY_WORDS.length
   ? `身份项 ${IDENTITY_WORDS.length} 个（用户名${LOCAL_USER ? '已查' : '不可用'}、.leak-ids ${IDENTITY_IDS.length} 条已查）`

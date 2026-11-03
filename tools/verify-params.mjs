@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 参数契约组（批 0，2026-11-02）
+ * 参数契约组（2026-11-02）
  *
  * 为什么单开一个文件，而不是往 verify.mjs 里再加几条：
  *   这 7 条验的不是「某个函数的返回值」，是**参数层的契约**——
@@ -13,7 +13,7 @@
  *   证据：_临时/20261102-dispatch/{mutate,mutate2}.js + result{,2}.json
  *
  * 现在的期望状态：**全部 11 条都应绿**。
- *   2026-11-02 批 1b 之后 ④⑦ 也满足了（--step 走域校验、--quiet 三处都认），
+ *   2026-11-02 第二步之后 ④⑦ 也满足了（--step 走域校验、--quiet 三处都认），
  *   原来「2 条靶子常红」的说法已失效——写在这里会让人把真回归当成「预期的靶子红」。
  *   看到红就是退化，别解释成靶子。
  *
@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url'
 // 执行器与失败信号只有一份（tools/check-run.mjs）。自己再写一份 = 又成了「验的和用的不是一个东西」，
 // 那正是 C77 当初把 makeChecker 搬出去要解决的毛病。
 import { makeChecker, must } from './check-run.mjs'
-// 参数表本体（批 1a）。它没有任何 IO、没有副作用，只导出声明与 audit()。
+// 参数表本体（第一步）。它没有任何 IO、没有副作用，只导出声明与 audit()。
 import { audit, KNOWN_FLAG_NAMES, VALUE_FLAG_NAMES } from '../lib/params.mjs'
 // positional() 是纯函数（收一个数组、返一个数组），可以直接 import 来单测；
 //   cli-io.mjs 顶层虽然会读本进程的 process.argv，但那只影响它导出的 cmd/pos 常量，与本文件无关。
@@ -83,9 +83,9 @@ function dispatchCmds(src) {
 /**
  * 分派前被统一读掉的全局常量：常量名 → 它代表的 flag。
  *
- * 批 1b 补（2026-11-02）：抽取器原来只认 `opt('x')` / `flag('x')` 字面形态，于是
+ * 第二步补（2026-11-02）：抽取器原来只认 `opt('x')` / `flag('x')` 字面形态，于是
  *   `step: STEP` / `p: P`（STEP / P 是 look.mjs 里预解析的两个常量）抽不到；
- *   「抽不到」在契约-8 的双向对账里被当成「没传」，批 1a 照现状抄就把 step / p
+ *   「抽不到」在契约-8 的双向对账里被当成「没传」，第一步照现状抄就把 step / p
  *   从**所有命令**的 accepts 里删掉了 —— 判据看不清，改的却是被测对象。
  *   现在让判据认得这两个常量。以后新增全局常量，这里加一行即可。
  */
@@ -99,7 +99,7 @@ function dispatchParams(src) {
   must(en > st, '找不到分派链末尾的顶层 } catch (e) { —— 分派链结构变了')
 
   // 映射自己也要有牙：常量名在源码里必须真有定义，否则这份映射就是死代码，
-  //   而「映射失效」会静默退化成批 1a 那个错误（抽不到 → 当成没传）。
+  //   而「映射失效」会静默退化成第一步那个错误（抽不到 → 当成没传）。
   for (const cn of Object.keys(GLOBAL_CONST)) {
     must(
       new RegExp(`\\bconst ${cn} =`).test(src),
@@ -137,7 +137,7 @@ function dispatchParams(src) {
 /**
  * 真正被读过的 flag。
  *
- * 批 1b 修了批 1a 的一个扫描缺陷：原来只认 `opt('x')` / `flag('x')`，于是
+ * 第二步修了第一步的一个扫描缺陷：原来只认 `opt('x')` / `flag('x')`，于是
  *   `tools/cli-io.mjs:88` 的 `if (argv.includes('--quiet')) setQuiet(true)` 扫不到，
  *   把 --quiet 误判成「死 flag」。它其实有效，B33 还有整条判据守着。
  * 三种形态都要认：opt() / flag() / argv.includes('--x')。
@@ -190,7 +190,7 @@ check('参数契约-3【真跑】失败细节打 stderr、且不污染 stdout（
   must(!r.out.includes('✗'), '✗ 不许出现在 stdout（json 模式下会让整段不可解析）')
 })
 
-// ── ④ --step 的域（靶子，批 1b 修）────────────────────────────
+// ── ④ --step 的域（靶子，第二步修）────────────────────────────
 check('参数契约-4【真跑·靶子】--step 的域：非数字/负数必须在做任何实际工作之前拒绝，不许等读到文件才报', () => {
   const bad = run(['local', '__no_such_file__.mp4', '--step', 'abc'])
   must(bad.status !== 0, `--step abc 应拒绝，实际 rc=${bad.status}`)
@@ -232,12 +232,12 @@ check('参数契约-6【真跑】未知参数必须提示，近似拼错的要�
   must(far.err.includes('未知参数'), `完全不像的参数也要提示，实际 stderr：${far.err.slice(0, 160)}`)
 })
 
-// ── ⑦ 参数的文档覆盖（静态，靶子，批 1b 修）──────────────────
+// ── ⑦ 参数的文档覆盖（静态，靶子，第二步修）──────────────────
 check('参数契约-7【静态·靶子】参数表里的每个 flag 至少要在 HELP 或 README 有一处说明（不许「接受但没人知道」）', () => {
   const src = read('tools/look.mjs')
   const doc = helpText(src) + '\n' + read('README.md')
   const inDoc = uniq([...doc.matchAll(/--([a-z][a-z0-9-]*)/g)].map((m) => m[1]))
-  // 批 1b：KNOWN_FLAGS 已从表生成，这里直接读表。**不是自指** ——
+  // 第二步：KNOWN_FLAGS 已从表生成，这里直接读表。**不是自指** ——
   //   判的是「表里的名字在 HELP/README 里有没有出现」，文档是被测对象之外的东西。
   //   表被打空的话下面的条数护栏会先红。
   const kf = KNOWN_FLAG_NAMES
@@ -250,12 +250,12 @@ check('参数契约-7【静态·靶子】参数表里的每个 flag 至少要在
   )
 })
 
-// ── 参数表对账（批 1a，2026-11-02）──────────────────────────────
+// ── 参数表对账（第一步，2026-11-02）──────────────────────────────
 // 表在 lib/params.mjs。这三条只做两件事：从 look.mjs 抽出「现状」，让表去和它比。
-// 为什么表要和现状比、而不是直接当新标准：批 1a 的约束是**行为零变化**，
+// 为什么表要和现状比、而不是直接当新标准：第一步的约束是**行为零变化**，
 //   表是照现状抄的（差异登记在 GAPS 里），所以这三条现在必须全绿。
 //   它们绿着的意思是「此刻表和代码一致」；下一次谁改了分派链没改表，这里就红。
-// 批 1b 把分派链改用这张表之后，这三条的作用会变成「锁住新写法」，判据不用改。
+// 第二步把分派链改用这张表之后，这三条的作用会变成「锁住新写法」，判据不用改。
 let _facts = null
 function facts() {
   if (_facts) return _facts
@@ -265,7 +265,7 @@ function facts() {
   _facts = {
     helpCmds: uniq([...helpText(src).matchAll(/node look\.mjs ([a-z][a-z0-9-]*)/g)].map((m) => m[1])),
     dispCmds: dispatchCmds(src),
-    // 批 1b：KNOWN_FLAGS 改为从 lib/params.mjs 生成，两侧恒等 —— 再比「表 vs 手写清单」
+    // 第二步：KNOWN_FLAGS 改为从 lib/params.mjs 生成，两侧恒等 —— 再比「表 vs 手写清单」
     //   就成了自指判据（表被打空它也绿）。改成验「文档覆盖」与「运行时是否真接受」，
     //   见下面的契约-7（文档）与契约-9（真跑）。
     docFlags: uniq([...(helpText(src) + '\n' + read('README.md')).matchAll(/--([a-z][a-z0-9-]+)/g)].map((m) => m[1])),
@@ -291,7 +291,7 @@ check('参数契约-8【静态】参数表 × 分派链 × HELP：命令三方�
 })
 
 // ── ⑨ flag 层 ──────────────────────────────────────────────────
-// 批 1b：KNOWN_FLAGS 已从参数表生成，「表 vs 手写清单」这条对账失去意义（两侧恒等，自指）。
+// 第二步：KNOWN_FLAGS 已从参数表生成，「表 vs 手写清单」这条对账失去意义（两侧恒等，自指）。
 //   换成**真跑**：表里每个 flag 必须真的被接受（不报未知参数），表外的一个必须被拒。
 //   这条同时锁住「表 → KNOWN_FLAGS 的生成确实生效」和「未知参数警告确实在工作」——
 //   两者都只有真跑才验得到，读源码只能验「字面量里有没有这个词」。
@@ -310,7 +310,7 @@ check('参数契约-9【真跑】参数表里的每个 flag 运行时都必须�
   const outside = run(['help', '--totallynotaflag'])
   must(/未知参数/.test(outside.err), '表外的 flag 没被拒 —— 未知参数警告失效了（这条判据没有牙了）')
 
-  // 另一半：表里的每个 flag 必须有消费点（批 1a 的 dead 分类删掉了，改成「没人读就红」）
+  // 另一半：表里的每个 flag 必须有消费点（第一步的 dead 分类删掉了，改成「没人读就红」）
   const r = audit(facts())
   must(r.flags.length === 0, `flag 层对不上 ${r.flags.length} 处：\n      - ${r.flags.join('\n      - ')}`)
   return `${KNOWN_FLAG_NAMES.length} 个 flag 逐个真跑都被接受；表外的被拒；每个都有消费点`
@@ -327,7 +327,7 @@ check('参数契约-10【静态】GAPS 两端咬：该在的差异还在，修�
 })
 
 // ── ⑪ 带值 flag 的值不许被当成位置参数 ────────────────────────
-// 这条是批 1b 修的真 bug 的直接判据：`at` 原来只在 KNOWN_FLAGS、不在 VALUE_OPTS，
+// 这条是第二步修的真 bug 的直接判据：`at` 原来只在 KNOWN_FLAGS、不在 VALUE_OPTS，
 //   于是 `frames --at 12:30 BV1xx` 里的 12:30 被 positional 当成第一个位置参数，
 //   BV 落到 pos[2]，整个命令拿不到目标。两张表合成一张之后这类漏项不该再有，所以立一条盯着。
 check('参数契约-11【单元】每个带值 flag 的值，都不许被 positional 当成位置参数', () => {
@@ -370,7 +370,7 @@ if (skipN > 0) {
 // 红的分两类：预期中的靶子 / 意外回归。只看汇总行的人分不出这两者，所以这里点名。
 // 判前缀而不是比截断后的短名 —— 中文字符串按码元截会切歪（slice(0,9) 拿到的是「参数契约-4【真跑」，
 // 跟白名单里的「参数契约-4」对不上，于是 2 条预期红被误报成意外红）。
-// 2026-11-02：原有两个靶子（④--step 域、⑦--quiet）批 1b 已修，这里清空。
+// 2026-11-02：原有两个靶子（④--step 域、⑦--quiet）第二步已修，这里清空。
 //   留空意味着「任何红都是意外」，不再是「预期中的靶子红」。
 const TARGETS = []
 const reds = results.filter((r) => !r.ok && !r.skip)
@@ -379,7 +379,7 @@ const redTargets = reds.filter((r) => TARGETS.some((t) => r.name.startsWith(t)))
 const redUnexpected = reds.filter((r) => !TARGETS.some((t) => r.name.startsWith(t)))
 if (reds.length) {
   if (redTargets.length) {
-    console.log(`\n预期中的靶子红 ${redTargets.length} 条（${redTargets.map(short).join('、')}）：批 1b 修完才会绿，不是回归。`)
+    console.log(`\n预期中的靶子红 ${redTargets.length} 条（${redTargets.map(short).join('、')}）：第二步修完才会绿，不是回归。`)
   }
   if (redUnexpected.length) {
     console.log(`\n意外红 ${redUnexpected.length} 条（${redUnexpected.map(short).join('、')}）：这几条本该是绿的，先查是不是真退化了。`)
