@@ -10,6 +10,8 @@
  *   node scripts/fetch-deps.mjs all --proxy http://127.0.0.1:7890
  *   node scripts/fetch-deps.mjs all --no-proxy
  *   node scripts/fetch-deps.mjs where            # 只回答「装到哪」，不下载不建目录
+ *   node scripts/fetch-deps.mjs lockcheck       # 只报告跨进程锁路径并试抢一次，不下载
+ *   node scripts/fetch-deps.mjs lockcheck --hold=1500   # 持锁 1.5 秒，供并发自检
  *
  * 目标（可单独装，也可 all 全装）：
  *   ffmpeg  Windows：BtbN 静态构建（GPL）→ deps/ffmpeg.exe、deps/ffprobe.exe
@@ -25,8 +27,8 @@
  * 2026-11-02：本文件由 scripts/fetch-deps.ps1（801 行）+ scripts/fetch-deps.sh（382 行）合并而来。
  *   合并的理由不是「少两种语言」，是两份实现里有三处只有一边做对了，而用户只在自己那个平台上
  *   遇到其中一半：
- *     · **装完复验**：.sh 在 pip 返回 0 之后还会 `import <module>` 再验一次（0.4.1 第 3 条，
- *       守卫 C98），.ps1 只在**入口**验（半成品陷阱），装完没验 → Windows 上 pip 返回 0 但
+ *     · **装完复验**：.sh 在 pip 返回 0 之后还会 `import <module>` 再验一次（守卫 C98 覆盖这点），
+ *       .ps1 只在**入口**验（半成品陷阱），装完没验 → Windows 上 pip 返回 0 但
  *       import 失败时脚本打 ✓，等跑 ASR 才炸。合并后两个平台都复验。
  *     · **get-pip 引导**：.sh 处理「python3 -m venv 失败 / 没有 ensurepip」（Ubuntu 26.04 的
  *       python3.14 就没有），.ps1 没有这条路径。
@@ -40,7 +42,7 @@
  *   · --dry-run 只打印将执行的命令，不下载不写盘。
  *   · 国内网络用 --mirror cn：GitHub 走 gh-proxy、PyPI 走清华、模型走 hf-mirror。
  *   · --gpu ask|yes|no：要不要装 CUDA 运行库（约 1.4 GB）。ask 会问一句（非交互时按 no）。
- *   · pip 包锁死四版本（本机实测能跑）：faster-whisper==1.2.1、av==15.1.0、
+ *   · pip 包锁死四版本（能跑）：faster-whisper==1.2.1、av==15.1.0、
  *     ctranslate2==4.8.3（10-28 issue #2 P3-2：4.8.4 在部分机器加载模型即 0xC0000005 硬崩，
  *     自己没有显式依赖，是 faster-whisper 拖进来的，所以必须自己钉）、
  *     rapidocr-onnxruntime==1.2.3。yt-dlp 不锁版本，必须跟上游走。
@@ -66,7 +68,7 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 import { createInterface } from 'node:readline'
-import { resolveDepsDir } from '../lib/plugin-paths.mjs'
+import { resolveDepsDir, depsLockFile } from '../lib/plugin-paths.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const IS_WIN = process.platform === 'win32'
@@ -83,7 +85,7 @@ function opt(name, def = '') {
 }
 const has = (name) => argv.includes(`--${name}`)
 
-const TARGETS = ['all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda', 'where']
+const TARGETS = ['all', 'ffmpeg', 'ytdlp', 'asr', 'ocr', 'model', 'cuda', 'where', 'lockcheck']
 const positional = argv.find((a) => !a.startsWith('--'))
 const TARGET = opt('target', positional || 'all')
 if (!TARGETS.includes(TARGET)) {
@@ -136,7 +138,9 @@ if (TARGET === 'where') {
   console.log(DEPS)
   process.exit(0)
 }
-if (!DRY) {
+// lockcheck 只验锁、不下载，不许顺手建出 DEPS —— 那会改变 resolveDepsDir 的判据③，
+// 把「包外还不存在」这个状态抹掉（判据 L 要在这个状态下量一次）。
+if (!DRY && TARGET !== 'lockcheck') {
   try {
     mkdirSync(DEPS, { recursive: true })
   } catch {}
@@ -145,8 +149,12 @@ if (!DRY) {
 // ── 跨进程锁 ────────────────────────────────────────────────────
 // issue #10 问题 3（2026-11-03）：宿主侧的 DOWNLOADING 表只在**一个进程的内存**里，
 //   两个窗口 / 两个宿主实例各有一份，挡不住并发。所以锁必须落到磁盘：
-//   deps\.fetch-deps.lock 写 {pid, startedAt, target}；pid 还活着且没过期 = 别人在跑。
-const LOCK_FILE = join(DEPS, '.fetch-deps.lock')
+//   .fetch-deps.lock 写 {pid, startedAt, target}；pid 还活着且没过期 = 别人在跑。
+// 锁的**绝对路径**由 lib/plugin-paths.mjs 的
+//   depsLockFile() 给，宿主侧后台迁移也调它。绝不能再把锁名拼进 DEPS 目录：
+//   DEPS 是 resolveDepsDir() 的结果，会随迁移进度在包内/包外之间变，同一进程的两个
+//   时刻算出两个锁路径，互斥就形同虚设（端到端实跑证实）。
+const LOCK_FILE = depsLockFile()
 // 2026-11-03 自审改的：原来 1 小时，且**先看时间再看 pid** —— 一个跑满 1 小时的下载
 //   （模型 1 GB 起，慢线路 + 镜像限速很常见）会被判成「残留锁」，后来者直接删锁接管，
 //   两个进程同时动 venv，正好是 issue #10 要修的那件事。现在 pid 活着就是 held，
@@ -215,6 +223,21 @@ function acquireLock() {
   process.on('exit', releaseLock)
 }
 // dry-run 不抢锁：它不写盘，也不该被别人的下载挡住（否则「只想看一眼」就跑不了）
+// lockcheck：只回答「锁落在哪 / 别的进程能不能拿到」，不下载、不建 DEPS。
+//   stdout 第一行给锁的绝对路径（判据 L 用它做下载侧取值）；--hold=<ms> 持锁一段时间，
+//   好让判据 M 起第二个进程验「被占用」。两个进程都走生产 acquireLock，不是复刻。
+if (TARGET === 'lockcheck') {
+  console.log(LOCK_FILE)
+  if (!DRY) {
+    try { mkdirSync(dirname(LOCK_FILE), { recursive: true }) } catch {}
+    acquireLock()
+  }
+  const holdMs = Number(opt('hold')) || 0
+  // 必须**同步**阻塞再退出：只挂 setTimeout 的话代码会继续落到下面的 acquireLock /
+  // 下载逻辑，第二次抢到自己刚写的锁，报「已经有一个安装进程在跑」并把进程提前放掉。
+  if (holdMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holdMs)
+  process.exit(0)
+}
 if (!DRY) acquireLock()
 
 // ── 日志 ────────────────────────────────────────────────────────
@@ -419,7 +442,27 @@ function curlBase() {
   if (PROXY) a.push('--proxy', PROXY)
   return a
 }
-function download(url, out, label) {
+// 把「正在下的那个 .part 在哪」写成独立状态文件，面板据此
+//   statSync 出实时字节数。为什么不写 download.log：那是 append 流水，要取最后一条、
+//   还会累积旧行，而且里面的体积是下载**完**才写的；为什么不让面板自己猜 .part 路径：
+//   pip / huggingface 那几项根本没有 .part，猜出来就是假进度。
+const PART_STATE = join(DEPS, '.download-part.json')
+function writePartState(v) {
+  try {
+    if (v) writeFileSync(PART_STATE, JSON.stringify(v), 'utf8')
+    else rmSync(PART_STATE, { force: true })
+  } catch {}
+}
+/**
+ * 下载一个文件。
+ * @param {string} url
+ * @param {string} out 落地文件名
+ * @param {string} label 给人看的名字（写日志用）
+ * @param {string} [depId] 面板上对应那一行的 id（ffmpeg / ytdlp / …）。
+ *   **只有会写 .part 的大文件才传**：传了面板才敢把字节数挂到那一行上；
+ *   不传（如 get-pip.py 那 2 MB）就是「没有进度可报」，不许借用别的行的估算体积当分母。
+ */
+function download(url, out, label, depId = '') {
   const tmp = `${out}.part`
   if (DRY) {
     const px = PROXY ? ` --proxy "${PROXY}"` : ''
@@ -428,6 +471,9 @@ function download(url, out, label) {
   }
   const via = PROXY ? `代理 ${PROXY}` : '直连'
   log(`下载 ${label}（${via}）：${url}`)
+  // 状态文件在 curl 起来之前写：面板 8 秒一轮，写晚了第一轮就看不到这一项。
+  //   dep 为空串表示「这一项没有可挂的行」，面板不会去猜。
+  writePartState({ dep: depId, part: tmp, out, label, url, at: Date.now(), pid: process.pid })
   const curl = curlBin()
   let r
   if (existsSync(tmp)) {
@@ -453,6 +499,8 @@ function download(url, out, label) {
     if (r.error) hint += `（${r.error.message}）`
     if (!PROXY) hint += '；如果这台机器要走代理，试 --proxy 或检查 --no-proxy'
     log(`下载失败 ${label}（${hint}）：${url}`)
+    // 失败时清掉状态：.part 已被删，留着这条只会让面板显示一个永远不动的进度。
+    writePartState(null)
     throw new Error(`下载失败：${url}（${hint}）`)
   }
   const size = statSync(tmp).size
@@ -463,6 +511,7 @@ function download(url, out, label) {
   try {
     rmSync(tmp, { force: true })
   } catch {}
+  writePartState(null) // 完成了：状态文件不留，面板随之收起这一行
   log(`下载完成 ${label}（${mb(size)}）-> ${out}`)
   if (VERIFY_HASH) {
     const h = createHash('sha256').update(readFileSync(out)).digest('hex')
@@ -488,7 +537,7 @@ function ensureFfmpeg() {
   const url = GH_PROXY + 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip'
   const zip = join(tmpdir(), 'bili-watch-ffmpeg.zip')
   try {
-    download(url, zip, 'ffmpeg-master-latest-win64-gpl.zip')
+    download(url, zip, 'ffmpeg-master-latest-win64-gpl.zip', 'ffmpeg')
   } catch (e) {
     // 80 MB 的 BtbN zip 在 GitHub 直连不稳时大概率断流；给替代路径，别让安装卡死在这
     console.warn('ffmpeg 下载失败。可选替代路径：')
@@ -578,7 +627,7 @@ function ensureFfmpegLinux(exe, probe) {
   mkdirSync(tmp, { recursive: true })
   const tgz = join(tmp, 'ffmpeg.tar.xz')
   try {
-    download(url, tgz, 'ffmpeg 静态包')
+    download(url, tgz, 'ffmpeg 静态包', 'ffmpeg')
   } catch {
     console.error(`✗ 下载 ffmpeg 失败：${url}`)
     console.error(`  离线/被墙可换源：BILI_WATCH_FFMPEG_URL=<镜像地址> node scripts/fetch-deps.mjs ffmpeg`)
@@ -590,7 +639,7 @@ function ensureFfmpegLinux(exe, probe) {
   //
   //   2026-11-02（合一）：原来这里写的是裸 `'tar'`，与上面 ZIP 分支的 `tarBin()` 不一致 ——
   //   Windows 上裸 `tar` 走 PATH 命中 Git Bash 的 **GNU tar**（它把 `C:\` 当远程主机，
-  //   实测报 `tar: Cannot connect to C: resolve failed`），于是「归档坏了」和「本机 tar 不行」
+  //   报 `tar: Cannot connect to C: resolve failed`），于是「归档坏了」和「本机 tar 不行」
   //   混成同一个失败，用户被指去装 xz-utils 而真因不在这里。统一用 tarBin()。
   const list = run(tarBin(), ['-tJf', tgz])
   if (list.code !== 0 || !list.out) {
@@ -661,7 +710,7 @@ function ensureYtdlp() {
   step(IS_WIN ? 'yt-dlp.exe' : 'yt-dlp')
   const base = IS_MAC ? 'yt-dlp_macos' : IS_WIN ? 'yt-dlp.exe' : 'yt-dlp'
   const url = `${GH_PROXY}https://github.com/yt-dlp/yt-dlp/releases/latest/download/${base}`
-  download(url, exe, base)
+  download(url, exe, base, 'ytdlp')
   if (DRY) return
   if (!IS_WIN) chmodSync(exe, 0o755)
   console.log(`    ✓ ${exe}`)
@@ -671,7 +720,7 @@ function ensureYtdlp() {
 // 顺序：--python > uv 管的 3.12/3.13（uv venv 可离线）> Windows py 启动器 3.13/3.12/3.11/3.10/3.14
 //   > PATH 上的 python/python3。WindowsApps 存根一律跳过。
 // 2026-10-30 更正：3.14 从「硬拒」改成「排在最后」——那个「3.14 没有 onnxruntime wheel」的
-//   前提已不成立（实测 3.14.6 的 venv 里 onnxruntime 1.31.1 能 import，ocr 真跑通）。
+//   前提已不成立（3.14.6 的 venv 里 onnxruntime 1.31.1 能 import，ocr 真跑通）。
 function pyOk(v) {
   return /^3\.(1[0-4])$/.test(String(v).trim())
 }
@@ -758,7 +807,7 @@ function venvPy(venv) {
   return IS_WIN ? join(venv, 'Scripts', 'python.exe') : join(venv, 'bin', 'python')
 }
 /**
- * 半成品 venv 不用递归批量删——会撞上用户的删除守卫（issue #3 实测）。改成改名留档。
+ * 半成品 venv 不用递归批量删——会撞上用户的删除守卫（issue #3）。改成改名留档。
  * M-03（2026-10-29）：以前只改名不清理，反复失败会攒出好几个 xxx.old-*（每个 1–2 GB）。
  *   改名之前先清上一次留下的 .old-*——那是我们自己造的垃圾，不是用户的文件。
  */
@@ -805,7 +854,7 @@ function pipInstall(py, args) {
   if (plan.mode === 'uv') {
     // uv 没有 --proxy 参数（只认 HTTP_PROXY/HTTPS_PROXY 环境变量）；而且 uv pip install 自带
     //   install 子命令，要把调用方传的 'install' 去掉，否则 uv 会把 install 当包名解析
-    //   （本机实测：uv pip install install rapidocr-onnxruntime → No solution found）。
+    //   （uv pip install install rapidocr-onnxruntime → No solution found）。
     const rest = args.slice(1)
     log(`uv pip install ${rest.join(' ')}（--python ${py}）`)
     let r = run(plan.uv, ['pip', 'install', '--python', py, ...rest, '--index-url', PY_INDEX])

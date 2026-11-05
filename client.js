@@ -69,6 +69,13 @@ function rowBusy(id, clickedId, downloading) {
   return Array.isArray(downloading) && downloading.indexOf(id) >= 0
 }
 
+/** 后端已全局互斥（任意一项在跑就拒），面板不能再只置灰正在下的那一行：
+ *  否则点别的行会「点了没反应」——按钮看着能点，请求发出去才被拒。
+ *  抽成纯函数是为了 verify 能真跑，而不是只读源码里有没有这句话。 */
+function anyDownloading(downloading) {
+  return Array.isArray(downloading) && downloading.length > 0
+}
+
 function canDownloadRow(d) {
   if (!d || d.ok) return false
   if (d.na) return false // 不适用（没卡时的 GPU 运行库）：装了也用不上
@@ -206,6 +213,7 @@ MODULE_LOADER.load({
 /* 2026-10-28：凭证行的「文件：<长路径>」原来挤在同一 flex 行里，把更新时间那一列压到几十像素、
    中文被逐字换行成竖排。让 note 在 flex 行里独占一行（flex-basis:100%），并允许长路径整词断开。 */
 [data-bl-row] [data-bl-note]{flex-basis:100%;min-width:0;word-break:break-all;}
+[data-bl-row] [data-bl-progress]{flex-basis:100%;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary,#5c636b);}
 [data-bl-bad]{color:#d9534f;}
 [data-bl-good]{color:#3c9a5f;}
 [data-bl-qrbox]{display:flex;gap:16px;align-items:center;flex-wrap:wrap;}
@@ -224,6 +232,22 @@ MODULE_LOADER.load({
       if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB'
       if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB'
       return (n / 1024).toFixed(1) + ' KB'
+    }
+    // 进度只有三种说法，一种都不许糊成「0%」：
+    //   ① 有 .part、分母是估算 → 「已下载 X（总量约 Y，估算）」
+    //   ② 有 .part、没有估算值 → 「已下载 X（总量未知）」
+    //   ③ 没有 .part / 没有进程在写 → 「无法测量」
+    //   为什么不在后端算百分比：ESTIMATES 是「约 94 MB」这种字符串，真百分比是编出来的；
+    //   而且 0.4.5 那个 model ok=True 假绿、-DryRun 会真删都是同一族——数字看着正常、实际是错的。
+    const progressText = (dl, estimate) => {
+      if (!dl) return ''
+      const who = dl.label ? dl.label + '：' : ''
+      if (dl.basis !== 'live' || !Number.isFinite(dl.bytes)) {
+        return `进行中 ${who}无法测量进度（${dl.why || '拿不到 .part 文件'}）`
+      }
+      const got = fmtBytes(dl.bytes)
+      const est = typeof estimate === 'string' ? estimate.trim() : ''
+      return est ? `进行中 ${who}已下载 ${got}（总量${est}，估算）` : `进行中 ${who}已下载 ${got}（总量未知）`
     }
     const fmtTime = (t) => {
       if (!t) return '—'
@@ -375,7 +399,7 @@ MODULE_LOADER.load({
         status === 'fail' ? h('span', { 'data-bl-bad': '' }, '复制失败') : null)
     }
 
-    function DepRow({ d, busy, onDownload, onDelete }) {
+    function DepRow({ d, busy, locked, onDownload, onDelete, progress }) {
       const canDownload = canDownloadRow(d)
       // issue #10 问题 1：na = 这台机器上不适用（目前只有「没有 NVIDIA 卡时的 GPU 运行库」）。
       //   它是灰的，不是红的；也不挂 data-bl-bad（那会让它看起来像故障）。
@@ -388,20 +412,26 @@ MODULE_LOADER.load({
         d.id === 'credential'
           ? h('button', { 'data-bl-btn': '', onClick: () => onDownload('login') }, d.ok ? '重新扫码' : '去扫码登录')
           : canDownload
-            ? h('button', { 'data-bl-btn': '', disabled: busy, onClick: () => onDownload(d.id) }, busy ? '下载中…' : '一键下载')
+            ? h('button', {
+              'data-bl-btn': '',
+              disabled: busy || locked,
+              title: locked && !busy ? '已有下载在跑，等它结束再点' : undefined,
+              onClick: () => onDownload(d.id),
+            }, busy ? '下载中…' : '一键下载')
             : null,
         d.id === 'credential'
           ? h('button', { 'data-bl-btn': '', disabled: !d.ok, onClick: () => onDelete(d.id) }, '清除凭证')
           : d.removable
             ? h('button', { 'data-bl-btn': '', onClick: () => onDelete(d.id) }, '删除')
             : h('button', { 'data-bl-btn': '', disabled: true, title: d.removableWhy || '不在插件目录内' }, '删除'),
+        progress ? h('span', { 'data-bl-progress': '' }, progressText(progress, d.estimate)) : null,
         d.id === 'credential' && d.path ? h('span', { 'data-bl-note': '' }, '文件：' + d.path) : null,
       )
     }
 
     // 参数分层（2026-10-28 阶段B）：一项 = 输入框 + 默认值提示 + 范围 + 一句话后果 + 恢复默认。
     // 只写 h()，不引新依赖；保存/恢复都由外面传进来的回调走 /config。
-    // 2026-10-28 老大要求「高级设置放开」：这 8 项原来是代码里的硬编码，现在都能在面板里调。
+    // 高级设置放开：这 8 项原来是代码里的硬编码，现在都能在面板里调。
     // 元数据跟后端 TUNING_DEFS 一一对应（键名、默认值、上下界都从 /status 的 tuningDefaults/tuningRanges 取，
     // 这里只放文案），加项时后端 TUNING_DEFS 与这张表各加一行即可。
     const ADV_TUNING = [
@@ -435,6 +465,9 @@ MODULE_LOADER.load({
       const [saveErr, setSaveErr] = React.useState('')
       const [msg, setMsg] = React.useState('')
       const [busy, setBusy] = React.useState('')
+      // 2026-11-04：手点刷新的进行态。它只服务「点了有没有反应」——8 秒轮询不碰它，
+      //   否则轮询会把标签反复在「刷新中…」和「刷新」之间闪。
+      const [refreshing, setRefreshing] = React.useState(false)
       const [days, setDays] = React.useState('7')
       const [maxMb, setMaxMb] = React.useState('2048')
       // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
@@ -796,6 +829,8 @@ MODULE_LOADER.load({
       if (!st) return h('div', { 'data-bl-page': '' }, h('div', { 'data-bl-note': '' }, '读取中…'))
 
       const deps = st.deps || []
+      // 任意一项在跑 = 全部下载入口都禁用（与后端 downloadConflict 的全局互斥同口径）。
+      const dlLocked = anyDownloading(st && st.downloading)
       const cache = st.cache || { bytes: 0, files: 0 }
       const lastRun = st.lastRun || {}
 
@@ -837,8 +872,21 @@ MODULE_LOADER.load({
           h('div', { 'data-bl-sechead': '' },
             h('span', { 'data-bl-sec-title': '' }, '运行依赖'),
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('download') }, '批量下载'),
-            h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
-          ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), onDownload: download, onDelete: delOne })),
+            h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理'),
+            // 从「最近一次调用」挪到这儿。原来跟在那条记录旁边，
+            //   读起来像「刷新这条调用记录」，实际它刷的是整页状态（依赖 + 显卡 + 缓存 + 参数）。
+            //   手点必须带 fresh=1 —— 服务端据此跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存，
+            //   用户刚在终端里装完东西点刷新，不该看到 5 分钟前的结论。
+            //   点击反馈：置灰 + 文案换成「刷新中…」，否则用户分不清「没生效」和「没反应」。
+            h('button', {
+              'data-bl-btn': '',
+              disabled: refreshing,
+              onClick: async () => {
+                setRefreshing(true)
+                try { await load(true) } finally { setRefreshing(false) }
+              },
+            }, refreshing ? '刷新中…' : '刷新')),
+          ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), locked: dlLocked, onDownload: download, onDelete: delOne, progress: st.download && st.download.dep === d.id ? st.download : null })),
           h('div', { 'data-bl-note': '' },
             '下载由内置 fetch-deps 脚本执行，需保持面板打开（宿主退出会中断）；体积为预估值，实际以完成后为准。')),
         dlg
@@ -872,7 +920,12 @@ MODULE_LOADER.load({
                     ),
                   )),
               h('div', { 'data-bl-row': '' },
-                h('button', { 'data-bl-btn': '', onClick: confirmDlg }, dlg === 'download' ? '开始下载' : '确认删除'),
+                h('button', {
+                  'data-bl-btn': '',
+                  disabled: dlg === 'download' && dlLocked,
+                  title: dlg === 'download' && dlLocked ? '已有下载在跑，等它结束再点' : undefined,
+                  onClick: confirmDlg,
+                }, dlg === 'download' ? '开始下载' : '确认删除'),
                 h('button', { 'data-bl-btn': '', onClick: () => setDlg(null) }, '取消')))
           : null,
         qr
@@ -1066,8 +1119,7 @@ MODULE_LOADER.load({
           h('span', { 'data-bl-sec-title': '' }, '最近一次调用'),
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, lastRun.command || '—'),
-            h('span', { 'data-bl-detail': '' }, lastRun.time ? `${fmtTime(lastRun.time)}（${lastRun.ok ? '成功' : '失败'}）` : '还没有记录'),
-            h('button', { 'data-bl-btn': '', onClick: () => load(true) }, '刷新'))),
+            h('span', { 'data-bl-detail': '' }, lastRun.time ? `${fmtTime(lastRun.time)}（${lastRun.ok ? '成功' : '失败'}）` : '还没有记录'))),
         msg ? h('div', { 'data-bl-note': '' }, msg) : null,
       )
     }

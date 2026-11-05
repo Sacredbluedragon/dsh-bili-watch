@@ -56,7 +56,12 @@ const stub = `
   const DOWNLOAD_LOG = '/stub/download.log'
   const join = (...a) => a.join('/')
   const existsSync = () => true
-  const appendFileSync = () => {}
+  // issue #12：把宿主写进 download.log 的行收集起来，Q 判据验「进程已拉起」那行
+  //   有没有把 shell / electron / runAsNode 三个字段写全。
+  const __logLines = []
+  const appendFileSync = (_p, s) => { __logLines.push(String(s)) }
+  // runDownload 现在会 stat 一下 outLog（判「本次输出全空」），桩里给个稳定值。
+  const statSync = () => ({ size: 0 })
   const openSync = () => 3
   const closeSync = () => {}
   let __spawnOpt = null
@@ -69,6 +74,8 @@ const stub = `
       ret,
       hasDetached: __spawnOpt ? Object.prototype.hasOwnProperty.call(__spawnOpt, 'detached') : null,
       detachedValue: __spawnOpt ? __spawnOpt.detached : null,
+      envHasRunAsNode: __spawnOpt ? __spawnOpt.env?.ELECTRON_RUN_AS_NODE === '1' : null,
+      launchedLine: __logLines.find((l) => l.includes('进程已拉起')) || '',
     }
   })()
 `
@@ -99,5 +106,24 @@ if (r.detachedValue !== false) {
   console.log('FAIL: win32 下 detached 必须是 false，实际 ' + JSON.stringify(r.detachedValue))
   process.exit(1)
 }
-console.log('PASS: runDownload 求值通过，started=true，spawn 收到 detached=false')
+// issue #12 P（真跑那一份）：spawn 选项里必须真有 ELECTRON_RUN_AS_NODE=1。
+//   verify 里另有一条 stripComments(fnBody) 静态判据同时盯 runLook 与 runDownload 两处。
+if (r.envHasRunAsNode !== true) {
+  console.log('FAIL: issue #12 P — spawn env 里没有 ELECTRON_RUN_AS_NODE=1')
+  process.exit(1)
+}
+// issue #12 Q：「进程已拉起」行必须带解释器判定，三个字段缺一不可。
+const launched = r.launchedLine
+if (!launched) { console.log('FAIL: issue #12 Q — 没写出「进程已拉起」日志行'); process.exit(1) }
+for (const key of ['shell=', 'electron=', 'runAsNode=']) {
+  if (!launched.includes(key)) {
+    console.log(`FAIL: issue #12 Q — 日志行缺 ${key}：${launched.trim()}`)
+    process.exit(1)
+  }
+}
+if (!/runAsNode=true/.test(launched)) {
+  console.log(`FAIL: issue #12 Q — runAsNode 不是 true：${launched.trim()}`)
+  process.exit(1)
+}
+console.log('PASS: runDownload 求值通过，started=true，spawn 收到 detached=false；env 带 ELECTRON_RUN_AS_NODE，日志带解释器三字段')
 process.exit(0)

@@ -16,3 +16,6 @@ deps/.venv-ocr/
 
 *.tmp
 bili-watch-*/
+
+# 本机身份清单（与 dev 树同口径）：装的是昵称 / mid / 用户名，绝不进公开仓库
+.leak-ids

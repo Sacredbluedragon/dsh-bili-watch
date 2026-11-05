@@ -48,7 +48,7 @@ import { hasAnyLock, makeLocks } from '../lib/locks.mjs'
 //   此后 dirStat / isOurCacheRoot / isOwnBvDir 在本文件已无人直接调用（都在 lib 内部用），
 //   只留 removeOwned；同理上面的 consts 两项也不再需要 import（CACHE_MARK 只被 pickCacheDir 用，
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进了 lib/cache-path.mjs）。
-import { removeOwned } from '../lib/cache-own.mjs'
+import { provableNamesIn, removeOwned } from '../lib/cache-own.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from '../lib/keys.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
 //   （与 index.js 同一份；原来这里那份判据差一截，见下面 DEPS 处的注释）。
@@ -131,7 +131,7 @@ function readDepsCfg() {
   //   这里只把 problem 翻成英文打 stderr。
   const { value, problem } = readJsonOrBackup(p, {})
   if (problem) {
-    // 必须保持 ASCII 前缀 + 英文：PS 5.1 管道按当前代码页解码，中文会变成问号（2026-10-24 实测）
+    // 必须保持 ASCII 前缀 + 英文：PS 5.1 管道按当前代码页解码，中文会变成问号
     const note = problem.kind === 'parse'
       ? (problem.backup ? `, backed up as ${basename(problem.backup)}` : ', backup failed')
       : ''
@@ -191,7 +191,7 @@ function ensureCache() {
 // 原来这里是一句裸调用 migrateLegacyCache()（模块加载即搬目录），D98 之后推迟到第一次真要读写缓存时。
 const require = createRequire(import.meta.url)
 // 凭证（2026-10-30 B 方案）：与 index.js 同一套——只认自己这一份。
-//   以前这里有「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁与单向复制，用户拍板整套拿掉：
+//   以前这里有「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁与单向复制，整套拿掉：
 //   那个目录只在特定机器上存在，用户侧是死分支，却把本机概念写进了公开源码。
 //   2026-10-31：两个常量与迁移判据搬进 lib/cred.mjs，这里只留「拿到路径」这一步。
 const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
@@ -287,7 +287,7 @@ function credFor(explicit) {
   if (explicit) return loadCred(explicit)
   // 2026-10-30 B 方案：只认 $DSH_HOME/bili-watch/credential.json，与 index.js resolveCredPath() 同一套。
   //   以前这里有一层「跟随同机另一个 B 站工具写的凭证」的 mtime 仲裁（外加一个单向复制），
-  //   用户拍板整套拿掉：那个目录只在特定机器上存在，用户侧是死分支，
+  //   整套拿掉：那个目录只在特定机器上存在，用户侧是死分支，
   //   却把本机概念写进了公开源码。E6-01 当初判的「两处有意不同」也随之整段消失。
   // 2026-10-31：迁移判据搬进 lib/cred.mjs，这里只按结果说话，四种情形一一对应：
   const a = adoptLegacyCred({ shared: SHARED_CRED, legacy: LEGACY_CRED })
@@ -406,7 +406,7 @@ function baitSignals(text, v, c) {
   }
   if (BAIT_WORD.test(String(text || ''))) reasons.push('字幕自称「实验/钓鱼」')
   // 命中率不能单独触发：ASR 常把英文读成中文谐音（DeepSeek→deep sick），
-  // 正常视频也会低命中（2026-10-26 实测 BV19dJQ6sE9F 命中 2/13、语速 5 字/秒）。
+  // 正常视频也会低命中（BV19dJQ6sE9F 命中 2/13、语速 5 字/秒）。
   if (speedBad && c?.ks && c.ks.total >= 8 && c.ks.hit / c.ks.total < 0.3) {
     reasons.push(`关键词只命中 ${c.ks.hit}/${c.ks.total}（字幕和标题/UP 对不上）`)
   }
@@ -536,7 +536,7 @@ async function peekViaVideoShot(bv, v, dir, bin) {
   if (!d?.image?.length || !d?.index?.length) throw new Error('videoshot 没给 image/index')
   const { image, index, img_x_len, img_y_len, img_x_size, img_y_size } = d
   // 在 index 时间点里均匀挑 5 个
-  // P1（2026-10-31，灰度指纹对拍实测）：**格 k 存的是 index[k+1]，不是 index[k]**。
+  // P1（灰度指纹对拍）：**格 k 存的是 index[k+1]，不是 index[k]**。
   //   videoshot 的 index[0] 是哨兵值，格 0 是一张纯黑占位图；可用格数 = index.length - 1。
   //   原来按 index[k] 取，五个点全部错位一格，最后一帧越界落进黑色格 —— peek-05 恒为
   //   986 字节纯黑（与 peek-01 同 md5），OCR 只出 4 帧。时间对、图不对，正是 A2 修过的那件事。
@@ -549,7 +549,7 @@ async function peekViaVideoShot(bv, v, dir, bin) {
     picks.push({ t: index[k + 1], idx: k }) // 格 k ↔ index[k+1]
   }
   // 对每个 pick，算出它在第几张图、第几行第几列
-  // 一张图是 img_x_len 列 × img_y_len 行（这台机器上实测 10×10）
+  // 一张图是 img_x_len 列 × img_y_len 行（10×10）
   // 顺带修：原来列数取的是 img_y_len（行数），非方阵拼版图会把行列算错
   const cols = img_x_len || 10
   const rows = img_y_len || 10
@@ -772,9 +772,16 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   }
   try {
     if (fresh && !outDir) {
-      for (const e of readdirSync(dir)) {
-        if (e === '.lock') continue // 锁留着，只清产物
-        try { rmSync(join(dir, e), { recursive: true, force: true }) } catch {}
+      // 2026-11-05（0.4.7 删除面 P0）：原来这里「不是 .lock 就整棵删」，连归属判据
+      //   都不看，还抢在下面 :790 的 manifest.files 记账清理之前。现在与面板 clear
+      //   共用同一套正向凭证（lib/cache-own.mjs 的 provableNamesIn），没凭证的一律不碰。
+      //   这个 if 的骨架必须留着：verify.mjs 的锁序守卫按 `if (fresh && !outDir) {`
+      //   定位，C113 还要切这块做扰动自检。
+      const proven = provableNamesIn(dir)
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.name === '.lock') continue // 锁留着，只清产物
+        if (!proven.has(e.name)) continue // 没有正向凭证 → 认不出 → 不动
+        try { rmSync(join(dir, e.name), { recursive: true, force: true }) } catch {}
       }
     }
     const p = await jget(
@@ -800,7 +807,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
         // A5（2026-10-27）+ X-01（2026-10-28）：没有 manifest，或 manifest 里没有 files 清单，
         //   都说明「这目录不是本工具这一次跑出来的」——绝不能按文件名猜着删。
         //   原来老 manifest（有文件、无 files）走命名兜底删 数字.jpg 与 peek-NN.jpg，
-        //   用户的 1.jpg / 2.jpg 正好被第一条命中：`--fresh --out <用户目录>` 实测会把它们删掉。
+        //   用户的 1.jpg / 2.jpg 正好被第一条命中：`--fresh --out <用户目录>` 会把它们删掉。
         //   想在旧缓存上重抽，删掉整个缓存目录即可；这里一律不碰。
         say(m0 ? 'manifest 没有 files 清单，跳过清理（目录里的文件一概不动）' : '没有 manifest，跳过清理（目录里的文件一概不动）')
       }
@@ -889,7 +896,7 @@ const runsFile = () => join(cacheDir(), '_logs', 'runs.jsonl')
 
 // ── 本地 ASR 转写（复用项目 .venv-asr，零 token）────────────────────────
 // #6（2026-10-30 E8 总表）：安装脚本原本只选 Python 3.10–3.13，理由是「onnxruntime 没有 cp314 的 wheel」——
-//   这条理由 2026-10-30 被实测推翻（3.14.6 的 venv 里 onnxruntime 1.31.1 可装可用），脚本已把 3.14 收进候选。
+//   这条理由已被推翻（3.14.6 的 venv 里 onnxruntime 1.31.1 可装可用），脚本已把 3.14 收进候选。
 //   但「已就绪」的判据一直是「文件在不在」——用户机器上早先由 3.14 建的 venv 照样报绿，
 //   跑起来才在 import 阶段炸，而且报的是「导入 faster_whisper 失败」这种看不出根因的话。
 //   这里不改判据，只在失败时点名环境版本，让人一眼看到该重装（3.14 能跑，但 3.12/3.13 更稳）。
@@ -2331,7 +2338,7 @@ function writeMeta(bv, extra = {}, dirHint = '') {
 //   ② 长文本**不补**语义规则。「冒充官方/威胁施压/反向试探」的原文正则跑 20 条正常字幕
 //      命中 8 条（40%）——字幕几千字必然命中，护栏就变报警器，下一步必然被人整段注释掉。
 //      而中文分类器的召回上限也就 25%（Prompt Guard 2 中文 recall 0.2529、Nemoguard 0.0008），
-//      加规则换不来召回（下面两个分类器的中文召回是实测值）。
+//      加规则换不来召回（下面两个分类器的中文召回是测量值）。
 //      长文本改守两件**形态**的事：不可见字符（正常字幕不会有 → 确定性判、零误报）
 //      ＋ 边界标记自校验（见 printText 里 wrapped 文件的回读）。
 // 按 OWASP：输入过滤是 supporting control，不是 security boundary；承重的是「标记 + 不下放权限」。
@@ -2594,7 +2601,7 @@ function printText(text, opts, bv, kind = 'text') {
     return
   }
   if (full.length <= tuning().textLimit) { console.log(`\n${disp(full)}`); if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）'); return }
-  const brief = tuning().textBrief // 2026-10-28 高级设置：textBrief 默认 400
+  const brief = tuning().textBrief // 高级设置：textBrief 默认 400
   console.log(`\n${disp(cutCp(full, brief))}`)
   console.log(`\n…（全文 ${full.length} 字，这里只给开头 ${brief} 字）`)
   if (file) console.log(`全文已存：${file}`)
@@ -2686,7 +2693,7 @@ async function cmdText(bv, credPath, opts = {}) {
     }
   // 信道优先：官方字幕能拿到就是可信内容，语速/关键词只作提示，不拦
   // 口径差异（有意）：自动化选片链路会把「语速/关键词不合格」当硬拦，
-  // 这里是人看的排查通道，取到就用、质量交给调用方判断。同一判据两种策略，别当 bug 报。
+  // 这里是人看的排查通道，取到就用、质量交给调用方判断。两条通道用同一套判据，差别只在拦不拦。
     if (emitText(opts, {
       video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
       source: 'subtitle',
@@ -3011,14 +3018,14 @@ function ffTimeoutMs() {
 
 // ── 通用入口（yt-dlp）：B 站外任意 http(s) 视频 ──────────────────────
 // 目标可以是裸 BV 号，也可以是 App/网页分享出来的整条链接（带 buvid/spmid/unique_k 等参数）。
-// 短链 b23.tv 先按公共 DNS 展开（本机内网 DNS 会把它答成 31.13.x.x 这类错误地址，见 2026-10-23 实测）。
+// 短链 b23.tv 先按公共 DNS 展开（本机内网 DNS 会把它答成 31.13.x.x 这类错误地址）。
 const B23_DNS_SERVERS = ['223.5.5.5', '119.29.29.29', '1.1.1.1']
 
 /**
  * 展开 b23.tv 短链：绕过系统 DNS，直接问公共 DNS 拿 IP，再按 IP 直连读 30x 的 Location。
  * 返回 { bv } 或 { error }：error 区分 dns（没解析出来）/ network（连不上）/ not-found（短码不存在）/ unknown。
  * 注意 b23.tv 对不存在的短码返回 HTTP 200 + {"code":-404,...}，所以「没拿到 Location」不等于网络坏
- * （2026-10-24 wb 第二轮实测，归因错会把用户引向查 DNS）。
+ * （归因错会把用户引向查 DNS）。
  */
 async function expandB23(shortUrl) {
   const m = String(shortUrl).match(/b23\.tv\/([A-Za-z0-9]+)/i)
@@ -3078,7 +3085,7 @@ async function expandB23(shortUrl) {
       const converted = await aidToBvid(av[1])
       if (converted) return { bv: converted }
     }
-    // 没拿到跳转：b23.tv 对不存在的短码回 200 + JSON error body（实测 code=-404），
+    // 没拿到跳转：b23.tv 对不存在的短码回 200 + JSON error body（code=-404），
     // 这种情况是「链接不对」，不是「DNS 坏了」。
     let bodyCode = null
     try {
@@ -3474,7 +3481,7 @@ const HELP = `用法:
   node look.mjs hot [--limit 10]              综合热门榜（B 站按热度排）
   node look.mjs peek <BV或链接>              先看标题/简介/热评 + 5 帧，判断内容类型（仅 B 站）
   node look.mjs view <BV或链接或URL>         只看元数据与热评
-  node look.mjs sub <BV或链接> [--cred 凭证路径] [--format srt|json|md|txt] [--out 文件]  字幕（仅 B 站）
+  node look.mjs sub <BV或链接> [--cred 凭证路径] [--format text|srt|json|md|txt] [--out 文件]  字幕（仅 B 站）
   node look.mjs comments <BV或链接> [条数] [--format json] [--out 文件]  评论区（仅 B 站）
   node look.mjs danmaku <BV或链接> [--format json] [--out 文件]  弹幕热区（仅 B 站）
   node look.mjs asr <BV或链接或URL> [--ffmpeg 路径] [--asr-max 毫秒] [--head N] [--full]  本地转写（B 站或通用 URL 均可）
@@ -3633,7 +3640,7 @@ try {
     //   ocr 接的是 BV（cmdOcr(bv, opts)，HELP 也写 `ocr <BV或链接>`），--format 是 text 的参数不是 ocr 的。
     //   缺参提示指错方向比不给提示更糟，所以按 HELP 原样写。
     ocr: '需要 BV 号或视频链接：node look.mjs ocr <BV|链接> [--step 2]',
-    text: '需要 BV 号或视频链接：node look.mjs text <BV|链接> [--fast] [--scene]',
+    text: '需要 BV 号或视频链接：node look.mjs text <BV|链接> [--fast]',
   }
   // W-07（2026-10-28 阶段B-①）：所有命令的 --out 统一过黑名单（原来只有 cmdFrames 一处过了）。
   //   模型被注入「把结果写到 C:\Windows\...」时，sub/comments/danmaku/text/sheet/local 也要拦。
@@ -3647,8 +3654,8 @@ try {
     console.error(`✗ ${why}`)
     process.exit(1)
   }
-  // P1（2026-10-31，实测踩到）：`<任意命令> --help` 原来**不拦**——`node look.mjs clean --help`
-  //   会真的执行 clean。本次实测因此删掉 158 个文件 / 18.1 MB 真实缓存。根因：help 只按位置参数判
+  // P1：`<任意命令> --help` 原来**不拦**——`node look.mjs clean --help`
+  //   会真的执行 clean。那次因此删掉 158 个文件 / 18.1 MB 真实缓存。根因：help 只按位置参数判
   //   （cmd === 'help'），--help 落在 opts 里没人读；而 60e0c86 把它补进 KNOWN_FLAGS 之后，
   //   连「未知参数 --help（已忽略）」这句唯一像是提醒的话也没了。
   //   现在统一在分派前拦：带 --help 就只打全文，任何命令都不执行。

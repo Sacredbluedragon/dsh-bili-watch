@@ -39,7 +39,7 @@ import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults,
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
-import { depsPaths, readPluginVersion, resolveDepsDir } from './lib/plugin-paths.mjs'
+import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile } from './lib/plugin-paths.mjs'
 // 2026-10-31：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
 import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/config.mjs'
@@ -151,7 +151,7 @@ const KNOWN_FLAGS = ['--step', '--p', '--cred', '--days', '--limit', '--order', 
 //   任何一步失败都回退用包内那份——功能不能因为搬家失败而哑掉。
 let depsWarning = null
 // X-30：手写递归复制。Node 22 的 fs.cpSync 在 Windows 中文路径下会进程级崩溃
-//   （exit 127、无异常栈，实测带空格的中文路径必崩），不能用来搬 460 MB 的 deps。
+//   （exit 127、无异常栈，带空格的中文路径必崩），不能用来搬 460 MB 的 deps。
 function copyTreeSync(src, dst) {
   const st = statSync(src)
   if (st.isDirectory()) {
@@ -161,35 +161,354 @@ function copyTreeSync(src, dst) {
     copyFileSync(src, dst)
   }
 }
+// ── 拷完校验（源树与目标树逐项比对，不通过就不删 bak）──────
+// 原来 `if (existsSync(dst)) { try { copyTreeSync(dst, tmp) } catch {} }` 是**局部**吞异常：
+//   copyTreeSync 整体递归，一处抛错后面条目全不写进 tmp；异常被吞后照常 rename 上位、删 bak、
+//   warning 报「已生效、包内旧 deps 可手动删除」——用户刚下好的文件永久没了，还被劝去删唯一副本。
+// 两道一起做，缺一不可：① 局部 catch{} 去掉，异常冒泡；② 拷完校验，兜住「不抛错但少拷」那条路
+//   （copyTreeSync 的 else 分支对既非 file 也非 dir 的条目是**静默跳过**）。
+/**
+ * 不跟随地收集一棵树：相对路径 → {type, size, path}。
+ * 用 lstatSync 而不是 copyTreeSync 里的 statSync：后者跟随时断链会抛、特殊条目会静默漏，
+ * 校验器若也跟着抛/漏就等于自证。readdirSync 抛错一律冒泡——读不出来不许当空目录。
+ * key 手工用 `/` 拼，Windows 的 `sep` 不会让两侧 Map 对不上。symlink 不递归：
+ * copyTreeSync 跟随它拷内容，校验只看「目标可达 + tmp 里有对应条目」。
+ */
+function collectEntries(root) {
+  const out = new Map()
+  const walk = (dir, rel) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name)
+      const r = rel ? `${rel}/${e.name}` : e.name
+      const st = lstatSync(p)
+      const type = st.isDirectory() ? 'dir' : st.isFile() ? 'file'
+        : st.isSymbolicLink() ? 'symlink' : 'other'
+      out.set(r, { type, size: st.size, path: p })
+      if (type === 'dir') walk(p, r)
+    }
+  }
+  walk(root, '')
+  return out
+}
+
+/** 校验专用异常：带上「哪几个条目、为什么」，warning 才能点名，用户才有处置线索。 */
+class DepsCopyIncompleteError extends Error {
+  constructor(issues, extra = []) {
+    super(`包外 deps 有 ${issues.length} 个条目无法完整复制`)
+    this.name = 'DepsCopyIncompleteError'
+    this.issues = issues
+    this.extra = extra
+  }
+  /** warning 里最多列 10 条 + 总数。 */
+  describe() {
+    const names = this.issues.slice(0, 10).map((i) => `${i.rel}（${i.why}）`)
+    const more = this.issues.length > 10 ? `…等共 ${this.issues.length} 个` : ''
+    const extra = this.extra.length
+      ? `；副本里另有 ${this.extra.length} 个计划外条目（前 3 个：${this.extra.slice(0, 3).join('、')}）`
+      : ''
+    return `${names.join('、')}${more}${extra}`
+  }
+}
+
+/**
+ * 按类型的差异化判据，缺一不可：
+ *   other   → 直接判失败并点名（copyTreeSync 的 else 会静默跳过它，tmp 里根本没有）
+ *   symlink → statSync 不抛（目标可达）+ tmp 里对应 rel 存在（不限类型）——断链必红，
+ *             有效 blob 链接 / junction 通过。不比类型、不递归比 target 内容，
+ *             不给 symlink 定义「齐全」（那是无底洞）。
+ *   dir     → tmp 里 rel 存在且 lstat 是 dir
+ *   file    → tmp 里 rel 存在、是 file、且 size 相等
+ * tmp 里不许出现 dst 没有的条目（:312 阶段严格来说不该有）。
+ * 不比字节、不比 mtime（460 MB 比字节太慢）。
+ */
+function compareDepsEntries(dstEntries, tmp) {
+  const tmpEntries = collectEntries(tmp)
+  const issues = []
+  for (const [rel, d] of dstEntries) {
+    const t = tmpEntries.get(rel)
+    if (d.type === 'other') { issues.push({ rel, why: '特殊类型，复制会静默跳过' }); continue }
+    if (!t) { issues.push({ rel, why: '副本里没有这个条目' }); continue }
+    if (d.type === 'symlink') {
+      try { statSync(d.path) } catch { issues.push({ rel, why: '链接目标不可达（断链）' }) }
+      continue
+    }
+    if (d.type === 'dir' && t.type !== 'dir') { issues.push({ rel, why: '副本里不是目录' }); continue }
+    if (d.type === 'file' && (t.type !== 'file' || t.size !== d.size)) {
+      issues.push({ rel, why: '副本不是同名文件或大小不一致' })
+    }
+  }
+  // symlink 被 copyTreeSync 解引用成实体目录时，tmp 里会多出 `<rel>/...` 这些
+  //   dst 侧 lstat 看不到的后代——那是「跟随拷贝」的正常结果，不是写到了计划外的地方
+  //   （有效链接必须迁移成功，不能因为这条判据把它们一律拒绝）。
+  //   其余任何 tmp 独有的条目仍记红并点名。
+  const symlinkRels = [...dstEntries].filter(([, d]) => d.type === 'symlink').map(([rel]) => rel)
+  const extra = [...tmpEntries.keys()].filter((rel) =>
+    !dstEntries.has(rel) && !symlinkRels.some((s) => rel.startsWith(`${s}/`)))
+  return { ok: issues.length === 0 && extra.length === 0, issues, extra }
+}
+
+/**
+ * 把 dst 完整复制进 tmp 并校验。时机必须在「dst 拷完、src 拷之前」：
+ *   放到 copyTreeSync(src,tmp) 之后，tmp 会多出包内独有文件，「条目数全等」立刻失效、
+ *   只能退化成子集检查（1703 问 1 纠正 1702 的口径）。
+ * 链接可达性在 copyTreeSync **之前**先预检：断链 junction 会在 copyTreeSync 里抛 ENOENT，
+ *   先判掉才能给用户「哪几个条目、为什么」而不是一句系统错误。
+ */
+function copyAndVerifyDstToTmp(dst, tmp) {
+  const dstEntries = collectEntries(dst)
+  const preflight = []
+  for (const [rel, d] of dstEntries) {
+    if (d.type === 'other') { preflight.push({ rel, why: '特殊类型，复制会静默跳过' }); continue }
+    if (d.type === 'symlink') {
+      try { statSync(d.path) } catch { preflight.push({ rel, why: '链接目标不可达（断链）' }) }
+    }
+  }
+  if (preflight.length) throw new DepsCopyIncompleteError(preflight)
+  copyTreeSync(dst, tmp) // 异常不吞，冒泡到外层整体回滚
+  const verdict = compareDepsEntries(dstEntries, tmp)
+  if (!verdict.ok) throw new DepsCopyIncompleteError(verdict.issues, verdict.extra)
+}
 // 2026-11-01（0.4.1 第 8 条）：deps 的三个候选路径与「用哪份」的判据搬进 lib/plugin-paths.mjs。
 //   tools/look.mjs 原来有一份「长得像但差一截」的：它只判包内目录**存在**，不判有内容，
 //   于是干净安装（包内 deps 是空目录）时面板用包外、CLI 用包内。判据现在只有一份，以本文件为准。
 const { pref: DEPS_PREF, local: DEPS_LOCAL, movedMark: DEPS_MOVED_MARK } = depsPaths({ pluginRoot: HERE })
 // 当前用哪份——**同步决定、不搬东西**。搬家见下面的 scheduleDepsMigration。
 //   mkdirPref：包内外都没内容时顺手建出包外目录（面板要往里写）；CLI 侧不建。
-const DEPS = resolveDepsDir({ pluginRoot: HERE, mkdirPref: true })
+let DEPS = resolveDepsDir({ pluginRoot: HERE, mkdirPref: true })
 /**
- * X-30 第二轮：后台把包内 deps 搬到包外，搬完写 .deps-moved，**下次启动生效**。
+ * 0.4.7：迁移完成后**当场**把路径绑到新目录，不再等下次启动。
+ *
+ * 为什么必须收在一个函数里：下面四个派生（`LAST_RUN` / `CACHE_CFG` / `UI_CFG` / `DOWNLOAD_LOG`）
+ * 和 `credPaths(DEPS)` 解构出的两个凭据路径，都是**模块级求值**的 —— 原来全是 const，
+ * `DEPS` 变了它们不动。于是迁移完那一刻：fetch-deps 子进程往新目录装、宿主仍按旧目录查，
+ * 「装新查旧」，退出码 0 也被判失败，用户必须重启宿主才恢复。
+ *
+ * 纪律：**新增派生路径一律写进这里，不许再在模块顶层写 `const X = join(DEPS, ...)`**。
+ *   顶层那一行在加载时就定死了，重绑再也不会碰它 —— 判据
+ *   （tools/fixtures/deps-rebind-probe.mjs）逐字段断言的就是这件事。
+ */
+function rebindDeps(dir) {
+  DEPS = dir
+  LAST_RUN = join(dir, 'last-run.json')
+  CACHE_CFG = join(dir, 'cache-config.json')
+  UI_CFG = join(dir, 'ui-config.json')
+  DOWNLOAD_LOG = join(dir, 'download.log')
+  const c = credPaths(dir)
+  SHARED_CRED = c.shared
+  LEGACY_CRED = c.legacy
+}
+/** 只读快照：判据从这里看「这一刻路径到底绑在哪」。生产不读它。 */
+function depsPathSnapshot() {
+  return {
+    dir: DEPS,
+    lastRun: LAST_RUN,
+    cacheCfg: CACHE_CFG,
+    uiCfg: UI_CFG,
+    downloadLog: DOWNLOAD_LOG,
+    sharedCred: SHARED_CRED,
+    legacyCred: LEGACY_CRED,
+  }
+}
+/**
+ * 后台把包内 deps 搬到包外，搬完写 .deps-moved。
  * 由 apply() 在插件注册完之后调，3 秒延迟——那时插件已经装好，堵一会儿不影响 cordis 判活。
  * 迁到一半进程被杀：留下 deps.migrating，下次这里开头的 rmSync 会清掉重搬。
+ *
+ * 0.4.7：搬完立刻 `rebindDeps(DEPS_PREF)` —— 原来写的是「下次启动生效」，
+ *   那正是「装新查旧」的来源。三个参数只服务判据，生产调用不传任何参数。
  */
-function scheduleDepsMigration() {
-  if (resolve(DEPS) !== resolve(DEPS_LOCAL)) return // 已经在用包外，不用搬
-  const tmp = DEPS_PREF + '.migrating'
-  const t = setTimeout(() => {
+// ── 0.4.7 / issue #11：迁移与下载的互斥（2026-11-05）──────────────────────
+// 原来迁移由 setTimeout(3000) 触发、下载是独立 spawn 的进程，两者能同时动同一个 deps：
+// 用户刚下好的 yt-dlp.exe / last-bin.json 被 `rmSync(dst)` 整棵删掉（CBlazed 的现场日志）。
+// 两道一起做，缺一不可：① 迁移前**真抢**这把锁（只检查不占有，挡不住「检查完才开始写」）；
+//                      ② 不再删 dst，先合并再换位（合并解决「已经在那里的」）。
+let depsMigrationInFlight = false  // 幂等：重试期间不许第二条链并跑同一个 tmp
+let depsMigrationRuns = 0          // 判据可观测：真正进入迁移链的次数
+let depsMigrationRetries = 0
+const DEPS_MIGRATION_STALE_MS = 6 * 60 * 60 * 1000 // 与 scripts/fetch-deps.mjs 的 LOCK_STALE_MS 同口径
+
+// 锁的绝对路径只在这里算一次，且**不来自 resolveDepsDir()**。
+//   宿主侧后台迁移与 scripts/fetch-deps.mjs 共用 lib 的 depsLockFile()，
+//   两边算出同一串；迁移前 / 中 / 后都不变（DEPS 会 rebind，这个不会）。
+const DEPS_LOCK_FILE = depsLockFile()
+function readDepsLock() {
+  try { return JSON.parse(readFileSync(DEPS_LOCK_FILE, 'utf8')) } catch { return null }
+}
+function depsLockPidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (e) { return Boolean(e && e.code === 'EPERM') }
+}
+/**
+ * 真抢锁：wx 独占写，拿不到返回 null（由调用方延后重试）。锁体与 scripts/fetch-deps.mjs
+ * 的 acquireLock 同形（pid / startedAt / target），所以它那侧读到的就是「有人正在跑」。
+ * stale 锁只删「自己刚判定为 stale 的那一份」——删前重读比对，否则两个进程交错时
+ * 会把对方刚写的新锁删掉（lib/locks.mjs 记的 A-1 双持事故）。
+ */
+function acquireDepsLock(dir) {
+  // 保留：dst 仍需在换位前被建出来（P1-1 的 dstPreexisted 语义、K3 夹具都靠它）。
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  // 锁目录与 dst 不一定相同（depsLockFile 落在 deps 的父级），得单独建出来，
+  // 否则 writeFileSync(..., 'wx') 会报 ENOENT 而不是「锁被占用」。
+  try { mkdirSync(dirname(DEPS_LOCK_FILE), { recursive: true }) } catch {}
+  const mine = { pid: process.pid, startedAt: Date.now(), target: 'deps-migration' }
+  for (let i = 0; i < 2; i++) {
     try {
-      mkdirSync(dirname(DEPS_PREF), { recursive: true })
-      try { rmSync(tmp, { recursive: true, force: true }) } catch {} // 上次迁到一半的残留
-      copyTreeSync(DEPS_LOCAL, tmp)
-      try { rmSync(DEPS_PREF, { recursive: true, force: true }) } catch {} // 3 秒内可能被别人建出来
-      renameSync(tmp, DEPS_PREF)
-      writeFileSync(DEPS_MOVED_MARK, JSON.stringify({ at: new Date().toISOString(), from: DEPS_LOCAL }), 'utf8')
-      depsWarning = `依赖目录已迁到 ${DEPS_PREF}，下次启动生效；包内旧 deps\\ 可手动删除`
-    } catch (e) {
-      try { rmSync(tmp, { recursive: true, force: true }) } catch {}
-      depsWarning = `依赖目录后台迁移失败，继续用包内 deps\\（${String(e?.message || e)}）；装依赖请先手动把 deps\\ 移到 ${DEPS_PREF}`
+      writeFileSync(DEPS_LOCK_FILE, JSON.stringify(mine), { flag: 'wx' })
+      return mine
+    } catch {
+      const cur = readDepsLock()
+      const held = cur && Number.isFinite(cur.pid) && depsLockPidAlive(cur.pid)
+        && (!Number.isFinite(cur.startedAt) || Date.now() - cur.startedAt <= DEPS_MIGRATION_STALE_MS)
+      if (held) return null
+      try {
+        const now = readDepsLock()
+        if (now && cur && (now.pid !== cur.pid || now.startedAt !== cur.startedAt)) continue
+        rmSync(DEPS_LOCK_FILE, { force: true })
+      } catch {}
     }
-  }, 3000)
+  }
+  return null
+}
+/** 只释放自己写的那把：比对 pid + startedAt + target，不动别人的锁。 */
+function releaseDepsLock(mine) {
+  if (!mine) return
+  try {
+    const cur = readDepsLock()
+    if (cur && cur.pid === mine.pid && cur.startedAt === mine.startedAt && cur.target === mine.target) {
+      rmSync(DEPS_LOCK_FILE, { force: true })
+    }
+  } catch {}
+}
+/** 只读快照：判据从这里看迁移链状态与 warning。生产不读它。
+ *  lockFile 是 1810 判据 L 的宿主侧取值——直接给抢锁真用的那个常量，不是另算一遍。 */
+function depsMigrationSnapshot() {
+  return {
+    warning: depsWarning, inFlight: depsMigrationInFlight,
+    runs: depsMigrationRuns, retries: depsMigrationRetries, lockFile: DEPS_LOCK_FILE,
+  }
+}
+
+function scheduleDepsMigration(opts = {}) {
+  const delayMs = Number.isFinite(opts.delayMs) ? opts.delayMs : 3000
+  const src = opts.src || DEPS_LOCAL
+  const dst = opts.dst || DEPS_PREF
+  if (!opts.force && resolve(DEPS) !== resolve(src)) return // 已经在用包外，不用搬
+  // 1532：同一时间只跑一条迁移链（含 8 次重试）。apply() 被重复调用，或重试期间又来
+  // 一次触发，两条链会同时 copy / rename 同一个 tmp —— 那是新的丢文件路径。
+  if (depsMigrationInFlight) return
+  depsMigrationInFlight = true
+  const tmp = dst + '.migrating'
+  const bak = dst + '.migrating.bak'
+  const tmp2 = dst + '.migrating.rollback' // P2-1 分阶段复位的中转名
+  const retryMs = Number.isFinite(opts.retryMs) ? opts.retryMs : 15000 // 生产 15s × 8 = 2 分钟上界
+  const maxAttempts = Number.isFinite(opts.maxAttempts) ? opts.maxAttempts : 8
+  let attempt = 0
+
+  /**
+   * acquireDepsLock 第一行会 mkdirSync(dst)，失败/放弃后留下一个**空** dst，
+   *   resolveDepsDir 判据③ 只看 existsSync(pref) → 下次启动迁移永不触发（第 3 轮 P1）。
+   *   只在「自己建的」且「现在仍为空」时撤掉：非空一律不动（可能是 3 秒窗口里别人建的）。
+   *   锁文件已不在 dst 里（落在 deps 的父级），但仍在 releaseDepsLock
+   *   之后调：失败/放弃出口统一在 finally 收尾，不与抢锁重试交错。
+   */
+  const cleanupSelfCreatedEmptyDst = (preexisted) => {
+    if (preexisted) return
+    try {
+      if (existsSync(dst) && readdirSync(dst).length === 0) rmdirSync(dst)
+    } catch {}
+  }
+
+  const run = () => {
+    attempt += 1
+    // 进 acquireDepsLock **之前**记，不许「建完再看」（那会把恒真写两遍）
+    const dstPreexisted = existsSync(dst)
+    const lock = acquireDepsLock(dst)
+    if (!lock) {
+      if (attempt >= maxAttempts) {
+        // 不再承诺「下次启动会再试」——判据③ 命中非空 dst 时根本不会触发
+        depsWarning = `有下载在跑，本次不迁移（${DEPS_LOCK_NAME} 等 ${attempt} 次 × ${retryMs / 1000}s 仍被占用）；本次继续用包内 deps\\，迁移已停止；下次启动不会再尝试，若要迁移请先关掉正在跑的下载再重启。依赖目前仍放在插件包内，卸载插件会一并删除；包内 deps 正在正常使用`
+        depsMigrationInFlight = false // 不许无限重试，插件不能在后台永远转
+        cleanupSelfCreatedEmptyDst(dstPreexisted)
+        return
+      }
+      depsWarning = `有下载在跑，本次迁移延后 ${retryMs / 1000}s 重试（第 ${attempt}/${maxAttempts} 次）`
+      depsMigrationRetries += 1
+      const rt = setTimeout(run, retryMs)
+      try { rt.unref?.() } catch {}
+      return
+    }
+    depsMigrationRuns += 1
+    let movedOld = false
+    let promoted = false      // renameSync(tmp,dst) 是否已成功（P2-1 分界）
+    let copyVerified = false  // 拷完校验是否通过（删 bak 的第二条件）
+    let succeeded = false     // 成功路径不碰 dst
+    try {
+      mkdirSync(dirname(dst), { recursive: true })
+      try { rmSync(tmp, { recursive: true, force: true }) } catch {} // 上次迁到一半的残留
+      try { rmSync(bak, { recursive: true, force: true }) } catch {}
+      try { rmSync(tmp2, { recursive: true, force: true }) } catch {}
+      // ① 先把包外已有的搬进 tmp —— 3 秒窗口里刚下好的、上一版留在包外的，一个都不能少。
+      // ② 再拷包内覆盖同名（包内是权威基线）。顺序不能反：反了是旧副本盖掉刚下好的新文件。
+      //    copyTreeSync 用 copyFileSync(src, dst) 且**无 mode 参数** → 同名是覆盖不是跳过
+      //    （实现 index.js:161；真跑与端到端证据见《删除面P0补丁与迁移面交付.md》）。
+      if (existsSync(dst)) copyAndVerifyDstToTmp(dst, tmp) // P0-1：去吞异常 + 拷完校验
+      copyVerified = true
+      copyTreeSync(src, tmp)
+      // ③ 原目录一个字节都不删：先原子挪到 bak，新目录再上位；中途失败立刻回滚。
+      if (existsSync(dst)) { renameSync(dst, bak); movedOld = true }
+      renameSync(tmp, dst)
+      promoted = true
+      writeFileSync(DEPS_MOVED_MARK, JSON.stringify({ at: new Date().toISOString(), from: src }), 'utf8')
+      rebindDeps(dst)
+      depsWarning = `依赖目录已迁到 ${dst}，本次已生效；包内旧 deps\\ 可手动删除`
+      succeeded = true
+      // movedOld **与** 校验通过才删 bak。校验失败走 throw，到这里 copyVerified
+      //   必然为真；显式写成「与」是为了挡住后来把校验改成「只告警不中断」的人。
+      if (movedOld && copyVerified) { try { rmSync(bak, { recursive: true, force: true }) } catch {} }
+    } catch (e) {
+      if (promoted) {
+        // P2-1：renameSync(tmp,dst) 之后失败——物理上新目录已上位、逻辑上
+        //   mark 未写 / DEPS 未重绑、bak 还在，而旧 warning 说「继续用包内 deps」。
+        //   acquireDepsLock 已建出 dst，所以 promoted 蕴含 movedOld、必有 bak 可还；
+        //   万一前提不成立也如实报「无备份可还」，不假装复位成功。
+        if (!movedOld || !existsSync(bak)) {
+          depsWarning = `依赖目录后台迁移失败：新目录已上位但没有可还原的备份（${String(e?.message || e)}）；包内 deps 正在正常使用，请以本次实际目录状态为准，勿手动删除任何 deps 目录`
+        } else {
+          let rolledBack = false
+          try {
+            renameSync(dst, tmp2)
+            renameSync(bak, dst)
+            rmSync(tmp2, { recursive: true, force: true })
+            rolledBack = true
+          } catch {}
+          if (rolledBack) {
+            depsWarning = `依赖目录后台迁移失败，已完整复位到迁移前状态（${String(e?.message || e)}）；本次继续用包内 deps\\，包内 deps 正在正常使用；失败原因已记录。若你已手动处理过，重启即可`
+          } else {
+            depsWarning = `依赖目录后台迁移失败且自动复位未完成（${String(e?.message || e)}）；原目录备份仍在 ${bak}，新目录暂存于 ${tmp2}，请勿手动删除这两个目录。本次继续用包内 deps\\，包内 deps 正在正常使用`
+          }
+        }
+      } else if (e instanceof DepsCopyIncompleteError) {
+        // P0-1 校验不过：不上位、不删 bak（此时 bak 还没生成）、只清 tmp。
+        //   三条出路（几个 / 是什么 / 要做什么）+ 掐掉「迁移失败＝功能坏了」。
+        //   **不承诺自动重试**：3 秒窗口里 dst 可能被建成非空目录，finally 不会撤，
+        //   重启后判据③ 命中它，迁移根本不触发。
+        try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+        const n = e.issues.length + e.extra.length
+        depsWarning = `依赖目录后台迁移已停止：包外 deps 里有 ${n} 个条目无法完整复制（前 10 个：${e.describe()}）；为避免删掉你的文件，本次没有改动任何目录，继续用当前 deps，包内 deps 正在正常使用。请把这些条目移走或修好（断链、被占用、特殊类型）后重启；若包外目录为空，本次已自动移除`
+      } else {
+        // rename 之前失败（含 copyTreeSync 抛错）：bak 已建则还回去，tmp 清掉，dst 原封不动。
+        try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+        if (movedOld && !existsSync(dst)) { try { renameSync(bak, dst) } catch {} }
+        // 不再指示具体动作，也不承诺下次启动会自动再试。
+        depsWarning = `依赖目录后台迁移失败，本次继续用包内 deps\\，包内 deps 正在正常使用；失败原因已记录（${String(e?.message || e)}）。若你已手动处理过，重启即可`
+      }
+    } finally {
+      releaseDepsLock(lock)
+      // 只在失败/放弃出口清，成功路径一个字都不碰。
+      if (!succeeded) cleanupSelfCreatedEmptyDst(dstPreexisted)
+      depsMigrationInFlight = false
+    }
+  }
+  const t = setTimeout(run, delayMs)
   // 别让这个定时器拖住宿主退出；宿主活着它照样会到点
   try { t.unref?.() } catch {}
 }
@@ -301,19 +620,22 @@ function writeTuning(body) {
 function projDir() { return process.env.BILI_WATCH_PROJ || depsCfg().proj || DEPS }
 // 凭证路径（2026-10-30 B 方案）：watch 只认自己这一份。
 //   以前这里是「两处写入口谁新用谁」的 mtime 仲裁——跟随同机另一个 B 站工具写下的凭证。
-//   用户拍板把这套功能整套拿掉，两个理由：
+//   这套功能整套拿掉，两个理由：
 //     ① 它把一个不属于本插件的本机目录概念写进了公开源码（那个目录只在特定机器上存在，
 //        于是相关分支在用户侧是死代码，却把本机信息泄露给了所有读源码的人）；
 //     ② 「跟随别人写的凭证」本身就不该是 watch 的职责——读谁的号应该由用户在本插件里扫。
 //   现在规则只有一条：$DSH_HOME/bili-watch/credential.json；没有就从 deps/credential.json
 //   （更旧的 legacy）迁移一次；都没有就是未登录（匿名请求）。
-const { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
+// 0.4.7：解构目标改成 let —— 迁移后由 rebindDeps 重算，const 绑不住新目录。
+let { shared: SHARED_CRED, legacy: LEGACY_CRED } = credPaths(DEPS)
 // 迁移与校验搬进 lib/cred.mjs（2026-10-31）：这里只要「这次该读哪个路径」。
 //   面板侧原本就静默（不打印），所以这里对 problem 一律不翻译——凭证状态由 /status 的 credState 解释。
 function resolveCredPath() {
   return adoptLegacyCred({ shared: SHARED_CRED, legacy: LEGACY_CRED }).path
 }
-const LAST_RUN = join(DEPS, 'last-run.json')
+// 0.4.7：四个派生路径全部 let —— 它们是模块级求值的，只改 DEPS 改不动，
+//   迁移后必须由 rebindDeps 逐个重算（判据逐字段断言，漏一个就红）。
+let LAST_RUN = join(DEPS, 'last-run.json')
 // 缓存位置：env BILI_WATCH_CACHE > deps\deps-config.json 的 cache > $DSH_HOME/bili-watch/cache。发布版不含本机路径。
 // 自定义目录不可写时不让功能哑掉：回退到默认路径（$DSH_HOME/bili-watch/cache），并把原因挂进 /status.warnings。
 // 缓存根标记：CACHE_MARK 已搬到 lib/consts.mjs（2026-10-31）——两处同名同值的「身份凭证」只留一份。
@@ -338,7 +660,7 @@ const lockTtlMs = () => lockTtlMsOf(readTuning())
 // isAdoptableDir 已搬到 lib/locks.mjs（2026-10-31）。它守住的那条线没变：
 //   能认领的只有三种——不存在（我们会新建）/ 空的 / 已经带我们的标记；
 //   有内容又没有标记 = 用户自己的目录（素材库、下载目录），绝不认领，否则 pickCacheDir 这次就把标记写进去，
-//   紧接着 removeOwned 看到标记就开始按名字删，守卫等于空转（实测：指向素材库跑 clean 会删掉 4 个用户文件）。
+//   紧接着 removeOwned 看到标记就开始按名字删，守卫等于空转（指向素材库跑 clean 会删掉 4 个用户文件）。
 // isOurCacheRoot / isOwnBvDir / removeOwned / dirStat 已搬到 lib/cache-own.mjs（2026-10-31）。
 //   搬的动机就是「删除面判据只能有一份」：历史上两次删到用户文件（2026-10-29 素材库、
 //   2026-10-30 E8 #1 自动清理），根因都是两处判据不同步。三道闸与由来见那边的文件头。
@@ -368,7 +690,7 @@ function ensureCache() {
 // 追加四（2026-10-29，T35-EXT）：旧缓存提示——只说不做；正文与判据在 lib/cache-path.mjs。
 // 严格「只提示」：认领旧目录的开关（--adopt）还没做，所以提示里不提任何当前版本不存在的参数。
 // P1-②（2026-10-29 全量审）：/status 是 8 秒轮询，dirStat 会递归 walk 用户目录
-//   （实测 2.8 万文件 664 ms 中位、首跑 2 秒），同步 walk 会顶到面板 10 秒超时并卡别的路由。
+//   （2.8 万文件 664 ms 中位、首跑 2 秒），同步 walk 会顶到面板 10 秒超时并卡别的路由。
 //   所以这里按 10 分钟节流——配置变了最多晚 10 分钟反映，换掉的是每 8 秒一次的全盘扫描。
 //   节流留在本文件而不是 lib：它跟「面板轮询周期」有关，是调用方的性能策略，不是路径语义。
 let adoptNoticeCacheAt = 0
@@ -420,8 +742,8 @@ function resolveFfmpeg() {
 }
 function hfHomes() { const p = projDir(); return [join(DEPS, '.hf-home'), join(p, '.hf-home')] }
 const SCRIPTS = join(HERE, 'scripts')
-const CACHE_CFG = join(DEPS, 'cache-config.json')
-const UI_CFG = join(DEPS, 'ui-config.json')
+let CACHE_CFG = join(DEPS, 'cache-config.json')
+let UI_CFG = join(DEPS, 'ui-config.json')
 const DEFAULT_UI_CFG = { hintDismissed: false, activationSeen: false, showInSettings: true, autoHint: true }
 
 function uiCfg() {
@@ -439,7 +761,7 @@ function writeUiCfg(patch) {
 }
 const DEFAULT_CACHE_DAYS = 7
 const DEFAULT_CACHE_MAX_MB = 2048
-const DOWNLOAD_LOG = join(DEPS, 'download.log')
+let DOWNLOAD_LOG = join(DEPS, 'download.log')
 // 一键下载的预估体积，只给面板显示，不参与逻辑
 const ESTIMATES = {
   ffmpeg: '约 94 MB',
@@ -447,7 +769,7 @@ const ESTIMATES = {
   asr: '约 294 MB（venv）',
   ocr: '约 263 MB（venv）',
   model: '约 464 MB',
-  // issue #7（2026-10-31）实测 Windows：下载约 1.4 GB（cublas 553 MB + cudnn 743 MB + nvrtc 76 MB），
+  // issue #7 · Windows：下载约 1.4 GB（cublas 553 MB + cudnn 743 MB + nvrtc 76 MB），
   //   装完 site-packages/nvidia 约 2.0 GB。原来写「约 500 MB」是估的，用户按它算流量会差三倍。
   // issue #5：Linux 那三个 wheel 更大（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB，展开约 2.2 GB）。
   cuda: process.platform === 'win32' ? '约 1.4 GB（下载）/ 约 2 GB（装完）' : '约 2.2 GB（pip 三个 wheel，Linux 版更大）',
@@ -538,12 +860,31 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
       cleanupTimer()
       cleanupAbort()
       const ms = Date.now() - t0
-      runLogRecord(args, res.code, res.err, ms)
-      resolve({ ...res, ms })
+      // issue #12（2026-11-05）：Electron 宿主里 process.execPath 是 DSH Desktop.exe，
+      //   子进程抢单例锁后退出码 0、stdout/stderr 全空、脚本一行没执行。不在这里判失败，
+      //   runs.jsonl 就会记成 ok:true —— view/search 静默返回空还被当成成功（数据静默丢失）。
+      //   只判 stdout 会误伤 --out：那条路径 stdout 本来就空，stderr 有「✓ 已写入 <path>」，
+      //   所以要求 stdout 与 stderr 同时为空；且只在 code === 0 时收紧（信号杀死的 code 是 null，
+      //   必须保持原样交给 logRun，别把失败形状改掉）。
+      let final = res
+      if (res.code === 0 && !String(res.out || '').trim() && !String(res.err || '').trim()) {
+        final = {
+          ...res,
+          code: -4,
+          err: `子进程没有执行脚本（解释器不对？）shell=${process.execPath}`,
+        }
+      }
+      runLogRecord(args, final.code, final.err, ms)
+      resolve({ ...final, ms })
     }
     try {
       child = spawn(process.execPath, [LOOK, ...args], {
         windowsHide: true,
+        // issue #12（2026-11-05）：Electron 宿主里 process.execPath 是 DSH Desktop.exe 而不是 node。
+        //   不带这个变量，子进程去抢 Electron 单例锁 → 退出码 0、一行脚本没执行；
+        //   纯 node 宿主不认这个变量，spawnSync(execPath,['-e','console.log(1)']) 仍 rc=0。
+        //   这一处原来连 env 都没传，两处调用点必须同时带上（C142 的 P 判据盯两处）。
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
         // A-6（2026-10-28 阶段A）：POSIX 下 killTree 用 process.kill(-pid) 杀整个进程组，要求子进程自成进程组。
         //   spawn 未 detached 时 -pid 必抛 ESRCH（子进程不在独立进程组里）。win32 走 taskkill /T /F，不受影响，
         //   故只在非 win32 开 detached。本机是 Windows，这条 POSIX 分支未在本机验证。
@@ -689,7 +1030,7 @@ function credState() {
 //   必须同一口径（跳过标记与 _logs、一律 lstat），两处各写一份就是口径对不上的老病根。
 
 // #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就按 10 分钟节流了，
-//   但 cache 那块占用每次都重新 dirStat(CACHE) 全盘递归 walk（3 万文件实测中位 219 ms，
+//   但 cache 那块占用每次都重新 dirStat(CACHE) 全盘递归 walk（3 万文件中位 219 ms，
 //   首跑更慢）。面板一开着就是「每 8 秒白扫一遍」。
 //   现在 30 秒节流；清理/清除之后调 invalidateCacheStat() 立刻失效，面板看到的是清完的真实值。
 const CACHE_STAT_TTL_MS = 30 * 1000
@@ -781,7 +1122,7 @@ function writeDepsCfg(patch) {
 /**
  * 弹原生选目录框（Windows）。脚本里只用 ASCII，避免 PS 5.1 按 ANSI 解码中文变乱；
  * 选中的路径经 UTF-8 文件回传，不走 stdout——PS 5.1 的管道输出是当前代码页（中文系统为 GBK），
- * 中文路径经管道会变成问号（2026-10-24 实测：带中文的目录名过管道后，中文段全变成 ?）。
+ * 中文路径经管道会变成问号（带中文的目录名过管道后，中文段全变成 ?）。
  * 取消返回 null；非 Windows 直接报错，让面板提示手填。
  */
 function pickFolderDialog() {
@@ -902,7 +1243,7 @@ function pruneEmptyDirs(root) {
 }
 
 /**
- * 10-28 派单（20261028-1015-DB）：取消绝对路径遮罩，面板显示完整路径。
+ * 取消绝对路径遮罩，面板显示完整路径。
  * 原来按「14-8」把 /status 里的本机绝对路径遮成 `…\basename`，理由是「别把本机路径吐给面板」。
  * 现在这个理由不成立：`/api/bili-watch` 的每个请求（**含 GET /status**）在进路由分支之前
  * 都先过 `sameOriginBlocked(req)`，而它的第一条判据就是 `socket.remoteAddress` 必须是回环——
@@ -936,16 +1277,16 @@ function ytdlpVersion() {
 
 // 第十条（2026-10-29）：GPU 状态。三个问题分开答，别混成一个布尔：
 //   deviceCount——有没有 NVIDIA 卡（nvidia-smi -L 的行数）
-//   dllReady——cuBLAS 运行库能不能真加载（派单要求：不看 pip 包名，真跑一次加载）。
+//   dllReady——cuBLAS 运行库能不能真加载（不看 pip 包名，真跑一次加载）。
 //     Windows 是 ctypes.WinDLL("cublas64_12.dll")，Linux 是先 RTLD_GLOBAL 预载
 //     nvidia/*/lib 再 CDLL("libcublas.so.12") —— 两边都下沉到 _bili-asr.py --probe-gpu，
 //     这里只读退出码，不分平台写第二份判据（issue #5）。
 //   cudaLibs——venv 里有没有 nvidia 包（只作说明，不作 ok 判据）
 // 探测要跑两个子进程，/status 每 8 秒轮询一次，所以缓存 5 分钟；删完 GPU 运行库后 resetGpuCache() 立刻作废。
-// GPU 第二轮（2026-10-29）：原来 probeGpu 是同步 execFileSync，缓存失效那一次会堵住事件循环，
+// 原来 probeGpu 是同步 execFileSync，缓存失效那一次会堵住事件循环，
 //   而面板 8 秒轮询 + 用户手点刷新很容易同时来两个 /status。改成异步 + 模块级 in-flight Promise：
 //   在飞期间所有调用复用同一个 Promise，探测完清空，缓存照旧 5 分钟。
-// GPU 第三轮（2026-10-30，老大报「面板说运行库未装、手动跑同一个探测却 rc=0」）：
+// 面板说运行库未装、手动跑同一个探测却 rc=0：
 //   ① 3 秒超时 → 10 秒。探测有 5 分钟缓存，单次慢点没代价；机器忙时 3 秒偏紧，一超时就被当成「没装」。
 //   ② 原来 stdio:'ignore' 把子进程输出全丢了，失败时只剩一句笼统的「加载失败」——真因（超时被 kill /
 //      退出码 / stderr）看不到。现在统一 encoding:'utf8' 收输出，失败时把真因拼进 note。
@@ -1357,7 +1698,7 @@ async function depRows(gpuVal, opts = {}) {
     na: cudaRowNa(gpu),
     // 2026-10-31（issue #5）：文案按平台分开 —— Linux 上照 Windows 说「装上快 2-8 倍」
     //   等于给了个不存在的手工路径（README 那段只写 PowerShell 脚本）。
-    //   「2-8 倍」也改成「约 2 倍」：issue 作者同机多次实测 1.96–2.24×，
+    //   「2-8 倍」也改成「约 2 倍」：同机多次测量 1.96–2.24×，
     //   量级差一档会让复测的人直接怀疑数据。
     detail: gpu.noCard
       ? '不适用：本机无 NVIDIA 显卡，转写走 CPU'
@@ -1431,7 +1772,51 @@ function downloadConflict(target, running) {
   if (target === 'all' || set.includes('all')) {
     return `已有下载在跑（${set.includes('all') ? '一键装全部' : set[0]}），等它结束再点`
   }
-  return ''
+  // 不同的两个单项（先 ffmpeg 再 ytdlp）上面三条全不命中。
+  // 但 .download-part.json 是单文件单槽位，后写覆盖先写，任一路结束时 rmSync 整个文件，
+  // 另一路的进度会静默消失。加上两个大文件抢同一条带宽、总时长更长，不是好行为。
+  // 所以任意一项在跑就拒，不区分同项/不同项。
+  return `已有下载在跑（${set[0]}），等它结束再点（同时下两个只会互相抢带宽）`
+}
+const PART_STATE_NAME = '.download-part.json'
+/**
+ * 把 fetch-deps 写的 .download-part.json 与真实的 .part 文件
+ * 合成「这一项下载到哪了」。三条硬规矩（判据 C157–C159 逐条守）：
+ *   ① .part 真在 → 报它的**真实字节数**，不许写死 0；
+ *   ② 分母（ESTIMATES）是「约 94 MB」这种字符串估算 → 交给面板标「估算」，这里不编造百分比；
+ *   ③ .part 不在 / 没有进程在写它 → basis='unmeasurable'，面板必须显「无法测量」，不许显 0%。
+ * 为什么要 ③：pip / huggingface 那几项根本不写 .part，失败分支还会 rmSync 掉——
+ *   这两种情况下「磁盘上有个正在长大的文件」不成立，硬报 0 B 就是假进度。
+ * io 与 activeDepIds 可注入：判据拿它跑真逻辑，不真起下载。
+ */
+function downloadProgress(dir, opts = {}) {
+  const read = opts.read || ((p) => readFileSync(p, 'utf8'))
+  const stat = opts.stat || ((p) => statSync(p))
+  let st = null
+  try {
+    st = JSON.parse(read(join(dir, PART_STATE_NAME)))
+  } catch {
+    return null
+  }
+  if (!st || typeof st !== 'object' || !st.part) return null
+  const base = { dep: String(st.dep || ''), label: String(st.label || ''), part: String(st.part), since: st.at || null }
+  // 进程还活着才叫「进行中」。宿主重启后残留的状态文件如果照着报，就是一条永远不动的进度条。
+  if (opts.activeDepIds && base.dep) {
+    const active = new Set(Array.from(opts.activeDepIds))
+    if (!active.has(base.dep) && !(active.has('all') && base.dep !== 'all')) {
+      return { ...base, basis: 'unmeasurable', bytes: null, why: '没有下载进程在写这个文件（上次可能被中断）' }
+    }
+  }
+  let bytes = null
+  try {
+    bytes = stat(base.part).size
+  } catch {
+    return { ...base, basis: 'unmeasurable', bytes: null, why: '.part 文件不在了（这项不走断点续传，或已完成/失败时清掉了）' }
+  }
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return { ...base, basis: 'unmeasurable', bytes: null, why: `读到的体积不是数字（${String(bytes)}）` }
+  }
+  return { ...base, basis: 'live', bytes }
 }
 const DOWNLOAD_TARGET_DEPS = {
   ytdlp: ['ytdlp'],
@@ -1450,11 +1835,19 @@ const DOWNLOAD_TARGET_DEPS = {
  * @param {number|null} code 退出码
  * @param {string|null} signal 终止信号
  * @param {Array<{id:string, ok:boolean}>} rows depRows() 的结果；没查成就传 null
+ * @param {{emptyOutput?: boolean, shell?: string}} [ctx] 退出处理器给的现场（issue #12）
  * @returns {{ok:boolean, note:string}}
  */
-function downloadVerdict(target, code, signal, rows) {
+function downloadVerdict(target, code, signal, rows, ctx = {}) {
   if (signal) return { ok: false, note: `信号 ${signal}` }
   if ((code ?? 0) !== 0) return { ok: false, note: `退出码 ${code ?? 'null'}` }
+  // issue #12 R：退出码 0、但子进程输出一个字节都没长 —— 这不是「装到一半」也不是
+  //   「产物没就绪」，是脚本根本没被执行（Electron 宿主把 execPath 当成了 app 本体）。
+  //   结论里带上 shell=，让人第一眼看出解释器不对；不许再写死「宿主被关掉时下载进程
+  //   会被连带杀掉」（那句把 issue #10 的排查也引错方向了）。
+  if (ctx.emptyOutput) {
+    return { ok: false, note: `退出码 0，但子进程没有执行脚本（解释器不对？）shell=${ctx.shell ?? '?'}；详见 deps\\download.out.log` }
+  }
   const ids = DOWNLOAD_TARGET_DEPS[target] || []
   // 查不到就退一步说「退出码 0」，不谎称成功也不谎称失败——但要把原因写清楚
   if (!Array.isArray(rows)) return { ok: false, note: `退出码 0，但没能复查产物（depRows 失败）` }
@@ -1495,10 +1888,16 @@ function runDownload(target) {
   } catch {}
   // 2026-11-02（fetch-deps 合一）：脚本从「Windows 走 powershell -File .ps1 / 其它走 bash .sh」
   //   改成两个平台都用 node 跑同一份 .mjs。
-  //   用 process.execPath 而不是裸 'node'：宿主自己就是 node 拉起来的，这样能保证子进程用的是
-  //   同一个解释器；用户机器上 'node' 未必在 PATH 里（尤其是 DSH 打包分发的情况）。
+  //   用 process.execPath 而不是裸 'node'：保证子进程用的是同一个解释器；用户机器上
+  //   'node' 未必在 PATH 里（尤其是 DSH 打包分发的情况）。
+  //   issue #12：但「execPath 一定是 node」这个前提只在纯 node 宿主成立。Electron 宿主里
+  //   execPath 是 DSH Desktop.exe，必须靠下面 spawn 显式带 ELECTRON_RUN_AS_NODE 让它以 node 模式启动。
   const cmd = process.execPath
   const args = [script, target]
+  // 只在这一处定 runAsNode 的值：spawn 的 env 与 download.log 的解释器判定共用同一个来源，
+  //   不许两处各写一份（写两份就会出现「日志说 true、实际没传」）。
+  const runAsNode = '1'
+  const isElectron = Boolean(process.versions?.electron)
   // G-04（2026-10-29）：那条「win32 下 detached:true 会让 powershell.exe 启动后 0.5 秒内
   //   以 exit code 0 退出、脚本一行都不执行」的坑随 powershell 一起消失了，但这一行**不因合并而改**：
   //   这次只换解释器，不顺带动进程生命周期。非 win32 仍用 detached（与合并前一致）。
@@ -1515,6 +1914,10 @@ function runDownload(target) {
   //   （开始 / pid / detached / 退出码）。fetch-deps 脚本自己也会往 download.log 写关键节点和失败原因，
   //   两个文件合起来看：宿主确实拉起了进程 + 脚本到底跑到哪一步。
   const outLog = join(DEPS, 'download.out.log')
+  // issue #12：记下本次 spawn 前 outLog 的大小。outLog 是 append 模式、旧内容一直在，
+  //   所以「文件为空」不是判据，「本次一个字节都没长」才是脚本根本没跑起来的形状。
+  let outSizeBefore = 0
+  try { outSizeBefore = statSync(outLog).size } catch {}
   let outFd = null
   try { outFd = openSync(outLog, 'a') } catch {}
   let child = null
@@ -1525,7 +1928,8 @@ function runDownload(target) {
       detached,
       // G-04：显式透传环境变量——DSH 的 .env 代理机制（HTTP_PROXY/HTTPS_PROXY）靠子进程继承，
       //   不能指望 spawn 默认行为在以后被改掉。
-      env: { ...process.env },
+      //   issue #12：再加 ELECTRON_RUN_AS_NODE，Electron 宿主里的 execPath 才不会以 app 本体启动。
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: runAsNode },
     })
   } catch (e) {
     if (outFd !== null) try { closeSync(outFd) } catch {}
@@ -1535,7 +1939,10 @@ function runDownload(target) {
   try {
     appendFileSync(
       DOWNLOAD_LOG,
-      `[${new Date().toISOString()}] ${target} 进程已拉起：pid=${child.pid ?? '?'} detached=${detached} shell=${cmd}\n`,
+      // issue #12 Q：这次定位成本几乎全花在「看不出 shell= 这个值有问题」上，
+      //   所以把「解释器到底是谁」一起写进日志，三个字段缺一不可（C142 探针盯着）。
+      `[${new Date().toISOString()}] ${target} 进程已拉起：pid=${child.pid ?? '?'} detached=${detached} ` +
+        `shell=${cmd} electron=${isElectron} runAsNode=${runAsNode === '1'}\n`,
       'utf8',
     )
   } catch {}
@@ -1562,9 +1969,16 @@ function runDownload(target) {
   //   resolveFfmpeg、在 venv 里真 import 一次）。异步，所以写完日志再 closeOut。
   //   失败路径不复查（省几秒），只有退出码 0 才值得问一句「东西真装上了吗」。
   child.on('exit', (code, signal) => {
+    // issue #12：退出码 0 但 outLog 一个字节没长 → 脚本根本没跑起来。现场必须传进
+    //   downloadVerdict，否则 R 分支永远走不到（C32 盯着 verdictCtx 这条链）。
+    let emptyOutput = false
+    if (outFd !== null) {
+      try { emptyOutput = statSync(outLog).size <= outSizeBefore } catch {}
+    }
+    const verdictCtx = { emptyOutput, shell: cmd }
     const finish = (rows) => {
       try {
-        const v = downloadVerdict(target, code, signal, rows)
+        const v = downloadVerdict(target, code, signal, rows, verdictCtx)
         appendFileSync(
           DOWNLOAD_LOG,
           `[${new Date().toISOString()}] ${target} 结束，${v.note}${v.ok ? '（成功）' : '（失败）'}（详细输出见 deps\\download.out.log）\n`,
@@ -1578,7 +1992,7 @@ function runDownload(target) {
     beforeRecheck(target, { resetGpu: resetGpuCache })
     depRows()
       .then((rows) => {
-        const v = downloadVerdict(target, code, signal, rows)
+        const v = downloadVerdict(target, code, signal, rows, verdictCtx)
         if (v.ok) return finish(rows)
         // issue #10 问题 2：判失败先清掉目标 venv 的 import 探针缓存，再复查一次。
         //   探针可能在 venv 写完之前就跑过（用户日志：21:18:31 复查、python.exe mtime 21:19:50），
@@ -1688,7 +2102,7 @@ function sameOriginBlocked(req) {
   }
   const host = hostNameOf(req.headers?.host)
   // DNS rebinding：攻击者把自己的域名解析到 127.0.0.1，Origin 与 Host 就都是他自己的域名，
-  // 只比两者相等挡不住（2026-10-24 wb 第二轮实测 Host/Origin 同为 evil.example:3080 返回 200）。
+  // 只比两者相等挡不住（Host/Origin 同为 evil.example:3080 时返回 200）。
   // 所以先要求 Host 是回环，再比 Origin。
   if (!LOOPBACK.has(host)) return "非本机请求被拒绝（Host 必须是回环地址）"
   const method = String(req.method || 'GET').toUpperCase()
@@ -1697,7 +2111,7 @@ function sameOriginBlocked(req) {
   const site = req.headers?.["sec-fetch-site"]
   // 14-6：写操作必须带 Origin 且同源。不带 Origin 的（curl 直打、旧浏览器）一律拒——
   // 原本 `if (origin)` 是可选的，等于裸 POST 没有任何同源校验。
-  // 2026-10-28 issue #2 P1-1 修正：DSH 桌面端壳层的同源 fetch **不带 Origin**（实测复现：
+  // issue #2 P1-1 修正：DSH 桌面端壳层的同源 fetch **不带 Origin**（复现：
   //   无 Origin 的 POST → 403「缺少 Origin 头」，面板所有写操作全废）。改成有 Origin 才严格同源，
   //   没 Origin 时只拒 sec-fetch-site 明确写着跨站的（cross-site / same-site），
   //   其余交给下面「必须 application/json」那条兜——CSRF 的简单请求向量走不到这里。
@@ -1938,7 +2352,7 @@ function bootCache(ctx) {
     if (r.failed?.length) ctx.logger?.warn?.(`[dsh-bili-watch] 自动清理缓存有 ${r.failed.length} 个文件没删掉：${r.failed.slice(0, 3).map((f) => f.name).join('、')}${r.failed.length > 3 ? ' 等' : ''}`)
   } catch {}
 
-  // X-30 第二轮：deps 搬家排后台（3 秒后，那时插件已注册完）。本次启动仍用包内那份。
+  // deps 搬家排后台（3 秒后，那时插件已注册完）。本次启动仍用包内那份。
   scheduleDepsMigration()
 }
 
@@ -2112,7 +2526,7 @@ function registerTool(ctx) {
         const head = value?.ok === false ? '⚠ 本次调用失败（ok=false），下面是错误信息，不是视频内容。' + String.fromCharCode(10) : ''
         // N05-A4（2026-10-27 改）：full=true 是「用户明确要全文」，渲染层不许再截。
         //   原来一律砍成 2000+400，还会补一句「全文见上面提示里的路径」，可 full 分支（trimForModel 的 cap=20000）
-        //   压根不写路径——等于承诺了一条不存在的路，8000 字实测只回 2421 字。
+        //   压根不写路径——等于承诺了一条不存在的路，8000 字只回 2421 字。
         if (args?.full) return [{ type: 'text', text: head + s }]
         if (s.length <= 2500) return [{ type: 'text', text: head + s }]
         // 超长时保头也保尾：尾部通常是「全文已存 → read 这个文件」，切掉就等于没给路（T31-2）
@@ -2175,9 +2589,12 @@ function registerTool(ctx) {
 /** ⑤ 设置页端点 /api/bili-watch：读盘状态 + 清缓存（唯一写操作是删本机缓存）。返回 dispose。 */
 function registerPanelRoute(ctx) {
   // ③ 设置页：读盘状态 + 清缓存（只读优先；唯一写操作是删本机抽帧缓存目录）
+  const ROUTE = '/api/bili-watch'
+  // 多实例/重放路由守卫：同一路径只注册一次，后续实例跳过（T41-P0-1）。
+  //   2026-11-04：认领必须先于 ctx.effect，**不能**改成「先注册成功再认领」——
+  //   那样两个实例会各注册一个 handler，正好是 T41-P0-1 要防的那件事。
+  if (!claimRoute(ROUTE)) return () => {}
   try {
-    // 多实例/重放路由守卫：同一路径只注册一次，后续实例跳过（T41-P0-1）
-    if (!claimRoute('/api/bili-watch')) return () => {}
     const disposeRoute = ctx.effect(
       () =>
         ctx.webServer.register({
@@ -2204,6 +2621,11 @@ function registerPanelRoute(ctx) {
                     // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
                     //   这张表，暴露出去面板才知道该灰哪几行。只列目标名，不含 pid/路径。
                     downloading: Array.from(DOWNLOADING),
+                    // 只报「哪个 .part、现在多大、算不算数」，
+                    //   百分比由面板算 —— 分母是估算字符串，后端算不出真百分比。
+                    //   activeDepIds 传 DOWNLOADING：没有进程在写它就判「无法测量」，
+                    //   避免上次中断留下的状态变成一条永远不动的进度条。
+                    download: downloadProgress(DEPS, { activeDepIds: DOWNLOADING }),
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
@@ -2360,12 +2782,19 @@ function registerPanelRoute(ctx) {
     )
     return () => {
       try { disposeRoute?.() } catch {}
-      releaseRoute('/api/bili-watch')
+      releaseRoute(ROUTE)
     }
   } catch (e) {
+    // 唯一的释放点：effect 自己抛（cordis 的 "cannot create effect on inactive context"，
+    //   fiber 重放会撞），或 effect 体里的 register 抛 —— register 是同步调用
+    //   （cordis fiber._execute 直接 runner.execute()），两种都落到这一个 catch。
+    //   不释放 = 本进程后续每次 apply 都被 claimRoute 挡住、静默 return，并且一行日志都没有，
+    //   路由永久 404 直到进程重启 —— 2026-11-04 13:22 面板整体 404 就是这个。
+    releaseRoute(ROUTE)
     try {
       ctx.logger?.info?.(`[dsh-bili-watch] 设置页端点没挂上：${e?.message ?? e}`)
     } catch {}
+    return () => {}
   }
 }
 
@@ -2377,4 +2806,8 @@ function apply(ctx) {
   return registerPanelRoute(ctx)
 }
 
-export { apply, inject, name }
+// 0.4.7：后三个导出只服务判据（tools/fixtures/deps-rebind-probe.mjs）——
+//   rebindDeps 在生产里的唯一调用点是 scheduleDepsMigration 的成功分支；
+//   scheduleDepsMigration 导出是为了让判据能拿小目录真跑一遍迁移，而不是复刻它；
+//   depsPathSnapshot 是只读的，生产代码一处都不读。
+export { apply, depsMigrationSnapshot, depsPathSnapshot, inject, name, rebindDeps, scheduleDepsMigration }

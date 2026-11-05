@@ -75,7 +75,17 @@ export function makeChecker(results) {
       //   skip() 已经自己 push 过一笔，补进去就成了「同一条断言 SKIP + PASS 各一行」，
       //   通过数虚高 1（发布树的 C11 一直是这样：53 通过/3 跳过，真实是 52/3）。
       //   判据用「这一趟有没有新结果」，不猜名字——skip() 传的是短名，与 check 的全名对不上。
-      if (results.length === before) results.push({ name, ok: true, detail: detail ?? '' })
+      //
+      // 局部 skip 例外（C164）：只跳过某一个子项、其余子项仍跑完并返回了实质说明串，
+      // 这时主 check 必须补一条 PASS，否则硬判结果和 return 的 detail 都被吞掉，
+      // 汇总里只剩一条短名 SKIP。整体 skip 的写法统一是 return 'ok' / return（无值），
+      // 只有返回了非空、非 'ok' 的说明串才算局部 skip —— 不会碰 C114/C11/C41/C115 等。
+      const skippedHere = results.slice(before).some((r) => r.skip)
+      const partialSkip = skippedHere && typeof detail === 'string'
+        && detail.length > 0 && detail !== 'ok'
+      if (results.length === before || partialSkip) {
+        results.push({ name, ok: true, detail: detail ?? '' })
+      }
     } catch (e) {
       // 2026-11-01（P1-7）：原来是 `e?.message ?? String(e)` —— String(e) 自己会抛（见 safeMsg 注释）。
       results.push({ name, ok: false, detail: safeMsg(e) })

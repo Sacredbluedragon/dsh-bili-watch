@@ -7,6 +7,10 @@
 // 尺度（用户 2026-11-01 拍板）：只清协作方名，缺陷追踪编号（P0-1 / E4-02 / C26）留着——
 // 外人反推不出内部流程，删了以后我们自己也查不到「这条为什么这么改」。
 //
+// HARD 覆盖四类：内部协作标记 / 派单编号·内部时刻 / 内部路径 / 本机身份项。
+// 本机身份项从 scripts/_identity.mjs 动态读，与 scripts/check-public-text.mjs 共用唯一一份，
+// 不在这里再写死清单（写死 = 闸门自己撞自己的闸门，见 HARD 上方那段说明）。
+//
 // 用法：
 //   node scripts/check-release-leak.mjs            # 扫当前目录
 //   node scripts/check-release-leak.mjs --dir <路径>
@@ -14,10 +18,17 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { readIdentity, escapeRe } from './_identity.mjs';
+import { scanCollab } from './_rules.mjs';
 
 const args = process.argv.slice(2);
 const dirIdx = args.indexOf('--dir');
 const ROOT = dirIdx >= 0 && args[dirIdx + 1] ? path.resolve(args[dirIdx + 1]) : process.cwd();
+
+// 本机身份（昵称 / mid / 用户名）的唯一读取处是 scripts/_identity.mjs：
+//   --dir 指向哪棵树，就读哪棵树的 .leak-ids；环境变量与 USERNAME 三源合并。
+//   取不到时整条身份规则不启用（空正则会匹配任何文本，等于把闸门关掉），并明说没扫什么。
+const { LOCAL_USER, IDENTITY_IDS, IDENTITY_WORDS } = readIdentity(ROOT);
 
 // 只扫真正会进 npm 包的文件：以 package.json 的 files 为准，外加 npm 自动带的几个。
 const ABSENT = []; // 清单里有、盘上没有 —— 记下来，最后点名（2026-11-01 第三轮）
@@ -71,28 +82,36 @@ function listTargets() {
 const HARD = [
   ['Windows 绝对路径', /(?:^|[^A-Za-z0-9])[A-Za-z]:\\(?![\\/])/g],
   ['本机用户目录', /Users[\\/][A-Za-z0-9_.-]{2,}/g],
-  // 下面两条的字面量特意拆开拼：本文件自己也在 sync-release.ps1 的泄漏扫描范围里
-  // （它扫 $repoOnly），写成一整串会在那里报「检测器自己被检测」。
-  ['账号昵称', new RegExp(['大', '肥鱼', '|', '奇术', '湮锁'].join(''), 'g')],
-  ['账号 mid', new RegExp(['1081', '904267'].join(''), 'g')],
+  // 本机身份项（昵称 / mid / 用户名）从 _identity.mjs 动态读，两个守卫共用唯一一份。
+  // 旧版把昵称拆字拼在这里（「大」「肥鱼」…），清单本身就是一份真实身份，
+  // 而本文件在 sync-release.ps1 的 $repoOnly 里会进公开仓库 —— 等于拿清单去泄漏身份。
+  // 一个身份项都没取到时**整条不启用**：空正则会匹配任何文本，那等于把闸门关掉。
+  ...(IDENTITY_WORDS.length
+    ? [['本机身份项（昵称 / mid / 用户名）', new RegExp(IDENTITY_WORDS.map(escapeRe).join('|'), 'g')]]
+    : []),
   ['真 SESSDATA 值', /SESSDATA["']?\s*[:=]\s*["'][^"']*(?:%2C|[0-9a-f]{32})/gi],
   ['写死本机端口', /127\.0\.0\.1:3080/g],
-  ['协作方 WorkBuddy', /WB-?CN|WBcn|WorkBuddy/gi],
-  ['协作方 豆包', /豆包/g],
-  ['协作方 hy3/hy4', /\bhy[34]\b/gi],
+  // 「协作方 WorkBuddy / 豆包 / hy3-hy4」三类形态已并入 _rules.mjs 的「内部协作标记」，
+  // 不再本地重复；下面只剩「路径 / 身份 / 凭据 / 端口」四类。
+  // 「内部协作标记 / 派单编号」两类已抽到 scripts/_rules.mjs，由 scanCollab 统一跑
+  // （含 NFKC 归一化与 5 个变体缺口），这里不再存第二份平行清单。
+  // 四类之一「内部路径」：本机工作区与同机其它项目名（盘符 / 用户目录两条已在上面）。
+  ['内部工作区 / 同机项目名', /D:\\+007|Dsh工作区|DeepSeek-Harness|GPT-SoVITS|bili-duty|bili-panel|刷B站|surf CORE/g],
 ];
 
-// 明知会误报、但要留档的豁免：文件 + 行内容特征 → 理由
+// 明知会误报、但要留档的豁免：文件 + 行内容特征 + **只对哪条规则生效** → 理由。
+// rule 不能省：旧写法「命中任一 EXEMPT 就 continue 整行」会把该行所有规则一起放过，
+// 于是 GNU tar 那行塞进真 SESSDATA 也能溜过两道发布闸。
 const EXEMPT = [
-  { file: 'client.js', match: /不写死\s*127\.0\.0\.1:3080/, why: '注释说的是正确做法，不是泄露' },
-  { file: 'tools/look.mjs', match: /C:\\Windows/, why: '拦危险路径的测试用例' },
-  { file: 'tools/cli-io.mjs', match: /C:\\Windows|任一盘符根|全是 c:\\ 开头/, why: '讲路径归一化绕过的注释示例，不是本机路径' },
-  { file: 'lib/cred.mjs', match: /SESSDATA:\s*'sessdata'/, why: '字段名映射表，不是真值' },
+  { file: 'client.js', match: /不写死\s*127\.0\.0\.1:3080/, rule: '写死本机端口', why: '注释说的是正确做法，不是泄露' },
+  { file: 'tools/look.mjs', match: /C:\\Windows/, rule: 'Windows 绝对路径', why: '拦危险路径的测试用例' },
+  { file: 'tools/cli-io.mjs', match: /C:\\Windows|任一盘符根|全是 c:\\ 开头/, rule: 'Windows 绝对路径', why: '讲路径归一化绕过的注释示例，不是本机路径' },
+  { file: 'lib/cred.mjs', match: /SESSDATA:\s*'sessdata'/, rule: '真 SESSDATA 值', why: '字段名映射表，不是真值' },
   // 2026-11-02（发版前审查）：这文件里的 `C:\...` / `` `C:\` `` 是**讲 Windows tar 陷阱**的
   //   命令示例——GNU tar 会把 `-C C:\...` 里的 `C:\` 当成远程主机名。它不是本机路径，
   //   改成别的写法那句注释就失真了（失真后读者反而会去试裸 tar）。
   //   match 收窄到 `GNU tar` 这个只在讲这个坑的行上出现的词，不是整文件豁免。
-  { file: 'scripts/fetch-deps.mjs', match: /GNU tar/, why: '讲 Windows 裸 tar 把盘符当远程主机的注释示例，不是本机路径' },
+  { file: 'scripts/fetch-deps.mjs', match: /GNU tar/, rule: 'Windows 绝对路径', why: '讲 Windows 裸 tar 把盘符当远程主机的注释示例，不是本机路径' },
 ];
 
 const files = listTargets();
@@ -113,15 +132,28 @@ for (const rel of files) {
   if (buf.subarray(0, 8192).includes(0)) { skipped.push(rel); continue; }
   const src = buf.toString('utf8');
   src.split('\n').forEach((line, i) => {
+    const exemptFor = (rule) => EXEMPT.some(
+      (e) => e.file === rel && e.match.test(line) && e.rule === rule);
+    // 协作两类走唯一那份（含 NFKC 归一化），不在本地存正则。
+    for (const rule of scanCollab(line)) {
+      if (exemptFor(rule)) continue;
+      hits.push({ file: rel, line: i + 1, rule, sample: line.trim().slice(0, 140) });
+    }
     for (const [rule, re] of HARD) {
       re.lastIndex = 0;
       if (!re.test(line)) continue;
-      if (EXEMPT.some((e) => e.file === rel && e.match.test(line))) continue;
+      // 按规则豁免：只放过被点名那条规则，同一行里其它规则照常 hits.push。
+      if (exemptFor(rule)) continue;
       hits.push({ file: rel, line: i + 1, rule, sample: line.trim().slice(0, 140) });
     }
   });
 }
 
+// 身份项一个都没取到时不能静默通过 —— 与 check-public-text.mjs 同口径，明说没扫什么。
+const idNote = IDENTITY_WORDS.length
+  ? `身份项 ${IDENTITY_WORDS.length} 个（用户名${LOCAL_USER ? '已查' : '不可用'}、.leak-ids ${IDENTITY_IDS.length} 条已查）`
+  : '身份项 0 个（用户名取不到、也没有 .leak-ids → 昵称/mid 两类没扫）';
+console.log(`[info] ${idNote}；HARD 四类：内部协作标记 / 派单编号·内部时刻 / 内部路径 / 本机身份项`);
 if (skipped.length) {
   console.log(`[skip] ${skipped.length} 个二进制文件没做文本扫描：${skipped.join(', ')}`);
 }

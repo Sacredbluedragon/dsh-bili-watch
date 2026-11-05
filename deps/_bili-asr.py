@@ -34,7 +34,7 @@ class _FlushStderr:
     缓冲区一丢，用户就只看到「转写失败（exit -1073741819）：」后面一片空白。
     包一层、每次 write 后立刻 flush，进程被打死时调用方至少能拿到崩之前最后那几行。
 
-    注：实测 CPython 3.9+ 的 sys.stderr 即使重定向到管道也是**行缓冲**，print 自带换行
+    注：CPython 3.9+ 的 sys.stderr 即使重定向到管道也是**行缓冲**，print 自带换行
     本身就会落盘；这一层是为「将来换成 block-buffered 的 stdout 口径 / 被包装成别的流」
     兜底，成本是每行一次 write syscall，对本脚本几十行的量级可忽略。
     """
@@ -74,7 +74,7 @@ os.environ.setdefault("HF_HOME", os.path.join(_HERE, ".hf-home"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 # ⭐ 必须关掉 Xet：新版本 huggingface_hub 默认走 cas-server.xethub.hf.co，
-#   镜像站不代理那条重建接口，会报 CAS Client Error: 401 Unauthorized（2026-10-17 实测）。
+#   镜像站不代理那条重建接口，会报 CAS Client Error: 401 Unauthorized。
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # 避免 OpenMP 在多核上抢线程把机器拖死
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))
@@ -131,7 +131,7 @@ def _add_nvidia_dll_dirs() -> None:
 def _probe_gpu(platform_name=None) -> int:
     """--probe-gpu 的实现：0 = 运行库可用，1 = 不可用。
 
-    2026-10-31（issue #5）：原来这段内联在 main() 里、写死 WinDLL，Linux 的 ctypes 没有
+    issue #5：原来这段内联在 main() 里、写死 WinDLL，Linux 的 ctypes 没有
     WinDLL 属性 → --probe-gpu 在 Linux 上恒 exit 1（AttributeError 被 except 吞掉）。
     现在按平台分开：Windows 仍只看 DLL 能不能加载（判据不变，不动已验证的行为）；
     Linux 还要再问 ctranslate2 看得见几张卡 —— 库能载入但驱动/卡不对时它返回 0，
@@ -250,7 +250,7 @@ def main() -> int:
 
     print("[asr] 开始转写…", file=sys.stderr)
 
-    # ⭐ 先自己解码一次 + 量 VAD 语音时长，用来区分两种「空转写」（2026-10-17 实测踩到）：
+    # ⭐ 先自己解码一次 + 量 VAD 语音时长，用来区分两种「空转写」：
     #   · 纯 BGM 骑车视频，音频很响（mean -14.4 dB）但没人说话 → 语音时长≈0，空是内容结果；
     #   · 转写环境坏了（模型没加载/依赖缺/静音检测误杀）→ 明明有语音段却零字。
     # 只看「有没有音频/时长多少」判不出来，必须看 VAD 到底找到了多少「像人说话」的片段。
@@ -297,7 +297,7 @@ def main() -> int:
         return parts, segs, info
 
     # issue #3 第 4 条（2026-10-29）：模型能在 CUDA 上「加载成功」不代表能转写——
-    #   实测本机 WhisperModel(device="cuda") 初始化没报错、VAD 也跑完了，
+    #   本机 WhisperModel(device="cuda") 初始化没报错、VAD 也跑完了，
     #   真正调 cuBLAS 时才炸：Library cublas64_12.dll is not found or cannot be loaded。
     #   普通用户装了 ctranslate2 但没装 CUDA 12 运行时，就是这个下场。
     #   所以回落必须包住「转写本身」，不能只包「加载模型」。

@@ -163,7 +163,12 @@ if (section === 'B') {
   const pyProbe = sliceFn(src, 'function pyProbe(py, code, opts = {}) {')
   const mapSrc = /const DOWNLOAD_TARGET_DEPS = \{[\s\S]*?\n\}\n/.exec(src)
   if (!mapSrc) broken('找不到 DOWNLOAD_TARGET_DEPS')
-  const verdict = sliceFn(src, 'function downloadVerdict(target, code, signal, rows) {')
+  // issue #12（2026-11-05）：downloadVerdict 多了第 5 个 ctx 形参。这里不再把整条签名
+  //   抄进探针（抄死就会在下次加参数时变成「探针自身失效」的假红，C144 已经红过一次），
+  //   改成从源码取真实签名再交给 sliceFn，检查面与被检查面同源。
+  const verdictSig = /function downloadVerdict\([^)]*\)\s*\{/.exec(src)?.[0]
+  if (!verdictSig) broken('找不到 downloadVerdict 定义')
+  const verdict = sliceFn(src, verdictSig)
 
   const stub = `
     ${ttlConst}
@@ -260,7 +265,10 @@ if (section === 'C') {
   must(r1.a && r1.a.started === true, '第一次下载应放行，实际 ' + JSON.stringify(r1.a))
   must(r1.b && r1.b.started === false, '连点第二次必须被拒，实际 ' + JSON.stringify(r1.b))
   must(/正在下载中/.test(String(r1.b && r1.b.why)), '第二次拒绝理由没说「正在下载中」：' + (r1.b && r1.b.why))
-  must(r1.c && r1.c.started === true, '不同目标（ocr）不该被 asr 挡住，实际 ' + JSON.stringify(r1.c))
+  // 2026-11-04 发前审核 P1-1：口径反转。原来允许不同目标并发，但 .download-part.json
+  // 是单文件单槽位，任一路结束 rmSync 整个文件，另一路进度静默消失；两个大文件还抢带宽。
+  // 现在后端全局互斥，这里必须跟着改成「也被拒」。放行场景由 C160 的空 running 用例守（单项与 all 各一条）。
+  must(r1.c && r1.c.started === false, '不同目标（ocr）也必须被 asr 挡住（全局互斥），实际 ' + JSON.stringify(r1.c))
   must(r1.d && r1.d.started === false, 'asr 在跑时 all 必须被拒，实际 ' + JSON.stringify(r1.d))
 
   // ② 跨进程锁的判定（纯函数，注入 now / alive）

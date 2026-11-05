@@ -24,7 +24,7 @@ import vm from 'node:vm'
 import { cleanKey, bvOf } from '../lib/keys.mjs'
 // 2026-10-31：锁判据与「目录能不能认领」搬进 lib/ 之后，C6/C23 也改成 import 真跑。
 import { hasAnyLock, isAdoptableDir, lockExpired, pidAlive, readLock } from '../lib/locks.mjs'
-import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned } from '../lib/cache-own.mjs'
+import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, provableNamesIn } from '../lib/cache-own.mjs'
 // 2026-10-31：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
@@ -146,19 +146,55 @@ check('数据模式短路还在（P0：--format json 不许被提示污染）', 
 //   包装成表达式（`return ( ... )`）而不是声明：片段自带 `function NAME(...)`，
 //   前面补 `async` 是为了片段里有 `await` 时不误报（`async function` 被 indexOf 命中时
 //   只从 `function` 起切，`async` 关键字是丢掉的）。
+//
+// 2026-11-04（E05-1）：**编译自检只证明「这段能编译」，不证明「它是真函数」**。
+//   块注释 / 模板字符串里行首写一个**完整合法**的假函数，片段编译得过，下游照样绿在
+//   一个不存在的函数上（C79/C101/C113 三条一条都不会红）。所以先判命中位置在不在代码里。
+//   用逐字符状态机，不靠正则配对：先试过「抹掉注释再数反引号」，被模板里的 /* 反噬
+//   （look.mjs 34 个真函数被误判成在字符串里），所以改成扫到命中位置为止、只跟踪
+//   跨行的块注释与模板；行内单双引号与行注释就地跳过（JS 字符串不裸跨行，跨行状态只剩这两个）。
+//   边界：正则字面量里的 /* 或反引号会被当定界符；偏错只会让真函数报「找不到」，
+//   是显式红，不会把假函数放过去。
+const codeAt = (src, pos) => {
+  let inBlock = false, inTpl = false
+  for (let i = 0; i < pos;) {
+    const c = src[i], n = src[i + 1]
+    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i += 2 } else i++; continue }
+    if (inTpl) { if (c === '\\') i += 2; else { if (c === '`') inTpl = false; i++ } continue }
+    if (c === '/' && n === '*') { inBlock = true; i += 2; continue }
+    if (c === '/' && n === '/') { const e = src.indexOf('\n', i); i = e < 0 ? src.length : e; continue }
+    if (c === '`') { inTpl = true; i++; continue }
+    if (c === "'" || c === '"') {
+      const q = c
+      for (i++; i < pos && src[i] !== q; i++) if (src[i] === '\\') i++
+      i++
+      continue
+    }
+    i++
+  }
+  return !inBlock && !inTpl
+}
+
 const fnBody = (src, name) => {
   // 2026-11-01（0.4.1 第 7 条）：原来用 `src.indexOf('function ' + name + '(')`——
   //   ① 认不出 `export function name(`（lib/ 下全是这个形状，抽不到就报「找不到函数」）；
   //   ② 会命中**注释里**的同名声明（改成按行首匹配，注释行前面是 `//` 或 ` *`，匹配不上）。
   //   两条都只改「怎么找」，找到之后仍然从 `function` 起切 —— 返回值形状不变，
   //   下游 compile() 拿到的还是能直接包进 `new Function` 的片段（export 前缀必须丢掉）。
-  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?function[ \\t]+${name}[ \\t]*\\(`)
-  const m = re.exec(src)
-  must(m, `找不到 function ${name}`)
+  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?function[ \\t]+${name}[ \\t]*\\(`, 'g')
+  // 逐个命中往后找：跳过落在块注释 / 模板字符串里的假头（E05-1），只认代码里的那一个。
+  let m = null
+  for (let x; (x = re.exec(src));) {
+    if (codeAt(src, x.index + x[0].indexOf('function'))) { m = x; break }
+  }
+  must(m, `找不到 function ${name}（同名声明只出现在块注释/模板字符串里）`)
   const i = m.index + m[0].indexOf('function')
   const j = src.indexOf('\n}', i)
   must(j > i, `${name} 的函数体没有行首闭合括号`)
   const body = src.slice(i, j + 2)
+  // 起点必须正好切在函数声明上：切到注释中间、切到半个名字，都算抽错。
+  must(new RegExp(`^function[ \\t]+${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*\\(`).test(body),
+    `${name} 抽出来的第一行不是函数声明（起点切错了）：${JSON.stringify(body.slice(0, 40))}`)
   const isAsync = /async\s$/.test(src.slice(Math.max(0, i - 20), i))
   try {
     new Function(`return (${isAsync ? 'async ' : ''}${body})`)
@@ -1177,8 +1213,8 @@ const mkCacheRoot = (tag) => {
   writeFileSync(join(dir, '.bili-watch-root'), '')
   const bv = join(dir, 'BV1aaaaaaaaa')
   mkdirSync(bv, { recursive: true })
-  writeFileSync(join(bv, 'meta.json'), JSON.stringify({ files: ['1.jpg'], at: Date.now() }))
-  writeFileSync(join(bv, '1.jpg'), 'x')
+  writeFileSync(join(bv, 'meta.json'), JSON.stringify({ files: ['BV1aaaaaaaaa-01.jpg'], at: Date.now() }))
+  writeFileSync(join(bv, 'BV1aaaaaaaaa-01.jpg'), 'x')
   return dir
 }
 const runClean = (cache) => {
@@ -1220,7 +1256,7 @@ check('C22 clean 遇到残留锁照清：rc=0 且 BV 目录被移除（别把死
   try {
     const fr = join(cache, 'frames')
     mkdirSync(fr, { recursive: true })
-    writeFileSync(join(fr, 'BV1aaaaaaaaa-1.jpg'), 'x')
+    writeFileSync(join(fr, 'BV1aaaaaaaaa-01.jpg'), 'x')
     writeFileSync(join(fr, '.lock'), JSON.stringify({ pid: 999999, at: Date.now() - 7200000, ttlMs: 60000, owner: 'stale' }))
     const r = runClean(cache)
     must(r.code === 0, `残留锁下 clean 失败 rc=${r.code}：${r.out.slice(0, 160)}`)
@@ -1596,7 +1632,19 @@ check('C32 下载结束的「成功」必须由产物推导，不能只看退出
   must(/asr/.test(v5.note), '⑤ 没点名缺的是哪一项：' + v5.note)
   // ⑥ 退出处理器必须真的用了这个判据
   must(/downloadVerdict\(/.test(src.slice(src.indexOf("child.on('exit'"))), "child.on('exit') 里没调用 downloadVerdict")
-  return '产物就绪才算成功；退出码 0 但缺项会点名；查不到产物不谎称成功'
+  // ⑦ issue #12 R：退出码 0 但输出全空 —— 结论必须点解释器、带 shell=，
+  //   且不许用回那句写死的「宿主被关掉时下载进程会被连带杀掉」。
+  const v7 = downloadVerdict('ytdlp', 0, null, rows([['ytdlp', true]]), { emptyOutput: true, shell: '/stub/DSH Desktop.exe' })
+  must(!v7.ok, '⑦ 输出全空却判成功：' + v7.note)
+  must(/子进程没有执行脚本/.test(v7.note) && /解释器不对/.test(v7.note), '⑦ 没点明「解释器不对」：' + v7.note)
+  must(/shell=\/stub\/DSH Desktop\.exe/.test(v7.note), '⑦ 结论里没带 shell=：' + v7.note)
+  const verdictCode = stripComments(fnBody(src, 'downloadVerdict'))
+  must(!/宿主被关掉时下载进程会被连带杀掉/.test(verdictCode), '⑦ 又用回那句写死的失败原因')
+  // 分支写了但 exit 回调没传现场 = 分支永远走不到（假绿）
+  const exitSrc = src.slice(src.indexOf("child.on('exit'"))
+  must(/verdictCtx/.test(exitSrc) && /emptyOutput/.test(exitSrc),
+    '⑦ exit 回调没把「输出全空」传给 downloadVerdict，R 分支永远走不到')
+  return '产物就绪才算成功；退出码 0 但缺项会点名；查不到产物不谎称成功；输出全空点解释器'
 })
 
 // 2026-10-30（用户要求「全面搜一轮本机泄漏」）：把「哪些字面量不许进包」变成一条可执行的断言。
@@ -3988,13 +4036,15 @@ check('C69 两个入口的同名顶层函数只剩文案薄壳：白名单之外
 const ROUTE_PROBE = [
   "const mod = await import(process.argv[2])",
   'const regs = []',
-  'const mkCtx = () => ({',
-  '  logger: { warn() {}, info() {}, error() {} },',
+  // 2026-11-04：mkCtx 收选项 —— 原来 effect 恒为 `fn()`，永不抛错，
+  //   于是「effect 抛错后认领有没有放开」这条分支从来没被执行过（C72 把 bug 挡在门外）。
+  'const mkCtx = (o = {}) => ({',
+  '  logger: { warn() {}, info(m) { (o.logs || []).push(String(m)) }, error() {} },',
   '  commands: { register() {} },',
   '  on() {},',
   '  get() { return { register() {} } },',
-  '  effect(fn) { return fn() },',
-  '  webServer: { register(rt) { regs.push(rt); return () => {} } },',
+  '  effect(fn) { if (o.effectThrows) throw new Error("cannot create effect on inactive context"); return fn() },',
+  '  webServer: { register(rt) { if (o.registerThrows) throw new Error("route already taken"); regs.push(rt); return () => {} } },',
   '})',
   // ① 首次 apply：注册一次；② 同进程再来一次（fiber 重放）：必须被 claimRoute 挡住
   'const dispose = mod.apply(mkCtx())',
@@ -4003,8 +4053,25 @@ const ROUTE_PROBE = [
   // ③ 不 release 就重放 → 路由永久 404（这正是 T41-P0-1 要防的）；dispose 后必须能重新注册
   'let disposeErr = null',
   'try { dispose() } catch (e) { disposeErr = String(e && e.message) }',
-  'mod.apply(mkCtx())',
+  'const dispose3 = mod.apply(mkCtx())',
   'const afterDispose = regs.length',
+  'dispose3()',
+  // ④ effect 抛错（cordis INACTIVE_EFFECT，fiber 重放会撞）：认领必须当场放开，
+  //   否则本进程后续每次 apply 都被挡住、静默 return —— 2026-11-04 面板整体 404 的成因。
+  'const logs = []',
+  'mod.apply(mkCtx({ effectThrows: true, logs }))',
+  'const afterEffectThrow = regs.length',
+  'const logsAfterThrow = logs.filter((m) => /设置页端点没挂上/.test(m))',
+  'const dispose4 = mod.apply(mkCtx())',
+  'const afterEffectThrowRetry = regs.length',
+  'dispose4()',
+  // ⑤ register 自己抛（路径被占）：claim 在 register 之前，同样必须放开。
+  'const beforeRegThrow = regs.length',
+  'mod.apply(mkCtx({ registerThrows: true }))',
+  'const afterRegThrow = regs.length',
+  'const dispose5 = mod.apply(mkCtx())',
+  'const afterRegThrowRetry = regs.length',
+  'dispose5()',
   'const route = regs[0]',
   "if (!route) { console.log('NO_ROUTE'); process.exit(3) }",
   // 假 res：把 sendJson 真正写下去的东西记下来（writeHead 的 code/headers + end 的 body）
@@ -4034,7 +4101,7 @@ const ROUTE_PROBE = [
   'const afterBlocked = { bvStill: fs.existsSync(path.join(root, \'BV1aaaaaaaaa\')), userStill: fs.existsSync(userFile) }',
   'const clear = await call(mkReq(\'POST\', \'/api/bili-watch/cache/clear\', { headers: { host: \'127.0.0.1:1\', \'content-type\': \'application/json\' } }))',
   'const afterClear = { bvGone: !fs.existsSync(path.join(root, "BV1aaaaaaaaa")), userKept: fs.existsSync(userFile) }',
-  'console.log("ROUTE_JSON=" + JSON.stringify({ afterTwice, afterDispose, disposeErr, status, notFound, boom, clear, clearBlocked, afterBlocked, afterClear }))',
+  'console.log("ROUTE_JSON=" + JSON.stringify({ afterTwice, afterDispose, disposeErr, afterEffectThrow, logsAfterThrow, afterEffectThrowRetry, beforeRegThrow, afterRegThrow, afterRegThrowRetry, status, notFound, boom, clear, clearBlocked, afterBlocked, afterClear }))',
   'process.exit(0)',
 ].join('\n')
 
@@ -4113,8 +4180,251 @@ check('C72 claimRoute 真跑：同路径重复 apply 只注册一次，dispose �
   return `apply×2 → 1 个注册；dispose 后再 apply → ${d.afterDispose} 个（release 生效）`
 })
 
-// apply(ctx) 已从 429 行拆成 5 个子系统 + 8 行调度。这条断言盯两件事：
-//   ① apply 本身不许再长回去（上限 120 是定下的）；
+// 2026-11-04：认领泄漏（P0，那天面板整体 404 的成因）。
+//   上面 C72 的三步只走「一切顺利」的路径——它的假 ctx 里 effect 恒为 fn()，永不抛错，
+//   于是「effect 抛错时认领有没有放开」从来没被执行过。这两条补的就是那条分支。
+//   判据口径：抛错之后**换一个完全正常的 ctx 再 apply**，必须能注册出来 —— 黑盒看注册数，
+//   不看 return 值，也不看日志（日志只是第二个证据，见下面那条）。
+check('C154 effect 抛错后认领必须当场放开：同进程换正常 ctx 再 apply 必须注册成功（2026-11-04 P0）', () => {
+  const d = routeProbe()
+  // ④ effect 抛错那次不该注册出任何东西（不能「抛一半还挂上了」）
+  must(d.afterEffectThrow === d.afterDispose, `effect 抛错那次居然注册了（${d.afterDispose} → ${d.afterEffectThrow}）`)
+  // 关键断言：认领没放开的话这里恒等于 d.afterDispose，路由永久 404 直到进程重启
+  must(
+    d.afterEffectThrowRetry === d.afterDispose + 1,
+    `effect 抛错后换正常 ctx 再 apply 没注册（${d.afterDispose} → ${d.afterEffectThrowRetry}）——claimRoute 的认领泄漏了，本进程后续每次 apply 都被挡住、静默 return，路由永久 404`,
+  )
+  // 顺带守「不许静默」：抛错那条路径必须留下一条点名「设置页端点没挂上」的日志。
+  //   为什么单列：认领泄漏之所以难查，一半原因就是它连日志都不打（实测第二次 apply 的 logger 调用是空数组）。
+  must(
+    d.logsAfterThrow.length >= 1,
+    `effect 抛错时没有任何「设置页端点没挂上」日志——用户只能看到 404，不知道发生了什么（实际日志：${JSON.stringify(d.logsAfterThrow)}）`,
+  )
+  return `effect 抛错 → 不注册、有日志、认领已放开（再 apply 得 ${d.afterEffectThrowRetry} 个）`
+})
+
+check('C155 register 抛错后认领同样要放开：否则这条路径再也注册不上（2026-11-04 P0）', () => {
+  const d = routeProbe()
+  must(d.afterRegThrow === d.beforeRegThrow, `register 抛错那次居然注册成功了（${d.beforeRegThrow} → ${d.afterRegThrow}）——桩没打坏`)
+  must(
+    d.afterRegThrowRetry === d.afterRegThrow + 1,
+    `register 抛错后认领没放开（${d.afterRegThrow} → ${d.afterRegThrowRetry}）——claim 在 register 之前，抛了不 release 就永久占用`,
+  )
+  return `register 抛错 → 认领放开，再 apply 得 ${d.afterRegThrowRetry} 个`
+})
+
+// 2026-11-04（DSH 派单 B）：刷新按钮从「最近一次调用」挪进「运行依赖」。
+//   为什么不能只 grep 字数：挪回去也还是「一处」，字数守恒抓不到位置错。
+//   两半都要：① 位置用源码顺序钉（在「运行依赖」这个 sechead 里、在「最近一次调用」之前）；
+//            ② 行为真跑 —— 把 client.js 里的 load 原样抠出来，桩掉 jget，看它到底请求哪个 URL。
+//   load 是 async，check() 是同步的（await 进去会记成 PASS），所以只取「同步调用 jget 那一步」
+//   的结果：`const j = await jget(...)` 里 jget 是在 await 之前同步调用的，URL 当场就能抓到。
+check('C156 手点刷新：按钮只在「运行依赖」里一处，且真发 /status?fresh=1（2026-11-04 派单 B）', () => {
+  const src = read('client.js')
+
+  // ① 位置：`'刷新'` 全文件只许一处，且夹在「运行依赖」sechead 内、「最近一次调用」之前
+  const labels = src.split("'刷新'").length - 1
+  must(labels === 1, `client.js 里 '刷新' 出现 ${labels} 处（应恰好 1 处）——多出来的那个按钮会让人不知道点哪个`)
+  const iBtn = src.indexOf("'刷新'")
+  const iDeps = src.indexOf("'运行依赖'")
+  const iLast = src.indexOf("'最近一次调用'")
+  must(iDeps > 0 && iLast > 0, '找不到「运行依赖」或「最近一次调用」这两个区块标题')
+  must(
+    iBtn > iDeps && iBtn < iLast,
+    `刷新按钮不在「运行依赖」区块里（运行依赖 L${src.slice(0, iDeps).split('\n').length} / 刷新 L${src.slice(0, iBtn).split('\n').length} / 最近一次调用 L${src.slice(0, iLast).split('\n').length}）——它刷的是整页状态，摆在调用记录旁边会被读成「刷新那条记录」`,
+  )
+  // 按钮到自己那段 sechead 收尾之间不许跨过别的区块：取「运行依赖」到「deps.map」之间这一段查
+  const iHeadEnd = src.indexOf('.map((d) => h(DepRow', iDeps)
+  must(iHeadEnd > 0, '找不到运行依赖区块的 deps.map —— 结构变了，这条判据要跟着改')
+  must(iBtn < iHeadEnd, '刷新按钮不在「运行依赖」的 sechead 里（跑到依赖行后面去了）')
+
+  // ② 反馈：点击必须置灰 + 换文案，否则用户分不清「没生效」和「没反应」
+  const seg = src.slice(iBtn - 700, iBtn + 30)
+  must(/disabled:\s*refreshing/.test(seg), '刷新按钮没有 disabled: refreshing——点了没有任何反馈')
+  must(/刷新中/.test(seg), '刷新按钮没有「刷新中…」文案——点了没有任何反馈')
+  must(/try\s*\{\s*await load\(true\)\s*\}\s*finally\s*\{\s*setRefreshing\(false\)\s*\}/.test(seg), '刷新按钮的点击处理没有「await load(true) + finally 复位」——按钮可能一直卡在「刷新中…」')
+
+  // ③ 行为：把 load 原样抠出来真跑，看它请求哪个 URL
+  const iLoad = src.indexOf('const load = React.useCallback(async (fresh) => {')
+  must(iLoad > 0, '找不到 load 的 useCallback 定义（抽取点要跟着改）')
+  const iArrow = src.indexOf('async (fresh) => {', iLoad)
+  const iEnd = src.indexOf('\n      }, [])', iArrow)
+  must(iArrow > iLoad && iEnd > iArrow, 'load 的函数体切不出来（闭合标记变了）')
+  const arrow = src.slice(iArrow, iEnd + 8).replace(/\n      \}, \[\]\)$/, '')
+  const urls = []
+  const noop = () => {}
+  let load
+  try {
+    load = new Function(
+      'jget', 'setSt', 'setErr', 'setTuneMeta', 'setDays', 'setMaxMb', 'setAsrMin', 'setAsrDev',
+      'setFrames', 'setAsrTmo', 'setFfTmo', 'setCmdTmo', 'setAdvVals', 'dirtyRef', 'ADV_TUNING',
+      `return (${arrow})`,
+    )(
+      (u) => { urls.push(u); return Promise.resolve({ ok: false, why: 'stub' }) },
+      noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop,
+      { current: false }, [],
+    )
+  } catch (e) {
+    must(false, `load 抽出来不是合法函数（抽取点命中了注释或结构变了）：${e.message}`)
+  }
+  const p1 = load(true)
+  const p2 = load(false)
+  p1.catch(noop)
+  p2.catch(noop)
+  must(urls.length === 2, `桩到的请求只有 ${urls.length} 次（应 2 次）——load 里 jget 的调用形状变了`)
+  must(urls[0] === '/status?fresh=1', `手点刷新请求的是 ${JSON.stringify(urls[0])}——不带 fresh=1 就吃 5 分钟前的 GPU 缓存与 30 秒的 import 缓存，用户刚装完东西点刷新看到的还是旧结论`)
+  must(urls[1] === '/status', `8 秒轮询请求的是 ${JSON.stringify(urls[1])}——轮询不许带 fresh=1，否则每 8 秒起两个 python 子进程`)
+  return `按钮 1 处且在运行依赖 sechead 内；load(true)→${urls[0]}，load()→${urls[1]}`
+})
+
+// 2026-11-04（DSH 派单 C）：下载进度。三条硬判据缺一条就会退化成假进度——
+//   不报错、数字看着正常、实际是错的（与 0.4.5 的 model ok=True 假绿、-DryRun 会真删同族）。
+//   C157 管后端事实（.part 真实字节数 / 没有 .part 时不许报 0），C158 管面板三种说法。
+check('C157 下载进度取真实字节数：.part 在就报实际大小，不在/没进程写就判「无法测量」（派单 C-1）', () => {
+  const { downloadProgress: dp } = compile(read('index.js'), ['downloadProgress'], {
+    params: ['readFileSync', 'statSync', 'join', 'PART_STATE_NAME'],
+    args: [readFileSync, statSync, join, '.download-part.json'],
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'bw-part-'))
+  try {
+    const part = join(dir, 'ffmpeg.exe.part')
+    must(dp(dir, { activeDepIds: ['ffmpeg'] }) === null, '没有状态文件时应回 null（面板不该显示进度行）')
+    writeFileSync(part, Buffer.alloc(1536 * 1024, 7))
+    writeFileSync(
+      join(dir, '.download-part.json'),
+      JSON.stringify({ dep: 'ffmpeg', part, label: 'ffmpeg.zip', at: Date.now() }),
+      'utf8',
+    )
+    // ① .part 真在：报的必须是**实际字节数**，不能是写死的 0（0 会让面板显示「0 B / 94 MB」）
+    const live = dp(dir, { activeDepIds: ['ffmpeg'] })
+    must(live && live.basis === 'live', `有 .part 却没判成 live：${JSON.stringify(live)}`)
+    must(live.bytes === 1536 * 1024, `.part 实际 1572864 B，报的是 ${live.bytes}——不是读文件大小算出来的`)
+    must(live.dep === 'ffmpeg' && live.label === 'ffmpeg.zip', `dep/label 没带出来：${JSON.stringify(live)}`)
+
+    // ③ .part 不在（pip 那几项、或失败分支 rmSync 之后）：必须「不可测量」，不许回 0
+    rmSync(part)
+    const gone = dp(dir, { activeDepIds: ['ffmpeg'] })
+    must(gone && gone.basis === 'unmeasurable', `.part 不在了却仍判成 ${gone?.basis}——面板会显示 0 B`)
+    must(gone.bytes === null, `.part 不在了还给出 ${gone.bytes} 字节——这是编的`)
+    must(/part/.test(String(gone.why || '')), `「不可测量」没说明原因（why=${JSON.stringify(gone.why)}）`)
+
+    // ③' 状态文件还在但没有进程在写它（上次中断留下的）：同样不可测量，否则就是一条永远不动的进度条
+    writeFileSync(part, Buffer.alloc(1024, 1))
+    const stale = dp(dir, { activeDepIds: [] })
+    must(stale && stale.basis === 'unmeasurable' && stale.bytes === null, `没有下载进程在跑却报了 ${JSON.stringify(stale)}`)
+    must(/中断/.test(String(stale.why || '')), `过期状态的说明没点出「中断」（why=${JSON.stringify(stale.why)}）`)
+
+    // 挂到 /status 上：字段名必须是 download，面板靠它认这一项
+    const data = routeProbe().status.json?.data ?? {}
+    must(Object.prototype.hasOwnProperty.call(data, 'download'), `/status 没有 download 字段（现有：${Object.keys(data).join(',')}）——面板拿不到进度`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  return '有 .part → 1572864 B（实测）；没了 → unmeasurable/null；没进程写 → unmeasurable'
+})
+
+check('C158 进度文案三态：分母只能标「估算」、没数据必须说「无法测量」，一律不许出现 0%（派单 C-2/3）', () => {
+  const src = read('client.js')
+  // 抽原样的 fmtBytes + progressText 真跑（不重写一份，重写就等于测了个平行实现）
+  const iPT = src.indexOf('const progressText = (dl, estimate) => {')
+  const iEnd = src.indexOf('\n    }\n    const fmtTime', iPT)
+  must(iPT > 0 && iEnd > iPT, 'progressText 切不出来（抽取点或后面的 fmtTime 变了）')
+  // fmtBytes 是 const 箭头函数（fnBody 只认 function 声明），单独按同一套起止标记切
+  const iFmt = src.indexOf('const fmtBytes = (b) => {')
+  const iFmtEnd = src.indexOf('\n    }\n', iFmt)
+  must(iFmt > 0 && iFmtEnd > iFmt, 'fmtBytes 切不出来（抽取点变了）')
+  const fmtSrc = src.slice(iFmt, iFmtEnd + 6)
+  const pt = new Function(`${fmtSrc}\n${src.slice(iPT, iEnd + 7)}\nreturn progressText`)()
+  const est = '约 94 MB'
+  // ① 有 .part + 有估算分母：报真实体积，但分母必须标「估算」，不许给百分比
+  const a = pt({ basis: 'live', bytes: 1536 * 1024, label: 'ffmpeg.zip' }, est)
+  must(/已下载/.test(a) && /1\.5 MB/.test(a), `没报出真实体积：${JSON.stringify(a)}`)
+  must(/估算/.test(a), `分母是 ESTIMATES 的字符串估算值，文案里却没标「估算」：${JSON.stringify(a)}`)
+  must(!/%/.test(a), `文案里出现了百分比：${JSON.stringify(a)}——分母是「约 94 MB」这种字符串，百分比是编的`)
+  // ② 有 .part 但没有估算值：只能说总量未知
+  const b = pt({ basis: 'live', bytes: 2048, label: '' }, undefined)
+  must(/总量未知/.test(b), `没有估算值时该说「总量未知」，实际 ${JSON.stringify(b)}`)
+  must(!/%/.test(b), `没有分母却给了百分比：${JSON.stringify(b)}`)
+  // ③ 没有 .part：必须说「无法测量」，绝不许退化成 0
+  const c = pt({ basis: 'unmeasurable', bytes: null, label: 'x', why: '.part 文件不在了' }, est)
+  must(/无法测量/.test(c), `不可测量时文案不是「无法测量」：${JSON.stringify(c)}`)
+  must(!/0\s*(%|B)/.test(c), `不可测量却写成了 0：${JSON.stringify(c)}——这正是「数字看着正常、实际是错的」`)
+  return `三态：${a} ｜ ${b} ｜ ${c}`
+})
+
+// 派单 C 的接线部分：函数对了但没接上，面板还是看不到进度（这是「判据在验错对象」的常见形态）。
+check('C159 进度接线：/status 把 DOWNLOADING 当活性判据，脚本两个出口都清状态（派单 C）', () => {
+  const idx = read('index.js')
+  must(
+    /download:\s*downloadProgress\(DEPS,\s*\{\s*activeDepIds:\s*DOWNLOADING\s*\}\)/.test(idx),
+    '/status 没把 DOWNLOADING 传给 downloadProgress——上次中断留下的状态会被当成「正在下载」，面板显示一条永远不动的进度',
+  )
+  const fd = read('scripts/fetch-deps.mjs')
+  // curl 之前就要写：写晚了 8 秒一轮的第一轮看不到这一项
+  const iWrite = fd.indexOf('writePartState({ dep: depId')
+  const iCurl = fd.indexOf('const curl = curlBin()', iWrite > 0 ? iWrite - 800 : 0)
+  must(iWrite > 0, 'fetch-deps 没有写 .download-part.json —— 面板永远拿不到进度')
+  must(iCurl > iWrite, 'writePartState 写在 curl 之后了（应在发起下载之前）')
+  // 发前审核 P1-2：原来只数「全文出现几次」。把完成分支那次注释掉、失败分支补一行，
+  // 数量仍是 2，照样绿。改成**按位置**分段：download() 里失败分支的 throw 是天然分界，
+  // 失败出口必须落在 throw 之前、成功出口必须落在 throw 之后，两段各恰好一次。
+  // 用 codeLines 去掉注释行，否则「// writePartState(null)」也会被数进去（R13 同族假绿）。
+  const fnMap = topFunctions(fd)
+  const dlBody = fnMap.get('download')
+  must(dlBody, '切不出 download() 函数体，两个出口的位置无从判起')
+  if (dlBody) {
+    const lines = codeLines(dlBody)
+    const throwLines = lines.filter((l) => l.startsWith('throw new Error('))
+    must(throwLines.length === 1, `download() 内 throw new Error( 有 ${throwLines.length} 处，应恰好 1 处 —— 分界不唯一时 findIndex 会选错分支，按位置分段就成了摆设`)
+    const iThrow = lines.findIndex((l) => l.startsWith('throw new Error('))
+    must(iThrow > 0, 'download() 里找不到失败分支的 throw —— 无法按位置分出成功/失败两段')
+    if (iThrow > 0) {
+      const failSeg = lines.slice(0, iThrow + 1).join('\n')
+      const okSeg = lines.slice(iThrow + 1).join('\n')
+      const nFail = (failSeg.match(/writePartState\(null\)/g) || []).length
+      const nOk = (okSeg.match(/writePartState\(null\)/g) || []).length
+      must(nFail === 1, `失败路径（throw 之前）的 writePartState(null) 有 ${nFail} 次，应恰好 1 次`)
+      must(nOk === 1, `成功路径（throw 之后）的 writePartState(null) 有 ${nOk} 次，应恰好 1 次 —— 只数全文总数会把「两次都在失败分支」也判绿`)
+    }
+  }
+  return `接线齐：status 传 DOWNLOADING；脚本先写后下；失败/成功两个出口按位置各清一次`
+})
+
+// C160：发前审核 P1-1。.download-part.json 是单文件单槽位，任一路结束都会 rmSync 整个
+// 文件；两个不同单项并发时后写覆盖先写、先结束那路的进度静默消失。所以后端全局互斥，
+// 面板也必须同时置灰所有下载入口（否则「点了没反应」）。五条判据都真跑原样函数。
+check('C160 下载全局互斥：不同单项并发被拒，面板所有下载入口同时禁用（发前审核 P1-1）', () => {
+  const { downloadConflict } = compile(read('index.js'), ['downloadConflict'])
+  const cases = [
+    { t: 'ytdlp', r: ['ffmpeg'], want: 'reject', why: '不同单项并发会共写单槽位状态文件' },
+    { t: 'ytdlp', r: ['ytdlp'], want: 'reject', why: '同项连点原有行为不许退化' },
+    { t: 'ytdlp', r: [], want: 'allow', why: '没有下载在跑时必须放行，别把门关死' },
+    { t: 'all', r: [], want: 'allow', why: '没有下载在跑时 all 也必须放行，别把「一键装全部」永久关死' },
+    { t: 'all', r: ['ffmpeg'], want: 'reject', why: 'all 与单项互斥不许退化' },
+  ]
+  for (const c of cases) {
+    const got = downloadConflict(c.t, c.r)
+    must(
+      c.want === 'allow' ? got === '' : typeof got === 'string' && got.length > 0,
+      `downloadConflict('${c.t}', [${c.r.join(',')}]) = ${JSON.stringify(got)}；${c.why}`,
+    )
+  }
+  const { anyDownloading, rowBusy } = compile(read('client.js'), ['anyDownloading', 'rowBusy'])
+  must(anyDownloading(['ffmpeg']) === true, 'anyDownloading 没把「有下载在跑」判 true')
+  must(anyDownloading([]) === false, 'anyDownloading 把「没有下载在跑」也判 true，会把按钮永久置灰')
+  must(
+    rowBusy('ytdlp', '', ['ffmpeg']) === false,
+    'rowBusy 不该因别的行在跑就把这一行当成「正在下」（否则文案误显示下载中…）',
+  )
+  const cl = read('client.js')
+  must(/const dlLocked = anyDownloading\(st && st\.downloading\)/.test(cl), 'dlLocked 没接到 st.downloading')
+  must(/locked:\s*dlLocked/.test(cl), 'DepRow 没接到 dlLocked，面板仍只置灰正在下的那一行')
+  must(/disabled:\s*busy\s*\|\|\s*locked/.test(cl), 'DepRow 的下载按钮没用 busy || locked')
+  must(/disabled:\s*dlg === 'download' && dlLocked/.test(cl), '对话框「开始下载」没置灰')
+  return '五条真跑断言 + anyDownloading/rowBusy 真跑 + 面板四处接线逐条钉住'
+})
+
+// apply(ctx) 已从 429 行拆成 5 个子系统 + 8 行调度。这条断言盯两件事：//   ① apply 本身不许再长回去（上限 120 是定下的）；
 //   ② 五个子系统必须还在、必须有实质内容，且 apply 真的调它们——
 //      否则「拆」可以靠「把内容删掉」通过，那不是拆。
 check('C73 apply(ctx) 只剩调度：五个子系统各在其位，加起来的量级没缩水（429 → 8 行）', () => {
@@ -5162,10 +5472,10 @@ check('C96 白名单目录不按名字整棵删：里面出现用户的文件就
     mkdirSync(root, { recursive: true })
     mkdirSync(join(root, 'frames'), { recursive: true }) // 空目录：该认领（清 mkdir 空壳）
     mkdirSync(join(root, 'asr'), { recursive: true }) // 只有我们的产物
-    writeFileSync(join(root, 'asr', 'BV1aa4111111.json'), '{}')
+    writeFileSync(join(root, 'asr', 'BV1aa4111111-p1-123-model-abcdef12.txt'), '{}')
     writeFileSync(join(root, 'asr', '.lock'), '')
     mkdirSync(join(root, 'sheets'), { recursive: true })
-    writeFileSync(join(root, 'sheets', 'a.png'), 'x')
+    writeFileSync(join(root, 'sheets', 'BV1aa4111111-p1-3x3.jpg'), 'x')
     mkdirSync(join(root, 'frames', 'BV1aa4111111-p1-shots'), { recursive: true }) // 我们的子目录形状
     mkdirSync(join(root, '_hot'), { recursive: true }) // 用户自己的东西
     writeFileSync(join(root, '_hot', '工程文件.psd'), 'user')
@@ -5966,7 +6276,7 @@ check('C112 removeOwned 对白名单目录也要看内容：混了用户文件�
       '整目录跳过了却没进 skipped —— 用户既不知道自己的东西还在，也不知道为什么没清')
   } finally { rmSync(r1, { recursive: true, force: true }) }
   // ② 全是我们的 jpg：必须照常清掉（别把修复做成「白名单目录永远不删」）
-  const r2 = mk(['f001.jpg', 'f002.jpg'])
+  const r2 = mk(['BV1xx411c7mD-01.jpg', 'BV1xx411c7mD-02.jpg'])
   try {
     const b = removeOwned(r2)
     must(!existsSync(join(r2, 'frames')), '纯产物的 frames/ 没被清掉 —— 修过头了，clean 会永远清不动')
@@ -7000,7 +7310,26 @@ check('C142 runDownload 函数体能求值并真的拉起进程（引用未声�
   const detail = `${(r.stdout || '') + (r.stderr || '')}`.trim().slice(0, 300)
   must(r.status !== 2, `探针自身失效（rc=2，说明切不出函数体，不是被测代码的问题）：${detail}`)
   must(r.status === 0, `runDownload 跑不通：${detail}`)
-  return '函数体求值通过，started=true，spawn 收到 detached=false'
+  // issue #12 P：两处 spawn 调用点都必须显式带 ELECTRON_RUN_AS_NODE（删一处必须红）。
+  //   只查「名字出现过」会被注释骗过，所以定位到 env: {...} 这个对象里再找变量。
+  const idx = read('index.js')
+  const bodies = {}
+  for (const fn of ['runLook', 'runDownload']) {
+    const body = stripComments(fnBody(idx, fn))
+    bodies[fn] = body
+    must(/env:\s*\{[^}]*ELECTRON_RUN_AS_NODE/.test(body),
+      `issue #12 P：${fn} 的 spawn 选项里没有 env.ELECTRON_RUN_AS_NODE（Electron 宿主里 process.execPath 不是 node）`)
+  }
+  // issue #12 S：runLook 必须把「退出码 0 但 stdout/stderr 双空」判成失败 —— 否则
+  //   runs.jsonl 会记成 ok:true（假成功、数据静默丢失）。判据盯 if 条件本身，
+  //   改成 `if (false && ...)` 必须红；还要求两路都判：--out 成功时 stdout 本来就空、
+  //   stderr 有「✓ 已写入」，只判 stdout 会把正常用法误伤成失败。
+  //   诚实边界：这是静态形状判据，不是 Electron 端到端真跑（本机纯 node 跑不到那条分支）。
+  must(/if\(res\.code===0&&!String\(res\.out/.test(bodies.runLook)
+    && /&&!String\(res\.err/.test(bodies.runLook)
+    && /code:-4/.test(bodies.runLook),
+    'issue #12 S：runLook 没有「退出码 0 且 stdout/stderr 双空 → 判失败」，runs.jsonl 会记成假成功')
+  return '函数体求值通过，started=true，spawn 收到 detached=false；两处 env 带 ELECTRON_RUN_AS_NODE，日志带解释器三字段，双空不记假成功'
 })
 
 // ── C143–C146：issue #10 / discussion #9 的四条（2026-11-03）──────────────────
@@ -7077,6 +7406,416 @@ check('C150 清探针缓存按解释器精确匹配；下载互斥两个方向�
 check('C151 issue #10 的三条建议逐条对上：不适用判定、无法确认时不报加载失败、下载中面板禁用', () => {
   reviewProbe('I')
   return '没卡→不适用（有卡时不许）；有库但没 smi、验不出加载→不适用且不写「加载失败」；宿主说在下的行按钮禁用'
+})
+
+// ── C152–C153：0.4.7「迁完当场生效」（2026-11-04）────────────────────────────
+// 为什么必须是子进程：这条测的是**模块加载时机** —— 真 import index.js，才能观察到
+//   「四个派生常量出生在旧目录上」。同一进程里先 import 过别的就污染了缓存，顺序也复现不了。
+// C152 的四步与红法见 fixture 头注释；四个扰动的实测结果在交付报告里。
+const rebindProbe = () => {
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures/deps-rebind-probe.mjs')], {
+    encoding: 'utf8', timeout: 60000, env: { ...process.env },
+  })
+  const detail = `${(r.stdout || '') + (r.stderr || '')}`.trim().slice(0, 400)
+  must(r.status !== 2, `探针自身失效（rc=2）：${detail}`)
+  must(r.status === 0, `热重绑判据红：${detail}`)
+  return '加载时七个名字在旧目录、迁移后逐个 `===` 新目录、真实 I/O 也落到新目录'
+}
+
+check('C152 迁移完成当场重绑：DEPS 与四个派生常量 + legacyCred 全跟到新目录，真实 I/O 也跟（0.4.7）', () => rebindProbe())
+
+// C153 守的是「以后」。C152 只证明**现在**这六个重绑对了；下一个人加一条
+//   `const XXX = join(DEPS, ...)` 在模块顶层，C152 照样绿，直到用户那边出问题。
+//   所以这条不验行为，验形态：模块级不许再出现直接派生自 DEPS 的 const。
+check('C153 模块级不再有直接派生自 DEPS 的 const，且 rebindDeps 里逐条重算（0.4.7）', () => {
+  const src = readFileSync(join(ROOT, 'index.js'), 'utf8')
+  const offenders = []
+  src.split('\n').forEach((l, i) => {
+    if (/^const\s+[A-Za-z_$][\w$]*\s*=\s*(DEPS\b|join\(DEPS\b|[^/\n]*\bjoin\(DEPS\b)/.test(l)) {
+      offenders.push(`L${i + 1}: ${l.trim().slice(0, 70)}`)
+    }
+  })
+  must(offenders.length === 0, `模块级还有直接派生自 DEPS 的 const（迁移后它不会跟着变）：\n    ${offenders.join('\n    ')}`)
+  const start = src.indexOf('function rebindDeps(dir) {')
+  must(start > 0, '找不到 function rebindDeps(dir) —— 接缝没了，C152 之外没有第二处可核')
+  const body = src.slice(start, src.indexOf('\n}', start))
+  const nDerived = (body.match(/=\s*join\(dir,\s*/g) || []).length
+  must(nDerived >= 4, `rebindDeps 只重算了 ${nDerived} 个派生路径，应 ≥4（LAST_RUN / CACHE_CFG / UI_CFG / DOWNLOAD_LOG）`)
+  must(/credPaths\(dir\)/.test(body), 'rebindDeps 没重算 credPaths —— legacyCred 会留在旧目录')
+  return `模块级 0 条直连 DEPS；rebindDeps 重算 ${nDerived} 条 + credPaths`
+})
+
+// ── C161：fnBody 的判据自检（E05-1，2026-11-04）──────────────────────────
+// E05 报出：编译自检只能证明「这段能编译」，挡不住块注释 / 模板字符串里行首的
+//   **完整合法假函数**——那种片段编译得过，下游拿到的是假函数，C79/C101/C113
+//   三条一条都不会红。判据的判据失真，等于所有用 fnBody 抽函数体的 check 一起失真。
+// 这条只验一件事，两个方向都真跑：假函数必须取不到，真函数必须取得到。
+check('C161 fnBody 不吃块注释/模板字符串里的假函数，真函数照常取到（E05-1）', () => {
+  const src = [
+    '/*',
+    'function ghost(x) {',
+    '  return x + 1',
+    '}',
+    '*/',
+    'const t = `',
+    'function ghost2() {',
+    '  return 1',
+    '}',
+    '`',
+    'function real(x) {',
+    '  return x * 2',
+    '}',
+  ].join('\n')
+  const grab = (n) => {
+    try { return { body: fnBody(src, n) } } catch (e) { return { err: String(e.message || e) } }
+  }
+  const g1 = grab('ghost')
+  must(g1.err && /找不到 function ghost/.test(g1.err),
+    `块注释里的假函数被取到了（判据会绿在一个不存在的函数上）：${JSON.stringify(g1)}`)
+  const g2 = grab('ghost2')
+  must(g2.err && /找不到 function ghost2/.test(g2.err),
+    `模板字符串里的假函数被取到了：${JSON.stringify(g2)}`)
+  const r = grab('real')
+  must(r.body, `真函数反而取不到：${JSON.stringify(r)}`)
+  must(/return x \* 2/.test(r.body), `真函数取到的不是真内容：${JSON.stringify(r.body.slice(0, 60))}`)
+  must(/^function real\(x\) \{/.test(r.body), `返回值不是从函数声明起切：${JSON.stringify(r.body.slice(0, 30))}`)
+  return '块注释假函数 / 模板字符串假函数都取不到；真函数照常取到'
+})
+
+// ── C162–C163：删除面与迁移面的归属判据（2026-11-05，0.4.7 待修项）────────────
+// 为什么必须是子进程：这两条要在临时目录里造一整棵伪缓存根 / 伪 deps，造完真删真读回。
+//   verify.mjs 的 check() 回调必须同步（C77），而且它们要独占地 import index.js（迁移那条
+//   依赖「模块加载那一刻 DEPS 在哪」）。详见两个 fixture 的头注释。
+//
+// 夹具的形态先说清，否则这条本身就是纸老虎：每个 fixture 输出两组字段——
+//   defect     ＝当前代码的缺陷，**修好之前必须每一条都是 false**（真删了用户文件）；
+//                修好之后会转 true，那时本 check 应当被改成断言 true。
+//   capability ＝修的时候最容易顺手弄坏的反向能力，**必须每一条都是 true**。
+//                只做「一律不删」能让 defect 全绿，但 capability 会红——两组同时成立才算修对。
+const runFixture = (file, timeout) => {
+  const r = spawnSync(process.execPath, [join(ROOT, 'tools/fixtures', file)], {
+    encoding: 'utf8', timeout, env: { ...process.env },
+  })
+  const raw = `${(r.stdout || '')}${(r.stderr || '')}`.trim()
+  let json = null
+  try { json = JSON.parse(raw) } catch {}
+  return { status: r.status, raw, json }
+}
+
+/**
+ * 2026-11-05（DSH 1848 §三）同源断言的「检查面」：从 tools/look.mjs 的
+ * printText( 真调用点抽 kind，不许在 verify 里手抄第二份清单。
+ *
+ *   ・字面量实参直接取；没给第 4 个实参的，取函数签名里的默认值（不硬编码 'text'）；
+ *   ・动态实参（变量）不放行，回溯同文件 `const <name> = ...` 声明里的字面量值域；
+ *     穷举不出来就计 parseFail，让断言红 —— 宁可红也不猜。
+ *   ・只在实参括号内做引号感知 + 括号平衡，**不做全文件词法屏蔽**：
+ *     look.mjs 里有含引号的正则字面量，全文件状态机会被带偏（实测把 17 个
+ *     调用点扫成 4 个）。注释整行与函数定义行按行首排除。
+ */
+function printTextKinds(src) {
+  const lines = src.split('\n')
+  const kinds = new Set()
+  const dynamic = []
+  let calls = 0, parseFail = 0
+  const sig = /function\s+printText\s*\([^)]*kind\s*=\s*'([^']+)'/.exec(src)
+  const splitArgs = (open) => {
+    const args = []
+    let depth = 0, start = open + 1, q = '', lineComment = false
+    for (let k = open; k < src.length; k++) {
+      const c = src[k], n = src[k + 1]
+      if (lineComment) { if (c === '\n') lineComment = false; continue }
+      if (q) { if (c === '\\') { k++; continue } if (c === q) q = ''; continue }
+      if (c === '/' && n === '/') { lineComment = true; k++; continue }
+      if (c === '/' && n === '*') { const e = src.indexOf('*/', k + 2); k = e < 0 ? src.length : e + 1; continue }
+      if (c === "'" || c === '"' || c === '`') { q = c; continue }
+      if (c === '(' || c === '[' || c === '{') { depth++; continue }
+      if (c === ')' || c === ']' || c === '}') {
+        depth--
+        if (depth === 0) { args.push(src.slice(start, k)); return args }
+        continue
+      }
+      if (c === ',' && depth === 1) { args.push(src.slice(start, k)); start = k + 1 }
+    }
+    return null
+  }
+  let base = 0
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]
+    const t = line.trim()
+    const skipLine = t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
+    let from = 0, p
+    while ((p = line.indexOf('printText', from)) >= 0) {
+      from = p + 9
+      if (skipLine) continue
+      const rest = line.slice(p + 9)
+      if (!/^\s*\(/.test(rest)) continue
+      const before = line.slice(0, p)
+      if (/[\w$]$/.test(before) || /function\s+$/.test(before)) continue
+      calls++
+      const args = splitArgs(base + p + 9 + rest.indexOf('('))
+      if (!args) { parseFail++; continue }
+      const kth = (args[3] || '').trim()
+      const lit = /^'([^']*)'$/.exec(kth) || /^"([^"]*)"$/.exec(kth)
+      if (lit) { kinds.add(lit[1]); continue }
+      if (kth === '') { if (sig) kinds.add(sig[1]); continue }
+      const esc = kth.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const decl = new RegExp(`\\bconst\\s+${esc}\\s*=\\s*([^\\n]+)`).exec(src)
+      const vals = decl ? [...decl[1].matchAll(/'([^']+)'/g)].map((m) => m[1]) : []
+      if (!vals.length) { parseFail++; continue }
+      for (const v of vals) kinds.add(v)
+      dynamic.push({ name: kth, values: vals })
+    }
+    base += line.length + 1
+  }
+  return { kinds: [...kinds], calls, parseFail, dynamic, defaultKind: sig ? sig[1] : null }
+}
+
+check('C162 删除面包容：用户自己的图必须活下来（E02 P0 合并项）', () => {
+  const { status, raw, json } = runFixture('deps-delete-probe.mjs', 60000)
+  must(status !== 2, `探针自身失效（rc=2）：${raw.slice(0, 300)}`)
+  const defect = json?.defect
+  const capability = json?.capability
+  must(defect && Object.keys(defect).length > 0, `探针没输出 defect 组：${raw.slice(0, 300)}`)
+  must(capability && Object.keys(capability).length > 0, `探针没输出 capability 组：${raw.slice(0, 300)}`)
+  const bad = Object.entries(defect || {}).filter(([, v]) => v === false).map(([k]) => k)
+  must(bad.length === 0,
+    `删除面仍在删用户文件（${bad.join(' / ')}）——整棵删之前必须先确认里面每一项都是本工具写的，不许按扩展名/名字猜归属`)
+  const capBad = Object.entries(capability || {}).filter(([, v]) => v !== true).map(([k]) => k)
+  must(capBad.length === 0, `修得过头了，反向能力丢了（${capBad.join(' / ')}）——我们自己的产物还得清得掉`)
+
+  // 2026-11-05（DSH 1848 §三）同源断言：PROVEN_NAME_RE 里的 kind 清单不许有第二份。
+  //   检查面 = 从 tools/look.mjs 的 printText( 真调用点抽出来的 kind；
+  //   被检查面 = provableNamesIn() 真跑删除面判据（末尾落到 PROVEN_NAME_RE.test）。
+  //   新加 kind 忘了往正则登记 → <kind>.txt 认领不了 → 这里红，不需人手同步清单。
+  //   两条 must 都并进 C162，不新增 C 编号（1848 §五 要求 verify 仍是 176/0/3）。
+  const pk = printTextKinds(read('tools/look.mjs'))
+  // 抽取器健康下限（不是 kind 清单）：2026-11-05 实测 17 个调用点 / 10 个 kind，
+  //   留余量取 10 / 8；抽空了却报「0 个不匹配」是最容易混过去的假绿。
+  must(pk.calls >= 10 && pk.kinds.length >= 8 && pk.parseFail === 0,
+    `printText kind 抽取器失效：calls=${pk.calls} kinds=${pk.kinds.length} parseFail=${pk.parseFail}`)
+  const kindDir = mkdtempSync(join(tmpdir(), 'bw-kind-'))
+  try {
+    const wanted = []
+    for (const k of pk.kinds) {
+      for (const name of [`${k}.txt`, `${k}.wrapped.txt`]) {
+        writeFileSync(join(kindDir, name), 'x', 'utf8')
+        wanted.push(name)
+      }
+    }
+    const provable = provableNamesIn(kindDir)
+    const missed = wanted.filter((n) => !provable.has(n))
+    must(missed.length === 0,
+      `printText 落盘的 kind 没登记进 PROVEN_NAME_RE：${missed.join(' / ')} —— 以后新加 kind 忘了登记就红`)
+  } finally {
+    try { rmSync(kindDir, { recursive: true, force: true }) } catch {}
+  }
+  return `用户 frames/1.jpg 与 BV 目录里的用户文件都保住；纯我们的目录照旧清得掉；printText ${pk.kinds.length} 个 kind 与删除面判据同源`
+})
+
+check('C163 迁移面不丢文件：包外刚下好的 venv 不能被搬没，锁在位时不许搬（issue #11）', () => {
+  const { status, raw, json } = runFixture('deps-migrate-probe.mjs', 90000)
+  must(status !== 2, `探针自身失效（rc=2）：${raw.slice(0, 300)}`)
+  const defect = json?.defect
+  const capability = json?.capability
+  must(defect && Object.keys(defect).length > 0, `探针没输出 defect 组：${raw.slice(0, 300)}`)
+  must(capability && Object.keys(capability).length > 0, `探针没输出 capability 组：${raw.slice(0, 300)}`)
+  const bad = Object.entries(defect || {}).filter(([, v]) => v === false).map(([k]) => k)
+  must(bad.length === 0,
+    `迁移仍在丢文件/绕开锁（${bad.join(' / ')}）——包外已有的要先合并进来再覆盖，且迁移前必须抢 .fetch-deps.lock`)
+  const capBad = Object.entries(capability || {}).filter(([, v]) => v !== true).map(([k]) => k)
+  must(capBad.length === 0, `修得过头了（${capBad.join(' / ')}）——包内文件该搬的还得搬，迁完还得重绑`)
+  return '包外独有的 venv 保住、锁在位不搬、同名包内优先、迁完仍重绑'
+})
+
+
+// C164（2026-11-05）：身份读取器只在仓库、不进 npm 包；两个守卫必须共用唯一一份。
+//
+//   背景：d41fc5b 曾把 scripts/_identity.mjs 加进 package.json.files，只为了让
+//   发布树里的两个守卫能 import 到它。结果是 npm 用户拿到一份包内没人用的身份读取器 ——
+//   正是这轮在拆的「第二份清单」形态。正解是让它进 sync-release.ps1 的 $repoOnly
+//   （只进仓库、不进包），发布树 clone 下来的人照样能跑守卫。
+//
+//   四条判据，全部文件实读，不靠字符串猜：
+//   ① _identity.mjs 不在 package.json 的 files 里（核心；只读 package.json，任何环境都能跑，不许 skip）
+//   ② _identity.mjs 在 sync-release.ps1 的 $repoOnly 里（权威定义现读，别另抄一份；C114 同口径）
+//   ③ 两个守卫都 import './_identity.mjs' 且不含内联身份清单
+//   ④ 两个守卫所有相对 import 的模块都「不在 files、在 $repoOnly」——清单从守卫源码动态取，
+//      不手抄模块名；新增一个被守卫 import 的模块却忘了挂 $repoOnly，这条自己会红。
+//   发布树上 sync-release.ps1 不存在时，②④ 的 repoOnly 面走 skip，①③ 与 files 面照常硬判
+//   （不 return 'ok' 提前退出）。
+check('C164 身份读取器只在仓库不进包，两个守卫共用唯一一份', () => {
+  const IDENTITY_REL = 'scripts/_identity.mjs'
+  const GUARDS = ['scripts/check-public-text.mjs', 'scripts/check-release-leak.mjs']
+
+  // package.json.files 的「会不会被打进包」只写一份：① 与 ④ 共用，别让两个口径各判一半。
+  // files 里的目录项（尾斜杠）覆盖整棵子树；精确文件项只覆盖自己。
+  const pkg = JSON.parse(read('package.json'))
+  const files = Array.isArray(pkg.files) ? pkg.files : []
+  must(files.length > 0, 'C164 ①：package.json 的 files 为空/不是数组 —— 这条判据没东西可判')
+  const normRel = (x) => String(x).replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, '')
+  const inFiles = (rel) => files.some((f) => {
+    const n = normRel(f)
+    return n === rel || (String(f).replace(/\\/g, '/').endsWith('/') && rel.startsWith(n + '/'))
+  })
+
+  // ① 只读 package.json，任何环境都能跑，不许 skip
+  must(!inFiles(IDENTITY_REL),
+    `C164 ①：${IDENTITY_REL} 又进了 package.json.files —— npm 用户会拿到包内没人用的身份读取器；它该只进 $repoOnly`)
+
+  // ③ 两个守卫都 import 唯一那份，且不含内联身份清单
+  for (const rel of GUARDS) {
+    const src = read(rel)
+    must(/from\s+['"]\.\/_identity\.mjs['"]/.test(src),
+      `C164 ③：${rel} 没有 import './_identity.mjs' —— 身份读取会出现第二份清单`)
+    // 历史形态：把昵称 / mid 拆成单字数组，再 join('') 拼回完整值。
+    // 盯「拆字数组后接空串 join」这个形态而不是某个完整词：换一批字也照样红。
+    must(!/\]\s*\.join\(\s*['"]{2}\s*\)/.test(src),
+      `C164 ③：${rel} 里还有「拆字数组 + join('')」的内联身份字面量 —— 清单本身就是泄漏源`)
+    // 旧版 check-public-text.mjs 那几个本地 const（LOCAL_USER / IDENTITY_IDS / ...）。
+    // 解构写法 `const { ... } = readIdentity()` 不算本地定义，不会被这条误伤。
+    must(!/\bconst\s+(?:LOCAL_USER|IDENTITY_IDS|IDENTITY_WORDS|okId|escapeRe)\s*=/.test(src),
+      `C164 ③：${rel} 里还有本地身份清单定义 —— 必须走 _identity.mjs 的 readIdentity()`)
+  }
+
+  // ②④ 共用一份 $repoOnly 解析（C114 的解析口径，别另抄一份）；发布树没有该脚本时为 null。
+  const sp = join(ROOT, 'scripts/sync-release.ps1')
+  let repoOnly = null
+  let note2
+  if (!existsSync(sp)) {
+    skip('C164 ② $repoOnly 含身份读取器',
+      '发布树不含 scripts/sync-release.ps1（只在开发态）；① ③ 已照常硬判')
+    note2 = '② 跳过（发布树，① ③ 硬判）'
+  } else {
+    const syncSrc = readFileSync(sp, 'utf8')
+    const m = syncSrc.match(/\$repoOnly\s*=\s*@\(([^)]*)\)/)
+    must(m, 'C164 ②：sync-release.ps1 里找不到 $repoOnly 定义 —— 权威清单解析口径可能变了')
+    repoOnly = m[1].split(',').map((x) => x.trim().replace(/^"|"$/g, '')).filter(Boolean)
+    must(repoOnly.length >= 6,
+      `C164 ②：$repoOnly 只解析出 ${repoOnly.length} 项（应 ≥6）——解析口径可能变了`)
+    must(repoOnly.includes(IDENTITY_REL),
+      `C164 ②：$repoOnly 里没有 ${IDENTITY_REL} —— 发布树 clone 下来的人跑守卫会 ERR_MODULE_NOT_FOUND`)
+    note2 = `② $repoOnly ${repoOnly.length} 项已查`
+  }
+
+  // ④ 检查面 = 守卫源码里真实的相对 import（含 ../），不手抄模块名清单 ——
+  //    手抄的清单第二次加模块就会漏，那就又变成「检查面自己维护一份与被检查面同步的清单」。
+  //    每个目标按「守卫所在目录」解析成仓库根相对路径，再逐个判 files / repoOnly 两面。
+  const imports = new Map()
+  for (const rel of GUARDS) {
+    const src = read(rel)
+    const re = /\bfrom\s+['"](\.\.?\/[^'"]+)['"]/g
+    let mm
+    while ((mm = re.exec(src)) !== null) {
+      const modRel = join(dirname(rel), mm[1]).replace(/\\/g, '/')
+      if (!imports.has(modRel)) imports.set(modRel, new Set())
+      imports.get(modRel).add(rel)
+    }
+  }
+  const mods = [...imports.keys()].sort()
+  // 形状断言而非模块名清单：解析口径失效（0 项 / 只剩 1 项）时必须红，不能静默空检查面。
+  must(mods.length >= 2,
+    `C164 ④：两个守卫只解析出 ${mods.length} 个相对 import 模块 —— 解析口径可能变了，检查面不能是空的`)
+  let note4
+  for (const modRel of mods) {
+    const owners = [...imports.get(modRel)].join(' / ')
+    must(!inFiles(modRel),
+      `C164 ④：${modRel} 进了 package.json.files —— 它是 ${owners} 的内部依赖，npm 用户不该拿到；该只进 $repoOnly`)
+    must(existsSync(join(ROOT, modRel)),
+      `C164 ④：${modRel} 被 ${owners} import，但盘上没有这个文件 —— 守卫根本起不来`)
+  }
+  if (repoOnly === null) {
+    skip('C164 ④ $repoOnly 覆盖守卫的相对 import',
+      '发布树不含 scripts/sync-release.ps1（只在开发态）；files 面已硬判')
+    note4 = `④ ${mods.length} 个相对 import 模块的 files 面已硬判；repoOnly 面跳过（发布树）`
+  } else {
+    for (const modRel of mods) {
+      must(repoOnly.includes(modRel),
+        `C164 ④：${modRel} 不在 sync-release.ps1 的 $repoOnly 里 —— ${[...imports.get(modRel)].join(' / ')} 会 import 它，发布树 clone 下来跑守卫必 ERR_MODULE_NOT_FOUND`)
+    }
+    note4 = `④ ${mods.length} 个相对 import 模块（${mods.join('、')}）均不在 files、均在 $repoOnly`
+  }
+  return `① files ${files.length} 项不含身份读取器；③ 两个守卫共用唯一一份；${note2}；${note4}`
+})
+
+// C165（2026-11-06）：协作类规则只有一份；8 个变体两个守卫都必须拦住。
+//
+//   背景：R6 外审发现 check-public-text.mjs 与 check-release-leak.mjs 各存一份几乎
+//   逐字相同的协作正则，补一个变体要改两处，漏改一处就变「一个守卫拦、另一个放」。
+//   正解是抽 scripts/_rules.mjs，一处改两处生效（与 _identity.mjs 同一件事）。
+//   判据① 盯「两守卫共用唯一一份」，判据② 逐个真跑 8 个变体——不读源码猜正则。
+check('C165 协作规则只有一份，8 个变体两个守卫都必须拦住', () => {
+  const GUARDS_LOCAL = ['scripts/check-public-text.mjs', 'scripts/check-release-leak.mjs']
+  const localDef = /(?:const|let|var)\s+COLLAB|name:\s*['"]内部协作标记|\[\s*['"]内部协作标记['"]\s*,/
+  for (const rel of GUARDS_LOCAL) {
+    const src = read(rel)
+    must(/from\s+['"]\.\/_rules\.mjs['"]/.test(src),
+      `C165 ①：${rel} 没有 import './_rules.mjs' —— 协作规则会出现第二份清单`)
+    must(/scanCollab\s*\(/.test(src),
+      `C165 ①：${rel} 只是 import 了 _rules.mjs 却没调用 scanCollab() —— 等于摆着不用`)
+    must(!localDef.test(src),
+      `C165 ①：${rel} 里还有本地协作规则定义 —— 必须走 _rules.mjs 的唯一一份`)
+  }
+  const rulesSrc = read('scripts/_rules.mjs')
+  must(/export\s+const\s+COLLAB_RULES/.test(rulesSrc),
+    'C165 ①：_rules.mjs 里没有导出 COLLAB_RULES —— 唯一那份规则表不在了')
+  must(/export\s+function\s+scanCollab/.test(rulesSrc),
+    'C165 ①：_rules.mjs 里没有导出 scanCollab() —— 两个守卫无从共用')
+
+  // ② 8 个变体逐个真跑两个守卫。临时假仓库用纯 ASCII 路径，不碰生产文件。
+  const VARIANTS = ['WB-CN', 'wbcn', 'ＷＢＣＮ', 'Work Buddy', 'Hy-4',
+    '20261105-2308-dsh', 'DSH　2308', '派 单']
+  const tmp = mkdtempSync(join(tmpdir(), 'c165-'))
+  try {
+    writeFileSync(join(tmp, 'package.json'),
+      JSON.stringify({ name: 'x', version: '0.0.1', files: ['README.md', 'probe.txt'] }))
+    writeFileSync(join(tmp, 'README.md'), '# x\n')
+    for (const v of VARIANTS) {
+      writeFileSync(join(tmp, 'probe.txt'), v + '\n')
+      for (const [label, script, args] of [
+        ['check-public-text', 'scripts/check-public-text.mjs', ['--repo', tmp]],
+        ['check-release-leak', 'scripts/check-release-leak.mjs', ['--dir', tmp]],
+      ]) {
+        const r = spawnSync(process.execPath, [join(ROOT, script), ...args],
+          { encoding: 'utf8', timeout: 60000, cwd: ROOT })
+        const out = `${r.stdout || ''}${r.stderr || ''}`
+        must(!/ERR_MODULE_NOT_FOUND|Cannot find module|ReferenceError|SyntaxError|TypeError/.test(out),
+          `C165 ②：${label} 自己起不来，这次红不算有效验证：${out.slice(0, 250)}`)
+        must(r.status !== 0,
+          `C165 ②：变体 ${JSON.stringify(v)} 没被 ${label} 拦住（rc=${r.status}）`)
+      }
+    }
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+  return `① 两守卫共用 _rules.mjs 且无本地表；② ${VARIANTS.length} 个变体 × 2 守卫全部拦住（真跑）`
+})
+
+// C166（2026-11-06）：EXEMPT 必须「按规则豁免」，不能整行放过。
+//
+//   背景：旧写法 `if (EXEMPT.some(...)) continue` 落在「每条 HARD 规则」的循环里、
+//   与规则无关，一行只要含 GNU tar 就把该行所有命中一起放过。R6 的 V9c 实证：
+//   GNU tar 行 + 真 SESSDATA 可让 release.ps1 的 4b / 4b-2 两道闸同时 rc=0。
+check('C166 EXEMPT 按规则豁免：GNU tar 行里的真 SESSDATA 仍必须命中', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'c166-'))
+  try {
+    mkdirSync(join(tmp, 'scripts'))
+    writeFileSync(join(tmp, 'package.json'),
+      JSON.stringify({ name: 'x', version: '0.0.1', files: ['README.md', 'scripts/fetch-deps.mjs'] }))
+    writeFileSync(join(tmp, 'README.md'), '# x\n')
+    // 同一行里既有 GNU tar（EXEMPT 特征词），又有真 SESSDATA 值。
+    writeFileSync(join(tmp, 'scripts', 'fetch-deps.mjs'),
+      "// GNU tar 讲 Windows 盘符陷阱；SESSDATA: 'abc%2Cdef123' 也是真值\n")
+    const r = spawnSync(process.execPath,
+      [join(ROOT, 'scripts/check-release-leak.mjs'), '--dir', tmp],
+      { encoding: 'utf8', timeout: 60000, cwd: ROOT })
+    const out = `${r.stdout || ''}${r.stderr || ''}`
+    must(!/ERR_MODULE_NOT_FOUND|Cannot find module|ReferenceError|SyntaxError|TypeError/.test(out),
+      `C166：守卫自己起不来，这次红不算有效验证：${out.slice(0, 250)}`)
+    must(r.status !== 0,
+      'C166：GNU tar 行里塞真 SESSDATA 竟然放行 —— EXEMPT 又退回整行豁免了')
+    must(/真 SESSDATA 值/.test(out),
+      `C166：rc≠0 但不是被「真 SESSDATA 值」这条规则抓住：${out.slice(0, 300)}`)
+    return 'V9c 重放：GNU tar 行 + 真 SESSDATA → rc≠0 且点名「真 SESSDATA 值」'
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
