@@ -68,7 +68,8 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 import { createInterface } from 'node:readline'
-import { resolveDepsDir, depsLockFile } from '../lib/plugin-paths.mjs'
+import { resolveDepsDir, depsLockFile, DEPS_LOCK_STALE_MS } from '../lib/plugin-paths.mjs'
+import { inspectModelHomes } from '../lib/model-integrity.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const IS_WIN = process.platform === 'win32'
@@ -159,7 +160,7 @@ const LOCK_FILE = depsLockFile()
 //   （模型 1 GB 起，慢线路 + 镜像限速很常见）会被判成「残留锁」，后来者直接删锁接管，
 //   两个进程同时动 venv，正好是 issue #10 要修的那件事。现在 pid 活着就是 held，
 //   时间只兜「pid 被复用」这一个极端：6 小时够任何一次 all 跑完。
-const LOCK_STALE_MS = 6 * 60 * 60 * 1000
+const LOCK_STALE_MS = DEPS_LOCK_STALE_MS // 单点在 lib/plugin-paths.mjs（C48-P2-1），别再写第二份字面量
 /**
  * 纯函数：现有锁算不算「有人正在跑」。抽出来是为了能真跑断言（C145），不靠读源码猜。
  * 判定顺序：没有 pid -> free；pid 活着 -> held（超过 6 小时才翻成 stale，兜 pid 复用）；
@@ -201,14 +202,23 @@ function releaseLock() {
     if (cur && cur.pid === process.pid) rmSync(LOCK_FILE, { force: true })
   } catch {}
 }
+/**
+ * 三行拒绝原因只留一份：held（启动时就看见别人的锁）与 EEXIST（并发抢锁输了）共用。
+ * cur 可能是 null —— 锁文件在但内容读不出来（写了一半 / 损坏）时，pid 显示 ? 而不是
+ * undefined，免得「比不报更误导」。
+ */
+function printLockBusy(cur) {
+  const since = cur?.startedAt ? new Date(cur.startedAt).toLocaleString() : '未知时间'
+  const pid = Number.isFinite(cur?.pid) ? cur.pid : '?'
+  console.error(`✗ 已经有一个安装进程在跑（pid=${pid}，目标 ${cur?.target || '?'}，开始于 ${since}）`)
+  console.error('  等它结束再重试。确认它已经不在了的话，删掉这个文件后重来：')
+  console.error(`  ${LOCK_FILE}`)
+}
 function acquireLock() {
   const cur = readLock()
   const st = lockState(cur)
   if (st === 'held') {
-    const since = cur.startedAt ? new Date(cur.startedAt).toLocaleString() : '未知时间'
-    console.error(`✗ 已经有一个安装进程在跑（pid=${cur.pid}，目标 ${cur.target || '?'}，开始于 ${since}）`)
-    console.error('  等它结束再重试。确认它已经不在了的话，删掉这个文件后重来：')
-    console.error(`  ${LOCK_FILE}`)
+    printLockBusy(cur)
     process.exit(3)
   }
   if (st === 'stale') {
@@ -218,8 +228,17 @@ function acquireLock() {
     console.log('    清掉了上次残留的锁')
   }
   try {
-    writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: Date.now(), target: TARGET }), 'utf8')
-  } catch {}
+    // wx = 原子独占创建。原来无条件覆盖写：两个进程同时读到「没锁」或都判 stale 时，
+    // 两边都删、两边都写，后写的赢，前一个还以为自己拿到了锁。
+    writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: Date.now(), target: TARGET }), { encoding: 'utf8', flag: 'wx' })
+  } catch (e) {
+    if (e?.code === 'EEXIST') {
+      // 重读再报：刚才 readLock 看到的那份可能已经过期或是空的，直接用旧变量会报 pid=undefined。
+      printLockBusy(readLock())
+      process.exit(3)
+    }
+    throw e
+  }
   process.on('exit', releaseLock)
 }
 // dry-run 不抢锁：它不写盘，也不该被别人的下载挡住（否则「只想看一眼」就跑不了）
@@ -831,7 +850,7 @@ function moveSemiVenv(venv) {
     }
     if (freed > 0) console.log(`    已清掉上一次的半成品目录，回收 ${mb(freed)}`)
   } catch {}
-  const dst = `${leaf}.old-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)}`
+  const dst = `${leaf}.old-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
   try {
     renameSync(venv, join(parent, dst))
     console.log(`    半成品 venv 已改名为 ${dst}（确认无用后可手动删）`)
@@ -1143,6 +1162,21 @@ function ensureModel() {
   const hfHome = join(DEPS, '.hf-home')
   if (existsSync(join(hfHome, 'hub')) && !FORCE) return skip(IS_WIN ? 'deps\\.hf-home' : 'deps/.hf-home')
   if (!DRY && !existsSync(asrPy)) throw new Error('模型要用 ASR 环境里的 huggingface_hub。先跑 asr。')
+  // --force 时若留着体积不足的 model.bin，snapshot_download 见到已有文件可能直接跳过，
+  // 于是「强制重下」什么也没修。先删掉那一份快照目录；下载逻辑本身不动。
+  // 只删体积不足这一种：缺别的文件由 snapshot_download 自己补齐，不需要整目录删掉。
+  // 干跑只打印、不删（干跑的承诺是「什么都没改」）。
+  if (FORCE) {
+    const left = inspectModelHomes([hfHome])
+    if (left.tooSmall === true && left.snapshotDir) {
+      if (DRY) {
+        console.log(`    [dry-run] 会先删掉半截快照 ${left.snapshotDir}，再重新下载`)
+      } else {
+        rmSync(left.snapshotDir, { recursive: true, force: true })
+        log(`清掉半截快照 ${left.snapshotDir}（${left.reason}）`)
+      }
+    }
+  }
   step('faster-whisper-small 模型（约 464 MB）')
   if (DRY) {
     console.log(`    [dry-run] HF_HOME="${hfHome}" HF_ENDPOINT=${HF_ENDPOINT} HF_HUB_DISABLE_XET=1 "${asrPy}" -c "snapshot_download('Systran/faster-whisper-small')"`)

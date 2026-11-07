@@ -49,8 +49,14 @@ if (!conflictBody.includes('function downloadConflict')) { console.error('PROBE-
 // 桩只做一件事：让函数一路走到 spawn。existsSync 恒 true（跳过「脚本缺失」早退），
 // target 传 'asr'（在 allowed 白名单里，跳过「不支持」早退）。
 const stub = `
-  const DOWNLOADING = new Set()
+  // 0.4.8 C4a：活性表改成 Map<target,{at,pid}>，桩必须跟着换，否则 runDownload 里的 .set() 会崩。
+  const DOWNLOADING = new Map()
   ${conflictBody}
+  // 跨进程锁同步预检：探针只验「函数体能求值并拉起进程」，这里给一个「没人占锁」的替身。
+  const DEPS_LOCK_FILE = '/stub/.fetch-deps.lock'
+  const downloadLockBusy = () => null
+  const lockBusyText = () => ''
+  const readFileSync = () => ({ subarray: () => ({ toString: () => '' }) })
   const SCRIPTS = '/stub/scripts'
   const DEPS = '/stub/deps'
   const DOWNLOAD_LOG = '/stub/download.log'
@@ -80,7 +86,7 @@ const stub = `
   })()
 `
 
-const ctx = { process, console, Date, String, Array, Object, JSON, setTimeout, clearTimeout, globalThis: null }
+const ctx = { process, console, Date, String, Number, Array, Object, JSON, Map, Buffer, setTimeout, clearTimeout, globalThis: null }
 ctx.globalThis = ctx
 try {
   vm.runInNewContext(stub, ctx, { timeout: 5000 })

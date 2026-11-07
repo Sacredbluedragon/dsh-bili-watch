@@ -370,14 +370,28 @@ check('W-14 writeMeta 抢不到锁就不读改写（P1：并发下 meta.files �
   return `lock@${iLock} < guard@${iGuard} < read@${iRead}`
 })
 
-check('W-04 autoCleanCache 有锁就不清（P1：正在转写时清缓存会让转写白跑且无提示）', () => {
+check('W-04 autoCleanCache 有锁/读不出来就不清（P1：正在转写时清缓存会让转写白跑且无提示）', () => {
   const body = fnBody(read('index.js'), 'autoCleanCache')
-  const iGuard = body.indexOf('hasAnyLock')
+  // 0.4.8 C1：布尔 hasAnyLock 升级成三态 lockState（free / locked / unknown）。旧断言钉死
+  //   `hasAnyLock` 这个字面量，实现一升级就假红（守的是旧实现，不是行为）。改成钉三件事：
+  //   ① 三态守卫挡在 walkEntries 之前；② locked 与 unknown 两个非 free 分支都早退且 removed:0；
+  //   ③ still 给面板 locked:true。行为正确性由 C21 与新增 C174 真跑负责，本条只守结构位置。
+  //   不是放宽：旧版只查一处布尔，新版要求两个分支都在，少一个就红。
+  const g = body.match(/const\s+(\w+)\s*=\s*lockState\(/)
+  must(g, 'autoCleanCache 里没有 lockState 三态守卫')
+  const V = g[1]
+  const iGuard = g.index
   const iWalk = body.indexOf('walkEntries')
-  must(iGuard >= 0, 'autoCleanCache 里没有 hasAnyLock 判据')
-  must(iWalk > iGuard, 'hasAnyLock 出现在 walkEntries 之后——判据必须挡在遍历/删除之前')
-  must(/locked:\s*true/.test(body.slice(iGuard, iGuard + 240)), '有锁时没返回 locked:true（面板分不清「跳过」与「没东西可清」）')
-  return `lock@${iGuard} < walk@${iWalk}`
+  must(iWalk > iGuard, 'lockState 出现在 walkEntries 之后——判据必须挡在遍历/删除之前')
+  for (const s of ['locked', 'unknown']) {
+    const m = new RegExp(`${V}\\.state === '${s}'`).exec(body)
+    must(m && m.index > iGuard, `${s} 分支不在三态守卫之后`)
+    const seg = body.slice(m.index, m.index + 340)
+    must(/return\s*\{/.test(seg) && /skipped:\s*true/.test(seg) && /removed:\s*0/.test(seg),
+      `${s} 分支没有「跳过且不删」的早退——把读不出来当成可以清会误删`)
+  }
+  must(/locked:\s*true/.test(body), '有锁时没返回 locked:true（面板分不清「跳过」与「没东西可清」）')
+  return `lockState(${V})@${iGuard} < walk@${iWalk}；locked/unknown 均早退不清`
 })
 
 check('W-07 所有命令的 --out 都过黑名单（P0：原来只有 frames 一处过闸）', () => {
@@ -2960,6 +2974,21 @@ const findPy = () => {
 const FD_PROBE_TAIL = readFileSync(join(ROOT, 'tools', 'fixtures', 'fetch-deps-probe-tail.txt'), 'utf8')
 
 /**
+ * 把 fetch-deps.mjs 引用到的 lib 模块原样带进沙箱。
+ * 清单从被测源码现抽，不手抄：曾经只拷 plugin-paths.mjs，后来 fetch-deps 多 import
+ * 一个 lib 模块，整批探针就一起 ERR_MODULE_NOT_FOUND —— 看着像被测代码坏了，
+ * 其实是桩少拷了一个文件。少拷/文件不存在由 copyFileSync 当场抛，不会静默 PASS。
+ */
+const copyFdLibDeps = (dir) => {
+  const src = read('scripts/fetch-deps.mjs')
+  const names = [...src.matchAll(/from\s+'\.\.\/lib\/([\w-]+\.mjs)'/g)].map((m) => m[1])
+  must(names.length > 0, 'fetch-deps.mjs 里一个 ../lib/*.mjs 引用都没抽到：沙箱会漏带依赖而假红')
+  mkdirSync(join(dir, 'lib'), { recursive: true })
+  for (const name of new Set(names)) copyFileSync(join(ROOT, 'lib', name), join(dir, 'lib', name))
+  return [...new Set(names)]
+}
+
+/**
  * 生成一个探针并跑一条模式。
  * @param {string} mode BW_PROBE_MODE（ffmpeg-html / ffmpeg-list6000 / ffmpeg-version / bootstrap-pip / move-venv / venv-import）
  * @param {object} env 额外环境变量
@@ -2968,8 +2997,7 @@ const FD_PROBE_TAIL = readFileSync(join(ROOT, 'tools', 'fixtures', 'fetch-deps-p
 const fdProbe = (mode, env = {}) => {
   const dir = mkdtempSync(join(tmpdir(), 'bw-fdprobe-'))
   mkdirSync(join(dir, 'scripts'), { recursive: true })
-  mkdirSync(join(dir, 'lib'), { recursive: true })
-  copyFileSync(join(ROOT, 'lib', 'plugin-paths.mjs'), join(dir, 'lib', 'plugin-paths.mjs'))
+  copyFdLibDeps(dir)
   const src = read('scripts/fetch-deps.mjs')
   const cut = src.indexOf('// ── 主流程')
   must(cut > 0, 'fetch-deps.mjs 里找不到「// ── 主流程」锚点 —— 结构变了，探针切不出来（锚点别删，它是这条测试接缝）')
@@ -3277,14 +3305,12 @@ check('C116 viewOf 分P 守卫真跑：NaN/非数字/小数/超界必须抛错�
 //   不下载、不建目录，正好把三级解析这件事单独拎出来看，一次网络请求都不发。
 check('C55 fetch-deps 的 deps 目录三级解析，与运行时同一套（issue #6 坑 1）', () => {
   const fdSrc = join(ROOT, 'scripts', 'fetch-deps.mjs')
-  const libSrc = join(ROOT, 'lib', 'plugin-paths.mjs')
   // 造一个「插件包」骨架（scripts/ + lib/），因为「包内 deps 已有内容」那条分支只能靠
   //   插件根目录下的 deps 触发 —— 直接在仓库根造 deps 就是污染生产目录，判据不许这么干。
   const mkPkg = (dir) => {
     mkdirSync(join(dir, 'scripts'), { recursive: true })
-    mkdirSync(join(dir, 'lib'), { recursive: true })
     copyFileSync(fdSrc, join(dir, 'scripts', 'fetch-deps.mjs'))
-    copyFileSync(libSrc, join(dir, 'lib', 'plugin-paths.mjs'))
+    copyFdLibDeps(dir)
     return join(dir, 'scripts', 'fetch-deps.mjs')
   }
   // 默认把 BILI_WATCH_DEPS 清空：本机环境变量若指到真 deps，下面每条分支都会走同一个出口，
@@ -4356,7 +4382,9 @@ check('C158 进度文案三态：分母只能标「估算」、没数据必须�
 check('C159 进度接线：/status 把 DOWNLOADING 当活性判据，脚本两个出口都清状态（派单 C）', () => {
   const idx = read('index.js')
   must(
-    /download:\s*downloadProgress\(DEPS,\s*\{\s*activeDepIds:\s*DOWNLOADING\s*\}\)/.test(idx),
+    // 0.4.8 C4a：DOWNLOADING 由 Set 改成 Map，接线要传 .keys() 才还是「名字的可迭代」。
+    // 只跟着改接线字面，断言仍是「/status 把活性表传进 progress」，强度没变。
+    /download:\s*downloadProgress\(DEPS,\s*\{\s*activeDepIds:\s*DOWNLOADING\.keys\(\)\s*\}\)/.test(idx),
     '/status 没把 DOWNLOADING 传给 downloadProgress——上次中断留下的状态会被当成「正在下载」，面板显示一条永远不动的进度',
   )
   const fd = read('scripts/fetch-deps.mjs')
@@ -7816,6 +7844,436 @@ check('C166 EXEMPT 按规则豁免：GNU tar 行里的真 SESSDATA 仍必须命�
       `C166：rc≠0 但不是被「真 SESSDATA 值」这条规则抓住：${out.slice(0, 300)}`)
     return 'V9c 重放：GNU tar 行 + 真 SESSDATA → rc≠0 且点名「真 SESSDATA 值」'
   } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+// —— 0.4.8 C1 + A1 + A2 三条常驻判据 ——
+// 夹具一次真起十来个独立进程（模块级状态与 env 在 import 时定死，只能一个用例一进程），
+// 三条 check 共用一次结果，不重复付代价。断言只按编号前缀分检，不在这里抄第二份清单。
+let c1a1a2Run = null
+const c1a1a2 = () => {
+  if (!c1a1a2Run) c1a1a2Run = runFixture('c1a1a2-probe.mjs', 300000)
+  return c1a1a2Run
+}
+const c1a1a2Must = (prefix) => {
+  const r = c1a1a2()
+  must(r.status === 0 && r.json && !r.json.notes?.fatal,
+    `${prefix}：夹具没起来或抛异常（rc=${r.status}）——守卫自己崩了不算有效验证：${String(r.json?.notes?.fatal || r.raw || '').slice(0, 300)}`)
+  const bad = [
+    ...Object.entries(r.json.defect || {}).filter(([k, v]) => k.startsWith(prefix) && v !== true).map(([k]) => k),
+    ...Object.entries(r.json.capability || {}).filter(([k, v]) => k.startsWith(prefix) && v !== true).map(([k]) => k),
+  ]
+  must(bad.length === 0, `${prefix}：${bad.join(' / ')} 没过（夹具 notes=${JSON.stringify(r.json.notes || {}).slice(0, 400)}）`)
+  return r.json
+}
+
+check('C167 A1 自动清理开关：关得掉自动清 且 不影响手动清（D1 删开关判断 / D2 手动清被阉）', () => {
+  const j = c1a1a2Must('C167')
+  return `启动不清=${j.capability.C167_bootDidNotClean}、手动清仍清掉=${j.capability.C167_manualStillClears}、只传 maxMb 不抹开关=${j.defect.C167_patchPreserves}、坏值回 true=${j.defect.C167_badValueFallsBackTrue}`
+})
+
+check('C168 A2 skipReason 六值 / lastRealClean 不被节流盖掉 / truncated 透到面板', () => {
+  const j = c1a1a2Must('C168')
+  return `六值齐=${j.defect.C168_sixStates}、活锁连打 3 次都 locked=${j.defect.C168_lockedStable}、启动那次 truncated 可见=${j.defect.C168_bootTruncatedVisible}、面板有提示=${j.defect.C168_truncatedPanelHint}`
+})
+
+check('C174 C1 锁三态：free / EACCES 注入 / EPERM 真权限 / locked + forceUnknown 两向', () => {
+  const j = c1a1a2Must('C174')
+  const ep = j.notes?.eperm
+  // 真权限造得出就硬判；造不出只记「未核」，不红也不假绿（EACCES 注入那条永远硬判）。
+  if (ep?.threw) {
+    must(j.notes?.s7?.eperm?.state === 'unknown' && j.notes?.s7?.eperm?.gotCode === 'EPERM',
+      'C174：icacls 真造出 EPERM，但 lockState 没判成 unknown 或没原样透传 code')
+  }
+  return `四态 + 残留锁 + 深度截断；forceUnknown：unknown 真清=${j.capability.C174_forceUnknownReallyCleans}、locked 仍拒=${j.defect.C174_forceRejectedOnLocked}；EPERM 真权限=${ep?.threw ? '已核' : '未核（本机造不出）'}`
+})
+
+// —— 0.4.8 C2 + C4a/C4b 两条常驻判据 ——
+// 夹具一次真起五个 fetch-deps 子进程（含一个确定性的 EEXIST 竞态）+ 五组原样函数体桩，
+// 两条 check 共用一次结果。断言只按编号前缀分检，不在这里抄第二份清单。
+let c175c177Run = null
+const c175c177 = () => {
+  if (!c175c177Run) c175c177Run = runFixture('c175c177-probe.mjs', 300000)
+  return c175c177Run
+}
+const c175c177Must = (prefix) => {
+  const r = c175c177()
+  must(r.status === 0 && r.json && !r.json.notes?.fatal,
+    `${prefix}：夹具没起来或抛异常（rc=${r.status}）——守卫自己崩了不算有效验证：${String(r.json?.notes?.fatal || r.raw || '').slice(0, 300)}`)
+  const bad = [
+    ...Object.entries(r.json.defect || {}).filter(([k, v]) => k.startsWith(prefix) && v !== true).map(([k]) => k),
+    ...Object.entries(r.json.capability || {}).filter(([k, v]) => k.startsWith(prefix) && v !== true).map(([k]) => k),
+  ]
+  must(bad.length === 0, `${prefix}：${bad.join(' / ')} 没过（夹具 notes=${JSON.stringify(r.json.notes || {}).slice(0, 400)}）`)
+  return r.json
+}
+
+check('C175 C2 依赖锁 wx 原子创建：EEXIST 不被吞、出路带 pid 与锁路径、正常单进程仍能接管', () => {
+  const j = c175c177Must('C175')
+  return `并发被挡=${j.defect.C175_secondBlocked}、异目标报得出=${j.defect.C175_otherTarget}、EEXIST 没被吞=${j.defect.C175_eexistNotSwallowed}、正常拿到锁=${j.capability.C175_normalStillAcquires}、残留锁可接管=${j.capability.C175_staleStillCleared}`
+})
+
+check('C177 C4 冲突原因：本进程带占用方 / 跨进程 why 带 pid 与锁路径 / /status 形状不变', () => {
+  const j = c175c177Must('C177')
+  return `本进程有占用方=${j.defect.C177_inProcessConflictHasOwner}、status 形状未变=${j.defect.C177_statusShapeUnchanged}、跨进程 why=${j.defect.C177_crossProcessWhyHasPidAndPath}、退出结论透传=${j.defect.C177_verdictCarriesLockBusy}、增量接线=${j.defect.C177_outLogIncrementWired}、面板显示 why=${j.defect.C177_clientShowsWhy}`
+})
+
+// ── C176：C3 模型残片（issue #11 问题 2）────────────────────────────────────
+// 夹具真造三种目录树，并且跑的是 lib/model-integrity.mjs 这份生产函数本身，
+// 不是复刻一份判定：体积下限只在那一个模块里定义，改它会让夹具一起变。
+let c176Run = null
+const c176 = () => {
+  if (!c176Run) c176Run = runFixture('c176-probe.mjs', 300000)
+  return c176Run
+}
+const c176Must = () => {
+  const r = c176()
+  const raw = (r.raw || '').slice(0, 400)
+  must(r.status === 0 && r.json, `C176 夹具自身失效（rc=${r.status}）：${raw}`)
+  const j = r.json
+  must(!j.notes?.fatal, `C176 夹具 fatal：${j.notes?.fatal}`)
+  const bad = [...Object.entries(j.defect || {}), ...Object.entries(j.capability || {})]
+    .filter(([, v]) => v !== true).map(([k]) => k)
+  must(bad.length === 0, `C176：${bad.join(' / ')} 没过（夹具 rows=${JSON.stringify(j.notes?.rows || {}).slice(0, 320)}）`)
+  return j
+}
+check('C176 C3 模型残片：目录存在不等于完整 / 体积不足要判残 / --force 先清半截', () => {
+  const j = c176Must()
+  return `完整判 ok=${j.defect.C176_completeOk}、半截判残=${j.defect.C176_partialNotOk}、空快照判残=${j.defect.C176_emptyNotOk}、`
+    + `读不出来有原因=${j.defect.C176_unreadableSaysWhy}、两个落点都扫=${j.defect.C176_twoHomesScanned}、`
+    + `--force 清半截=${j.defect.C176_forceRemovesPartial}、干跑不删=${j.defect.C176_dryRunNoDelete}、`
+    + `下限单点=${j.defect.C176_singleSourceConstant}、面板接线=${j.defect.C176_indexWired}`
+})
+
+// ── B 组守卫假绿（C178–C182）────────────────────────────────────────────────
+// 夹具真跑两侧：release.ps1 的 4b-2 原样段落配桩在 PS 5.1 里执行；
+// check-public-text.mjs 用最小隔离仓库真起 node 进程读 rc 与命中 label。
+// 每条 check 只断言自己那一组字段，扰动时能看出红的到底是哪条判据。
+let bGroupRun = null
+const bGroup = () => {
+  if (!bGroupRun) bGroupRun = runFixture('b-group-probe.mjs', 300000)
+  return bGroupRun
+}
+const bGroupMust = () => {
+  const r = bGroup()
+  must(r.status === 0 && r.json, `B 组夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `B 组夹具 fatal：${j.fatal}`)
+  must(j.capability?.B0_baselineGreen === true, 'B 组夹具基线不绿 —— 下面的红可能是脚本崩了，不是判据红')
+  return j
+}
+const bKeys = (j, keys) => {
+  const bad = keys.filter((k) => j.defect?.[k] !== true && j.capability?.[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（夹具 notes=${JSON.stringify(j.notes?.b5 || {}).slice(0, 300)}）`)
+}
+
+check('C178 B1 发布说明进 argv：release.ps1 真传 body 位置参数 + 日志打 sha256 + 缺失即 Fail', () => {
+  const j = bGroupMust()
+  bKeys(j, ['B1_notesPassedAsPositional', 'B1_sha256Logged', 'B1_notesReadOnly',
+    'B1_missingNotesFails', 'B1_argTailFeedsBody', 'B1_cleanBodyGreen',
+    'B1_defaultNotesPathWorks'])
+  return `位置参数 ${j.notes?.ps?.calls?.[0] ? '已传' : '没传'}、sha256 已打、缺失不静默、默认路径分支真跑=${j.notes?.ps?.defaultRc}`
+})
+
+check('C179 B2 --help 跳过显式记账 + 未扫全必须 rc≠0，三面扫全仍 rc=0', () => {
+  const j = bGroupMust()
+  bKeys(j, ['B2_helpSkipCounted', 'B2_helpSkipInSummary',
+    'B2_helpSkipWarnsIncomplete', 'B2_skipDoesNotClaimFull',
+    'B2_cleanAllGreen', 'B2_metaUnscannedRed'])
+  return `跳过 rc=${j.notes?.probes?.b2Skip?.rc}（须≠0，措辞为未扫全）、全扫 rc=${j.notes?.probes?.b2AllScanned?.rc}（须=0）`
+})
+
+check('C180 B3 对外三面全接 collab：body / --help 各真造文本，命中必须 rc≠0 且 label 对得上', () => {
+  const j = bGroupMust()
+  bKeys(j, ['B3_bodyCollabRed', 'B3_bodyHitLabelIsBody', 'B3_bodyFullwidthRed',
+    'B3_helpCollabRed', 'B3_helpHitLabelIsHelp', 'B3_helpNotSkipped',
+    'B3_threeFacesWired', 'B3_cleanHelpGreen'])
+  return `接线 ${j.notes?.b3WiredCalls} 处、body/全角/--help 三条真红、干净 HELP 仍绿`
+})
+
+check('C181 B4 HARD_PUBLIC 只删协作词、保留编号规则，协作词改由 scanCollab 覆盖', () => {
+  const j = bGroupMust()
+  bKeys(j, ['B4_collabWordsRemoved', 'B4_numberRulesKept', 'B4_numberProbeRed',
+    'B4_collabHitFromScanCollab', 'B4_normalReadmeGreen'])
+  return '编号探针 rc≠0 命中「内部编号」，workbuddy 命中「内部协作标记」'
+})
+
+check('C182 B5 description/keywords 进严版：五个内部词逐词真红，摘要看得出这一面扫了', () => {
+  const j = bGroupMust()
+  bKeys(j, ['B5_fiveWordsEachRed', 'B5_metaCollabRed', 'B5_metaScannedLine', 'B5_cleanMetaGreen'])
+  const b5 = j.notes?.b5 || {}
+  return Object.keys(b5).map((w) => `${w}=rc${b5[w].rc}`).join(' / ')
+})
+
+// ── C183：C48-P2-1 跨进程锁判据统一 ─────────────────────────────────────────
+// 夹具在 VM 里跑两侧的原样函数体（宿主 depsLockVerdict + downloadLockBusy / CLI lockState），
+// 造五把锁比对结论；不靠读源码猜「应该一致」。D1 打回只判 pid 存活 → 8h 那条必红，
+// D2 恒 stale / 恒 live → 活锁或没锁那侧必红。
+let c48Run = null
+const c48 = () => {
+  if (!c48Run) c48Run = runFixture('c48-p2-1-probe.mjs', 120000)
+  return c48Run
+}
+
+check('C183 C48-P2-1 跨进程锁判据统一：活锁 / 8h 活锁 / 坏 JSON，宿主侧与 CLI 侧同结论', () => {
+  const r = c48()
+  must(r.status === 0 && r.json, `C48 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `C48 夹具 fatal：${j.fatal}`)
+  must(j.capability?.C183_baselineGreen === true, 'C48 夹具没跑全五种锁 —— 下面的红可能是脚本崩了，不是判据红')
+  const keys = ['C183_oldLiveLockAgrees', 'C183_liveLockAgrees', 'C183_corruptNotBusyButNamed',
+    'C183_noneAgrees', 'C183_deadPidAgrees', 'C183_liveStillBlocks', 'C183_noLockStillPasses',
+    'C183_noAtStaysLive', 'C183_bothCallSitesWired', 'C183_singleStaleConst']
+  const bad = keys.filter((k) => j.defect?.[k] !== true && j.capability?.[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（rows=${JSON.stringify(j.notes?.rows || []).slice(0, 400)}）`)
+  return (j.notes?.rows || []).map((x) => `${x.tag}:宿主${x.panelBusy ? '占用' : '放行'}/CLI ${x.cliState}`).join(' / ')
+})
+
+// ── C184：面板首屏 4 并发不堆叠（2026-11-06 面板首屏性能）──────────────────
+// 改前基线（实测）：4 并发冷态 3063 / 3062 / 3062 / 3062 ms，墙钟 3064 ms；
+//   单发热态 150-210 ms。根因是 /status 里三处 execFileSync 堵住事件循环，4 个请求只能排队。
+// 为什么不能只判墙钟：缓存是共享的，同步版第一个请求跑完就写满三份缓存，后三个全命中，
+//   于是「4 并发墙钟 ≈ 单发冷态」也会落进 2 倍阈值里 —— 单靠墙钟是纸老虎。
+//   夹具另起 5ms 心跳直接测主线程有没有被堵，两条同时成立才算数（扰动 D1 里会实测墙钟不红、心跳红）。
+let perfRun = null
+const perf = () => {
+  if (!perfRun) perfRun = runFixture('perf-probe.mjs', 300000)
+  return perfRun
+}
+
+check('C184 面板首屏 4 并发不堆叠：墙钟 ≤ 单发×2 + 事件循环心跳 ≤40ms；三处 timeout 与判 ok 原样', () => {
+  const r = perf()
+  must(r.status === 0 && r.json, `性能夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `性能夹具 fatal：${j.fatal}`)
+  must(j.capability?.C184_baselineGreen === true, '性能夹具没跑全冷态基线 —— 下面的绿可能是没测到东西')
+  must(j.capability?.C184_fourConcurrentReallyServed === true, '4 个并发没有全部真回 200/ok=true')
+  must(j.capability?.C184_singleNotCheated === true, '单发那轮自身就堵了事件循环，对照不成立')
+  const bad = ['C184_quadWallWithinTwiceSingle', 'C184_eventLoopNotBlocked']
+    .filter((k) => j.defect?.[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（rows=${JSON.stringify(j.notes?.rows || []).slice(0, 500)}）`)
+  const src = read('index.js')
+  for (const t of [1200, 5000, 15000]) {
+    must(new RegExp(`timeout: ${t}\\b`).test(src), `改异步后把 timeout ${t} 弄丢了`)
+  }
+  must(/const r = await execFileP\(py,/.test(src) && /ok = r\.ok/.test(src), 'pyProbe 没判 ok 或没走 execFileP')
+  must(/r\.ok\) \{ hit = c/.test(src), 'resolveFfmpeg 没判 ok（失败会被当成装好了）')
+  const rows = (j.notes?.rows || []).map((x) => `${x.mode}:${x.wallMs}ms/心跳${x.maxTickMs}ms/yt${x.ytdlp}`)
+  return rows.join(' · ')
+})
+
+// ── C185：首屏请求合并 + 子进程调用次数（2026-11-06 面板首屏性能）────────────
+// 一条判据同时守两侧：服务端 4 并发下 yt-dlp 只起 1 次（缓存 + 在飞去重），
+//   客户端三处首屏组件共享同一个 /status promise（拆回各自请求这条必红）。
+// 反向能力：Panel.load 的 ?fresh=1 不许被合并、共享 promise 失败要变 null 不能漏 rejection、
+//   yt-dlp 不存在 / 子进程失败两种情形的 deps detail 都必须是确定文案。
+let shareRun = null
+const share = () => {
+  if (!shareRun) shareRun = runFixture('client-share-probe.mjs', 120000)
+  return shareRun
+}
+
+check('C185 首屏 4 请求合并 + 4 并发 yt-dlp 只起 1 次；500/缺文件/子进程失败三面不崩', () => {
+  const r = share()
+  must(r.status === 0 && r.json, `客户端共享夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const s = r.json
+  must(!s.fatal, `客户端共享夹具 fatal：${s.fatal}`)
+  const p = perf()
+  must(p.status === 0 && p.json && !p.json.fatal, `性能夹具失效：${p.json?.fatal || (p.raw || '').slice(0, 300)}`)
+  const j = p.json
+  const all = { ...j.defect, ...j.capability, ...s.defect, ...s.capability }
+  const keys = [
+    'C185_ytdlpSpawnOnce', 'C185_noSyncSpawn', 'C185_firstScreenRequestCount2', 'C185_sharedPromise',
+    'C185_singleSpawnsOnce', 'C185_missingYtDetail', 'C185_execFailDetailClean',
+    'C185_freshStillSeparate', 'C185_sharedCatchesToNull', 'C185_threeConsumersGuardNull',
+    'C185_successReturnsSame', 'C185_fiveHundredReturnsNull', 'C185_noRejectionLeak',
+  ]
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（perf=${JSON.stringify(j.notes?.rows || []).slice(0, 300)} client=${JSON.stringify(s.notes || {})}）`)
+  const quad = (j.notes?.rows || []).find((x) => x.mode === 'quad')
+  return `4 并发 yt-dlp ${quad?.ytdlp} 次 / 同步 ${quad?.sync} 次；首屏 jget('/status') ${s.notes?.jgetStatus} 处 + statusOnce() ${s.notes?.onceUses} 处；500 时三次取用都拿到 null`
+})
+
+// ── C186：首屏 /status 失败不缓存（2026-11-07 客户端重试语义）──────────────
+// 结果面：恒失败时每轮重新发一个请求（三轮 3 个），失败后转成功能拿到状态且成功后固定。
+// 机制面：一轮渲染内三个组件仍共享同一个在飞 promise（不能为了重试退化成三次请求），
+//   且定义段里没有节流计时器 —— 成功才缓存的方案不需要节流。
+// 反向能力：失败不漏 unhandledRejection、?fresh=1 穿透独立（由 C185 守）。
+check('C186 首屏 /status 失败不缓存：失败后跨轮重试、成功后固定、无节流无漏 rejection', () => {
+  const r = share()
+  must(r.status === 0 && r.json, `客户端共享夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const s = r.json
+  must(!s.fatal, `客户端共享夹具 fatal：${s.fatal}`)
+  const all = { ...s.defect, ...s.capability }
+  const keys = [
+    'C186_failureRetriable', 'C186_successPinned', 'C186_failureThenSuccess',
+    'C186_noThrottle', 'C186_lexicalSuccessOnly', 'C186_noRejectionLeak',
+  ]
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（client=${JSON.stringify(s.notes || {})}）`)
+  return `恒失败三轮 ${s.notes?.retryCalls} 个请求 / 恒成功三轮 ${s.notes?.pinnedCalls} 个 / 失败→成功 ${s.notes?.mixedCalls} 个（${(s.notes?.mixedRounds || []).join('→')}）`
+})
+
+// ── C187：三处在飞 Promise 的 finally 只清自己那一轮（2026-11-07）──────────
+// 结果面：旧探测 A 在飞 → 清缓存 → 起新探测 B → A 先完成，B 的在飞记录必须还在，
+//   且接下来的并发调用不许重复起第三个进程。
+// 机制面：三处 finally 都带「判自身」；正常运行（没有清缓存插队）完成后记录要真的清空，
+//   否则以后永远复用已完成的旧 promise。
+// VM 夹具抠三处原样函数体、用可控 deferred 造窄窗口，不用文本正则冒充行为判据。
+let inflightRun = null
+const inflight = () => {
+  if (!inflightRun) inflightRun = runFixture('inflight-promise-probe.mjs', 120000)
+  return inflightRun
+}
+
+check('C187 三处 finally 判自身：旧探测先完成不清掉新一轮在飞记录，正常路径仍会清空', () => {
+  const r = inflight()
+  must(r.status === 0 && r.json, `在飞 Promise 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `在飞 Promise 夹具 fatal：${j.fatal}`)
+  const all = { ...j.defect, ...j.capability }
+  const keys = [
+    'C187_ffmpegOldFinallyNotClearNew', 'C187_ytdlpOldFinallyNotClearNew',
+    'C187_gpuOldFinallyNotClearNew', 'C187_lexicalSelfCheck',
+    'C187_normalClearsAfterDone', 'C187_noExtraProbe',
+  ]
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（rows=${JSON.stringify(j.notes?.rows || {})}）`)
+  const rows = j.notes?.rows || {}
+  return `三处 A 先完成后 B 记录仍在（${['ffmpeg', 'ytdlp', 'gpu'].map((k) => `${k}:${rows[k]?.stillB === true ? '在' : '丢'}`).join('/')}），各起 ${Object.values(rows).map((x) => x.calls).join('/')} 次探测`
+})
+
+// ── C188：半成品 venv 改名不许生成尾点目录（2026-11-07 0.4.8 收口）──────
+// 结果面：从生产源码原样抠出 const dst 那一行、固定时钟求值，名字不以点结尾且是 14 位时间戳。
+// 能力面：不许靠「删掉时间戳 / 写死一个名字」骗绿，且真造一次 rename + rm 必须成功。
+// 扰动：把 slice(0, 14) 改回 15，这条断言必须红；固定时钟让红点可复现。
+let taildotRun = null
+const taildot = () => {
+  if (!taildotRun) taildotRun = runFixture('c188-taildot-probe.mjs', 120000)
+  return taildotRun
+}
+
+check('C188 半成品 venv 改名：目录名不以点结尾、14 位时间戳、真造真删成功', () => {
+  const r = taildot()
+  must(r.status === 0 && r.json, `尾点目录夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `尾点目录夹具 fatal：${j.fatal}`)
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['notTailDot', 'shape14', 'keepsOldPrefix', 'keepsTimestamp', 'nameDeletable']
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（dst=${j.notes?.dst}，slice=${j.notes?.sliceArg}，rename=${j.notes?.renamed}，rm=${j.notes?.removed}）`)
+  return `dst=${j.notes?.dst}（slice(0, ${j.notes?.sliceArg})）；真造改名 ${j.notes?.renamed ? '成功' : '失败'} / 真删 ${j.notes?.removed ? '成功' : '失败'}`
+})
+
+// ── C189：手工维护件两边不一致必须 Fail（2026-11-07 0.4.8 收口）───────
+// 结果面：从 release.ps1 原样切出第 3 段，在 PowerShell 里真跑三态——
+//   一致 rc=0 / 改坏发布树那侧 rc!=0 且点名文件与两侧 hash / 恢复 rc=0。
+// 静态面：不许退回只打 warn；Fail 与「点名哪一侧」两件事一起钉。
+// 扰动：把 Fail 改回 Say "[warn]"，这条断言必须红；恢复后一致态必须仍绿。
+let driftRun = null
+const drift = () => {
+  if (!driftRun) driftRun = runFixture('c189-release-drift-probe.mjs', 180000)
+  return driftRun
+}
+
+check('C189 手工维护件两边不一致：Fail 非零退出并点名哪一侧，一致与恢复都退出 0', () => {
+  const r = drift()
+  must(r.status === 0 && r.json, `发布树漂移夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.fatal, `发布树漂移夹具 fatal：${j.fatal}`)
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['noWarnOnly', 'hasFail', 'namesBothSides', 'consistentGreen', 'driftRed', 'restoredGreen']
+  const bad = keys.filter((k) => all[k] !== true)
+  const rcs = Object.fromEntries(Object.entries(j.notes?.runs || {}).map(([k, x]) => [k, x.rc]))
+  must(bad.length === 0, `${bad.join(' / ')} 没过（rcs=${JSON.stringify(rcs)}）`)
+  const rr = j.notes?.runs || {}
+  return `一致 rc=${rr.consistent?.rc} / 不一致 rc=${rr.drift?.rc}（点名 auto-trigger.js 与两侧 hash）/ 恢复 rc=${rr.restored?.rc}`
+})
+
+// ── C190–C193：0.4.8 发版前置的四条守卫补缺 ────────────────────────────────
+// 夹具在隔离副本上真起 node 跑 check-public-text.mjs，并用 PS 5.1 抠 sync-release.ps1
+// 的原样清单构造段求值。每条都同时验「该红时红」与「该活时活」——只做 D1 会造出永远红的闸。
+let guardCovRun = null
+const guardCov = () => {
+  if (!guardCovRun) guardCovRun = runFixture('guard-coverage-probe.mjs', 300000)
+  return guardCovRun
+}
+const guardCovMust = () => {
+  const r = guardCov()
+  must(r.status === 0 && r.json, `守卫补缺夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 500)}`)
+  must(!r.json.fatal, `守卫补缺夹具 fatal：${r.json.fatal}`)
+  return r.json
+}
+
+check('C190 files 解析出 0 条时按「未扫全」失败：rc≠0 且措辞不是「命中」；正常清单仍两向正确', () => {
+  const j = guardCovMust()
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['C190_noFilesRed', 'C190_noFilesWordingIncomplete', 'C190_noFilesNamesReason',
+    'C190_normalCleanGreen', 'C190_normalLeakRedAsHit', 'C190_noAlwaysRed']
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过`)
+  const r = j.notes?.runs?.c190Empty || {}
+  return `files=[] → rc=${r.rc} 且输出「未扫全」；正常清单干净 rc=${j.notes?.runs?.c190Clean?.rc} / 有泄漏 rc=${j.notes?.runs?.c190Dirty?.rc}（措辞「命中」）`
+})
+
+check('C191 tools/look.mjs 不存在时按「未扫全」失败：摘要写 --help 跳过、不放回就仍绿', () => {
+  const j = guardCovMust()
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['C191_lookMissingRed', 'C191_lookMissingNotClaimScanned',
+    'C191_lookMissingWordingIncomplete', 'C191_lookMissingNamesReason',
+    'C191_lookBackGreen', 'C191_notHardExit2']
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过`)
+  return `缺失 rc=${j.notes?.runs?.c191Missing?.rc} / 放回 rc=${j.notes?.runs?.c191Present?.rc}；不是 exit 2 硬失败`
+})
+
+check('C192 body 面补凭据与通用本机路径：三条样本各点名规则，系统路径与真实三面不误伤', () => {
+  const j = guardCovMust()
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['C192_threeSamplesRed', 'C192_threeSamplesNamed', 'C192_systemPathNotHurt',
+    'C192_cleanNotesGreen', 'C192_realRepoStillGreen', 'C192_noAlwaysRed',
+    'C192_sharedRuleTable', 'C192_exemptByRuleNotWholeLine', 'C192_exemptTableHasRuleField']
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过`)
+  const s = j.notes?.runs?.c192Samples || {}
+  return `凭据/路径/编号三样本 rc=${s.cred?.rc}/${s.path?.rc}/${s.number?.rc}；C:\\Windows 不误伤 rc=${j.notes?.runs?.c192SysPath?.rc}；规则表与 EXEMPT 同一份、豁免按规则名`
+})
+
+check('C193 sync-release 扫描面含 package.json：两守卫清单逐项一致（PS 原样段真算）', () => {
+  const j = guardCovMust()
+  const all = { ...j.defect, ...j.capability }
+  const keys = ['C193_scanListHasPkg', 'C193_notInExcludeCopy', 'C193_bothAssertUseScanList',
+    'C193_twoGuardsSameSet', 'C193_bothGuardsSameDefaults',
+    'C193_pubCountReadable', 'C193_syncListTrulyEvaluated', 'C193_evalScriptPresent']
+  const bad = keys.filter((k) => all[k] !== true)
+  must(bad.length === 0, `${bad.join(' / ')} 没过`)
+  const s = j.notes?.runs?.c193Sets || {}
+  return `pub ${s.pubCount} 份 / sync ${s.syncCount} 份，双向差集 ${(s.onlyPub || []).length}/${(s.onlySync || []).length}；package.json 只进 $scanList 不进 $excludeCopy`
+})
+
+// ── C194：F14-2 活锁不被 unknown 折叠（D1 该拦 + D2 该活） ──────────────────
+// 夹具真造「带活锁的目录 + readdir 抛 EACCES 的目录」，假 ctx 真调 /cache/clear 路由。
+//   removeOwned 零调用由注入计数器（根 readdir 次数 / rmSync 次数）+ 哨兵文件快照双证据判；
+//   D2(a) 反过来要求计数非零，证明计数器不是恒 0 的纸老虎。夹具不许只 mock lockState
+//   返回值，所以 lockState 是 lib 原样函数，只把默认 readdir 换成「真 fs + 指定目录抛错」。
+let c194Run = null
+const c194 = () => {
+  if (!c194Run) c194Run = runFixture('c194-probe.mjs', 300000)
+  return c194Run
+}
+const c194Must = () => {
+  const r = c194()
+  must(r.status === 0 && r.json, `C194 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 500)}`)
+  must(!r.json.notes?.fatal, `C194 夹具 fatal：${r.json.notes?.fatal}`)
+  return r.json
+}
+
+check('C194 F14-2 活锁不被 unknown 折叠：forceUnknown 也拦；仅 EACCES 仍放行、仅活锁两向拒绝', () => {
+  const j = c194Must()
+  const all = { ...j.defect, ...j.capability }
+  const bad = Object.entries(all).filter(([k, v]) => k.startsWith('C194') && v !== true).map(([k]) => k)
+  must(bad.length === 0, `${bad.join(' / ')} 没过（runs=${JSON.stringify(j.notes?.runs || {}).slice(0, 500)}）`)
+  const d1 = j.notes?.runs?.d1 || {}
+  return `D1 活锁+EACCES+forceUnknown=1 → ok=${d1.ok}，why 两类信息齐，removeOwned 零调用（rootReads=${d1.probe?.rootReads} / deletes=${d1.probe?.deletes}）；D2 仅 EACCES 放行 / 仅活锁两向拒绝 / 双无正常清理`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

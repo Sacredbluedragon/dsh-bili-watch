@@ -43,7 +43,9 @@ import { fileURLToPath } from 'node:url'
 // isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
 // 2026-10-31：锁判据搬进 lib/locks.mjs。此后 pidAlive / readLock / lockExpired
 //   在本文件已无人直接调用（都进了 makeLocks 内部），只剩 hasAnyLock 与 makeLocks。
-import { hasAnyLock, makeLocks } from '../lib/locks.mjs'
+// 0.4.8 C1：clean 改走 lockState 三态（读不出来 = unknown，不再压成「正在被占用」）；
+//   hasAnyLock 只留给不需要 reason 的老调用方。
+import { lockState, makeLocks } from '../lib/locks.mjs'
 // 删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 dirStat / isOurCacheRoot / isOwnBvDir 在本文件已无人直接调用（都在 lib 内部用），
 //   只留 removeOwned；同理上面的 consts 两项也不再需要 import（CACHE_MARK 只被 pickCacheDir 用，
@@ -3498,7 +3500,9 @@ const HELP = `用法:
   node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--verify] [--head N] [--full] [--format json] [--out 文件]
   node look.mjs local <文件路径> [--ocr] [--frames] [--step 2] [--format json] [--out 文件]  本地视频/音频转写+抽帧OCR（不依赖 B 站）
   node look.mjs login [--poll] [--check] [--key <二维码key>]  扫码登录，拿 AI 字幕用的本地凭证
-  node look.mjs clean                         清空缓存目录（$DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+  node look.mjs clean [--force-unknown]       清空缓存目录（$DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+  --force-unknown：仅 clean 用。缓存根有目录读不出来时默认拒绝清理（会给出错误码）；
+                   确认要清才加它。对「真有抽帧/转写任务在跑」的活锁无效，那种一律拒绝。
 
   多 P 视频加 --p N 指定第几个分P（默认 P1）。
   --verify：text 拿到字幕后，若字幕可疑（语速不在 2–8.5 字/秒、关键词命中过低、字幕自称实验/钓鱼）
@@ -3730,12 +3734,21 @@ try {
     // 追加四（2026-10-29）：清之前先把「旧目录还留在原地」这件事说出来——只说，不动它。
     const adopt = cacheAdoptNotice(cacheWant())
     if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删。`)
-    const locked = hasAnyLock(cacheDir(), lockTtlMs())
-    if (locked) {
-      console.error('✗ 正在被占用：检测到正在运行的抽帧/转写任务（.lock 存在），已取消清理。等任务跑完再清。')
+    // 0.4.8 C1：三态。原来 hasAnyLock 把「读不出来」压成「正在被占用」，文案说反了；
+    //   现在 locked 一律拒绝，unknown 默认拒绝，只有显式 --force-unknown 才放行（对 locked 无效）。
+    const ls = lockState(cacheDir(), lockTtlMs())
+    const forceUnknown = flag('force-unknown')
+    if (ls.state === 'locked') {
+      console.error(`✗ 正在被占用：检测到正在运行的抽帧/转写任务（锁 ${ls.lockPath}，pid ${ls.owner?.pid}），已取消清理。等任务跑完再清。`)
+      process.exitCode = 1
+    } else if (ls.state === 'unknown' && !forceUnknown) {
+      console.error(`✗ 缓存根有目录读不出来（${ls.code}），已拒绝。确认要清可加 --force-unknown`)
       process.exitCode = 1
     } else if (existsSync(cacheDir())) {
+      // 清前后各打一行带 reason：让「忽略了什么」可查，不许只说「已强制清理」
+      if (ls.state === 'unknown') say(`强制清理：将忽略 ${ls.reason}（--force-unknown）`)
       const cleared = removeOwned(cacheDir())
+      if (ls.state === 'unknown') say(`强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`)
       console.log(`已清理 ${cacheDir()}（${cleared.files} 个文件 / ${(cleared.bytes / 1048576).toFixed(1)} MB）`)
       if (cleared.skipped.length) {
         console.log('跳过（不是 bili-watch 的数据，没动）：' + cleared.skipped.map((s) => `${s.name}（${s.why}）`).join('；'))

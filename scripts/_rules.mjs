@@ -48,3 +48,43 @@ export function scanCollab(text) {
   }
   return hits
 }
+
+/**
+ * 凭据与通用本机路径：`check-public-text.mjs` 的对外文案面与
+ * `check-release-leak.mjs` 的包内容面共用唯一一份，不许各抄一遍。
+ *
+ * 对外文案面里 release notes 是发版那一刻手写、会公开发布、原先唯一不过凭据扫描的面；
+ * README / --help 在仓库里另有闸扫，漏的正是 body 这一面。
+ *
+ * 「通用本机路径」刻意只认盘符 + `Users` 的绝对路径与 `/Users/`：
+ * 不写「拦所有盘符路径」——`C:\Windows` 这类系统默认值有正面理由留在文案里（讲 tar 陷阱、
+ * 讲路径归一化），一刀切会误伤。规则不带 g：两个守卫按行 test，带 g 会让 lastIndex 跨行串味。
+ */
+// 单独导出：包内容面只要凭据那一条（它另有更严的盘符 / 用户目录规则 + 按规则豁免），
+// 对外文案面要两条全上。两边拿到的是**同一个数组元素、同一个正则对象**，不是抄的第二份。
+export const SESSDATA_RULE = ['真 SESSDATA 值', /SESSDATA["']?\s*[:=]\s*["'][^"']*(?:%2C|[0-9a-f]{32})/i]
+export const CRED_RULES = [
+  ['通用本机路径', /[A-Za-z]:\\Users\\|\/Users\//i],
+  SESSDATA_RULE,
+]
+
+/**
+ * 明知会误报、要留档的豁免：文件 + 行内容特征 + **只对哪条规则生效** → 理由。
+ * `rule` 字段不能省：旧写法「命中任一 EXEMPT 就 continue 整行」会把该行所有规则一起放过，
+ * 于是 `GNU tar` 那行塞进真 SESSDATA 也能溜过两道发布闸。
+ *
+ * 表放这里而不是两个守卫各存一份：加一条规则时若只改一侧的豁免，就会变成
+ * 「同一个词一个守卫拦、另一个放」，与 COLLAB_RULES 收拢是同一件事。
+ */
+export const EXEMPT_RULES = [
+  { file: 'client.js', match: /不写死\s*127\.0\.0\.1:3080/, rule: '写死本机端口', why: '注释说的是正确做法，不是泄露' },
+  { file: 'tools/look.mjs', match: /C:\\Windows/, rule: 'Windows 绝对路径', why: '拦危险路径的测试用例' },
+  { file: 'tools/cli-io.mjs', match: /C:\\Windows|任一盘符根|全是 c:\\ 开头/, rule: 'Windows 绝对路径', why: '讲路径归一化绕过的注释示例，不是本机路径' },
+  { file: 'lib/cred.mjs', match: /SESSDATA:\s*'sessdata'/, rule: '真 SESSDATA 值', why: '字段名映射表，不是真值' },
+  { file: 'scripts/fetch-deps.mjs', match: /GNU tar/, rule: 'Windows 绝对路径', why: '讲 Windows 裸 tar 把盘符当远程主机的注释示例，不是本机路径' },
+]
+
+/** 按规则名豁免：只放过被点名那条规则，同一行里其它规则照常命中。 */
+export function exemptFor(exempts, file, line, rule) {
+  return exempts.some((e) => e.file === file && e.match.test(line) && e.rule === rule)
+}

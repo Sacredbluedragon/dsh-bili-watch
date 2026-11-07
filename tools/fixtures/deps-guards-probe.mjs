@@ -53,6 +53,7 @@ function newCtx(extra) {
     Array,
     Object,
     Set,
+    Map,
     Promise,
     setTimeout,
     clearTimeout,
@@ -160,7 +161,9 @@ if (section === 'B') {
   if (!ttlConst || !failConst) broken('找不到 IMPORT_TTL_MS / IMPORT_TTL_FAIL_MS 常量')
   // 2026-11-03 自审：签名加了 opts（手点刷新跳缓存），这里跟着改。
   //   注意 opts 必须给默认值 {}，否则桩里 pyProbe(py, code) 的旧调用会 TypeError。
-  const pyProbe = sliceFn(src, 'function pyProbe(py, code, opts = {}) {')
+  // 2026-11-06 面板首屏：pyProbe 改走 execFileP / async，沙箱里的桩与调用都要跟着 async，
+  //   否则拿到的全是 Promise、B 段会「全绿但其实一条断言没跑到」。签名跟着源码同源改。
+  const pyProbe = sliceFn(src, 'async function pyProbe(py, code, opts = {}) {')
   const mapSrc = /const DOWNLOAD_TARGET_DEPS = \{[\s\S]*?\n\}\n/.exec(src)
   if (!mapSrc) broken('找不到 DOWNLOAD_TARGET_DEPS')
   // issue #12（2026-11-05）：downloadVerdict 多了第 5 个 ctx 形参。这里不再把整条签名
@@ -179,23 +182,27 @@ if (section === 'B') {
     globalThis.__runs = 0
     globalThis.__mode = 'fail'
     const statSync = () => ({ mtimeMs: 111 })
-    const execFileSync = () => {
+    const execFileP = async () => {
       globalThis.__runs++
-      if (globalThis.__mode === 'fail') { const e = new Error('boom'); e.stderr = 'ImportError: no module'; throw e }
-      return ''
+      if (globalThis.__mode === 'fail') {
+        const e = new Error('boom'); e.stderr = 'ImportError: no module'
+        return { ok: false, stdout: '', err: e }
+      }
+      return { ok: true, stdout: '', err: null }
     }
+    const probeWhy = () => 'stub'
     ${pyProbe}
     ${mapSrc[0]}
     ${verdict}
-    globalThis.__go = () => {
-      const a = pyProbe('/stub/py.exe', 'import x')
+    globalThis.__go = async () => {
+      const a = await pyProbe('/stub/py.exe', 'import x')
       globalThis.__now += 60000
-      const b = pyProbe('/stub/py.exe', 'import x')
+      const b = await pyProbe('/stub/py.exe', 'import x')
       const runsAfterFail = globalThis.__runs
       globalThis.__mode = 'ok'
-      const c = pyProbe('/stub/py.exe', 'import y')
+      const c = await pyProbe('/stub/py.exe', 'import y')
       globalThis.__now += 60000
-      pyProbe('/stub/py.exe', 'import y')
+      await pyProbe('/stub/py.exe', 'import y')
       const runsTotal = globalThis.__runs
       const v = downloadVerdict('ocr', 0, null, [{ id: 'ocr', ok: false }])
       const vOk = downloadVerdict('ocr', 0, null, [{ id: 'ocr', ok: true }])
@@ -208,7 +215,7 @@ if (section === 'B') {
   } catch (e) {
     broken('沙箱抛了 ' + e.message)
   }
-  const r = ctx.__go()
+  const r = await ctx.__go()
   if (!r) broken('没拿到结果')
   must(r.a && r.a.ok === false, '第一次探针应失败')
   must(r.runsAfterFail === 2, '失败结果 60 秒后必须重探（应跑 2 次），实际 ' + r.runsAfterFail + ' 次 —— 失败缓存 TTL 没缩短')
@@ -224,12 +231,17 @@ if (section === 'B') {
 if (section === 'C') {
   const src = readFileSync(join(root, 'index.js'), 'utf8').replace(/\r\n/g, '\n')
   const fd = readFileSync(join(root, 'scripts', 'fetch-deps.mjs'), 'utf8').replace(/\r\n/g, '\n')
-  const decl = 'const DOWNLOADING = new Set()'
+  const decl = 'const DOWNLOADING = new Map()'
   const conflict = sliceFn(src, 'function downloadConflict(target, running) {')
   const runDownload = sliceFn(src, 'function runDownload(target) {')
   const lockFn = sliceFn(fd, 'function lockState(cur, opts = {}) {')
   const lockConst = (fd.match(/const LOCK_STALE_MS = [^\n]+/) || [''])[0]
   if (!lockConst) broken('找不到 LOCK_STALE_MS 常量')
+  // C48-P2-1：6 小时常量抽到 lib/plugin-paths.mjs 单点，沙箱② 里要先把那行定义贴上，
+  //   否则 `LOCK_STALE_MS = DEPS_LOCK_STALE_MS` 在 VM 里会 ReferenceError（那是探针坏，不是被测代码红）。
+  const pp = readFileSync(join(root, 'lib', 'plugin-paths.mjs'), 'utf8').replace(/\r\n/g, '\n')
+  const staleDecl = (pp.match(/export const DEPS_LOCK_STALE_MS = [^\n]+/) || [''])[0].replace(/^export /, '')
+  if (!staleDecl) broken('lib/plugin-paths.mjs 里找不到 DEPS_LOCK_STALE_MS 单点常量')
   const moveSemi = sliceFn(fd, 'function moveSemiVenv(venv) {')
 
   // ① 进程内互斥：连点两次
@@ -244,6 +256,11 @@ if (section === 'C') {
     const appendFileSync = () => {}
     const openSync = () => 3
     const closeSync = () => {}
+    // 0.4.8 C4b 加的跨进程锁同步预检：本节只验进程内互斥，桩成「没人占锁」。
+    const DEPS_LOCK_FILE = '/stub/.fetch-deps.lock'
+    const downloadLockBusy = () => null
+    const lockBusyText = () => ''
+    const readFileSync = () => ({ subarray: () => ({ toString: () => '' }) })
     const spawn = () => ({ pid: 4242, on() {}, once() {}, unref() {} })
     ${runDownload}
     globalThis.__r = (() => {
@@ -273,6 +290,7 @@ if (section === 'C') {
 
   // ② 跨进程锁的判定（纯函数，注入 now / alive）
   const stub2 = `
+    ${staleDecl}
     ${lockConst}
     ${lockFn}
     globalThis.__r = (() => {

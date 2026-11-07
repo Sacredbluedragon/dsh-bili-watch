@@ -134,23 +134,29 @@ if (section === 'E') {
 
 if (section === 'F') {
   const cacheFn = sliceFn(src, 'function gpuCacheHit(cache, now, ttl, fresh) {')
-  const probeFn = sliceFn(src, 'function pyProbe(py, code, opts = {}) {')
+  // 2026-11-06 面板首屏：pyProbe 改 async / execFileP，桩与调用同步跟着改（否则 F 段拿 Promise 假绿）。
+  const probeFn = sliceFn(src, 'async function pyProbe(py, code, opts = {}) {')
   const stub = `
     globalThis.__calls = 0
     const IMPORT_TTL_MS = 5 * 60 * 1000
     const IMPORT_TTL_FAIL_MS = 30 * 1000
     let importCache = {}
     const statSync = () => ({ mtimeMs: 1 })
-    const execFileSync = () => { globalThis.__calls++; throw new Error('boom') }
+    const execFileP = async () => {
+      globalThis.__calls++
+      const e = new Error('boom'); e.stderr = 'ImportError: no module'
+      return { ok: false, stdout: '', err: e }
+    }
+    const probeWhy = () => 'stub'
     ${cacheFn}
     ${probeFn}
-    globalThis.__r = (() => {
+    globalThis.__r = (async () => {
       const now = 1700000000000
       const hot = { at: now - 1000, val: { deviceCount: 1 } }
       const cold = { at: now - 10 * 60 * 1000, val: { deviceCount: 1 } }
-      const r1 = pyProbe('/py.exe', 'import x')
-      const r2 = pyProbe('/py.exe', 'import x')
-      const r3 = pyProbe('/py.exe', 'import x', { fresh: true })
+      const r1 = await pyProbe('/py.exe', 'import x')
+      const r2 = await pyProbe('/py.exe', 'import x')
+      const r3 = await pyProbe('/py.exe', 'import x', { fresh: true })
       return {
         hitFreshOff: gpuCacheHit(hot, now, 5 * 60 * 1000, false),
         hitFreshOn: gpuCacheHit(hot, now, 5 * 60 * 1000, true),
@@ -169,7 +175,7 @@ if (section === 'F') {
   } catch (e) {
     broken('沙箱 F 抛了 ' + e.message)
   }
-  const r = ctx.__r
+  const r = await ctx.__r
   if (!r) broken('没拿到结果 F')
   must(r.hitFreshOff === true, 'F/GPU：没传 fresh 且缓存未过期时应命中，实际 ' + r.hitFreshOff)
   must(r.hitFreshOn === false, 'F/GPU：传了 fresh 就必须跳过缓存，实际 ' + r.hitFreshOn)
@@ -313,7 +319,9 @@ if (section === 'I') {
   must(r.busyNoList === false, 'I：宿主没给 downloading 列表时不该禁用，实际 ' + r.busyNoList)
 
   // 契约：/status 必须真的把这张表发出去，否则上面那条判据守的是死代码
-  must(/downloading:\s*Array\.from\(DOWNLOADING\)/.test(src), 'I/契约：/status 没把 DOWNLOADING 以 downloading 字段发出去')
+  // 0.4.8 C4a：活性表由 Set 改成 Map<target,{at,pid}>，取 .keys() 才仍是「只列目标名的字符串数组」。
+  // 断言仍是「/status 把活性表以 downloading 字段发出去」，只跟着改接线字面；形状由 C177 真跑守。
+  must(/downloading:\s*Array\.from\(DOWNLOADING\.keys\(\)\)/.test(src), 'I/契约：/status 没把 DOWNLOADING 以 downloading 字段发出去')
 
   report('issue #10 三条建议逐条对上：没卡→不适用（有卡时不许）、无法确认→不适用且不报加载失败、下载中→面板禁用对应行')
 }

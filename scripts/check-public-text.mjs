@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readIdentity, escapeRe } from './_identity.mjs'
-import { scanCollab } from './_rules.mjs'
+import { scanCollab, CRED_RULES, EXEMPT_RULES, exemptFor } from './_rules.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DEFAULT_REPO = resolve(HERE, '..')
@@ -57,7 +57,10 @@ const HARD_PUBLIC = [
   { name: '内部指标/工作流', re: /verify\.mjs|断言|自检|反向测试|审查报告|台账|派单|切片|全绿|通过\s*\/\s*\d+\s*失败/ },
   // 注意：不能写成裸 \bP[0-2]\b——bilibili 的「分P」（--p N 默认 P1）会被误伤。
   // 内部优先级标记的形态是 P0：/ P0-1 / **P0**，都带冒号、连字符或加粗。
-  { name: '协作方代称/内部编号', re: /WBcn|WBin|WB-CN|WB-Intl|豆包|\bE[1-8]-\d+\b|\bC\d{2,3}\b|\bP[0-2](?:-\d+|[:：])|\*\*P[0-2]\*\*/ },
+  // 协作方代称不再在这里存平行清单：scanCollab 用唯一那份词表（含 i 标志 + NFKC 归一化），
+  // 能认全角、大小写与中间插空格的变体，也免得补一个词要改两处、漏改一处就一面放一面拦。
+  // 编号类必须留在这里：词表不收编号，跟着一起删就等于真漏。
+  { name: '内部编号', re: /\bE[1-8]-\d+\b|\bC\d{2,3}\b|\bP[0-2](?:-\d+|[:：])|\*\*P[0-2]\*\*/ },
   // 本机标识分两半：
   //   · 项目名 / 路径 —— 写死。它们不是个人身份（公开仓库里本来就有），
   //     而且要能挡住**别人**写进 README 的路径。
@@ -71,6 +74,10 @@ const HARD_PUBLIC = [
     re: /D:\\+007|Dsh工作区|DeepSeek-Harness|GPT-SoVITS|bili-duty|bili-panel|刷B站|surf CORE/,
   }]),
   { name: '本机验证过程', re: /本机侧|作者侧|作者机器|我这台|我的机器|隔离目录.{0,10}真跑|download\.log\s*写出完整链路|rebase\s*到\s*\d\.\d\.\d+\s*后重跑/ },
+  // 凭据与通用本机路径：与 check-release-leak.mjs 共用 scripts/_rules.mjs 的唯一一份。
+  // body（release notes）是发版那一刻手写、会公开发布、原先唯一不过凭据扫描的面；
+  // 这两条补上后，「没扫到的面」与「扫到脏东西」在退出码上都是失败，但措辞仍分开。
+  ...CRED_RULES.map(([name, re]) => ({ name, re })),
 ]
 
 /**
@@ -139,17 +146,25 @@ function listPackageTexts(root) {
 const hits = []
 let scanned = 0
 let publicScanned = 0
+// 跳过不是「扫过了没问题」：--help 面没扫到就是对外面缺一面，必须单独记账并在摘要点名。
+let helpSkipped = 0
+let helpSkipReason = ''
+let metaScanned = 0
 
 function scan(label, text, rules, withSoft = false, collab = false) {
   scanned += 1
+  // 豁免按「文件 + 行特征 + 规则名」三元组，不是整行：一行里有 GNU tar 不能把
+  // 同一行的真 SESSDATA 一起放过。EXEMPT_RULES 与另一守卫共用唯一一份。
+  const exemptFile = label.startsWith('包内:') ? label.slice(3) : label
   const lines = text.split(/\r?\n/)
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]
     if (!line.trim()) continue
     let hit = false
+    const isExempt = (rule) => exemptFor(EXEMPT_RULES, exemptFile, line, rule)
     // 包内容面：协作两类走唯一那份（含 NFKC 归一化），不在本地存正则。
     if (collab) {
-      const cr = scanCollab(line)
+      const cr = scanCollab(line).filter((name) => !isExempt(name))
       if (cr.length) {
         hits.push({ level: 'HARD', label, line: i + 1, rule: cr[0], text: line.trim() })
         hit = true
@@ -157,7 +172,7 @@ function scan(label, text, rules, withSoft = false, collab = false) {
     }
     if (!hit) {
       for (const rule of rules) {
-        if (rule.re.test(line)) {
+        if (rule.re.test(line) && !isExempt(rule.name)) {
           hits.push({ level: 'HARD', label, line: i + 1, rule: rule.name, text: line.trim() })
           hit = true
           break
@@ -183,7 +198,7 @@ if (!existsSync(readme)) {
   console.error(`✗ 找不到 ${readme}`)
   process.exit(2)
 }
-scan('README.md', readFileSync(readme, 'utf8'), HARD_PUBLIC, true)
+scan('README.md', readFileSync(readme, 'utf8'), HARD_PUBLIC, true, true)
 publicScanned += 1
 
 // 2) --help（帮助必须走 stdout）
@@ -191,17 +206,43 @@ const look = join(repo, 'tools', 'look.mjs')
 if (existsSync(look)) {
   const r = spawnSync(process.execPath, [look, '--help'], { encoding: 'utf8', timeout: 60000 })
   const help = `${r.stdout || ''}\n${r.stderr || ''}`
-  if (r.status === 0 && (r.stdout || '').trim()) { scan('--help', r.stdout, HARD_PUBLIC, true); publicScanned += 1 }
-  else console.log(`（--help 跳过：rc=${r.status}，stdout ${(r.stdout || '').length} B）${help.trim() ? ` ${help.trim().slice(0, 120)}` : ''}`)
+  if (r.status === 0 && (r.stdout || '').trim()) {
+    scan('--help', r.stdout, HARD_PUBLIC, true, true)
+    publicScanned += 1
+  } else {
+    helpSkipped += 1
+    helpSkipReason = `rc=${r.status}，stdout ${(r.stdout || '').length} B`
+    console.log(`（--help 跳过：${helpSkipReason}）${help.trim() ? ` ${help.trim().slice(0, 120)}` : ''}`)
+  }
+} else {
+  // 文件不存在也是「这一面没扫到」，不许显示成 `--help ✓`。
+  // 不直接 exit 2：包内可以没有 look.mjs（只装 npm 包跑 CLI 的场景），该走「未扫全」而非硬失败。
+  helpSkipped += 1
+  helpSkipReason = 'tools/look.mjs 不存在'
+  console.log(`（--help 跳过：${helpSkipReason}）`)
 }
 
 // 3) 附加文件（release body）
 for (const f of bodyFiles) {
   const p = resolve(f)
   if (!existsSync(p)) { console.error(`✗ 找不到 ${p}`); process.exit(2) }
-  scan(p, readFileSync(p, 'utf8'), HARD_PUBLIC, true)
+  scan(p, readFileSync(p, 'utf8'), HARD_PUBLIC, true, true)
   publicScanned += 1
 }
+
+// 3b) package.json 的 description / keywords 也是对外文案（npm 搜索页直接展示）。
+//     它们原先只跟着 package.json 全文走 HARD_PACKAGE（内部路径 + 本机身份项），
+//     从没过 HARD_PUBLIC 的「内部指标/工作流」，也没过 scanCollab —— 两面对外词全漏。
+const pkgMeta = (() => {
+  try {
+    const j = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'))
+    return [String(j.description || ''), ...(Array.isArray(j.keywords) ? j.keywords : []).map(String)].join('\n')
+  } catch { return '' }
+})()
+scan('package.json:description/keywords', pkgMeta, HARD_PUBLIC, false, true)
+publicScanned += 1
+// 读到空值等于这一面没扫（不是「扫过没问题」）：metaScanned 必须如实反映，退出码才有的判。
+metaScanned = pkgMeta.trim() ? 1 : 0
 
 // 4) package.json.files 展开的全部待发布文本（包内容面）
 const pkg = listPackageTexts(repo)
@@ -212,7 +253,11 @@ const hard = hits.filter((h) => h.level === 'HARD')
 const soft = hits.filter((h) => h.level === 'soft')
 
 console.log(`\n扫描 ${scanned} 份文本（${repo}${bodyFiles.length ? ` + ${bodyFiles.length} 个附加文件` : ''}）`)
-console.log(`  对外文案面 ${publicScanned} 份；包内容面 ${pkg.texts.length} 个文本（package.json.files 展开）\n`)
+console.log(`  对外文案面 ${publicScanned} 份；包内容面 ${pkg.texts.length} 个文本（package.json.files 展开）`)
+console.log(`  对外文案面：README ✓ / --help ${helpSkipped ? `跳过（${helpSkipReason}）` : '✓'} / body ${bodyFiles.length} 份 / description+keywords ${metaScanned ? '✓' : '未扫'}`)
+if (helpSkipped) console.log(`  [warn] 对外文案面未扫全：--help 那一面没扫到（${helpSkipReason}），本次结果不等于三面全过`)
+if (!pkgMeta.trim()) console.log('  [warn] package.json 的 description/keywords 没读到 —— 这一面没扫，不许当成扫过没问题')
+console.log('')
 if (pkg.binary.length) console.log(`  [skip] ${pkg.binary.length} 个二进制文件没做文本扫描：${pkg.binary.join(', ')}`)
 if (pkg.absent.length) console.log(`  [warn] ${pkg.absent.length} 个 files 清单项不在盘上/读不出来、没扫：${pkg.absent.join(', ')}`)
 if (pkg.noFiles) console.log('  [warn] package.json 的 files 没解析出任何条目 —— 包内容这一面没扫，不许当成「扫过没问题」')
@@ -225,14 +270,25 @@ const idNote = IDENTITY_WORDS.length
     '要扫就把身份写进仓库根 .leak-ids 或环境变量 BILI_WATCH_LEAK_IDS）'
 console.log(`  ${idNote}\n`)
 
-if (hard.length === 0) {
-  console.log('✓ 硬闸全过')
-} else {
+// 没扫到的面 = 不知道有没有泄漏，在退出码上只能是失败。
+// 只打 [warn] 不够 —— release.ps1 只判 Rc，机器读不到 warn，没人看时这道闸仍是永真的。
+// 措辞必须与「命中泄漏」分开，别让操作员把「没扫到」误读成「扫到脏东西」。
+const incomplete = []
+if (helpSkipped) incomplete.push(`--help ${helpSkipReason}`)
+if (metaScanned === 0) incomplete.push('description/keywords 没读到')
+// files 解析出 0 条时包内容面一份都没扫，与「扫过没问题」不能同码。
+// 措辞沿用 :249 那句 warn，且只进 incomplete 不进 hard：语义是「没扫到」，不是「扫到脏东西」。
+if (pkg.noFiles) incomplete.push('package.json 的 files 没解析出任何条目')
+if (hard.length > 0) {
   console.log(`✗ 硬闸命中 ${hard.length} 行（必须删或改写）：\n`)
   for (const h of hard) {
     console.log(`  [${h.rule}] ${h.label}:${h.line}`)
     console.log(`    ${h.text.slice(0, 160)}`)
   }
+} else if (incomplete.length) {
+  console.log(`✗ 对外文案面未扫全（${incomplete.join('；')}） —— 没扫到的面等于不知道有没有泄漏，不许放行`)
+} else {
+  console.log('✓ 硬闸全过')
 }
 
 if (soft.length > 0) {
@@ -243,4 +299,4 @@ if (soft.length > 0) {
   if (soft.length > 12) console.log(`  …还有 ${soft.length - 12} 行`)
 }
 
-process.exit(hard.length === 0 ? 0 : 1)
+process.exit(hard.length === 0 && incomplete.length === 0 ? 0 : 1)

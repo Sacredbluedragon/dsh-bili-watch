@@ -23,10 +23,13 @@ import { fileURLToPath } from 'node:url'
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进 lib/cache-path.mjs 了。
 //   留着 import 会让人以为本文件还在判根标记/子目录归属。
 // isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
-import { hasAnyLock } from './lib/locks.mjs'
+// 0.4.8 C1：清缓存的三个入口改走 lockState 三态（读不出来 = unknown，不再压成「没锁」）；
+//   hasAnyLock 那个布尔薄壳只留给老调用方与 C6 真跑判据。
+import { lockState, classifyLock } from './lib/locks.mjs'
 // 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
 import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned } from './lib/cache-own.mjs'
+import { modelRow } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
 //   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
@@ -39,7 +42,7 @@ import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults,
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
-import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile } from './lib/plugin-paths.mjs'
+import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile, DEPS_LOCK_STALE_MS } from './lib/plugin-paths.mjs'
 // 2026-10-31：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
 import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/config.mjs'
@@ -325,7 +328,7 @@ function depsPathSnapshot() {
 let depsMigrationInFlight = false  // 幂等：重试期间不许第二条链并跑同一个 tmp
 let depsMigrationRuns = 0          // 判据可观测：真正进入迁移链的次数
 let depsMigrationRetries = 0
-const DEPS_MIGRATION_STALE_MS = 6 * 60 * 60 * 1000 // 与 scripts/fetch-deps.mjs 的 LOCK_STALE_MS 同口径
+// C48-P2-1：6 小时过期窗口只留 lib/plugin-paths.mjs 一个定义点，宿主与 CLI 共用。
 
 // 锁的绝对路径只在这里算一次，且**不来自 resolveDepsDir()**。
 //   宿主侧后台迁移与 scripts/fetch-deps.mjs 共用 lib 的 depsLockFile()，
@@ -334,8 +337,27 @@ const DEPS_LOCK_FILE = depsLockFile()
 function readDepsLock() {
   try { return JSON.parse(readFileSync(DEPS_LOCK_FILE, 'utf8')) } catch { return null }
 }
-function depsLockPidAlive(pid) {
-  try { process.kill(pid, 0); return true } catch (e) { return Boolean(e && e.code === 'EPERM') }
+/**
+ * deps 跨进程锁的唯一判据（C48-P2-1）。
+ *
+ * 原来宿主侧只判 pid 存活（进程在就占用），CLI 侧 fetch-deps.mjs 还判 6 小时 TTL，
+ * 于是「8 小时前的长下载、进程还活着」CLI 判 stale 能接管、面板判占用点不动，两边都不说为什么。
+ * 现在后台迁移 acquireDepsLock 与面板 downloadLockBusy 都走 lib 的 classifyLock 三态，
+ * 与 CLI 侧 lockState 的 held/stale/free 用同一个 pid 探活 + 同一个过期窗口。
+ *
+ * 字段映射：deps 锁体是 { pid, startedAt, target }，classifyLock 认 { pid, at, ttlMs }。
+ * 没有 startedAt 的老锁不能判成过期（等于「不知道」，宁可误拒不可误放）——给它一个极大
+ * ttlMs，pid 活着就仍是 live；这是原来 `!Number.isFinite(startedAt) || ...` 的保守语义，
+ * 统一判据不能把这一侧削掉。锁体没有合法 pid（写了一半 / 损坏）归 corrupt，不拦用户。
+ */
+function depsLockVerdict(cur) {
+  if (!cur || !Number.isInteger(cur.pid) || cur.pid <= 0) return { state: 'corrupt', why: 'corrupt' }
+  const hasAt = Number.isFinite(cur.startedAt) && cur.startedAt > 0
+  return classifyLock({
+    pid: cur.pid,
+    at: hasAt ? cur.startedAt : 0,
+    ttlMs: hasAt ? DEPS_LOCK_STALE_MS : Number.MAX_SAFE_INTEGER,
+  }, DEPS_LOCK_STALE_MS)
 }
 /**
  * 真抢锁：wx 独占写，拿不到返回 null（由调用方延后重试）。锁体与 scripts/fetch-deps.mjs
@@ -356,8 +378,7 @@ function acquireDepsLock(dir) {
       return mine
     } catch {
       const cur = readDepsLock()
-      const held = cur && Number.isFinite(cur.pid) && depsLockPidAlive(cur.pid)
-        && (!Number.isFinite(cur.startedAt) || Date.now() - cur.startedAt <= DEPS_MIGRATION_STALE_MS)
+      const held = depsLockVerdict(cur).state === 'live'
       if (held) return null
       try {
         const now = readDepsLock()
@@ -715,30 +736,40 @@ function ffmpegCands() {
   ].filter(Boolean)
 }
 let ffmpegProbeCache = { at: 0, path: '' }
+let _ffmpegProbePromise = null
+let _ffmpegProbeSeq = 0
 /** W-57（2026-10-28 全量检查）：面板侧的 ffmpeg 探测必须与 CLI（tools/look.mjs:750 findFfmpeg）同口径——
  *  文件候选查存在性，裸 'ffmpeg' 要试跑 -version（PATH 里装了也算有）。
  *  原来只 existsSync，于是「CLI 能抽帧、面板却说没装 ffmpeg」的谎报完全成立（用户最容易当场发现）。
- *  回归复核（2026-10-28）：这个函数在 GET /status 里被同步调用，而 /status 每 8 秒轮询一次——
- *  execFileSync 会阻塞事件循环，所以 timeout 从 5000 收到 1200（ffmpeg -version 正常 <100ms），
- *  缓存从 60s 提到 300s。最坏情况从「每 60 秒卡 5 秒」降到「每 5 分钟卡 1.2 秒」；
- *  没装 ffmpeg 的机器根本不会 spawn（execFileSync 在 PATH 查找失败就抛 ENOENT，约 1ms）。 */
-function resolveFfmpeg() {
+ *  回归复核（2026-10-28）：这个函数在 GET /status 里被调用，而 /status 每 8 秒轮询一次——
+ *  timeout 从 5000 收到 1200（ffmpeg -version 正常 <100ms），缓存从 60s 提到 300s。
+ *  2026-11-06 面板首屏：execFileSync 会堵住事件循环，首屏 4 个并发 /status 只能排队；
+ *  改走 execFileP（不 reject，统一回 {ok,...}），并加在飞 Promise 复用——
+ *  否则 4 个并发会同时未命中缓存、同时起 4 个 ffmpeg 进程，比同步版更糟。
+ *  写配置清缓存时 _ffmpegProbeSeq++，在飞那次基于旧配置的探测结果不许落地盖掉新结论。 */
+async function resolveFfmpeg() {
   const now = Date.now()
   if (now - ffmpegProbeCache.at < 300000) return ffmpegProbeCache.path
-  let hit = ''
-  for (const c of ffmpegCands()) {
-    if (c !== 'ffmpeg') {
-      if (existsSync(c)) { hit = c; break }
-      continue
+  if (_ffmpegProbePromise) return _ffmpegProbePromise
+  const seq = _ffmpegProbeSeq
+  // 2026-11-07：clear 时只清「自己」那一轮。写配置会把在飞记录置 null 并起新一轮探测，
+  //   旧一轮若先完成，无条件 finally 会把新一轮的记录一起清掉，再来一个并发 /status 就会重复起进程。
+  const p = (async () => {
+    let hit = ''
+    for (const c of ffmpegCands()) {
+      if (c !== 'ffmpeg') {
+        if (existsSync(c)) { hit = c; break }
+        continue
+      }
+      // execFileP 不 reject：超时 / ENOENT 都回 ok:false；不判 ok 会把失败当成装好了
+      const r = await execFileP(c, ['-version'], { stdio: 'ignore', timeout: 1200, windowsHide: true })
+      if (r.ok) { hit = c; break }
     }
-    try {
-      execFileSync(c, ['-version'], { stdio: 'ignore', timeout: 1200, windowsHide: true })
-      hit = c
-      break
-    } catch {}
-  }
-  ffmpegProbeCache = { at: now, path: hit }
-  return hit
+    if (seq === _ffmpegProbeSeq) ffmpegProbeCache = { at: Date.now(), path: hit }
+    return hit
+  })().finally(() => { if (_ffmpegProbePromise === p) _ffmpegProbePromise = null })
+  _ffmpegProbePromise = p
+  return p
 }
 function hfHomes() { const p = projDir(); return [join(DEPS, '.hf-home'), join(p, '.hf-home')] }
 const SCRIPTS = join(HERE, 'scripts')
@@ -822,6 +853,10 @@ function outerBudgetMs() {
 }
 function runLook(args, { timeoutMs = 0, signal = null } = {}) {
   const limitMs = timeoutMs > 0 ? timeoutMs : outerBudgetMs()
+  // 解释器现场只在这里定一次：spawn 的 env 与「假成功」结论共用，
+  // 不许日志说 true 而实际没传（issue #12 的定位成本全花在反推宿主上）。
+  const runAsNode = '1'
+  const isElectron = Boolean(process.versions?.electron)
   return new Promise((resolve) => {
     const t0 = Date.now()
     // C组（T42）：Buffer 分块各自 toString 会把跨 UTF-8 边界的汉字切成 ��；先攒 chunk，finish 时统一 concat 再 toString
@@ -871,7 +906,11 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
         final = {
           ...res,
           code: -4,
-          err: `子进程没有执行脚本（解释器不对？）shell=${process.execPath}`,
+          // 三个字段与 download.log 的「进程已拉起」行同口径：只带 shell= 时用户反推不了
+          // 宿主形态，会误以为是脚本坏了。这里点明进程确实拉起过、只是没执行脚本。
+          err: `进程已拉起，但子进程没有执行脚本（解释器不对？）` +
+            `shell=${process.execPath} electron=${isElectron} runAsNode=${runAsNode === '1'}` +
+            `；详见 deps\\download.out.log`,
         }
       }
       runLogRecord(args, final.code, final.err, ms)
@@ -884,7 +923,7 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
         //   不带这个变量，子进程去抢 Electron 单例锁 → 退出码 0、一行脚本没执行；
         //   纯 node 宿主不认这个变量，spawnSync(execPath,['-e','console.log(1)']) 仍 rc=0。
         //   这一处原来连 env 都没传，两处调用点必须同时带上（C142 的 P 判据盯两处）。
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: runAsNode },
         // A-6（2026-10-28 阶段A）：POSIX 下 killTree 用 process.kill(-pid) 杀整个进程组，要求子进程自成进程组。
         //   spawn 未 detached 时 -pid 必抛 ESRCH（子进程不在独立进程组里）。win32 走 taskkill /T /F，不受影响，
         //   故只在非 win32 开 detached。本机是 Windows，这条 POSIX 分支未在本机验证。
@@ -1086,15 +1125,26 @@ function cacheCfg() {
   return {
     days: Number.isFinite(j?.days) ? Math.max(1, j.days) : DEFAULT_CACHE_DAYS,
     maxMb: Number.isFinite(j?.maxMb) ? Math.max(100, j.maxMb) : DEFAULT_CACHE_MAX_MB,
+    // A1（0.4.8）：坏值一律回 true —— 坏配置不该改变行为，只有用户显式写 false 才关。
+    //   老配置没有这个字段 → undefined !== false → true，等于保持现状（自动清理本来就在跑）。
+    autoClean: j?.autoClean !== false,
   }
 }
 
 // N13（2026-10-28）：原来吞异常、无返回值，三处调用都不看结果——「保存规则」写盘失败仍回
 // 200 {ok:true}，与 BLK-02 同族（BLK-02 只修了 tuning 那条）。现在把结果交出去，调用方按失败处理。
-function writeCacheCfg(days, maxMb) {
+// A1（0.4.8）：改成 patch 签名。原来是 (days, maxMb) 两字段整体覆写，三个调用点各自得记得
+//   把没改的字段补回来 —— 实测 :2759（/config 只传 maxMb 的分支）就会把新加的 autoClean 抹掉。
+//   patch 形态下「漏传 = 不改」，天然免疫这类漏点，不用靠人记得改三处。
+function writeCacheCfg(patch) {
+  const cur = cacheCfg()
+  const next = { days: cur.days, maxMb: cur.maxMb, autoClean: cur.autoClean }
+  if (Number.isFinite(patch?.days)) next.days = Math.max(1, Math.floor(patch.days))
+  if (Number.isFinite(patch?.maxMb)) next.maxMb = Math.max(100, Math.floor(patch.maxMb))
+  if (typeof patch?.autoClean === 'boolean') next.autoClean = patch.autoClean
   try {
     // 原子写，indent 0 保持原格式。失败仍返回 {ok:false,why}，不抛（语义不动）。
-    writeJsonAtomic(CACHE_CFG, { days, maxMb }, 0)
+    writeJsonAtomic(CACHE_CFG, next, 0)
     return { ok: true }
   } catch (e) {
     return { ok: false, why: String(e?.message || e) }
@@ -1113,6 +1163,8 @@ function writeDepsCfg(patch) {
     // issue #2 P2-2（2026-10-28）：resolveFfmpeg 有 5 分钟缓存，改了 ffmpeg 路径后 /status 还会
     //   报旧路径 5 分钟。配置一写就清缓存，下一次 /status 立刻重探。
     ffmpegProbeCache = { at: 0, path: '' }
+    _ffmpegProbePromise = null
+    _ffmpegProbeSeq++
     return { ok: true, data: next }
   } catch (e) {
     return { ok: false, why: String(e?.message || e) }
@@ -1156,18 +1208,48 @@ function pickFolderDialog() {
  * 返回被删统计，供面板显示。
  */
 let lastCleanAt = 0
+// A2（0.4.8）：/status 每 8 秒来一次，而 autoCleanCache 有 10 分钟节流。直接把本次结果
+//   塞给 lastAutoClean，面板在 10 分钟里会看到 74 次「throttled」、只有 1 次真实原因。
+//   记住最近一次非 throttled 的结果；只在进程内保留（重启后第一次 /status 就会真跑一次）。
+let lastRealClean = null
+
+// A2：记录「最近一次非节流」的结果。必须两处共用（bootCache 的 force:true 与 /status 轮询）——
+//   只在 /status 记会漏掉启动那次：bootCache 已经把 lastCleanAt 设了，第一次 /status 必然
+//   命中节流，而 lastRealClean 还是 null，面板就只看到「节流中」，启动时的 truncated / locked
+//   全被盖掉（面板必须能查到启动那次的真实状态，不阻断但要可见）。
+function recordClean(r) {
+  if (r?.skipReason?.state !== 'throttled') lastRealClean = r
+  return r
+}
 
 function autoCleanCache(opts = {}) {
+  // A1：开关判断必须是第一行、在 10 分钟节流之前，且**不给 force 豁免**。
+  //   force 的语义只是「这次别走节流」（启动清那次），不是「无视用户开关」。
+  //   手动清走 /cache/clear → removeOwned，根本不过这里；写 force 豁免会让用户关掉开关后
+  //   每次启动仍清一次，开关就成了假开关——所以这里不给 force 开口子。
+  const cfg = cacheCfg()
+  if (!cfg.autoClean) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'disabled', at: Date.now() } }
   // T31-P2-6：面板每 8 秒轮询 /status，不许每次都全量 walk 缓存目录
-  if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true, failed: [] }
-  if (!existsSync(cacheDir())) return { removed: 0, bytes: 0, failed: [] }
+  if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'throttled', at: Date.now() } }
+  if (!existsSync(cacheDir())) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'missing-root', at: Date.now() } }
   // 追加一（2026-10-29，P0）：没有根标记就不是我们建过的缓存根，一律不清（CACHE 可以被指到任何目录）
-  if (!isOurCacheRoot(cacheDir())) return { removed: 0, bytes: 0, skipped: true, noMark: true, failed: [] }
+  if (!isOurCacheRoot(cacheDir())) return { removed: 0, bytes: 0, skipped: true, noMark: true, failed: [], skipReason: { state: 'noMark', at: Date.now() } }
   // W-04（2026-10-28 阶段B-①）：有正在跑的转写/抽帧（任何子目录有 .lock）就不自动清，
   //   否则会删掉正在写的 asr/sheet 产物（转写白跑且无提示）。与 /cache/clear 同判据。
+  // C1（0.4.8）：升级成三态。读不出来（EPERM/EACCES/…）是 unknown，不是「没有锁」——
+  //   自动清一律不清、不给确认；手动清默认拒绝，只有显式 forceUnknown 才放行（见 /cache/clear）。
   // TTL 由这里算好传进去（lib 里的判据不读配置）
-  if (hasAnyLock(cacheDir(), lockTtlMs())) return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [] }
-  const { days, maxMb } = cacheCfg()
+  const ls = lockState(cacheDir(), lockTtlMs())
+  const parallel = { staleLocks: ls.staleLocks, truncated: ls.truncated, truncatedDirs: ls.truncatedDirs }
+  if (ls.state === 'locked') {
+    return { removed: 0, bytes: 0, skipped: true, locked: true, failed: [], ...parallel,
+      skipReason: { state: 'locked', at: Date.now(), lockPath: ls.lockPath, owner: ls.owner } }
+  }
+  if (ls.state === 'unknown') {
+    return { removed: 0, bytes: 0, skipped: true, unknown: true, failed: [], ...parallel,
+      skipReason: { state: 'unknown', at: Date.now(), reason: ls.reason, code: ls.code, path: ls.path } }
+  }
+  const { days, maxMb } = cfg
   const cutoff = Date.now() - days * 86400000
   const limit = maxMb * 1024 * 1024
   const entries = walkEntries(cacheDir())
@@ -1210,7 +1292,8 @@ function autoCleanCache(opts = {}) {
   lastCleanAt = Date.now()
   // #11：清了东西就让占用缓存失效，否则面板最多 30 秒还在显示清理前的体积
   if (removed) invalidateCacheStat()
-  return { removed, bytes, failed }
+  // A2：staleLocks / truncated 是「清了但有些没查」，不是没清的原因，作平行字段不进 skipReason
+  return { removed, bytes, failed, ...parallel }
 }
 
 /** 清理后把插件自己名下（白名单 / BV_*）的空目录也删掉，根目录本身与别人的目录不动。 */
@@ -1258,7 +1341,13 @@ function maskAbs(p) {
 // 14-17：yt-dlp 版本号。depRows 每 8 秒被 /status 轮询一次，版本按文件 size+mtime 缓存，
 // 只有真换了二进制才重新 spawn 一次 --version。
 let ytdlpVerCache = { key: '', ver: '' }
-function ytdlpVersion() {
+let _ytdlpVerPromise = null
+/** 2026-11-06 面板首屏：改异步 + 在飞 Promise 复用。
+ *  键 size:mtimeMs 的缓存在同步时代天然串行、没有竞态；改异步后 4 个并发会同时未命中，
+ *  不复用在飞就会同时起 4 个 yt-dlp（单次 1.4 s），比改之前更慢。
+ *  execFileP 失败（超时 / ENOENT / 非零退出）一律回空字符串，让 deps 行显示成「没找到」，
+ *  绝不把 {ok:false,...} 或 Promise 拼进 detail。 */
+async function ytdlpVersion() {
   const ytdlp = join(DEPS, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
   if (!existsSync(ytdlp)) return ''
   let key = ''
@@ -1267,12 +1356,16 @@ function ytdlpVersion() {
     key = `${st.size}:${st.mtimeMs}`
   } catch { return '' }
   if (ytdlpVerCache.key === key) return ytdlpVerCache.ver
-  let ver = ''
-  try {
-    ver = String(execFileSync(ytdlp, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true }) || '').trim().split(/\s+/)[0]
-  } catch {}
-  ytdlpVerCache = { key, ver }
-  return ver
+  if (_ytdlpVerPromise) return _ytdlpVerPromise
+  // 2026-11-07：与 resolveFfmpeg 同形 —— 只清自己那一轮，别让先完成的旧探测抹掉新一轮的在飞记录
+  const p = (async () => {
+    const r = await execFileP(ytdlp, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true })
+    const ver = r.ok ? String(r.stdout || '').trim().split(/\s+/)[0] : ''
+    ytdlpVerCache = { key, ver }
+    return ver
+  })().finally(() => { if (_ytdlpVerPromise === p) _ytdlpVerPromise = null })
+  _ytdlpVerPromise = p
+  return p
 }
 
 // 第十条（2026-10-29）：GPU 状态。三个问题分开答，别混成一个布尔：
@@ -1329,7 +1422,9 @@ function gpuStatus(fresh) {
   if (gpuCacheHit(_gpuCache, Date.now(), GPU_CACHE_MS, fresh)) return Promise.resolve(_gpuCache.val)
   if (_probePromise) return _probePromise // 在飞就复用，并发 5 次也只起一套 nvidia-smi
   const mySeq = ++_gpuSeq
-  _probePromise = probeGpu()
+  // 2026-11-07：与另外两处同形 —— resetGpuCache() 会置 null 并起新一轮，
+  //   旧一轮先完成时不许清掉新一轮的在飞记录
+  const p = probeGpu()
     // ③ 只有「结论确定」才进缓存；不确定（超时/异常）只本次返回，下次重探
     // ④ 期间被 resetGpuCache() 作废过（序号变了）→ 这是过期观察，不写缓存
     .then((res) => { if (mySeq === _gpuSeq) _gpuCache = nextGpuCache(_gpuCache, res); return res.val })
@@ -1337,8 +1432,9 @@ function gpuStatus(fresh) {
       // 探测本身抛异常 → 同样不写缓存（否则一次崩溃锁死 5 分钟假状态）
       return { deviceCount: 0, dllReady: false, cudaLibs: false, note: `GPU 探测异常，按无卡处理（${String(e?.message ?? e).slice(0, 120)}）` }
     })
-    .finally(() => { _probePromise = null })
-  return _probePromise
+    .finally(() => { if (_probePromise === p) _probePromise = null })
+  _probePromise = p
+  return p
 }
 /** execFile 的 Promise 版：不 reject，统一回 {ok, stdout, err}，省得每处都 try。 */
 function execFileP(file, args, opts) {
@@ -1351,10 +1447,10 @@ function execFileP(file, args, opts) {
   })
 }
 /** ② 把子进程失败的真因说清楚：超时被 kill / 退出码 / stderr 末段。别只剩一句「加载失败」。 */
-function probeWhy(r) {
+function probeWhy(r, timeoutMs = GPU_PROBE_TIMEOUT_MS) {
   const e = r?.err
   if (!e) return '没有返回'
-  if (e.killed) return `超时 ${GPU_PROBE_TIMEOUT_MS}ms 被中止（killed=true）`
+  if (e.killed) return `超时 ${timeoutMs}ms 被中止（killed=true）`
   const out = []
   if (e.code != null) out.push(`code=${e.code}`)
   if (e.signal) out.push(`signal=${e.signal}`)
@@ -1523,7 +1619,7 @@ const OCR_IMPORT_CODE =
   '        __import__(m)\n' +
   '        sys.exit(0)\n' +
   'sys.exit(1)\n'
-function pyProbe(py, code, opts = {}) {
+async function pyProbe(py, code, opts = {}) {
   if (!py) return { ok: false, why: '没有 python 环境' }
   let stamp = 0
   try { stamp = statSync(py).mtimeMs } catch {}
@@ -1535,14 +1631,19 @@ function pyProbe(py, code, opts = {}) {
   if (!opts.fresh && hit && Date.now() - hit.at < ttl) return { ok: hit.ok, why: hit.why, cached: true }
   let ok = false
   let why = ''
-  try {
-    // stdio 必须显式写全：execFileSync 默认会把子进程 stderr 直接透到父进程 stderr，
-    // 探测失败时每次都会往 DSH 日志里刷一段 Python traceback。
-    execFileSync(py, ['-c', code], { timeout: 15000, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    ok = true
-  } catch (e) {
-    const raw = String(e?.stderr || e?.message || e)
-    why = (raw.split('\n').map((s) => s.trim()).filter(Boolean).slice(-1)[0] || '未知原因').slice(0, 160)
+  // stdio 必须显式写全：默认会把子进程 stderr 直接透到父进程 stderr，
+  // 探测失败时每次都会往 DSH 日志里刷一段 Python traceback。
+  // 2026-11-06 面板首屏：execFileSync → execFileP（不 reject，统一回 {ok, stdout, err}）。
+  //   缓存逻辑一行没动；超时被 kill 的真因照 probeWhy 的分支写，不另写一套。
+  const r = await execFileP(py, ['-c', code], { timeout: 15000, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  ok = r.ok
+  if (!ok) {
+    const e = r.err
+    if (e?.killed) why = probeWhy(r, 15000)
+    else {
+      const raw = String(e?.stderr || e?.message || e)
+      why = (raw.split('\n').map((s) => s.trim()).filter(Boolean).slice(-1)[0] || '未知原因').slice(0, 160)
+    }
   }
   // 按 key 存，不能整体替换：depRows 每轮跑两个探针（asr 的 import faster_whisper、
   //   ocr 的 rapidocr），整体替换会让后跑的挤掉先跑的，两条永远都不命中——5 分钟 TTL 直接失效，
@@ -1593,7 +1694,8 @@ function cudaRowNa(gpu) {
 
 async function depRows(gpuVal, opts = {}) {
   // W-57：用 resolveFfmpeg()（同 CLI 口径，含 PATH 试跑）而不是 existsSync 硬查文件
-  const ffmpeg = resolveFfmpeg()
+  // 2026-11-06：三处探测都改异步，调用方必须 await；漏一个 await 会把 Promise 当值拼进 detail。
+  const ffmpeg = await resolveFfmpeg()
   const ffmpegOnPath = ffmpeg === 'ffmpeg'
   let ffmpegSize = 0
   try {
@@ -1606,11 +1708,15 @@ async function depRows(gpuVal, opts = {}) {
   } catch {}
   const asrPython = venvAsr().find((p) => existsSync(p)) || ''
   const ocrPython = venvOcr().find((p) => existsSync(p)) || ''
-  const model = hfHomes().find((d) => existsSync(d)) || ''
+  // issue #11 问题 2：目录存在 ≠ 模型完整。判定与文案都在 lib/model-integrity.mjs，
+  // 这里只把结果接到 /status 的 model 行上；hfHomes() 的两个落点都扫。
+  const modelStatus = modelRow(hfHomes(), { mask: maskAbs, dirStat })
   // C-04：python.exe 在 ≠ 环境能用。真 import 一次（5 分钟缓存），失败就把原因写进 detail。
   // opts.fresh 由面板手点「刷新」透传（/status?fresh=1），8 秒轮询不带；见 pyProbe 的注释
-  const asrProbe = asrPython ? pyProbe(asrPython, 'import faster_whisper', opts) : { ok: false, why: '' }
-  const ocrProbe = ocrPython ? pyProbe(ocrPython, OCR_IMPORT_CODE, opts) : { ok: false, why: '' }
+  const asrProbe = asrPython ? await pyProbe(asrPython, 'import faster_whisper', opts) : { ok: false, why: '' }
+  const ocrProbe = ocrPython ? await pyProbe(ocrPython, OCR_IMPORT_CODE, opts) : { ok: false, why: '' }
+  // ytdlpVersion 失败一律回空字符串：detail 里只能是路径或「没找到」，不能是 undefined / [object Promise]
+  const ytdlpVer = await ytdlpVersion()
   const rows = [
     {
       id: 'ffmpeg',
@@ -1633,8 +1739,7 @@ async function depRows(gpuVal, opts = {}) {
       // 面板上就变成「只有版本号、看不出装在哪」。改成路径，版本拼在括号里。
       detail: (() => {
         if (!existsSync(ytdlp)) return '没找到，非 B 站 URL 不可用'
-        const v = ytdlpVersion()
-        return `${maskAbs(ytdlp)}${v ? `（v${v}）` : ''}`
+        return `${maskAbs(ytdlp)}${ytdlpVer ? `（v${ytdlpVer}）` : ''}`
       })(),
       path: maskAbs(ytdlp),
       removable: true,
@@ -1672,11 +1777,11 @@ async function depRows(gpuVal, opts = {}) {
     {
       id: 'model',
       name: '转写模型（faster-whisper small）',
-      ok: Boolean(model),
-      detail: model ? maskAbs(model) : '没找到模型目录，本地转写不可用',
-      path: maskAbs(model),
+      ok: modelStatus.ok,
+      detail: modelStatus.detail,
+      path: modelStatus.path,
       removable: true,
-      size: model ? dirStat(model).bytes : 0,
+      size: modelStatus.size,
       estimate: ESTIMATES.model,
     },
   ]
@@ -1757,26 +1862,67 @@ async function depRows(gpuVal, opts = {}) {
 //   原来 runDownload 没有任何 inflight 检查，两个子进程同时「改名旧 venv + 在原目录建新的」，
 //   第二个撞 EBUSY/EPERM；改名失败后脚本继续在原目录建，留下半成品。
 //   这里只做进程内的互斥（够用且零外部状态）；跨进程用 deps\.fetch-deps.lock（脚本自己抢）。
-const DOWNLOADING = new Set()
+const DOWNLOADING = new Map()
 /**
  * 纯函数：这次点击该不该拒。抽出来是为了能真跑断言（C145），而不是「源码里有这行」。
+ * 表里的值是 { at, pid }；传数组也认（旧调用方 / 真跑断言只给名字），只是文案里没有占用方细节。
  * @param {string} target 本次目标
- * @param {Iterable<string>} running 正在跑的目标
+ * @param {Iterable<string>|Map<string,{at:number,pid:number}>} running 正在跑的目标
  * @returns {string} 空串 = 放行；非空 = 拒绝理由
  */
 function downloadConflict(target, running) {
-  const set = Array.from(running || [])
+  const meta = running instanceof Map ? running : null
+  const set = Array.from(meta ? meta.keys() : (running || []))
+  // 占用方按 fetch-deps 的拒绝口径写：pid / 目标 / 开始时刻，三样都在才有得查。
+  const who = (key) => {
+    // all 的显示名是既有契约：面板/判据都认「一键装全部」，不能因为带元数据就只写 all。
+    const label = key === 'all' ? '一键装全部' : key
+    const m = meta?.get(key)
+    if (!m) return String(label)
+    const since = m.at ? new Date(m.at).toLocaleString() : '未知时间'
+    return `pid=${m.pid ?? '?'}，目标 ${label}，开始于 ${since}`
+  }
   if (!set.length) return ''
-  if (set.includes(target)) return '这个依赖正在下载中，等这次结束再点'
+  if (set.includes(target)) return `这个依赖正在下载中（${who(target)}），等这次结束再点`
   // all 与单项必须互相排斥：两者会动同一批 venv，第二个必然撞 EBUSY/EPERM。
   if (target === 'all' || set.includes('all')) {
-    return `已有下载在跑（${set.includes('all') ? '一键装全部' : set[0]}），等它结束再点`
+    return `已有下载在跑（${who(set.includes('all') ? 'all' : set[0])}），等它结束再点`
   }
   // 不同的两个单项（先 ffmpeg 再 ytdlp）上面三条全不命中。
   // 但 .download-part.json 是单文件单槽位，后写覆盖先写，任一路结束时 rmSync 整个文件，
   // 另一路的进度会静默消失。加上两个大文件抢同一条带宽、总时长更长，不是好行为。
   // 所以任意一项在跑就拒，不区分同项/不同项。
-  return `已有下载在跑（${set[0]}），等它结束再点（同时下两个只会互相抢带宽）`
+  return `已有下载在跑（${who(set[0])}），等它结束再点（同时下两个只会互相抢带宽）`
+}
+/**
+ * 跨进程锁占用的一句话，口径与 scripts/fetch-deps.mjs 的三行拒绝原因一致
+ * （pid / 目标 / 开始于 / 锁文件绝对路径）。同步预检与子进程输出的透传共用这一份。
+ * @returns {string} 空串 = 没读出占用方
+ */
+function lockBusyText(cur, lockPath) {
+  if (!cur || !Number.isFinite(cur.pid)) return ''
+  const since = Number.isFinite(cur.startedAt) ? new Date(cur.startedAt).toLocaleString() : '未知时间'
+  return `已经有一个安装进程在跑（pid=${cur.pid}，目标 ${cur.target || '?'}，开始于 ${since}）；锁文件：${lockPath}`
+}
+/**
+ * 同步读一次跨进程锁：只认 live（pid 活着且没过 6 小时窗口），与 CLI 侧 lockState 同结论。
+ * 锁文件根本不存在 = 没锁，静默放行；文件在但读不出合法锁体 = corrupt，按「不占用」
+ * 放行，同时在 download.log 点名 corrupt，留下「为什么放行」的痕迹 —— 一个坏 JSON
+ * 不该把面板永久卡死，但也不能悄悄当作什么都没发生。
+ */
+function downloadLockBusy() {
+  let raw
+  try { raw = readFileSync(DEPS_LOCK_FILE, 'utf8') } catch { return null }
+  let cur = null
+  try { cur = JSON.parse(raw) } catch {}
+  const v = depsLockVerdict(cur)
+  if (v.state === 'live') return cur
+  if (v.state === 'corrupt') {
+    try {
+      appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 跨进程锁读不出来（corrupt），按不占用处理；锁文件：${DEPS_LOCK_FILE}\n`, 'utf8')
+    } catch {}
+  }
+  return null
 }
 const PART_STATE_NAME = '.download-part.json'
 /**
@@ -1835,10 +1981,13 @@ const DOWNLOAD_TARGET_DEPS = {
  * @param {number|null} code 退出码
  * @param {string|null} signal 终止信号
  * @param {Array<{id:string, ok:boolean}>} rows depRows() 的结果；没查成就传 null
- * @param {{emptyOutput?: boolean, shell?: string}} [ctx] 退出处理器给的现场（issue #12）
+ * @param {{emptyOutput?: boolean, shell?: string, lockBusy?: string}} [ctx] 退出处理器给的现场（issue #12）
  * @returns {{ok:boolean, note:string}}
  */
 function downloadVerdict(target, code, signal, rows, ctx = {}) {
+  // 锁被别的进程占着时，「退出码 3」什么都说明不了；子进程已经把占用方写进输出，
+  // 优先原样透出来（pid / 目标 / 开始时刻 / 锁路径），别让面板只看到一个数字。
+  if (ctx.lockBusy) return { ok: false, note: ctx.lockBusy }
   if (signal) return { ok: false, note: `信号 ${signal}` }
   if ((code ?? 0) !== 0) return { ok: false, note: `退出码 ${code ?? 'null'}` }
   // issue #12 R：退出码 0、但子进程输出一个字节都没长 —— 这不是「装到一半」也不是
@@ -1882,7 +2031,13 @@ function runDownload(target) {
   // issue #10 问题 3：同一目标（或与 all 交叉）重复点击必须直接拒，不能让两个子进程同时动 venv。
   const conflict = downloadConflict(target, DOWNLOADING)
   if (conflict) return { started: false, why: conflict }
-  DOWNLOADING.add(target)
+  // 跨进程：本进程的 DOWNLOADING 是空的，但磁盘上的锁可能正被另一个宿主/窗口持有。
+  // 回包是 targets.map 同步发出的，等不到子进程退出，所以这里同步读一次锁，
+  // 能读到占用方就直接放进 results[i].why；锁在 spawn 之后才出现的那一半竞态，
+  // 由下面 child.on('exit') 读 outLog 本次增量那路兜住（两条路共用 lockBusyText 口径）。
+  const busy = downloadLockBusy()
+  if (busy) return { started: false, why: lockBusyText(busy, DEPS_LOCK_FILE) }
+  DOWNLOADING.set(target, { at: Date.now(), pid: process.pid })
   try {
     appendFileSync(DOWNLOAD_LOG, `[${new Date().toISOString()}] 开始下载 ${target}\n`, 'utf8')
   } catch {}
@@ -1975,7 +2130,18 @@ function runDownload(target) {
     if (outFd !== null) {
       try { emptyOutput = statSync(outLog).size <= outSizeBefore } catch {}
     }
-    const verdictCtx = { emptyOutput, shell: cmd }
+    // 子进程因锁被占退 3 时，它已经把拒绝原因写进 outLog。只取本次增量
+    // （outSizeBefore 是 spawn 前的字节数），免得翻出上一次下载留下的旧文案。
+    // 同步回包拿不到这段，但它会进 download.log 的「结束」行，面板看日志时不再是光秃秃的退出码 3。
+    let lockBusy = ''
+    if ((code ?? 0) === 3 && outFd !== null) {
+      try {
+        const added = readFileSync(outLog).subarray(outSizeBefore).toString('utf8')
+        const line = added.split(/\r?\n/).find((l) => l.includes('已经有一个安装进程在跑'))
+        if (line) lockBusy = `${line.trim()}；锁文件：${DEPS_LOCK_FILE}`
+      } catch {}
+    }
+    const verdictCtx = { emptyOutput, shell: cmd, lockBusy }
     const finish = (rows) => {
       try {
         const v = downloadVerdict(target, code, signal, rows, verdictCtx)
@@ -2346,7 +2512,7 @@ function bootCache(ctx) {
   }
   // 启动时按「天数 + 总量阈值」清一次缓存，不点按钮也不会无限涨
   try {
-    const r = autoCleanCache({ force: true })
+    const r = recordClean(autoCleanCache({ force: true }))
     if (r.removed) ctx.logger?.info?.(`[dsh-bili-watch] 自动清理缓存 ${r.removed} 个文件 / ${(r.bytes / 1048576).toFixed(1)} MB`)
     // M-05：删不掉的文件别再静默跳过，至少留一行可查的日志（被 ffmpeg/python 占用、只读、超长路径）
     if (r.failed?.length) ctx.logger?.warn?.(`[dsh-bili-watch] 自动清理缓存有 ${r.failed.length} 个文件没删掉：${r.failed.slice(0, 3).map((f) => f.name).join('、')}${r.failed.length > 3 ? ' 等' : ''}`)
@@ -2606,7 +2772,11 @@ function registerPanelRoute(ctx) {
             try {
               const url = new URL(req.url, 'http://127.0.0.1')
               if (req.method === 'GET' && url.pathname === '/api/bili-watch/status') {
-                const cleaned = autoCleanCache()
+                let cleaned = autoCleanCache()
+                // A2（0.4.8）：节流命中的那一轮不代表「上次为什么没清」。用最近一次非 throttled
+                //   的结果覆盖，否则面板 10 分钟里 74 次显示「节流中」、1 次才显示 locked/unknown。
+                if (cleaned?.skipReason?.state === 'throttled' && lastRealClean) cleaned = lastRealClean
+                else recordClean(cleaned)
                 // 2026-11-03 自审：?fresh=1 只由面板手点「刷新」带（8 秒轮询不带），
                 //   用它跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存 —— 用户刚在终端里
                 //   装完东西点刷新，不该看到 5 分钟前的结论。
@@ -2620,12 +2790,12 @@ function registerPanelRoute(ctx) {
                     deps: await depRows(gpuNow, { fresh }),
                     // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
                     //   这张表，暴露出去面板才知道该灰哪几行。只列目标名，不含 pid/路径。
-                    downloading: Array.from(DOWNLOADING),
+                    downloading: Array.from(DOWNLOADING.keys()),
                     // 只报「哪个 .part、现在多大、算不算数」，
                     //   百分比由面板算 —— 分母是估算字符串，后端算不出真百分比。
                     //   activeDepIds 传 DOWNLOADING：没有进程在写它就判「无法测量」，
                     //   避免上次中断留下的状态变成一条永远不动的进度条。
-                    download: downloadProgress(DEPS, { activeDepIds: DOWNLOADING }),
+                    download: downloadProgress(DEPS, { activeDepIds: DOWNLOADING.keys() }),
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
@@ -2671,28 +2841,52 @@ function registerPanelRoute(ctx) {
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
-                if (Number.isFinite(body?.days) || Number.isFinite(body?.maxMb)) {
-                  const wc = writeCacheCfg(
-                    Number.isFinite(body?.days) ? Math.max(1, body.days) : cacheCfg().days,
-                    Number.isFinite(body?.maxMb) ? Math.max(100, body.maxMb) : cacheCfg().maxMb,
-                  )
+                // A1：patch 形态，只传这次真要改的字段（漏传 = 不改，不会抹掉 autoClean）
+                const cfgPatch = {}
+                if (Number.isFinite(body?.days)) cfgPatch.days = Math.max(1, body.days)
+                if (Number.isFinite(body?.maxMb)) cfgPatch.maxMb = Math.max(100, body.maxMb)
+                if (Object.keys(cfgPatch).length) {
+                  const wc = writeCacheCfg(cfgPatch)
                   if (!wc.ok) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${wc.why || '未知错误'}` })
                 }
                 // A7（2026-10-27）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
                 //   不再像以前那样「先删完再补一句 warning」（锁外删会跟运行中的抽帧抢目录）。
-                //   锁可能在 frames/.lock 根，也可能在每个抽帧子目录 frames/<bv>-pN-<step>s/.lock。
-                // A-3（2026-10-28 阶段A）：原来只查 frames 一层锁，漏掉 sheet-tmp / substrip-tmp /
-                //   CACHE 根的 .meta-*.lock / asr 等会写盘的子目录。改成递归扫（hasAnyLock，限深度 3）。
-                const locked = hasAnyLock(cacheDir(), lockTtlMs())
-                if (locked) {
+                // A-3（2026-10-28 阶段A）：递归扫所有会写盘的子目录（限深度 3）。
+                // C1（0.4.8）：升级成三态。locked 一律拒绝；unknown 默认拒绝，只有显式
+                //   forceUnknown=1 且当前确实 unknown 才放行 —— 面板不给按钮，能力只走 CLI/API。
+                const ls = lockState(cacheDir(), lockTtlMs())
+                const forceUnknown = body?.forceUnknown === true || Number(body?.forceUnknown) === 1
+                // 活锁是「有人在用」的确定事实，unknown 只是「有目录读不全」的不确定信息。
+                //   forceUnknown 只能绕过后者，不能绕过有人正在写的事实；两者同时成立时 why 两条都写，
+                //   不许只报一条。
+                if (ls.state === 'locked' || ls.live) {
+                  const held = ls.live || { lockPath: ls.lockPath, owner: ls.owner }
+                  const readWhy = ls.state === 'unknown'
+                    ? ` 另有目录读不出来（${ls.code}：${maskAbs(ls.path)}），forceUnknown=1 也不能绕过正在运行的任务。`
+                    : ''
                   return sendJson(res, 200, {
                     ok: false,
-                    why: '正在被占用：检测到正在运行的抽帧任务，已取消清理。等抽帧跑完再清。',
-                    data: { removed: 0, bytes: 0, skipped: [], failed: [], locked: true },
+                    why: `正在被占用：检测到正在运行的抽帧/转写任务（锁 ${maskAbs(held?.lockPath)}，pid ${held?.owner?.pid}），已取消清理。等任务跑完再清。${readWhy}`,
+                    data: { removed: 0, bytes: 0, skipped: [], failed: [], locked: true,
+                      ...(ls.state === 'unknown' ? { unknown: true, reason: ls.reason, code: ls.code } : {}) },
                   })
+                }
+                const unknownWhy = `缓存根有目录读不出来（${ls.code}），已拒绝。确认要清可加 forceUnknown=1`
+                if (ls.state === 'unknown' && !forceUnknown) {
+                  return sendJson(res, 200, {
+                    ok: false, why: unknownWhy,
+                    data: { removed: 0, bytes: 0, skipped: [], failed: [], unknown: true, reason: ls.reason },
+                  })
+                }
+                if (ls.state === 'unknown') {
+                  // 清之前打一行带 reason：让「忽略了什么」可查，不许只说「已强制清理」
+                  try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理：我将忽略 ${ls.reason}（forceUnknown=1）`) } catch {}
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
                 const cleared = removeOwned(cacheDir())
+                if (ls.state === 'unknown') {
+                  try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`) } catch {}
+                }
                 // #11：清完立刻让占用缓存失效——面板紧接着那次 /status 要看到清完的真实体积
                 invalidateCacheStat()
                 // 9-8：有权限问题删不掉时不报成功，且 removed 只数真删掉的；面板按 ok/why 显示「部分失败：N 项」
@@ -2700,6 +2894,7 @@ function registerPanelRoute(ctx) {
                 return sendJson(res, 200, {
                   ok: !partial,
                   why: partial ? `部分失败：${cleared.failed.length} 项` : undefined,
+                  // 这里的 skipped 是 removeOwned 的清单**数组**，与 autoCleanCache 的布尔同名不同义，不许统一
                   data: { removed: cleared.files, bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed },
                 })
               }
@@ -2746,19 +2941,17 @@ function registerPanelRoute(ctx) {
                 //   落到 cache-config.json（与 /cache/clear 同源），不写进 ui-config.json。
                 let rule = null
                 let cacheErr = null
-                if (Number.isFinite(body?.days) && body.days > 0) {
-                  const cur = cacheCfg()
-                  const days = Math.max(1, Math.floor(body.days))
-                  const maxMb = Number.isFinite(body?.maxMb) && body.maxMb > 0 ? Math.max(100, Math.floor(body.maxMb)) : cur.maxMb
-                  const wc = writeCacheCfg(days, maxMb)
+                // A1（0.4.8）：原来两段分支各自调 writeCacheCfg(days, maxMb) 整体覆写，
+                //   只传 maxMb 的那段就是漏点。合成一个 patch 一次写盘，「漏传 = 不改」。
+                const cachePatch = {}
+                if (Number.isFinite(body?.days) && body.days > 0) cachePatch.days = Math.max(1, Math.floor(body.days))
+                if (Number.isFinite(body?.maxMb) && body.maxMb > 0) cachePatch.maxMb = Math.max(100, Math.floor(body.maxMb))
+                if (typeof body?.autoClean === 'boolean') cachePatch.autoClean = body.autoClean
+                if (Object.keys(cachePatch).length) {
+                  const wc = writeCacheCfg(cachePatch)
                   if (!wc.ok) cacheErr = wc.why || '未知错误'
-                  rule = { days, maxMb }
-                } else if (Number.isFinite(body?.maxMb) && body.maxMb > 0) {
-                  const cur = cacheCfg()
-                  const maxMb = Math.max(100, Math.floor(body.maxMb))
-                  const wc = writeCacheCfg(cur.days, maxMb)
-                  if (!wc.ok) cacheErr = wc.why || '未知错误'
-                  rule = { days: cur.days, maxMb }
+                  const saved = cacheCfg()
+                  rule = { days: saved.days, maxMb: saved.maxMb, autoClean: saved.autoClean }
                 }
                 // 参数分层（阶段B）：白名单键写进 deps-config.json，表外的键忽略、不报错。
                 // 值为 null = 恢复默认（从文件里删掉该键，回落到常量）；值非法 = 400 报错（D-01/D-02）。

@@ -176,6 +176,30 @@ MODULE_LOADER.load({
       return data
     }
     const jget = (p) => request(p)
+    // 2026-11-06 面板首屏：syncSettings / ActivationGuide / OverlayBanner 要的是同一份 /status data，
+    //   各自 jget 一次 = 首屏 4 个并发请求（再加 Panel.load 就是 4 个里的第 4 个）。
+    //   共享同一个 promise，三处只发 1 个请求。
+    // 硬边界：Panel.load(fresh) 不在这里。它要能带 ?fresh=1 单独穿透 GPU 5 分钟缓存与
+    //   import 30 秒缓存；合并进来会把「点刷新」放大成三处一起强制重探。
+    // 失败语义：共享 promise 在**创建处**就 catch 成确定值 null（比在取用处 catch 更严：
+    //   即使某个组件没挂载、没人取用，也不会留一个没人接的 rejection）；
+    //   三处取用仍判 !j 且各自保留 .catch，一处失败不影响另外两处。
+    // 2026-11-07：失败**不缓存**。面板打开那一刻服务端恰好不可用（重启中 / 路由未注册 /
+    //   HTTP 500），永久缓存 null 会让三个首屏组件整段会话都拿不到状态：设置页不注册 tab、
+    //   引导卡在 seen=false 时常驻。做法是「一轮渲染内在飞仍共享，失败落地后清掉记录」，
+    //   等价于「只缓存成功」但不会因为去掉在飞复用而让一轮渲染发三次请求。成功后固定，
+    //   因此不需要节流；判自身避免旧一轮的失败结果清掉新一轮已在飞的 promise。
+    let statusOncePromise = null
+    const statusOnce = () => {
+      if (statusOncePromise) return statusOncePromise
+      const p = jget('/status').catch(() => null)
+      statusOncePromise = p
+      // p 已 catch 成确定值，这里的 then 不会 reject；只有成功（j.ok === true）才留住 p
+      p.then((j) => {
+        if ((!j || j.ok !== true) && statusOncePromise === p) statusOncePromise = null
+      })
+      return p
+    }
     const jpost = (p, body) =>
       request(p, {
         method: 'POST',
@@ -470,6 +494,8 @@ MODULE_LOADER.load({
       const [refreshing, setRefreshing] = React.useState(false)
       const [days, setDays] = React.useState('7')
       const [maxMb, setMaxMb] = React.useState('2048')
+      // 0.4.8 A1：自动清理开关。默认 true 与老配置一致（后端 j?.autoClean !== false）。
+      const [autoClean, setAutoClean] = React.useState(true)
       // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
       const [asrMin, setAsrMin] = React.useState('30')
       // 第十条（2026-10-29）：ASR 推理设备。面板上是「转写时用 GPU」一个开关（开=auto / 关=cpu），
@@ -509,6 +535,8 @@ MODULE_LOADER.load({
             if (!dirtyRef.current) {
               setDays(String(j.data.cache?.days ?? 7))
               setMaxMb(String(j.data.cache?.maxMb ?? 2048))
+              // 0.4.8 A1：/status.cache 由 ...cacheCfg() 带出 autoClean，老配置没这字段 → 默认开
+              setAutoClean(j.data.cache?.autoClean !== false)
               const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
               setAsrMin(String(Math.round(sec / 60)))
               setAsrDev(String(tv.asrDevice ?? td.asrDevice ?? 'auto'))
@@ -695,7 +723,9 @@ MODULE_LOADER.load({
           return
         }
         try {
-          const j = await jpost('/config', { days: d, maxMb: m })
+          // 0.4.8 A1：开关一并提交。后端 writeCacheCfg 是 patch 形态（漏传=不改），
+          //   带上它既表达「规则包含开关」，也不会因为只改开关而抹掉天数/总量。
+          const j = await jpost('/config', { days: d, maxMb: m, autoClean })
           setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
           if (j?.ok !== false) { dirtyRef.current = false; await load() }
         } catch (e) {
@@ -977,6 +1007,26 @@ MODULE_LOADER.load({
                 cache.lastAutoClean.failed.slice(0, 5).map((f) => `${f.name}（${f.why}）`).join('、') +
                 (cache.lastAutoClean.failed.length > 5 ? ` 等 ${cache.lastAutoClean.failed.length} 项` : '')))
             : null,
+          // 0.4.8 A2：skipReason 六值要说清「为什么没清」，truncated 要说清「有些地方没查」。
+          //   深层目录未检查必须让用户能查到，不能只当没发生。
+          cache.lastAutoClean?.skipReason?.state
+            ? h('div', { 'data-bl-row': '' },
+              h('span', { 'data-bl-name': '' }, '自动清理状态'),
+              h('span', { 'data-bl-detail': '' },
+                ({ disabled: '自动清理已关闭', throttled: '10 分钟内已检查过', 'missing-root': '缓存目录不存在',
+                  noMark: '缓存根不是本插件建的，未清理', locked: '有任务正在运行，已跳过',
+                  unknown: '有目录读不出来，已跳过' }[cache.lastAutoClean.skipReason.state]
+                  || cache.lastAutoClean.skipReason.state) +
+                (cache.lastAutoClean.skipReason.at ? `（${new Date(cache.lastAutoClean.skipReason.at).toLocaleString()}）` : '') +
+                (cache.lastAutoClean.skipReason.state === 'unknown' && cache.lastAutoClean.skipReason.reason
+                  ? `：${cache.lastAutoClean.skipReason.reason}` : '')))
+            : null,
+          cache.lastAutoClean?.truncated
+            ? h('div', { 'data-bl-row': '' },
+              h('span', { 'data-bl-name': '' }, '检查范围'),
+              h('span', { 'data-bl-detail': '', style: { color: '#b36b00' } },
+                `有 ${cache.lastAutoClean.truncatedDirs} 个深层目录未检查`))
+            : null,
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '位置'),
             h('span', { 'data-bl-detail': '' }, cache.dir || '(未设置)'),
@@ -1006,8 +1056,27 @@ MODULE_LOADER.load({
               h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => { markDirty(); setMaxMb(e.target.value) }, inputMode: 'numeric' }),
               ' MB 时从最旧的删。'),
             h('button', { 'data-bl-btn': '', onClick: saveRule }, '保存规则')),
+          // 0.4.8 A1：开关即时生效，走 /config → writeCacheCfg({autoClean})（与「保存规则」同一入口）。
+          //   失败回滚勾选态，不许界面显示已关而后端还是开着。
+          h('div', { 'data-bl-row': '' },
+            h('span', { 'data-bl-name': '' }, '自动执行'),
+            h('span', { 'data-bl-detail': '' },
+              h('label', { style: { cursor: 'pointer' } },
+                h('input', {
+                  type: 'checkbox', checked: autoClean,
+                  onChange: async (e) => {
+                    const v = e.target.checked
+                    setAutoClean(v)
+                    try {
+                      const r = await jpost('/config', { autoClean: v })
+                      if (r?.ok === false) { setAutoClean(!v); setMsg('保存失败：' + (r.why || '未知错误')) }
+                      else setMsg(v ? '自动清理已开启。' : '自动清理已关闭；手动「立即清除」仍可用。')
+                    } catch (err) { setAutoClean(!v); setMsg('保存失败：' + String(err?.message || err)) }
+                  },
+                }),
+                ' 开启自动清理（关掉后只在你点「立即清除」时清）'))),
           h('div', { 'data-bl-note': '' },
-            '即使不手动清理，也会按上述规则自动执行（每次打开面板与插件启动时检查一次）。')),
+            '开启时按上述规则自动执行（每次打开面板与插件启动时检查一次）；关掉后只有手动「立即清除」会清。')),
         // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),
@@ -1170,8 +1239,8 @@ MODULE_LOADER.load({
       const [dismissed, setDismissed] = React.useState(false)
 
       React.useEffect(() => {
-        jget('/status').then((j) => {
-          if (!j.ok) return
+        statusOnce().then((j) => {
+          if (!j || !j.ok) return
           setSt(j.data)
           const missing = missingDeps(j.data.deps)
           if (missing.length > 0 && j.data.ui?.hintDismissed !== true) {
@@ -1205,8 +1274,8 @@ MODULE_LOADER.load({
     function ActivationGuide() {
       const [seen, setSeen] = React.useState(false)
       React.useEffect(() => {
-        jget('/status').then((j) => {
-          if (j.ok && j.data.ui?.activationSeen === true) setSeen(true)
+        statusOnce().then((j) => {
+          if (j && j.ok && j.data.ui?.activationSeen === true) setSeen(true)
         }).catch(() => {})
       }, [])
       if (seen) return null
@@ -1274,8 +1343,8 @@ MODULE_LOADER.load({
           }
         }
         try { window.__biliWatchSyncSettings = syncSettings } catch {}
-        jget('/status')
-          .then((j) => syncSettings(!!(j.ok && j.data.ui?.showInSettings !== false)))
+        statusOnce()
+          .then((j) => { if (!j) return; syncSettings(!!(j.ok && j.data.ui?.showInSettings !== false)) })
           .catch(() => {})
       },
     }

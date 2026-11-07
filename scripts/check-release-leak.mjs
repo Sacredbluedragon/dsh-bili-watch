@@ -19,7 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readIdentity, escapeRe } from './_identity.mjs';
-import { scanCollab } from './_rules.mjs';
+import { scanCollab, SESSDATA_RULE, EXEMPT_RULES, exemptFor } from './_rules.mjs';
 
 const args = process.argv.slice(2);
 const dirIdx = args.indexOf('--dir');
@@ -89,7 +89,8 @@ const HARD = [
   ...(IDENTITY_WORDS.length
     ? [['本机身份项（昵称 / mid / 用户名）', new RegExp(IDENTITY_WORDS.map(escapeRe).join('|'), 'g')]]
     : []),
-  ['真 SESSDATA 值', /SESSDATA["']?\s*[:=]\s*["'][^"']*(?:%2C|[0-9a-f]{32})/gi],
+  // 与 check-public-text.mjs 的对外文案面共用唯一一份（scripts/_rules.mjs），不许本地再抄。
+  SESSDATA_RULE,
   ['写死本机端口', /127\.0\.0\.1:3080/g],
   // 「协作方 WorkBuddy / 豆包 / hy3-hy4」三类形态已并入 _rules.mjs 的「内部协作标记」，
   // 不再本地重复；下面只剩「路径 / 身份 / 凭据 / 端口」四类。
@@ -99,20 +100,11 @@ const HARD = [
   ['内部工作区 / 同机项目名', /D:\\+007|Dsh工作区|DeepSeek-Harness|GPT-SoVITS|bili-duty|bili-panel|刷B站|surf CORE/g],
 ];
 
-// 明知会误报、但要留档的豁免：文件 + 行内容特征 + **只对哪条规则生效** → 理由。
-// rule 不能省：旧写法「命中任一 EXEMPT 就 continue 整行」会把该行所有规则一起放过，
-// 于是 GNU tar 那行塞进真 SESSDATA 也能溜过两道发布闸。
-const EXEMPT = [
-  { file: 'client.js', match: /不写死\s*127\.0\.0\.1:3080/, rule: '写死本机端口', why: '注释说的是正确做法，不是泄露' },
-  { file: 'tools/look.mjs', match: /C:\\Windows/, rule: 'Windows 绝对路径', why: '拦危险路径的测试用例' },
-  { file: 'tools/cli-io.mjs', match: /C:\\Windows|任一盘符根|全是 c:\\ 开头/, rule: 'Windows 绝对路径', why: '讲路径归一化绕过的注释示例，不是本机路径' },
-  { file: 'lib/cred.mjs', match: /SESSDATA:\s*'sessdata'/, rule: '真 SESSDATA 值', why: '字段名映射表，不是真值' },
-  // 2026-11-02（发版前审查）：这文件里的 `C:\...` / `` `C:\` `` 是**讲 Windows tar 陷阱**的
-  //   命令示例——GNU tar 会把 `-C C:\...` 里的 `C:\` 当成远程主机名。它不是本机路径，
-  //   改成别的写法那句注释就失真了（失真后读者反而会去试裸 tar）。
-  //   match 收窄到 `GNU tar` 这个只在讲这个坑的行上出现的词，不是整文件豁免。
-  { file: 'scripts/fetch-deps.mjs', match: /GNU tar/, rule: 'Windows 绝对路径', why: '讲 Windows 裸 tar 把盘符当远程主机的注释示例，不是本机路径' },
-];
+// 豁免表在 scripts/_rules.mjs 里只有一份，与对外文案面的守卫共用。
+// 每项带 rule 字段：只放过被点名那条规则，同一行里其它规则照常命中。
+// `scripts/fetch-deps.mjs` 那项的 match 收窄到 `GNU tar` 这个只在讲 tar 陷阱的行上出现的词，
+// 不是整文件豁免；规则名豁免保证「GNU tar 行里塞真 SESSDATA」仍被 `真 SESSDATA 值` 抓住。
+const EXEMPT = EXEMPT_RULES;
 
 const files = listTargets();
 const hits = [];
@@ -132,18 +124,17 @@ for (const rel of files) {
   if (buf.subarray(0, 8192).includes(0)) { skipped.push(rel); continue; }
   const src = buf.toString('utf8');
   src.split('\n').forEach((line, i) => {
-    const exemptFor = (rule) => EXEMPT.some(
-      (e) => e.file === rel && e.match.test(line) && e.rule === rule);
+    // 豁免实现也只有一份（scripts/_rules.mjs）：按规则名放过，同一行其它规则照常命中。
+    const isExempt = (rule) => exemptFor(EXEMPT, rel, line, rule);
     // 协作两类走唯一那份（含 NFKC 归一化），不在本地存正则。
     for (const rule of scanCollab(line)) {
-      if (exemptFor(rule)) continue;
+      if (isExempt(rule)) continue;
       hits.push({ file: rel, line: i + 1, rule, sample: line.trim().slice(0, 140) });
     }
     for (const [rule, re] of HARD) {
       re.lastIndex = 0;
       if (!re.test(line)) continue;
-      // 按规则豁免：只放过被点名那条规则，同一行里其它规则照常 hits.push。
-      if (exemptFor(rule)) continue;
+      if (isExempt(rule)) continue;
       hits.push({ file: rel, line: i + 1, rule, sample: line.trim().slice(0, 140) });
     }
   });
