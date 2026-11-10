@@ -14,7 +14,7 @@
 // 用法：
 //   node scripts/check-release-leak.mjs            # 扫当前目录
 //   node scripts/check-release-leak.mjs --dir <路径>
-// 退出码：0 干净；2 有 HARD 命中，或**有文件读不出来**（2026-11-02 起读不出来也算未通过）。
+// 退出码：0 干净；2 有 HARD 命中、有文件读不出来，或**目录展开异常**（这些面没扫到，不许放行）。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,6 +32,35 @@ const { LOCAL_USER, IDENTITY_IDS, IDENTITY_WORDS } = readIdentity(ROOT);
 
 // 只扫真正会进 npm 包的文件：以 package.json 的 files 为准，外加 npm 自动带的几个。
 const ABSENT = []; // 清单里有、盘上没有 —— 记下来，最后点名（2026-11-01 第三轮）
+const COMPLAIN = []; // 递归展开的异常（深度超限等），必须点名并按未通过处理，不许静默截断
+const MAX_DEPTH = 8;
+
+// C293：package.json.files 写目录项时 npm 会递归打包，扫描面必须同样递归。
+//   以前只 readdirSync 一层，lib/sub/leak.txt 这种子目录里的泄漏串两道闸都说通过。
+//   · lstatSync 判符号链接并直接跳过 —— statSync 会跟进去，junction 会把扫描面带出仓库；
+//   · 深度上限 8，超了记进 COMPLAIN 并在摘要点名，绝不静默截断。
+// 「basename 排除口径」现核说明：改前的平铺分支**没有任何 basename 排除**，只判 isFile()。
+//   本轮不新造一份排除逻辑，递归层沿用同一个 isFile()；files 本身就是白名单，
+//   递归不会越出清单项。1650 段说的「既有排除口径」不存在，已在交卷段更正。
+// 与 scripts/check-public-text.mjs 的 listPackageTexts 是同构的两份实现，改一边要改两边。
+function walkTargets(rel, depth, out) {
+  if (depth > MAX_DEPTH) {
+    COMPLAIN.push(`${rel}：目录层数超过 ${MAX_DEPTH}，可能不是 package layout，已停止向下展开`);
+    return;
+  }
+  const full = path.join(ROOT, rel);
+  let st;
+  try { st = fs.lstatSync(full); } catch { ABSENT.push(`${rel}(读不出来)`); return; }
+  if (st.isSymbolicLink()) return;
+  if (st.isDirectory()) {
+    let names;
+    try { names = fs.readdirSync(full); } catch { ABSENT.push(`${rel}(读不出来)`); return; }
+    for (const name of names) walkTargets(`${rel}/${name}`, depth + 1, out);
+    return;
+  }
+  if (st.isFile()) out.add(rel);
+}
+
 function listTargets() {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   // 三个默认项也先判存在再加（2026-11-01 第三轮）。
@@ -43,20 +72,15 @@ function listTargets() {
     if (fs.existsSync(path.join(ROOT, d))) out.add(d);
   }
   for (const entry of pkg.files || []) {
-    const p = path.join(ROOT, entry);
+    const rel = entry.replace(/\/$/, '');
+    const p = path.join(ROOT, rel);
     // 原来这里是 `continue` —— 静默把整个目录项跳过。清单与实物不符时，
     // 扫描面悄悄变小、脚本照样说「扫描通过」。现在记下来点名，与 sync-release.ps1 的
     // AssertNoPaths 同口径（那边是「清单里有、盘上没有 ⇒ 红」；这里 4b 的职责是扫内容、
     // 不负责判清单完整性，所以只点名不红，但**不许静默**）。
+    // 目录没建也走这条路：进 ABSENT，不抛异常。
     if (!fs.existsSync(p)) { ABSENT.push(entry); continue; }
-    if (fs.statSync(p).isDirectory()) {
-      for (const f of fs.readdirSync(p)) {
-        const rel = `${entry.replace(/\/$/, '')}/${f}`;
-        if (fs.statSync(path.join(ROOT, rel)).isFile()) out.add(rel);
-      }
-    } else {
-      out.add(entry);
-    }
+    walkTargets(rel, 1, out);
   }
   return [...out].sort();
 }
@@ -126,7 +150,7 @@ for (const rel of files) {
   src.split('\n').forEach((line, i) => {
     // 豁免实现也只有一份（scripts/_rules.mjs）：按规则名放过，同一行其它规则照常命中。
     const isExempt = (rule) => exemptFor(EXEMPT, rel, line, rule);
-    // 协作两类走唯一那份（含 NFKC 归一化），不在本地存正则。
+    // 协作三类走唯一那份（含 NFKC 归一化），不在本地存正则。
     for (const rule of scanCollab(line)) {
       if (isExempt(rule)) continue;
       hits.push({ file: rel, line: i + 1, rule, sample: line.trim().slice(0, 140) });
@@ -144,12 +168,30 @@ for (const rel of files) {
 const idNote = IDENTITY_WORDS.length
   ? `身份项 ${IDENTITY_WORDS.length} 个（用户名${LOCAL_USER ? '已查' : '不可用'}、.leak-ids ${IDENTITY_IDS.length} 条已查）`
   : '身份项 0 个（用户名取不到、也没有 .leak-ids → 昵称/mid 两类没扫）';
-console.log(`[info] ${idNote}；HARD 四类：内部协作标记 / 派单编号·内部时刻 / 内部路径 / 本机身份项`);
+console.log(`[info] ${idNote}；HARD 五类：内部协作标记 / 派单编号·内部时刻 / 会话坐标·内部批次 / 内部路径 / 本机身份项`);
 if (skipped.length) {
   console.log(`[skip] ${skipped.length} 个二进制文件没做文本扫描：${skipped.join(', ')}`);
 }
 if (ABSENT.length) {
   console.log(`[warn] ${ABSENT.length} 个 files 清单项在盘上不存在、没扫：${ABSENT.join(', ')}`);
+}
+if (COMPLAIN.length) {
+  console.log(`[warn] ${COMPLAIN.length} 处目录展开异常：${COMPLAIN.join('；')}`);
+}
+
+// C296：COMPLAIN 非空 = 有子树根本没展开、没扫，与下面「读不出来」同属没扫到的面。
+//   只打 [warn] 不够 —— 原来 warn 完照样输出「✓ 敏感信息扫描通过」+ exit(0)，
+//   等于「没看过的东西算干净」。1905 段实测：9 层树 + 真泄漏串，rc=0 放行。
+//   修法不新造机制，直接复用下面 unreadable 那段已经写透的理由：
+//   warning 会被翻页跳过，退出码不会；没扫到的面等于不知道有没有泄漏，不许放行。
+//   两道闸对「深度超限」统一判 rc=2：scripts/check-public-text.mjs 的 incomplete 也是 2，
+//   release.ps1 只判 Rc -ne 0，不依赖具体数值；选 2 是因为本闸所有「未通过」历来是 2。
+//   措辞与「扫到脏东西」分开：这里是没扫到，不是命中。
+if (COMPLAIN.length) {
+  console.error(`✗ 敏感信息扫描：${COMPLAIN.length} 处目录展开异常，这些子树没扫（按未通过处理）`);
+  for (const c of COMPLAIN) console.error(`  ${c}`);
+  console.error('  没扫到的面等于不知道有没有泄漏，不许放行。');
+  process.exit(2);
 }
 
 // 读不出来 ⇒ **红**（2026-11-02 00:13 定的；原来只 warn、然后照样 `✓ 通过` + exit 0）。

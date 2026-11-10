@@ -1,0 +1,218 @@
+{
+  "_comment": "C237 修前基线。由 _临时/20261109-C237/make-baseline.mjs 调 tools/fixtures/c237-scan.mjs::collectRows 现抽，口径与 check-release-leak.mjs::listTargets 一致；每行保留 相对路径 / 行号 / 原文。清理包内文案后本表是唯一原始凭证，不许改行数与文本。",
+  "generatedBy": "node _临时/20261109-C237/make-baseline.mjs",
+  "sourceRoot": "dev 仓库（package.json.files 展开）",
+  "textCount": 46,
+  "skipped": [],
+  "rows": [
+    {
+      "file": "README.md",
+      "line": 23,
+      "kinds": [
+        "写进报告"
+      ],
+      "text": "给它一个链接，它按成本从低到高找文本：**官方字幕 → 本地转写 → 画面认字**。字幕几秒就有；没有字幕才下模型转写；连音轨都没有才逐帧认画面。哪一级没成都会写进报告的「来源」行，不会把截图的字当成台词。"
+    },
+    {
+      "file": "README.md",
+      "line": 156,
+      "kinds": [
+        "本版"
+      ],
+      "text": "- **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `\"cache\"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——本版不动那些文件，要清理得你自己删。"
+    },
+    {
+      "file": "client.js",
+      "line": 105,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C1（0.4.9 B 桶第一批）：/status 的 lastRun 早就带 code/ms，面板原来只显示命令与时间，"
+    },
+    {
+      "file": "client.js",
+      "line": 116,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C3（0.4.9 B 桶第一批）：默认值提示原来 6 处硬编码，后端 TUNING_DEFS 改了默认值，"
+    },
+    {
+      "file": "client.js",
+      "line": 127,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C6（0.4.9 B 桶第一批）：后端 deps[].path 早就给了，面板原来只对凭证行显示「文件：」，"
+    },
+    {
+      "file": "client.js",
+      "line": 139,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C7（0.4.9 B 桶第一批）：下载互斥原来只有按钮置灰和一个 title，用户看不出「谁占着」。"
+    },
+    {
+      "file": "client.js",
+      "line": 149,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C8（0.4.9 B 桶第一批）：面板原来不显示插件版本，报障时对不上是哪个版本的行为。"
+    },
+    {
+      "file": "client.js",
+      "line": 335,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C206（0.4.9 B 桶第一批）：清理回显的容量统一恒用 MB，与 CLI 的"
+    },
+    {
+      "file": "client.js",
+      "line": 1007,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C2（0.4.9 B 桶第一批）：刷新按钮提到页面级标题栏。它刷的是整页状态"
+    },
+    {
+      "file": "index.js",
+      "line": 2655,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C201/C202/C203（0.4.9 B 桶第一批）：CLI 早有这几个参数，工具层 schema 没暴露，"
+    },
+    {
+      "file": "index.js",
+      "line": 2835,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C8（0.4.9 B 桶第一批）：面板显示插件版本。PLUGIN_VERSION 是"
+    },
+    {
+      "file": "index.js",
+      "line": 2867,
+      "kinds": [
+        "本版"
+      ],
+      "text": "return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删）。`]"
+    },
+    {
+      "file": "lib/default-out.mjs",
+      "line": 3,
+      "kinds": [
+        "本版"
+      ],
+      "text": "// 本版边界：只做「配置项 + sheet/ocr/substrip 三条命令的默认目录 + --out 仍可覆盖」，"
+    },
+    {
+      "file": "lib/default-out.mjs",
+      "line": 4,
+      "kinds": [
+        "写进报告"
+      ],
+      "text": "// 面板设置页排后（写进报告，不默默不做）。不动删除面、不动 lib/cache-own.mjs、不改 --out 黑名单。"
+    },
+    {
+      "file": "lib/default-out.mjs",
+      "line": 6,
+      "kinds": [
+        "段号"
+      ],
+      "text": "// 兼容口径（2350 段给的「加字段＝兼容」）：**没配 defaultOut 时，返回的路径与改动前逐字节相同**。"
+    },
+    {
+      "file": "lib/doctor.mjs",
+      "line": 4,
+      "kinds": [
+        "段号"
+      ],
+      "text": "* 设计约束（1720 段 §二）："
+    },
+    {
+      "file": "lib/scene-hsv.mjs",
+      "line": 4,
+      "kinds": [
+        "段号"
+      ],
+      "text": "* 做法（1720 段 §二）：低分辨率 2 fps 抽帧 → 每帧切 4x4 网格 → 每格算 H/S/V 各 8 bin"
+    },
+    {
+      "file": "tools/look.mjs",
+      "line": 27,
+      "kinds": [
+        "本版"
+      ],
+      "text": "*                                      bili-watch-cache；本版不自动清理那里（要清理请手动删旧目录）"
+    },
+    {
+      "file": "tools/look.mjs",
+      "line": 1286,
+      "kinds": [
+        "批次名"
+      ],
+      "text": "// C205（0.4.9 B 桶第一批）：search 与 hot 原来各写一遍 UTC 截日期，"
+    },
+    {
+      "file": "tools/look.mjs",
+      "line": 2080,
+      "kinds": [
+        "本版",
+        "报告里"
+      ],
+      "text": "// 面板设置页排后（本版边界），报告里明确标记，不默默不做。"
+    },
+    {
+      "file": "tools/look.mjs",
+      "line": 3936,
+      "kinds": [
+        "本版"
+      ],
+      "text": "if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删。`)"
+    }
+  ],
+  "novel": [
+    "// 0.5.0 A 桶第三批：面板原来只显示命令与时间",
+    "// 2410 段 §三：低分辨率抽帧仍走同一条路径",
+    "// 本版收口范围：只做配置项",
+    "// 报告里补充说明，不默默不做",
+    "// 写进交付报告（插词形态）",
+    "// 0.4.10 C 桶第 2 批：默认值提示"
+  ],
+  "novelCheck": [
+    {
+      "text": "// 0.5.0 A 桶第三批：面板原来只显示命令与时间",
+      "sameFamily": true,
+      "notInBaseline": true
+    },
+    {
+      "text": "// 2410 段 §三：低分辨率抽帧仍走同一条路径",
+      "sameFamily": true,
+      "notInBaseline": true
+    },
+    {
+      "text": "// 本版收口范围：只做配置项",
+      "sameFamily": true,
+      "notInBaseline": true
+    },
+    {
+      "text": "// 报告里补充说明，不默默不做",
+      "sameFamily": true,
+      "notInBaseline": true
+    },
+    {
+      "text": "// 写进交付报告（插词形态）",
+      "sameFamily": true,
+      "notInBaseline": true
+    },
+    {
+      "text": "// 0.4.10 C 桶第 2 批：默认值提示",
+      "sameFamily": true,
+      "notInBaseline": true
+    }
+  ]
+}

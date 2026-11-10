@@ -98,7 +98,8 @@ const runCase = (spec) => {
     '  return { aActive, bIsNew, stillB, noExtraProbe, thirdIsB, cleared, calls: globalThis.__defers.length }',
     '}',
   ].join('\n')
-  const ctx = vm.createContext({ Promise, Error, String, Math, JSON })
+  // C227-B：切出来的 index.js 函数体会调 isWin()；补真值，保持平台分支可测。
+  const ctx = vm.createContext({ Promise, Error, String, Math, JSON, isWin: () => process.platform === 'win32', isMac: () => process.platform === 'darwin', hostPlatform: () => process.platform })
   vm.runInContext(stub, ctx, { timeout: 5000 })
   return ctx.__go()
 }

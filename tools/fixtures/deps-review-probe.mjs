@@ -36,7 +36,8 @@ function sliceFn(src, sig) {
   return body
 }
 function newCtx(extra) {
-  const ctx = { process, console, Date, JSON, Math, Number, String, Array, Object, Set, Promise, setTimeout, clearTimeout, ...extra }
+  // C227-B：同 deps-guards-probe，补真平台别名，别用恒 true 的假桩把平台分支测没了。
+  const ctx = { process, isWin: () => process.platform === 'win32', isMac: () => process.platform === 'darwin', hostPlatform: () => process.platform, console, Date, JSON, Math, Number, String, Array, Object, Set, Promise, setTimeout, clearTimeout, ...extra }
   ctx.globalThis = ctx
   return ctx
 }

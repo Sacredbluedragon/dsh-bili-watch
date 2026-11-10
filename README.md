@@ -4,6 +4,8 @@
 [![version](https://img.shields.io/npm/v/dsh-bili-watch?label=version)](https://www.npmjs.com/package/dsh-bili-watch)
 [![node](https://img.shields.io/node/v/dsh-bili-watch?label=node)](https://www.npmjs.com/package/dsh-bili-watch)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
+[![dsh.so risk](https://cdn.dsh.so/badge/dsh-bili-watch.svg)](https://www.dsh.so/artifact/dsh-bili-watch/)
+[![dsh.so install](https://cdn.dsh.so/badge/install/dsh-bili-watch@0.2.2-rc.1.svg)](https://www.dsh.so/data/install/@Sacredbluedragon/dsh-bili-watch.json)
 
 DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内容（元数据、评论、弹幕、AI 字幕、本地 ASR 转写、抽帧 OCR）。
 
@@ -18,7 +20,7 @@ DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内
 
 ![一条链接进来之后](docs/workflow.png)
 
-给它一个链接，它按成本从低到高找文本：**官方字幕 → 本地转写 → 画面认字**。字幕几秒就有；没有字幕才下模型转写；连音轨都没有才逐帧认画面。哪一级没成都会写进报告的「来源」行，不会把截图的字当成台词。
+给它一个链接，它按成本从低到高找文本：**官方字幕 → 本地转写 → 画面认字**。字幕几秒就有；没有字幕才下模型转写；连音轨都没有才逐帧认画面。哪一级没成都会记在输出的「来源」行，不会把截图的字当成台词。
 
 想改代码、想知道模块怎么分层，见文末[「模块架构」](#模块架构)。
 
@@ -86,7 +88,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `search <关键词> [--days N] [--limit 10] [--order pubdate\|click]` | 视频搜索。`--days` 不传或传 0 表示不限时间；传了则只留最近 N 天发布的，并按播放量降序（最多抓 3 页，结果仍按 `--limit` 截断） |
 | `hot [--limit 10]` | 综合热门榜 |
 | `login [--check] [--poll] [--key <key>]` | 扫码登录。`--check` 校验凭证有效性；`--key` 需配合 `--poll` |
-| `clean` | 清空缓存根。任务进行中（锁文件存活）时拒绝并返回非零退出码 |
+| `clean` | 清空缓存根。加 `--dry-run` 只列出这次会删除哪些条目、多少文件与多少字节，不删除任何文件；加 `--all` 清到只剩缓存根标记，删除方式取 `cache-config.json` 的 `deleteMode`（默认 `permanent` 直删），可用 `--permanent` / `--recycle` / `--smart` 只覆盖这一次；任务进行中（锁文件存活）时拒绝并返回非零退出码。`clean` 不接受 `--keep-source`（它是通用 URL 下载产物的保留开关），加上会拒绝执行并返回非零退出码，不会当作没给、照常删除 |
 | `help` | 打印完整用法（所有命令、全部参数） |
 
 `<target>` 接受 BV 号、`b23.tv` 短链、av 号或 URL。
@@ -96,7 +98,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `--format` | enum | — | 输出格式。`text` / `sub` / `comments` / `danmaku` / `local` 落盘时必须配合此参数，单独指定 `--out` 返回退出码 1 |
-| `--out <path>` | string | — | 落盘路径，相对当前工作目录（cwd），目录不存在时自动创建。`text` / `sub` / `comments` / `danmaku` / `local` 写文件；`frames` 用它指定输出目录。`sheet` / `ocr` / `substrip` 固定写缓存目录，不收 `--out` |
+| `--out <path>` | string | — | 落盘路径，相对当前工作目录（cwd），目录不存在时自动创建。`text` / `sub` / `comments` / `danmaku` / `local` 写文件；`frames` 用它指定输出目录。`sheet` / `ocr` / `substrip` 的产物也可指定路径；不传时读 `deps-config.json` 的 `defaultOut`（或环境变量 `BILI_WATCH_OUT`），未配则沿用缓存目录 |
 | `--ffmpeg <path>` | string | — | ffmpeg 可执行文件路径 |
 | `--cred <path>` | string | — | 凭证 JSON 路径，格式 `{sessdata, bili_jct, buvid3, buvid4}` |
 | `--asr-max <ms>` | number | 1800000 | 转写时长闸门（毫秒）。视频长于此值时仅输出画面描述 |
@@ -151,7 +153,7 @@ r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
 - **批量操作**：标题行的「批量下载 / 批量清理」打开勾选清单，删除前会再确认一次。
 - **排查提示词**：面板里点一下按钮，把一段现成的排查指令复制到剪贴板，粘给你自己机器上的 agent 就行——它会按里面的步骤只读排查（不改你的配置、不删东西），最后整理成一份现象 / 环境 / 日志 / 已排查项 / 怀疑点的报告。按症状分成几段：「依赖装不上」「转写/OCR 失败」「面板打不开」，各对应自己那一种情况，不会混着给你。
 - **抽帧缓存**：显示当前占用与文件数，「立即清除」按归属判据清理（哪些目录会清、哪些暂不清见下方「缓存路径」）；不点则按规则自动清理（保留天数、总量上限），超过从最旧的删起。规则存 `deps/cache-config.json`，启动时与打开面板时各查一次。
-- **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `"cache"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——本版不动那些文件，要清理得你自己删。
+- **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `"cache"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——插件不会动那些文件，要清理得你自己删。
 - **运行时参数**：转写闸门、抽帧张数上限这类常改的放常规组，其余收在「高级设置」里（默认收起），每项都标了范围和「调大/调小会怎样」。
 - **最近一次调用**：显示命令、时间、成败，用来判断上一次是不是卡住了。
 
@@ -206,7 +208,7 @@ r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
 - 自定义缓存位置：设置 `BILI_WATCH_CACHE` 环境变量，或在 `deps/deps-config.json` 写入 `"cache": "<dir>"`。指向外部目录时插件自动创建 `bili-watch-cache/` 子目录作为缓存根
 - 修改后需重启 DSH 生效
 - 自动清理规则（保留天数 / 总量上限）存于 `deps/cache-config.json`，**首次默认保留 7 天 / 上限 2048 MB**（改过就以你改的为准，面板「保存规则」也是写这个文件），启动时与打开面板时各检查一次
-- **缓存根归插件专用**：`clean` 与面板「立即清除」只删能证明是本插件产物的条目，**不按名字整棵删**。这 10 个子目录 `_logs` `frames` `sheets` `sheet-tmp` `substrip-tmp` `_misc` `asr` `frames-dl` `audio-dl` `_hot` 中，`frames` `sheets` `_misc` `asr` 里能给出归属凭证的内容会清掉；**`sheet-tmp` `substrip-tmp` `frames-dl` `audio-dl` `_hot` 这 5 个暂不自动清理**——它们内部的文件名无法与本插件产物区分，为安全起见不动，需要时请手动删除（`_logs` 里若写过旧缓存下沉的 `migrate.log`，同样暂不自动清理）。别把自己的文件放进这些名字的目录；放在缓存根**根目录下**、名字不在上表的文件不会被删（`clean` 会跳过并列进「不是 bili-watch 的缓存条目」）
+- **缓存根归插件专用**：`clean` 与面板「立即清除」只删能证明是本插件产物的条目，**不按名字整棵删**。这 10 个子目录 `_logs` `frames` `sheets` `sheet-tmp` `substrip-tmp` `_misc` `asr` `frames-dl` `audio-dl` `_hot` 中，`frames` `sheets` `_misc` `asr` 里能给出归属凭证的内容会清掉；**`sheet-tmp` `substrip-tmp` `frames-dl` `audio-dl` `_hot` 这 5 个在常规 `clean` 与自动清理里仍不动**——内部文件名无法与本插件产物区分；只有 `clean --all` 会在目录能给出正面凭证（`meta.json` / `manifest.json` / `gen-<hash>` 命名）且内部没有用户扩展名时清掉它们（`_logs` 里若写过旧缓存下沉的 `migrate.log`，同样暂不自动清理）。别把自己的文件放进这些名字的目录；放在缓存根**根目录下**、名字不在上表的文件不会被删（`clean` 会跳过并列进「不是 bili-watch 的缓存条目」）
 
 ## 卸载
 
@@ -359,6 +361,21 @@ AI 字幕（需登录）
 - 通用 URL 走 yt-dlp 时不做内网地址过滤，禁止指向内网服务
 - 无内置限速，批量调用需自行 sleep
 - 工具名 `bili_watch` 与命令 `/bili` 若与其他插件冲突，后注册者覆盖前者
+
+## 数据流
+
+哪些东西会出网、去哪个域、带不带登录态、本地留什么，一次说清——不用去翻源码。
+
+| 动作 | 发出去的内容 | 去哪 | 带凭证 | 本地留下 |
+|---|---|---|---|---|
+| 取视频元数据 / 字幕 / 评论 | BV 号、分 P、页码 | `api.bilibili.com` | 字幕按需（匿名也能取到部分）、其余匿名 | 字幕与评论落到 `cache/` 对应子目录 |
+| 扫码登录 | 二维码轮询凭据 | `passport.bilibili.com` | 登录流程本身 | `credential.json`（缓存根的兄弟文件） |
+| 下载视频流（抽帧 / 转写要用的音轨） | BV 号、cid | api 返回的播放地址（B 站 CDN） | 是 | `cache/frames-dl`、`cache/audio-dl`，`clean` 暂不自动清 |
+| 取弹幕 | cid | `comment.bilibili.com` | 匿名 | 只进内存，需要时才落文件 |
+| B 站以外的链接 | 你给的那条 URL | 由 yt-dlp 按源站决定 | 按源站要求 | `cache/` 下临时文件 |
+| 装依赖（`fetch-deps`） | 无用户数据 | `pypi.org` / 清华镜像、`hf-mirror.com` / `huggingface.co`、`github.com` / `gh-proxy.com` | 无 | `deps/` 下 |
+
+**不出网的部分**：ASR 转写、画面 OCR、抽帧、拼图、转码、清缓存、环境检查，全部在本机跑完。环境检查只读本机状态，不联网、不改文件、不写缓存。
 
 ## 成本
 

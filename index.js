@@ -9,7 +9,10 @@
  *   <插件目录>\tools\look.mjs
  * 只读、匿名，不改任何业务状态。
  */
-import { spawn, execFile, execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+// C227-B：平台判定与子进程调用统一走这两个 lib；别名与守卫的禁词不同名。
+import { runSpawn, runExecFileSync } from './lib/exec.mjs'
+import { isWin } from './lib/platform.mjs'
 import { appendFileSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { dirname, join, relative, basename, resolve } from 'node:path'
@@ -28,7 +31,9 @@ import { fileURLToPath } from 'node:url'
 import { lockState, classifyLock } from './lib/locks.mjs'
 // 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
-import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned } from './lib/cache-own.mjs'
+import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll } from './lib/cache-own.mjs'
+// C236b：三档 deleteMode 的唯一实现；手动 / 自动 / --all 三条路径都从这里取策略。
+import { normalizeDeleteMode, deletePaths } from './lib/recycle.mjs'
 import { modelRow } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
@@ -57,6 +62,7 @@ import { adoptLegacyCred, credPaths, fillBuvids, missingCredFields, pickLoginCoo
 // 2026-10-31：路由守卫搬进 lib/route-claim.mjs（原样不改，只是从私有变导出，
 //   好让 C74 直接断言「同路径被拒 / 不同路径不冲突 / release 后可重登记」）。
 import { claimRoute, releaseRoute } from './lib/route-claim.mjs'
+import { extractWrittenPath } from './lib/written-path.mjs'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
 // 工具输出上限：超了就把全文落文件、只回摘要。
@@ -130,7 +136,7 @@ try {
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LOOK = join(HERE, 'tools', 'look.mjs')
-const COMMANDS = ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'login', 'clean']
+const COMMANDS = ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'login', 'clean', 'local']
 // 斜杠入口认识的 flag（与 tools/look.mjs CLI 对齐；未知 --xxx 给拼写提示而非静默吞）
 const KNOWN_FLAGS = ['--step', '--p', '--cred', '--days', '--limit', '--order', '--grid', '--out', '--ffmpeg', '--head', '--full', '--verify', '--format', '--fresh', '--ocr', '--poll', '--check', '--fast', '--scene', '--mark-seen', '--asr-max', '--quiet', '--no-time', '--at', '--help', '--frames', '--key']
 // ↑ 2026-10-31：补 --key。login --poll --key <code> 要用它，表里漏了 → 提示「未知参数」并拒执行。
@@ -723,15 +729,15 @@ function adoptNoticeThrottled() {
   return adoptNoticeCacheVal
 }
 
-const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
-const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
+const PY_DIR = isWin() ? 'Scripts' : 'bin'
+const PY_EXE = isWin() ? 'python.exe' : 'python'
 function venvAsr() { const p = projDir(); return [join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(p, '.venv-asr', PY_DIR, PY_EXE)] }
 function venvOcr() { const p = projDir(); return [join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(p, '.venv-ocr', PY_DIR, PY_EXE)] }
 function ffmpegCands() {
   return [
     process.env.BILI_WATCH_FFMPEG,
     depsCfg().ffmpeg,
-    join(DEPS, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+    join(DEPS, isWin() ? 'ffmpeg.exe' : 'ffmpeg'),
     'ffmpeg', // W-57：裸名 = 走 PATH，由 resolveFfmpeg() 试跑确认（CLI 的 findFfmpeg 早就有这条）
   ].filter(Boolean)
 }
@@ -803,7 +809,7 @@ const ESTIMATES = {
   // issue #7 · Windows：下载约 1.4 GB（cublas 553 MB + cudnn 743 MB + nvrtc 76 MB），
   //   装完 site-packages/nvidia 约 2.0 GB。原来写「约 500 MB」是估的，用户按它算流量会差三倍。
   // issue #5：Linux 那三个 wheel 更大（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB，展开约 2.2 GB）。
-  cuda: process.platform === 'win32' ? '约 1.4 GB（下载）/ 约 2 GB（装完）' : '约 2.2 GB（pip 三个 wheel，Linux 版更大）',
+  cuda: isWin() ? '约 1.4 GB（下载）/ 约 2 GB（装完）' : '约 2.2 GB（pip 三个 wheel，Linux 版更大）',
 }
 
 // 面板内扫码登录（与 tools/look.mjs 的 login 同一套接口，凭证落同一个文件）
@@ -873,8 +879,8 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
     const killTree = (c) => {
       if (!c?.pid) return
       try {
-        if (process.platform === 'win32') {
-          execFileSync('taskkill', ['/PID', String(c.pid), '/T', '/F'], { windowsHide: true })
+        if (isWin()) {
+          runExecFileSync('taskkill', ['/PID', String(c.pid), '/T', '/F'], { windowsHide: true })
         } else {
           process.kill(-c.pid, 'SIGKILL')
         }
@@ -917,7 +923,7 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
       resolve({ ...final, ms })
     }
     try {
-      child = spawn(process.execPath, [LOOK, ...args], {
+      child = runSpawn(process.execPath, [LOOK, ...args], {
         windowsHide: true,
         // issue #12（2026-11-05）：Electron 宿主里 process.execPath 是 DSH Desktop.exe 而不是 node。
         //   不带这个变量，子进程去抢 Electron 单例锁 → 退出码 0、一行脚本没执行；
@@ -927,7 +933,7 @@ function runLook(args, { timeoutMs = 0, signal = null } = {}) {
         // A-6（2026-10-28 阶段A）：POSIX 下 killTree 用 process.kill(-pid) 杀整个进程组，要求子进程自成进程组。
         //   spawn 未 detached 时 -pid 必抛 ESRCH（子进程不在独立进程组里）。win32 走 taskkill /T /F，不受影响，
         //   故只在非 win32 开 detached。本机是 Windows，这条 POSIX 分支未在本机验证。
-        detached: process.platform !== 'win32',
+        detached: !isWin(),
       })
     } catch (e) {
       finish({ code: -1, out: '', err: `启动失败：${e?.message ?? e}` })
@@ -1128,6 +1134,8 @@ function cacheCfg() {
     // A1（0.4.8）：坏值一律回 true —— 坏配置不该改变行为，只有用户显式写 false 才关。
     //   老配置没有这个字段 → undefined !== false → true，等于保持现状（自动清理本来就在跑）。
     autoClean: j?.autoClean !== false,
+    // C236b：默认 permanent 直删，不占用户的回收站配额；坏值一律回默认。
+    deleteMode: normalizeDeleteMode(j?.deleteMode),
   }
 }
 
@@ -1138,10 +1146,11 @@ function cacheCfg() {
 //   patch 形态下「漏传 = 不改」，天然免疫这类漏点，不用靠人记得改三处。
 function writeCacheCfg(patch) {
   const cur = cacheCfg()
-  const next = { days: cur.days, maxMb: cur.maxMb, autoClean: cur.autoClean }
+  const next = { days: cur.days, maxMb: cur.maxMb, autoClean: cur.autoClean, deleteMode: cur.deleteMode }
   if (Number.isFinite(patch?.days)) next.days = Math.max(1, Math.floor(patch.days))
   if (Number.isFinite(patch?.maxMb)) next.maxMb = Math.max(100, Math.floor(patch.maxMb))
   if (typeof patch?.autoClean === 'boolean') next.autoClean = patch.autoClean
+  if (typeof patch?.deleteMode === 'string') next.deleteMode = normalizeDeleteMode(patch.deleteMode)
   try {
     // 原子写，indent 0 保持原格式。失败仍返回 {ok:false,why}，不抛（语义不动）。
     writeJsonAtomic(CACHE_CFG, next, 0)
@@ -1179,7 +1188,7 @@ function writeDepsCfg(patch) {
  */
 function pickFolderDialog() {
   return new Promise((resolve, reject) => {
-    if (process.platform !== 'win32') return reject(new Error('folder picker is Windows only; set the path manually'))
+    if (!isWin()) return reject(new Error('folder picker is Windows only; set the path manually'))
     const outFile = join(tmpdir(), `bili-watch-pick-${Date.now()}.txt`)
     const script = [
       'Add-Type -AssemblyName System.Windows.Forms',
@@ -1187,7 +1196,7 @@ function pickFolderDialog() {
       '$d.Description = "bili-watch cache folder"',
       'if ($d.ShowDialog() -eq "OK") { [IO.File]::WriteAllText(\'' + outFile + '\', $d.SelectedPath, (New-Object Text.UTF8Encoding($false))) }',
     ].join('; ')
-    const ps = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: false })
+    const ps = runSpawn('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: false })
     let err = ''
     ps.stderr.on('data', (c) => { err += c })
     ps.on('close', (code) => {
@@ -1212,6 +1221,8 @@ let lastCleanAt = 0
 //   塞给 lastAutoClean，面板在 10 分钟里会看到 74 次「throttled」、只有 1 次真实原因。
 //   记住最近一次非 throttled 的结果；只在进程内保留（重启后第一次 /status 就会真跑一次）。
 let lastRealClean = null
+// C236b：最近一次自动清理因回收站放不下而跳过的条目，/status 每次都带（标黄一行）。
+let lastSkippedOverflow = null
 
 // A2：记录「最近一次非节流」的结果。必须两处共用（bootCache 的 force:true 与 /status 轮询）——
 //   只在 /status 记会漏掉启动那次：bootCache 已经把 lastCleanAt 设了，第一次 /status 必然
@@ -1253,47 +1264,42 @@ function autoCleanCache(opts = {}) {
   const cutoff = Date.now() - days * 86400000
   const limit = maxMb * 1024 * 1024
   const entries = walkEntries(cacheDir())
-  let removed = 0
-  let bytes = 0
-  // M-05：删不掉的文件必须记下来。以前两处 catch {} 是空的，被占用 / 只读 / 超长路径时
-  //   静默跳过，removed 不加、bytes 不减，调用方以为清干净了（与 clearCache 的 failed 清单对齐）。
+  // C236b（14:35 定案）：自动清理跟 deleteMode 走，与手动清除 / clean --all 同一套策略。
+  //   原来这里两处直接 rmSync，等于用户选了 recycle 而自动清理仍然直删、开关在最该生效的
+  //   路径上失效。现在先按原有「过期 + 超容量」两轮挑出待删清单，删除动作统一交给
+  //   deletePaths —— 挑清单的规则一个字没改，只把「怎么删」收口。
   const failed = []
   const fresh = []
+  const doomed = []
   for (const e of entries) {
-    if (e.mtime < cutoff) {
-      try {
-        rmSync(e.path, { force: true })
-        removed += 1
-        bytes += e.size
-      } catch (err) {
-        failed.push({ name: relative(cacheDir(), e.path), why: String(err?.message || err) })
-      }
-    } else {
-      fresh.push(e)
-    }
+    if (e.mtime < cutoff) doomed.push(e)
+    else fresh.push(e)
   }
   let total = fresh.reduce((n, e) => n + e.size, 0)
   if (total > limit) {
     fresh.sort((a, b) => a.mtime - b.mtime)
     for (const e of fresh) {
-      try {
-        rmSync(e.path, { force: true })
-        removed += 1
-        bytes += e.size
-        total -= e.size
-      } catch (err) {
-        failed.push({ name: relative(cacheDir(), e.path), why: String(err?.message || err) })
-      }
+      doomed.push(e)
+      total -= e.size
       if (total <= limit) break
     }
   }
+  const r = deletePaths(doomed.map((e) => ({
+    path: e.path, name: relative(cacheDir(), e.path), rel: relative(cacheDir(), e.path).replace(/\\/g, '/'),
+    files: 1, bytes: e.size,
+  })), { mode: cfg.deleteMode, root: cacheDir() })
+  const removed = r.removed
+  const bytes = r.bytes
+  for (const f of r.failed) failed.push(f)
+  // 放不进回收站的重要文件跳过不删，绝不静默降级成直删；面板标黄一行报数。
+  lastSkippedOverflow = r.overflow.count ? { count: r.overflow.count, bytes: r.overflow.bytes } : null
   // 清单 1-7：只删文件会留一堆空目录（跑 100 个视频留 100 个空目录）；删完后自底向上清白名单内空目录
   pruneEmptyDirs(cacheDir())
   lastCleanAt = Date.now()
   // #11：清了东西就让占用缓存失效，否则面板最多 30 秒还在显示清理前的体积
   if (removed) invalidateCacheStat()
   // A2：staleLocks / truncated 是「清了但有些没查」，不是没清的原因，作平行字段不进 skipReason
-  return { removed, bytes, failed, ...parallel }
+  return { removed, bytes, failed, skippedOverflow: lastSkippedOverflow, deleteMode: cfg.deleteMode, ...parallel }
 }
 
 /** 清理后把插件自己名下（白名单 / BV_*）的空目录也删掉，根目录本身与别人的目录不动。 */
@@ -1348,7 +1354,7 @@ let _ytdlpVerPromise = null
  *  execFileP 失败（超时 / ENOENT / 非零退出）一律回空字符串，让 deps 行显示成「没找到」，
  *  绝不把 {ok:false,...} 或 Promise 拼进 detail。 */
 async function ytdlpVersion() {
-  const ytdlp = join(DEPS, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
+  const ytdlp = join(DEPS, isWin() ? 'yt-dlp.exe' : 'yt-dlp')
   if (!existsSync(ytdlp)) return ''
   let key = ''
   try {
@@ -1469,7 +1475,7 @@ function probeWhy(r, timeoutMs = GPU_PROBE_TIMEOUT_MS) {
  *  绝对路径兜底一次 existsSync 的成本，换掉一整类误判。 */
 function nvidiaSmiCands() {
   const out = ['nvidia-smi']
-  if (process.platform === 'win32') {
+  if (isWin()) {
     const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows'
     out.push(join(root, 'System32', 'nvidia-smi.exe'))
   } else {
@@ -1501,7 +1507,7 @@ function cudaLibsBytes() {
     const venvRoot = dirname(dirname(py))
     // 2026-10-31（issue #5 同族）：原来只认 Windows 布局 <venv>\Lib\site-packages，
     //   Linux 的 site-packages 在 <venv>/lib/pythonX.Y/site-packages，这里原来恒 0。
-    if (process.platform === 'win32') return dirStat(join(venvRoot, 'Lib', 'site-packages', 'nvidia')).bytes
+    if (isWin()) return dirStat(join(venvRoot, 'Lib', 'site-packages', 'nvidia')).bytes
     const libDir = join(venvRoot, 'lib')
     if (!existsSync(libDir)) return 0
     let total = 0
@@ -1588,7 +1594,7 @@ async function probeGpu() {
         // unknown（拿不到 nvidia-smi，连有没有卡都不知道）时不写「加载失败」：
         //   这句话会把「没法验证」说成「库坏了」，正是 issue #10 问题 1 的原文。
         if (!noCardUnknown) {
-          notes.push(`${process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12'} 加载失败：${probeWhy(dll)}`)
+          notes.push(`${isWin() ? 'cublas64_12.dll' : 'libcublas.so.12'} 加载失败：${probeWhy(dll)}`)
         }
       }
     }
@@ -1701,7 +1707,7 @@ async function depRows(gpuVal, opts = {}) {
   try {
     ffmpegSize = (ffmpeg && !ffmpegOnPath) ? statSync(ffmpeg).size : 0
   } catch {}
-  const ytdlp = join(DEPS, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
+  const ytdlp = join(DEPS, isWin() ? 'yt-dlp.exe' : 'yt-dlp')
   let ytdlpSize = 0
   try {
     ytdlpSize = existsSync(ytdlp) ? statSync(ytdlp).size : 0
@@ -1812,11 +1818,11 @@ async function depRows(gpuVal, opts = {}) {
       : gpu.dllReady
       ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 卡）` : ''}，转写走 GPU`
       : (gpu.deviceCount
-        ? (process.platform === 'win32'
+        ? (isWin()
           ? `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——装上转写约快 2 倍`
           : `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——在 ASR 环境里装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（见 README 的 Linux 装法）`)
         : (gpu.note || '没有 NVIDIA 卡，转写走 CPU')),
-    path: gpu.dllReady ? (process.platform === 'win32' ? 'cublas64_12.dll' : 'libcublas.so.12') : '',
+    path: gpu.dllReady ? (isWin() ? 'cublas64_12.dll' : 'libcublas.so.12') : '',
     // 确定没有 NVIDIA 卡时不给「一键下载」按钮：装了也用不上，Linux 上那是 2.2 GB。
     //   判据用 noCard（只有 nvidia-smi 是 ENOENT 才为真），不是 deviceCount === 0 ——
     //   探测超时/异常时 deviceCount 也是 0，那时藏按钮会让有卡的人无从下手。
@@ -2063,7 +2069,7 @@ function runDownload(target) {
   //   ReferenceError，被 try/catch 收成 {started:false}，路由回 HTTP 400。
   //   口径与 PR #4 一致：win32 必须 false，非 win32 保持 detached。
   //   154 条断言一条都没红 —— 因为它们只验"函数存在"，没验"函数体能求值"。
-  const detached = process.platform !== 'win32'
+  const detached = !isWin()
   // A-下载黑洞（2026-10-29 二次修正）：子进程输出不再 stdio:'ignore'，也不再和宿主事件挤同一个文件——
   //   脚本自己的逐行输出写 deps\download.out.log；deps\download.log 只留宿主侧结构化事件
   //   （开始 / pid / detached / 退出码）。fetch-deps 脚本自己也会往 download.log 写关键节点和失败原因，
@@ -2077,7 +2083,7 @@ function runDownload(target) {
   try { outFd = openSync(outLog, 'a') } catch {}
   let child = null
   try {
-    child = spawn(cmd, args, {
+    child = runSpawn(cmd, args, {
       windowsHide: true,
       stdio: outFd === null ? 'ignore' : ['ignore', outFd, outFd],
       detached,
@@ -2182,7 +2188,7 @@ function runDownload(target) {
  */
 function deleteDeps(targets) {
   const map = {
-    ytdlp: join(DEPS, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'),
+    ytdlp: join(DEPS, isWin() ? 'yt-dlp.exe' : 'yt-dlp'),
     model: join(DEPS, '.hf-home'),
   }
   const deleted = []
@@ -2210,7 +2216,7 @@ function deleteDeps(targets) {
       const py = venvAsr().find((p) => existsSync(p)) || ''
       if (!py) { skipped.push({ id: t, why: 'ASR 环境还没装，没有 GPU 运行库可删' }); continue }
       try {
-        execFileSync(py, ['-m', 'pip', 'uninstall', '-y', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cuda-nvrtc-cu12'], {
+        runExecFileSync(py, ['-m', 'pip', 'uninstall', '-y', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cuda-nvrtc-cu12'], {
           timeout: 120000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
         })
         deleted.push(t)
@@ -2466,8 +2472,8 @@ async function lookup({ command, bv, positionals = [], extra = [], badOut = fals
   // 从 stderr 提取路径上报给模型，否则模型拿到「没有输出」且 code=0 时 last-error.json 不存在。
   let outWrittenPath = null
   if (!failed) {
-    const m = err.match(/✓\s*已写入\s*(.+)/)
-    if (m) outWrittenPath = m[1].trim()
+    // E6：原来用 (.+) 取到行尾，把「（source=text）」这类注记一起吞进路径。
+    outWrittenPath = extractWrittenPath(err)
   }
   // A3（2026-10-27）：成功分支里也读 stderr，把含 ⚠ 的警告行拼到结果末尾（一行「警告：…」）；
   //   不含 ⚠ 的进度/日志行照旧丢弃，不污染给模型的正文。
@@ -2610,7 +2616,7 @@ function registerTool(ctx) {
       command: {
         type: 'string',
         required: true,
-        enum: ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text'],
+        enum: ['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'local'],
         description: '要看哪一类材料；想要「讲了什么」的原料用 text，想先看有什么可看的用 search/hot。',
       },
       keyword: {
@@ -2645,6 +2651,37 @@ function registerTool(ctx) {
       grid: {
         type: 'string',
         description: 'command=sheet 时的格子，如 3x3 或 4x4（默认 3x3）。',
+      },
+      // C201/C202/C203：CLI 早有这几个参数，工具层 schema 没暴露，
+      //   模型拿不到入口。只加字段与透传，不改任何既有键的含义。
+      cred: {
+        type: 'string',
+        description: '登录凭证 JSON 路径（sub/text 拿 AI 字幕轨用）。不传走匿名。',
+      },
+      order: {
+        type: 'string',
+        enum: ['pubdate', 'click'],
+        description: 'command=search 的结果排序：pubdate 按发布时间、click 按播放量；不传用默认综合抓取。',
+      },
+      at: {
+        type: 'string',
+        description: 'command=frames/sheet 精看某一刻，支持 750（秒）、12:30（分:秒）、12:30-13:10（区间）。',
+      },
+      ffmpeg: {
+        type: 'string',
+        description: 'ffmpeg 可执行文件路径；不传按 deps 目录 / PATH 依次找。',
+      },
+      asrMax: {
+        type: 'number',
+        description: '转写时长闸门（毫秒）；超过就只出画面描述，不跑本地转写。',
+      },
+      markSeen: {
+        type: 'boolean',
+        description: 'command=text 时标记为已读。',
+      },
+      noTime: {
+        type: 'boolean',
+        description: 'text/sub 默认带 [mm:ss] 时间码，加这个退回纯文本。',
       },
       format: {
         type: 'string',
@@ -2730,6 +2767,15 @@ function registerTool(ctx) {
         }
         extra.push('--out', out)
       }
+      // C201/C202/C203：与上面 schema 一一对应的透传。CLI 层本就消费这些 flag，
+      //   这里只负责把模型给的值原样拼进 argv，不做二次解释。
+      if (typeof args.cred === 'string' && args.cred.trim()) extra.push('--cred', args.cred.trim())
+      if (typeof args.order === 'string' && args.order.trim()) extra.push('--order', args.order.trim())
+      if (typeof args.at === 'string' && args.at.trim()) extra.push('--at', args.at.trim())
+      if (typeof args.ffmpeg === 'string' && args.ffmpeg.trim()) extra.push('--ffmpeg', args.ffmpeg.trim())
+      if (typeof args.asrMax === 'number' && Number.isFinite(args.asrMax) && args.asrMax > 0) extra.push('--asr-max', String(Math.floor(args.asrMax)))
+      if (args.markSeen) extra.push('--mark-seen')
+      if (args.noTime) extra.push('--no-time')
       if (args.command === 'hot') {
         const r = await lookup({ command: 'hot', bv: '', extra, signal })
         return { ok: r.ok, text: trimForModel(r.text, 'hot', '_hot') }
@@ -2786,6 +2832,12 @@ function registerPanelRoute(ctx) {
                 return sendJson(res, 200, {
                   ok: true,
                   data: {
+                    // C8：面板显示插件版本。PLUGIN_VERSION 是
+                    //   从 package.json 读的顶层常量；只加字段，不改任何既有键（加字段 = 兼容）。
+                    version: PLUGIN_VERSION,
+                    // C236b：面板「因回收站空间不足跳过 N 项 / X MB」的数据源，
+                    //   只读进程内最近一次真实清理的结果，不在这里查回收站（单次 87ms，禁进轮询）。
+                    skippedOverflow: lastSkippedOverflow || { count: 0, bytes: 0 },
                     credential: credState(),
                     deps: await depRows(gpuNow, { fresh }),
                     // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
@@ -2812,7 +2864,7 @@ function registerPanelRoute(ctx) {
                         // 走节流壳（lib 里那份是纯函数，每 8 秒轮询都全盘 walk 会顶穿面板超时）
                         const a = adoptNoticeThrottled()
                         if (!a) return []
-                        return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，本版不动它（要清理请手动删）。`]
+                        return [`发现旧缓存 ${maskAbs(a.old)}（${a.files} 项，${a.mb} MB），已改用 ${maskAbs(a.next)}；它没有 bili-watch 的标记，插件不会动它（要清理请手动删）。`]
                       })(),
                     ].filter(Boolean),
                   },
@@ -2839,8 +2891,15 @@ function registerPanelRoute(ctx) {
                   return sendJson(res, 500, { ok: false, why: String(e?.message || e) })
                 }
               }
+              // C236b：确认框要算「将删除 N 项 / X MB」，只在点按钮那一下扫，绝不进 /status。
+              if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/preview') {
+                return sendJson(res, 200, { ok: true, data: previewAll(cacheDir()) })
+              }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
+                const all = body?.all === true || Number(body?.all) === 1
+                const confirmed = body?.confirmed === true || Number(body?.confirmed) === 1
+                const mode = normalizeDeleteMode(body?.mode || cacheCfg().deleteMode)
                 // A1：patch 形态，只传这次真要改的字段（漏传 = 不改，不会抹掉 autoClean）
                 const cfgPatch = {}
                 if (Number.isFinite(body?.days)) cfgPatch.days = Math.max(1, body.days)
@@ -2848,6 +2907,11 @@ function registerPanelRoute(ctx) {
                 if (Object.keys(cfgPatch).length) {
                   const wc = writeCacheCfg(cfgPatch)
                   if (!wc.ok) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${wc.why || '未知错误'}` })
+                }
+                // 两步确认：--all 第一次只回预览，一个字节都不删；必须带 confirmed=1 才真执行。
+                //   后端也守这道，面板之外直接打 API 同样绕不过去。
+                if (all && !confirmed) {
+                  return sendJson(res, 200, { ok: true, data: { needConfirm: true, ...previewAll(cacheDir()), mode } })
                 }
                 // A7（2026-10-27）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
                 //   不再像以前那样「先删完再补一句 warning」（锁外删会跟运行中的抽帧抢目录）。
@@ -2883,7 +2947,10 @@ function registerPanelRoute(ctx) {
                   try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理：我将忽略 ${ls.reason}（forceUnknown=1）`) } catch {}
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
-                const cleared = removeOwned(cacheDir())
+                const cleared = all
+                  ? removeAllOwned(cacheDir(), { mode })
+                  : removeOwned(cacheDir(), { mode })
+                if (cleared.overflow?.count) lastSkippedOverflow = { count: cleared.overflow.count, bytes: cleared.overflow.bytes }
                 if (ls.state === 'unknown') {
                   try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`) } catch {}
                 }
@@ -2895,7 +2962,9 @@ function registerPanelRoute(ctx) {
                   ok: !partial,
                   why: partial ? `部分失败：${cleared.failed.length} 项` : undefined,
                   // 这里的 skipped 是 removeOwned 的清单**数组**，与 autoCleanCache 的布尔同名不同义，不许统一
-                  data: { removed: cleared.files, bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed },
+                  data: { removed: cleared.files, bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed,
+                    mode, items: cleared.items ?? cleared.plan?.length ?? 0,
+                    skippedOverflow: cleared.overflow || { count: 0, bytes: 0 }, fallback: cleared.fallback || [] },
                 })
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/download') {

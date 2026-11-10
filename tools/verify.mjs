@@ -9,7 +9,11 @@
  * 不进 npm 包（files 里只留 tools/look.mjs，见 package.json）。
  */
 import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readdirSync, renameSync, copyFileSync, openSync, closeSync, statSync, symlinkSync, chmodSync } from 'node:fs'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
+// C227-D：verify 自己也用同步子进程跑真 CLI / git show / ffmpeg；别名照旧，
+//   平台判定用 hostPlatform()（本文件已有局部 const isWin，不能同名 import）。
+import { hostPlatform } from '../lib/platform.mjs'
+import { runExecFileSync } from '../lib/exec.mjs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, relative, basename } from 'node:path'
@@ -54,10 +58,19 @@ import { makeLocks } from '../lib/locks.mjs'
 // 2026-10-31 三审：C90 的三条守卫需要 logRun与缓存根推导的真跑。
 import { logRun } from '../lib/runs.mjs'
 import { defaultCacheRoot } from '../lib/cache-path.mjs'
+import { cacheNotice } from '../lib/text-notice.mjs'
+import { extractWrittenPath } from '../lib/written-path.mjs'
 // 2026-11-01（P0-3）：must 也跟着 makeChecker 搬进 check-run.mjs。
 //   它是 700 多处断言的失败信号，却原来只是本文件的局部常量——外面碰不到，也就没有一条断言验过它。
 //   C77 现在 import 同一个绑定，直接喂 false 验「必须抛」。**别在这里再写一份**（那就又成了「验的不是用的」）。
-import { makeChecker, must } from './check-run.mjs'
+import {
+  makeChecker, must, parseOnlySpecs, matchOnly, onlyNoticeLine, renderResults,
+  checkId, SLOW_CHECKS, makeSlowChecker, fastNoticeLine,
+} from './check-run.mjs'
+// C245/C246：删除类命令的干跑契约，判据直接调真参数表（不采信夹具自述）。
+// 用命名空间导入是刻意的：实现还没落地时，具名 import 会让整个主闸当场崩掉，
+// 那不是「判据红了」而是「一条断言都没跑」。命名空间里取不到 → 断言自己红。
+import * as paramsNs from '../lib/params.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -82,14 +95,178 @@ function flagAccepted(flag, val) {
 }
 
 const results = []
+// C247：`--only` 只在入口解析一次。specs === null 就是默认路径，后面所有新输出
+//   都关在 `if (onlySpec)` 里，默认路径一行都不多打。
+const ARGV = process.argv.slice(2)
+const specs = parseOnlySpecs(ARGV)
+const onlySpec = specs !== null
+// C272（输出瘦身）：默认只打 FAIL/SKIP 明细，PASS 给计数；--verbose 逐条全明细。
+//   --only 路径保持逐条明细（本来就只跑一两条，瘦掉反而看不到结果）。
+const VERBOSE = ARGV.includes('--verbose')
+const RENDER_VERBOSE = VERBOSE || onlySpec
+// C275（分档）：--fast 才跳慢判据；默认路径 FAST=false，select 的行为与加这个参数之前一致。
+const FAST = ARGV.includes('--fast')
+
+// C272：多条判据都要真跑本主闸看 stdout，每跑一次全量约 85 秒。按「参数 + 环境」
+//   缓存同一次真跑，避免三层改造把主闸从 85 秒拖到几分钟。
+//   子进程一律带两个轻量开关：C271 ④ 的 BW_VERIFY_C271_CHILD（原有）与
+//   BW_VERIFY_PROBE_CHILD（新判据共用），否则「判据真跑自己 → 里面又跑这条判据」无限递归。
+const PROBE_CHILD = process.env.BW_VERIFY_PROBE_CHILD === '1'
+const verifyRuns = new Map()
+function runVerify(args = []) {
+  const key = JSON.stringify(args)
+  if (!verifyRuns.has(key)) {
+    verifyRuns.set(key, spawnSync(process.execPath, ['tools/verify.mjs', ...args], {
+      cwd: ROOT, encoding: 'utf8', timeout: 400000, maxBuffer: 16 * 1024 * 1024,
+      env: { ...process.env, BW_VERIFY_PROBE_CHILD: '1', BW_VERIFY_C271_CHILD: '1' },
+    }))
+  }
+  return verifyRuns.get(key)
+}
+// C294/C295：起一个显式控制 BW_VERIFY_PROBE_CHILD 的 verify 子进程。
+//   runVerify() 一律强制注入 on=1（那是元判据的取证链），这里两个方向都要能跑，
+//   所以单独一份、不进缓存。同样刻意放在所有 check() 之前，避开 C276 的切块口径。
+function runVerifyEnv(args, on) {
+  return spawnSync(process.execPath, ['tools/verify.mjs', ...args], {
+    cwd: ROOT, encoding: 'utf8', timeout: 400000, maxBuffer: 16 * 1024 * 1024,
+    env: {
+      ...process.env,
+      BW_VERIFY_PROBE_CHILD: on ? '1' : '0',
+      BW_VERIFY_C271_CHILD: on ? '1' : '0',
+    },
+  })
+}
+// issue #14：夹具真跑包装。刻意放在所有 check() 之前 —— 若 spawnSync( 字面串落进某个
+//   判据块，C276 的双向差集会把它当成「新的慢判据」误报。判据只调这个包装。
+function runIssue14Probe() {
+  return spawnSync(process.execPath, [join(HERE, 'fixtures', 'issue14-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 4 * 1024 * 1024,
+  })
+}
+// C287：--keep-source 拒绝路线的取证夹具真跑包装。与 issue14 同理，刻意放在所有
+//   check() 之前 —— 判据块里出现子进程调用的字面串会被 C276 当成新的慢判据误报。
+//   三条判据共用一份 JSON（夹具一次约 20 秒），不在每条里各跑一遍。
+let c287Run = null
+const c287 = () => {
+  if (!c287Run) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c287-keep-source-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const raw = `${r.stdout || ''}${r.stderr || ''}`.trim()
+    let json = null
+    try { json = JSON.parse(raw) } catch {}
+    c287Run = { status: r.status, raw, json }
+  }
+  return c287Run
+}
+// C290：--dry-run=1 取证夹具真跑包装，同样放在所有 check() 之前避开 C276 的切块口径。
+//   三条判据共用一份 JSON；不设轻量分支，任何路径都真跑。
+let c290Run = null
+const c290 = () => {
+  if (!c290Run) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c290-dryrun-eq-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const raw = `${r.stdout || ''}${r.stderr || ''}`.trim()
+    let json = null
+    try { json = JSON.parse(raw) } catch {}
+    c290Run = { status: r.status, raw, json }
+  }
+  return c290Run
+}
+// C293：两道包内容面闸的取证夹具真跑包装，放在所有 check() 之前避开 C276 的切块口径。
+//   夹具 stdout 只吐 JSON；不设轻量分支，任何路径都真跑（几秒，不影响全量时间）。
+let c293Run = null
+const c293 = () => {
+  if (!c293Run) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c293-nested-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const raw = `${r.stdout || ''}${r.stderr || ''}`.trim()
+    let json = null
+    try { json = JSON.parse(raw) } catch {}
+    c293Run = { status: r.status, raw, json }
+  }
+  return c293Run
+}
+// C296：与 C293 同口径的取证包装，同样放在所有 check() 之前避开 C276 的切块口径。
+//   夹具 stdout 只吐 JSON；不设轻量分支，任何路径都真跑。
+let c296Run = null
+const c296 = () => {
+  if (!c296Run) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c296-depth-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const raw = `${r.stdout || ''}${r.stderr || ''}`.trim()
+    let json = null
+    try { json = JSON.parse(raw) } catch {}
+    c296Run = { status: r.status, raw, json }
+  }
+  return c296Run
+}
+// C275：跳过集合 = 过渡清单（93 条老判据，按编号） ∪ 本轮用 slowCheck() 显式声明的新判据。
+//   两边都不猜「名字像不像慢」：清单是 C276 双向差集守着的，声明是写的人自己标的。
+const declaredSlow = new Set()
+const isSlow = (name) => {
+  const id = checkId(name)
+  return declaredSlow.has(name) || (id !== null && SLOW_CHECKS.includes(id))
+}
+let skippedSlow = 0        // 被 --fast 真正跳过的条数 → 提示行的分子（运行时计数，不写常量）
+const allNames = []        // 所有 check() 调用过的名字（含被过滤的）→ 未跑提示的分母
+const matchedSpecs = new Set()
+let ranChecks = 0          // 真正调用过断言体的条数 → 未跑提示的分子
+const select = (name) => {
+  allNames.push(name)
+  if (specs) specs.forEach((s, i) => { if (matchOnly(name, [s])) matchedSpecs.add(i) })
+  const hit = matchOnly(name, specs)
+  // C275：只跳过「本来会跑」的慢判据；被 --only 过滤掉的不重复计数，
+  //   于是「跳过数 + 已跑数 === 总 check 数」在两个参数组合下都守恒。
+  if (FAST && hit && isSlow(name)) { skippedSlow++; return false }
+  if (hit) ranChecks++
+  return hit
+}
 // 2026-10-31：执行器搬进 tools/check-run.mjs，就为了让它**自己可被断言**——
 //   它是「所有断言是否真跑」的唯一开关，原来却是唯一没有断言的代码。C77 直接 import 它喂 async 回调。
-const check = makeChecker(results)
+const check = makeChecker(results, select)
+// C275：本轮新判据一律走 slowCheck() 显式声明为慢。register 在 check 之前调，
+//   保证同一条判据的 select 执行时 declaredSlow 里已经有它（否则 --fast 跳不掉）。
+const slowCheck = makeSlowChecker(check, (name) => declaredSlow.add(name))
 // must 从 ./check-run.mjs import（2026-11-01 P0-3）。它原来就在这一行，是文件局部常量。
 // 依赖网络的断言默认跳过：网络抖动不该让守卫变红（静态断言永远可跑）。VERIFY_ONLINE=1 才联网验。
 // C1（2026-10-27）：skip 以前记成 ok:true——汇总把跳过当通过，「8/8 通过」是虚的。
 //   现在记成 ok:false + skip:true，汇总时单独数跳过，不再混进通过数，也不算失败。
-const skip = (name, why) => results.push({ name, ok: false, skip: true, detail: why })
+// C247：被 --only 过滤掉的 skip 不进结果 —— 它本来就没执行，留着只会让「只跑 N 条」自相矛盾。
+const skip = (name, why) => {
+  if (!matchOnly(name, specs)) return
+  results.push({ name, ok: false, skip: true, detail: why })
+}
+// ── 1650 段必修 3：轻量分支一律记 SKIP，不许记 PASS ──────────────────────
+// 为什么这 9 条（C271/C274/C275/C277/C284/C286/C287/C288/C289）必须有轻量分支：
+//   它们都真跑本主闸（runVerify）或重夹具取证。元判据起的子进程带 BW_VERIFY_PROBE_CHILD=1，
+//   若它们在这些子进程里也照跑一遍，就会「判据真跑自己」无限递归，且每次全量翻数倍时间。
+//   父进程（不设该变量）里它们全部真跑，验收路径没有被削掉 —— 看到 9 条 SKIP 不是漏跑。
+// 为什么记 SKIP 而不是 PASS：跑不了的东西记跳过，不许记 ok:true（与 C139 POSIX 同源）。
+//   以前 return 一句说明串被 check() 记成 PASS —— 等于「没验却说过了」，也正是
+//   「不改代码、只加一个环境变量就能让 9 条集体变绿」那条路。现在 makeChecker 看到回调内
+//   push 过 SKIP 就不再补 PASS，一条 check 仍只产出一笔结果，PASS+SKIP+FAIL 三向守恒。
+//   detail 写死「本次未真跑，真跑只在父进程」，供 C294/C295 按行识别，不靠文案猜逻辑。
+const LIGHT_SKIP_DETAIL = '本次未真跑，真跑只在父进程'
+// detail 不重复编号：结果行的 name 已经是 Cxxx，跳过明细块也带 name。
+//   9 条 SKIP 在结果行 + 跳过明细块各占一份，带编号会把取证子进程的默认全量
+//   stdout 推过 C272 的 2048 B 硬数（实测 2112 B）；去掉冗余编号后 1932 B。
+//   语义一个字没少，也没有改阈值 —— 输出瘦身这一层本来就该省掉重复信息。
+const lightSkip = (id) => skip(id, LIGHT_SKIP_DETAIL)
+// C286（0750 §四 bug 2）：顶层独立 skip() 也是「判据单元」，但不经过 check()/select，
+//   所以既不在 allNames 里、也不参与 ranChecks。它们正是「--only 分母 271 vs
+//   汇总 273 差 2」的真实来源；0750 派单说的「C124/C165/C166/C227 被调两次」不成立
+//   （现核完整 name 重名 0、check() 调用 271、顶层独立 skip 2 条、另 1 条是 check 内局部 skip）。
+//   口径统一为「判据单元数 = check 调用数 + 顶层独立 skip 数」，两处数字同源。
+//   用 unitSkip 显式登记；以后有人加顶层 skip 忘了登记，C286 的真跑恒等式会红。
+const extraUnits = []
+const unitSkip = (name, why) => {
+  extraUnits.push(name)
+  skip(name, why)
+}
 const online = process.env.VERIFY_ONLINE === "1"
 
 // —— 静态断言 ——
@@ -514,7 +691,7 @@ check('W-28 credState 与 loadCred 用同一套四字段判据（P1：残缺凭�
 
 // —— 行为断言（真跑，但都很快）——
 if (online) check('text 摘要里给出落盘路径（P0：摘要必须指路，别让人再跑一遍）', () => {
-  const out = execFileSync(process.execPath, [join(HERE, 'look.mjs'), 'text', 'BV19dJQ6sE9F', '--head', '40'], {
+  const out = runExecFileSync(process.execPath, [join(HERE, 'look.mjs'), 'text', 'BV19dJQ6sE9F', '--head', '40'], {
     encoding: 'utf8', timeout: 120000,
   })
   must(/text\.txt/.test(out), '输出里没有 text.txt 路径')
@@ -523,7 +700,7 @@ if (online) check('text 摘要里给出落盘路径（P0：摘要必须指路，
 })
 
 if (online) check('sub --format json 的 stdout 是纯 JSON（P0：机器可读格式不许有中文提示）', () => {
-  const out = execFileSync(process.execPath, [join(HERE, 'look.mjs'), 'sub', 'BV19dJQ6sE9F', '--format', 'json'], {
+  const out = runExecFileSync(process.execPath, [join(HERE, 'look.mjs'), 'sub', 'BV19dJQ6sE9F', '--format', 'json'], {
     encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024,
   })
   must(out.trimStart().startsWith('{'), `首字符是 ${JSON.stringify(out.slice(0, 12))}`)
@@ -532,8 +709,8 @@ if (online) check('sub --format json 的 stdout 是纯 JSON（P0：机器可读�
 })
 
 if (!online) {
-  skip('text 摘要里给出落盘路径', '联网断言，设 VERIFY_ONLINE=1 才跑')
-  skip('sub --format json 纯 JSON', '联网断言，设 VERIFY_ONLINE=1 才跑')
+  unitSkip('text 摘要里给出落盘路径', '联网断言，设 VERIFY_ONLINE=1 才跑')
+  unitSkip('sub --format json 纯 JSON', '联网断言，设 VERIFY_ONLINE=1 才跑')
 }
 
 // —— 阶段 C（2026-10-28 全量检查）新增断言 ——
@@ -555,9 +732,18 @@ check('C2 每条接受 --ffmpeg 的命令在分发处都传了它（P1：ocr 链
   const need = ['cmdPeek', 'cmdAsr', 'cmdFrames', 'cmdSheet', 'cmdSubstrip', 'cmdOcr', 'cmdText', 'cmdLocal', 'runGeneric']
   const missing = []
   for (const fn of need) {
-    const line = lines.find((l) => l.includes(`await ${fn}(`))
-    must(line, `分发处找不到 await ${fn}(`)
-    if (!line.includes('ffmpeg')) missing.push(fn)
+    const direct = lines.find((l) => l.includes(`await ${fn}(`))
+    if (direct) {
+      if (!direct.includes('ffmpeg')) missing.push(fn)
+      continue
+    }
+    // C220 之后四条画面命令改成「参数先收进 const xo = {...}，再 fn: () => cmdX(BV, xo)」。
+    // 判据守的仍是「这条命令真把 --ffmpeg 传下去了」，所以认包装形态；但只认
+    // ffmpeg: opt('ffmpeg') 字面传参且跳过注释行，免得被注释里的「--ffmpeg」骗绿。
+    const at = lines.findIndex((l) => l.includes(`fn: () => ${fn}(`))
+    must(at >= 0, `分发处找不到 ${fn}( 的调用（直接形态与包装形态都没有）`)
+    const seg = lines.slice(Math.max(0, at - 4), at + 1).filter((l) => !/^\s*\/\//.test(l)).join('\n')
+    if (!/ffmpeg:\s*opt\('ffmpeg'\)/.test(seg)) missing.push(fn)
   }
   must(missing.length === 0, `这些分发没把 --ffmpeg 传下去：${missing.join(', ')}`)
   return `${need.length} 条都传了`
@@ -594,7 +780,7 @@ check('C4 --out 黑名单：真喂路径看拦/放（P1：`C:\\Windows.\\` 原�
   ]
   // POSIX 分支本机（Windows）跑不出真值：`/etc/x` 会被 resolve 成 `<当前盘>:\etc\x`，
   //   黑名单项 `/etc` 经 norm() 后是 `\etc`，两边永不相等。所以只在非 Windows 上断言。
-  const posixBlocked = process.platform === 'win32' ? [] : ['/etc/x', '/usr/local/x', '/sys/x', '/']
+  const posixBlocked = hostPlatform() === 'win32' ? [] : ['/etc/x', '/usr/local/x', '/sys/x', '/']
   const allowed = ['..\\x', '..\\out', '.\\out', 'out', join(ROOT, 'out'), '']
   const bad = []
   const expectBlocked = (p) => {
@@ -607,7 +793,7 @@ check('C4 --out 黑名单：真喂路径看拦/放（P1：`C:\\Windows.\\` 原�
   for (const p of allowed) expectAllowed(p)
   must(bad.length === 0, bad.join('；'))
   const n = blocked.length + posixBlocked.length + allowed.length
-  return `${n} 条行为${process.platform === 'win32' ? '（POSIX 4 条未在本机验证）' : ''}`
+  return `${n} 条行为${hostPlatform() === 'win32' ? '（POSIX 4 条未在本机验证）' : ''}`
 })
 
 check('C5 写端点的回环判据真拦非本机请求（P1：Host 头可伪造，绑 0.0.0.0 时局域网可删凭证）', () => {
@@ -1189,7 +1375,11 @@ check('C20 GPU 依赖行 + 删除走 pip uninstall + -Target cuda 在、all 不�
   //   「有 gpu 字段」+「这个字段来自 gpuStatus」，比原来更贴行为、也不绑具体写法。
   const statusI = idx.indexOf("url.pathname === '/api/bili-watch/status'")
   must(statusI > 0, '找不到 /status 分支')
-  const statusBlock = idx.slice(statusI, statusI + 1800)
+  // C236b：/status 每次新增字段都会把固定 1800 字符窗口撑破（新增 skippedOverflow 后
+  //   gpu 行被挤出窗口，C20 假红）。改用「到下一个路由分支」的真实边界，不再靠长度常量。
+  //   咬合不变：下面两条正则仍要求块里真有 gpu 字段且来自 gpuStatus。
+  const statusEnd = idx.indexOf('if (req.method', statusI + 1)
+  const statusBlock = idx.slice(statusI, statusEnd > statusI ? statusEnd : statusI + 1800)
   must(/gpu:\s*[^,\n]+/.test(statusBlock), '/status 没返回 gpu 字段（面板三态拿不到数据）')
   must(/gpuStatus\(/.test(statusBlock), '/status 的 gpu 不是从 gpuStatus 取的（面板会拿到别的值）')
   const i = idx.indexOf("if (t === 'cuda')")
@@ -2278,7 +2468,7 @@ check('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip
   // 这条是唯一真跑权限的判据，所以 Windows 上必须 skip 而不是「跑一遍说通过」：
   //   实测 Windows 上 mode/chmod 都是空操作（stat 恒 666），真跑也只能得出结论「666」，
   //   把它判成 PASS 就是拿一个必然成立的观察冒充判据。
-  if (process.platform === 'win32') {
+  if (hostPlatform() === 'win32') {
     skip('C139 POSIX 上凭证文件落盘就是 0600（Windows 无此语义，skip 不假绿）', 'win32：mode/chmod 是空操作（实测 stat 恒 666），权限语义只在 POSIX 上存在；参数是否传入由 C136 覆盖')
     return
   }
@@ -2756,7 +2946,7 @@ try {
   try {
     const f = join(tmp, 'c50.mjs')
     writeFileSync(f, script)
-    const out = execFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
+    const out = runExecFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
     const { got, want } = JSON.parse(out.trim().split('\n').pop())
     must(Array.isArray(got), `peekViaVideoShot 没返回 times（返回的是 ${JSON.stringify(got)}）——一进门就短路了？`)
     must(JSON.stringify(got) === JSON.stringify(want), `times 对不上：拿到 ${JSON.stringify(got)}，应该是 index[1/47/94/140/187]=${JSON.stringify(want)}`)
@@ -2803,7 +2993,7 @@ try {
   try {
     const f = join(tmp, 'c52.mjs')
     writeFileSync(f, script)
-    const out = execFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
+    const out = runExecFileSync(process.execPath, [f], { encoding: 'utf8', timeout: 60000 })
     const { times, crops } = JSON.parse(out.trim().split('\n').pop())
     const INDEX = Array.from({ length: 188 }, (_, k) => 100 + k * 5)
     const usable = INDEX.length - 1 // 187 格：0..186
@@ -3397,10 +3587,10 @@ check('C56 ffmpeg 下载有 tar -t 预校验，HTML 错误页会被拦住（issu
   try {
     const html = join(tmp, 'x.tar.xz')
     writeFileSync(html, '<!DOCTYPE html><html><body>404 Not Found</body></html>')
-    const tar = process.platform === 'win32'
+    const tar = hostPlatform() === 'win32'
       ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
       : 'tar'
-    must(existsSync(tar) || process.platform !== 'win32', `本机没有 ${tar} —— fetch-deps 的 tarBin() 也会抛，先修环境`)
+    must(existsSync(tar) || hostPlatform() !== 'win32', `本机没有 ${tar} —— fetch-deps 的 tarBin() 也会抛，先修环境`)
     const t = spawnSync(tar, ['-tJf', html], { encoding: 'utf8', timeout: 30000 })
     must(t.status !== 0,
       `真 tar 竟然把 HTML 当归档接受了（rc=${t.status}）—— 预校验的前提不成立，先查这个 tar 是什么`)
@@ -4245,7 +4435,7 @@ check('C155 register 抛错后认领同样要放开：否则这条路径再也�
 //            ② 行为真跑 —— 把 client.js 里的 load 原样抠出来，桩掉 jget，看它到底请求哪个 URL。
 //   load 是 async，check() 是同步的（await 进去会记成 PASS），所以只取「同步调用 jget 那一步」
 //   的结果：`const j = await jget(...)` 里 jget 是在 await 之前同步调用的，URL 当场就能抓到。
-check('C156 手点刷新：按钮只在「运行依赖」里一处，且真发 /status?fresh=1（2026-11-04 派单 B）', () => {
+check('C156 手点刷新：按钮只在页面级标题栏一处，且真发 /status?fresh=1（2026-11-04 派单 B / 2026-11-08 C2 移位）', () => {
   const src = read('client.js')
 
   // ① 位置：`'刷新'` 全文件只许一处，且夹在「运行依赖」sechead 内、「最近一次调用」之前
@@ -4253,16 +4443,17 @@ check('C156 手点刷新：按钮只在「运行依赖」里一处，且真发 /
   must(labels === 1, `client.js 里 '刷新' 出现 ${labels} 处（应恰好 1 处）——多出来的那个按钮会让人不知道点哪个`)
   const iBtn = src.indexOf("'刷新'")
   const iDeps = src.indexOf("'运行依赖'")
-  const iLast = src.indexOf("'最近一次调用'")
-  must(iDeps > 0 && iLast > 0, '找不到「运行依赖」或「最近一次调用」这两个区块标题')
+  const iHead = src.indexOf("h('div', { 'data-bl-head': '' }")
+  must(iDeps > 0, '找不到「运行依赖」区块标题')
+  must(iHead > 0, '找不到页面级 data-bl-head —— 结构变了，这条判据要跟着改')
+  // C2（0.4.9 B 桶第一批）：按钮从「运行依赖」sechead 提到页面级标题栏。位置仍用
+  //   源码顺序钉死：在 data-bl-head 之内、在「运行依赖」之前；只数「刷新」字数抓不到位置错。
   must(
-    iBtn > iDeps && iBtn < iLast,
-    `刷新按钮不在「运行依赖」区块里（运行依赖 L${src.slice(0, iDeps).split('\n').length} / 刷新 L${src.slice(0, iBtn).split('\n').length} / 最近一次调用 L${src.slice(0, iLast).split('\n').length}）——它刷的是整页状态，摆在调用记录旁边会被读成「刷新那条记录」`,
+    iBtn > iHead && iBtn < iDeps,
+    `刷新按钮不在页面级标题栏里（head L${src.slice(0, iHead).split('\n').length} / 刷新 L${src.slice(0, iBtn).split('\n').length} / 运行依赖 L${src.slice(0, iDeps).split('\n').length}）——它刷的是整页状态，挂在某个 sechead 里会被读成只刷那一块`,
   )
-  // 按钮到自己那段 sechead 收尾之间不许跨过别的区块：取「运行依赖」到「deps.map」之间这一段查
   const iHeadEnd = src.indexOf('.map((d) => h(DepRow', iDeps)
   must(iHeadEnd > 0, '找不到运行依赖区块的 deps.map —— 结构变了，这条判据要跟着改')
-  must(iBtn < iHeadEnd, '刷新按钮不在「运行依赖」的 sechead 里（跑到依赖行后面去了）')
 
   // ② 反馈：点击必须置灰 + 换文案，否则用户分不清「没生效」和「没反应」
   const seg = src.slice(iBtn - 700, iBtn + 30)
@@ -4300,7 +4491,7 @@ check('C156 手点刷新：按钮只在「运行依赖」里一处，且真发 /
   must(urls.length === 2, `桩到的请求只有 ${urls.length} 次（应 2 次）——load 里 jget 的调用形状变了`)
   must(urls[0] === '/status?fresh=1', `手点刷新请求的是 ${JSON.stringify(urls[0])}——不带 fresh=1 就吃 5 分钟前的 GPU 缓存与 30 秒的 import 缓存，用户刚装完东西点刷新看到的还是旧结论`)
   must(urls[1] === '/status', `8 秒轮询请求的是 ${JSON.stringify(urls[1])}——轮询不许带 fresh=1，否则每 8 秒起两个 python 子进程`)
-  return `按钮 1 处且在运行依赖 sechead 内；load(true)→${urls[0]}，load()→${urls[1]}`
+  return `按钮 1 处且在页面级 data-bl-head 内（C2 移位后）；load(true)→${urls[0]}，load()→${urls[1]}`
 })
 
 // 2026-11-04（DSH 派单 C）：下载进度。三条硬判据缺一条就会退化成假进度——
@@ -4353,8 +4544,12 @@ check('C158 进度文案三态：分母只能标「估算」、没数据必须�
   const src = read('client.js')
   // 抽原样的 fmtBytes + progressText 真跑（不重写一份，重写就等于测了个平行实现）
   const iPT = src.indexOf('const progressText = (dl, estimate) => {')
-  const iEnd = src.indexOf('\n    }\n    const fmtTime', iPT)
-  must(iPT > 0 && iEnd > iPT, 'progressText 切不出来（抽取点或后面的 fmtTime 变了）')
+  // 收尾标记原先钉成「换行 + 4 空格 } + 换行 + const fmtTime」—— 把抽取终点绑在 fmtTime 的
+  //   实现位置上。0.4.9 把 fmtTime 提到顶层（它是纯函数，顶层 lastRunDetail 要用），这条立刻假红：
+  //   切不出 progressText 不等于进度文案坏了，是抽取点依赖了一个与它无关的邻居。
+  //   改成只认 progressText 自己的收尾（换行 + 4 空格 } + 换行），不再牵连任何邻居。
+  const iEnd = src.indexOf('\n    }\n', iPT)
+  must(iPT > 0 && iEnd > iPT, 'progressText 切不出来（抽取点变了）')
   // fmtBytes 是 const 箭头函数（fnBody 只认 function 声明），单独按同一套起止标记切
   const iFmt = src.indexOf('const fmtBytes = (b) => {')
   const iFmtEnd = src.indexOf('\n    }\n', iFmt)
@@ -4781,11 +4976,12 @@ check('C85 autoStep / pickEvenly 真跑（快慢自适应与均匀取点，都�
 })
 
 // ── C86：sceneTimes 真起 ffmpeg（本机没装就跳过，不当通过）──────────────────
-// 为什么要真跑：sceneTimes 的 catch 会把**任何**异常吞成 []，而 [] 在 grabFrames 里
+// 为什么要真跑：sceneTimes 的 catch 会把**任何**异常吞成空结果，调用方据此
 //   只是「回落等间隔」——用户看到的是「场景检测没效果」，不是报错。上一轮 ffExec 的
-//   第三参数坏掉（对象当数字处理）就是这种形状：sceneTimes 永远返回 []，全绿。
-check('C86 sceneTimes 真起 ffmpeg：两段纯色片子必须有 1 个变化点；阈值真的生效；坏路径返回 [] 不抛', () => {
-  const cands = [process.env.BILI_WATCH_FFMPEG, join(ROOT, 'deps', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')].filter(Boolean)
+//   第三参数坏掉（对象当数字处理）就是这种形状：sceneTimes 永远没有变化点，全绿。
+// B8 之后返回 { times, ok, why }：ok=false 才代表扫描失败，见 C215。
+check('C86 sceneTimes 真起 ffmpeg：两段纯色片子必须有 1 个变化点；阈值真的生效；坏路径 ok=false 不抛', () => {
+  const cands = [process.env.BILI_WATCH_FFMPEG, join(ROOT, 'deps', hostPlatform() === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')].filter(Boolean)
   const bin = findFfmpeg(null, cands)
   if (!bin) {
     skip('C86 sceneTimes 真起 ffmpeg', '本机找不到 ffmpeg（PATH、BILI_WATCH_FFMPEG、deps 三处都看了）——装一个 ffmpeg 到 PATH 或设 BILI_WATCH_FFMPEG 指过去，这条会真跑；跳过不算通过')
@@ -4794,20 +4990,21 @@ check('C86 sceneTimes 真起 ffmpeg：两段纯色片子必须有 1 个变化点
   const tmp = mkdtempSync(join(tmpdir(), 'bw-c86-'))
   try {
     const file = join(tmp, 'two-colors.mp4')
-    execFileSync(bin, [
+    runExecFileSync(bin, [
       '-hide_banner', '-loglevel', 'error',
       '-f', 'lavfi', '-i', 'color=red:s=160x120:d=1.5',
       '-f', 'lavfi', '-i', 'color=blue:s=160x120:d=1.5',
       '-filter_complex', '[0:v][1:v]concat=n=2:v=1', '-c:v', 'mpeg4', '-y', file,
     ], { stdio: 'ignore', timeout: 120000 })
-    const pts = sceneTimes(file, 0.08, bin)
+    const pts = sceneTimes(file, 0.08, bin).times
     must(Array.isArray(pts) && pts.length >= 1, `两段纯色片子没检出变化点（返回 ${JSON.stringify(pts)}）——ffExec 第三参数一坏就是这个形状`)
     must(Math.abs(pts[0] - 1.5) < 0.6, `变化点位置不对：${JSON.stringify(pts)}（应≈1.5s）`)
     // 阈值真的传进去了：0.4 的场景分在 0.99 的门槛下必须一个都不留
-    must(sceneTimes(file, 0.99, bin).length === 0, '阈值 0.99 还检出变化点——th 没传进去？')
-    // 坏路径：不抛，返回 []（调用方据此回落等间隔）
-    must(sceneTimes(join(tmp, 'nope.mp4'), 0.3, bin).length === 0, '喂不存在的文件时没安静返回 []')
-    return `检出 ${JSON.stringify(pts)}；0.99 阈值下 0 个；坏路径 []`
+    must(sceneTimes(file, 0.99, bin).times.length === 0, '阈值 0.99 还检出变化点——th 没传进去？')
+    // 坏路径：不抛，返回 ok=false + times:[]（调用方据此回落等间隔并打 ⚠）
+    const bad = sceneTimes(join(tmp, 'nope.mp4'), 0.3, bin)
+    must(bad.ok === false && Array.isArray(bad.times) && bad.times.length === 0, `喂不存在的文件时没安静返回扫描失败：${JSON.stringify(bad)}`)
+    return `检出 ${JSON.stringify(pts)}；0.99 阈值下 0 个；坏路径 ok=false（${bad.why}）`
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -5685,8 +5882,15 @@ check('C98 pip 返回 0 不算装成，装完必须再 import 一次；失败要
 //        ③ 索引里的秒数从文件名读，推不出就给 null（不许编 00:00）。
 check('C99 sheet 认 --at：按时刻取帧、索引时间从文件名读、推不出留空', () => {
   const src = read('tools/look.mjs')
-  const callLine = src.split('\n').find((l) => /cmdSheet\(BV, \{/.test(l)) || ''
-  must(/at:\s*opt\('at'\)/.test(callLine), `sheet 的调用点没把 --at 传下去（用户敲了也不生效）：${callLine.trim().slice(0, 160)}`)
+  // C220 之后 sheet 的参数先收进 const sho = {...} 再交给结构化出口包装，
+  // 单行 `cmdSheet(BV, {` 的锚点没了。改成按「sheet 分派段」切，仍只认
+  // at: opt('at') 字面量；注释行滤掉，且不跨到下一个命令段。
+  const ls = src.split('\n')
+  const segAt = ls.findIndex((l) => l.includes("} else if (cmd === 'sheet')"))
+  must(segAt >= 0, '分派链里找不到 sheet 段')
+  const segEnd = ls.findIndex((l, i) => i > segAt && /^\s*\} else if \(cmd ===/.test(l))
+  const sheetSeg = ls.slice(segAt, segEnd > segAt ? segEnd : segAt + 12).filter((l) => !/^\s*\/\//.test(l)).join('\n')
+  must(/at:\s*opt\('at'\)/.test(sheetSeg), `sheet 的调用点没把 --at 传下去（用户敲了也不生效）：${sheetSeg.trim().slice(0, 160)}`)
   must(/look\.mjs sheet <BV或链接>[^\n]*--at/.test(src), '--help 里的 sheet 用法没写 --at')
   // 两个纯函数真跑（与 look.mjs 里同一份源码；依赖用同名 prelude 注入）
   const prelude = `
@@ -6970,7 +7174,7 @@ check('C124b 4b 遇到读不出来的文件必须变红：点名 + exit 2，且�
   const script = join(ROOT, 'scripts', 'check-release-leak.mjs')
   must(existsSync(script), '找不到 scripts/check-release-leak.mjs —— C124b 要验的对象不在了')
 
-  const isWin = process.platform === 'win32'
+  const isWin = hostPlatform() === 'win32'
   const user = process.env.USERNAME || ''
   if (isWin && !user) {
     skip('C124b 读不出来必须变红', 'Windows 上拿不到 USERNAME —— 造不出 deny ACE，这条只能跳（不算通过）')
@@ -7242,7 +7446,7 @@ check('C127 --format json 下护栏真的跑：命中带 _untrusted，未命中�
   try {
     const oldRoot = mkdtempSync(join(tmpdir(), 'bw-oldlook-'))
     mkdirSync(join(oldRoot, 'tools'), { recursive: true })
-    const oldSrc = execFileSync('git', ['show', `${GUARD_BASE}:tools/look.mjs`], { cwd: ROOT, encoding: 'utf8' })
+    const oldSrc = runExecFileSync('git', ['show', `${GUARD_BASE}:tools/look.mjs`], { cwd: ROOT, encoding: 'utf8' })
     for (const f of readdirSync(HERE)) if (f.endsWith('.mjs')) copyFileSync(join(HERE, f), join(oldRoot, 'tools', f))
     writeFileSync(join(oldRoot, 'tools', 'look.mjs'), oldSrc, 'utf8')
     try { symlinkSync(join(ROOT, 'lib'), join(oldRoot, 'lib'), 'junction') } catch {}
@@ -7252,10 +7456,27 @@ check('C127 --format json 下护栏真的跑：命中带 _untrusted，未命中�
     if (ro.status !== 0) oldWhy = `旧版跑失败 rc=${ro.status} ${tail(ro.stderr)}`
     else oldOut = ro.stdout
   } catch (e) { oldWhy = String(e?.message ?? e) }
+  // C217/A4 之后：comments 的 json 出口按派单补了 video 键（17:10 段判「加字段＝兼容，可做」）。
+  // 旧版逐字节全等禁止任何加法，与这条新要求冲突；改成「除本次批准的 video 外逐字节全等」，
+  // 并另加一条「video 必须在且形状对」—— 不是把断言删掉放水，护栏多改一个字段照样红。
+  const stripApprovedVideo = (s) => {
+    try {
+      const o = JSON.parse(s)
+      if (o && typeof o === 'object' && !Array.isArray(o)) { delete o.video; return JSON.stringify(o, null, 2) + '\n' }
+    } catch {}
+    return s
+  }
   if (oldWhy) skip(`${NAME} · 与改动前逐字节对比`, `拿不到改动前的输出，这条没验：${oldWhy}`)
-  else must(oldOut === rOk.stdout, `没命中时 stdout 变了（新 ${rOk.stdout.length} 字节 / 旧 ${oldOut.length} 字节）`)
+  else {
+    must(stripApprovedVideo(oldOut) === stripApprovedVideo(rOk.stdout),
+      `除 video 外 stdout 变了（新 ${rOk.stdout.length} 字节 / 旧 ${oldOut.length} 字节）`)
+    let pOk = null
+    try { pOk = JSON.parse(rOk.stdout) } catch {}
+    must(pOk && pOk.video && Object.keys(pOk.video).sort().join(',') === 'bv,dur,p,pages,title,up',
+      '未命中时 video 键缺失或形状不对 —— 别把批准的加法也一起 strip 掉')
+  }
 
-  return '命中→_untrusted+hits+stderr 警告；未命中→无扩展字段，且与 e889822 逐字节一致'
+  return '命中→_untrusted+hits+stderr 警告；未命中→无扩展字段；除 C217 批准的 video 外与 e889822 逐字节一致'
 })
 
 check('C128 落盘：原文件仍纯正文，wrapped 副本带 source tag+围栏，提示词指向 wrapped 且措辞收窄', () => {
@@ -7766,13 +7987,34 @@ check('C164 身份读取器只在仓库不进包，两个守卫共用唯一一�
   return `① files ${files.length} 项不含身份读取器；③ 两个守卫共用唯一一份；${note2}；${note4}`
 })
 
+// C270 与 C165 ② 共用：夹具真跑一次，规则名从 _rules.mjs 真求值（不手抄第二份）。
+//   C258 已经用同样的子进程求值法，这里加缓存，避免每条判据各起一次。
+const c165Run = () => runFixture('c165-variants.mjs', 120000)
+let _collabNames = null
+function collabRuleNames() {
+  if (_collabNames) return _collabNames
+  const modUrl = pathToFileURL(join(ROOT, 'scripts/_rules.mjs')).href
+  const probe = [
+    `import { COLLAB_RULES } from ${JSON.stringify(modUrl)}`,
+    'process.stdout.write(JSON.stringify(COLLAB_RULES.map((r) => r[0])))',
+  ].join('\n')
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe],
+    { encoding: 'utf8', timeout: 60000, cwd: ROOT })
+  must(r.status === 0 && (r.stdout || '').startsWith('['),
+    `规则表真求值失败 rc=${r.status}：${(r.stderr || '').slice(0, 200)}`)
+  _collabNames = JSON.parse(r.stdout)
+  return _collabNames
+}
+
 // C165（2026-11-06）：协作类规则只有一份；8 个变体两个守卫都必须拦住。
+// C270（2026-11-09）：② 原来只断 rc!==0，而最小假仓库缺 tools/look.mjs 时
+//   check-public-text 对干净行也 exit 1 —— 那一半恒真。现改走补齐树 + 控制组 + 点名。
 //
 //   背景：R6 外审发现 check-public-text.mjs 与 check-release-leak.mjs 各存一份几乎
 //   逐字相同的协作正则，补一个变体要改两处，漏改一处就变「一个守卫拦、另一个放」。
 //   正解是抽 scripts/_rules.mjs，一处改两处生效（与 _identity.mjs 同一件事）。
 //   判据① 盯「两守卫共用唯一一份」，判据② 逐个真跑 8 个变体——不读源码猜正则。
-check('C165 协作规则只有一份，8 个变体两个守卫都必须拦住', () => {
+check('C165 协作规则只有一份，8 个变体两个守卫都必须拦住（C270：控制组 + 点名到规则名与行号）', () => {
   const GUARDS_LOCAL = ['scripts/check-public-text.mjs', 'scripts/check-release-leak.mjs']
   const localDef = /(?:const|let|var)\s+COLLAB|name:\s*['"]内部协作标记|\[\s*['"]内部协作标记['"]\s*,/
   for (const rel of GUARDS_LOCAL) {
@@ -7790,31 +8032,29 @@ check('C165 协作规则只有一份，8 个变体两个守卫都必须拦住', 
   must(/export\s+function\s+scanCollab/.test(rulesSrc),
     'C165 ①：_rules.mjs 里没有导出 scanCollab() —— 两个守卫无从共用')
 
-  // ② 8 个变体逐个真跑两个守卫。临时假仓库用纯 ASCII 路径，不碰生产文件。
-  const VARIANTS = ['WB-CN', 'wbcn', 'ＷＢＣＮ', 'Work Buddy', 'Hy-4',
-    '20261105-2308-dsh', 'DSH　2308', '派 单']
-  const tmp = mkdtempSync(join(tmpdir(), 'c165-'))
-  try {
-    writeFileSync(join(tmp, 'package.json'),
-      JSON.stringify({ name: 'x', version: '0.0.1', files: ['README.md', 'probe.txt'] }))
-    writeFileSync(join(tmp, 'README.md'), '# x\n')
-    for (const v of VARIANTS) {
-      writeFileSync(join(tmp, 'probe.txt'), v + '\n')
-      for (const [label, script, args] of [
-        ['check-public-text', 'scripts/check-public-text.mjs', ['--repo', tmp]],
-        ['check-release-leak', 'scripts/check-release-leak.mjs', ['--dir', tmp]],
-      ]) {
-        const r = spawnSync(process.execPath, [join(ROOT, script), ...args],
-          { encoding: 'utf8', timeout: 60000, cwd: ROOT })
-        const out = `${r.stdout || ''}${r.stderr || ''}`
-        must(!/ERR_MODULE_NOT_FOUND|Cannot find module|ReferenceError|SyntaxError|TypeError/.test(out),
-          `C165 ②：${label} 自己起不来，这次红不算有效验证：${out.slice(0, 250)}`)
-        must(r.status !== 0,
-          `C165 ②：变体 ${JSON.stringify(v)} 没被 ${label} 拦住（rc=${r.status}）`)
+  // ② 8 个变体逐个真跑两个守卫。假仓库必须走 c165-variants.mjs 的补齐树：
+  //    缺 tools/look.mjs / description/keywords 时 check-public-text 对干净行也 exit 1，
+  //    只断 rc!==0 的那一半恒真（C237 报告 §五；DSH 2232 段独立复现）。
+  //    先证控制组 rc=0，再断每个变体被点名到规则名 + 行号，不许只断退出码。
+  const r = c165Run()
+  must(r.status === 0 && r.json, `C165 ②：夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 300)}`)
+  const j = r.json
+  const ctl = j.controlRows || []
+  must(ctl.length === 2 && ctl.every((x) => x.clean),
+    `C165 ②：干净行控制组没过（${ctl.map((x) => `${x.guard} rc=${x.status}`).join(' / ')}）—— 这一面红着时「变体被拦住」恒真`)
+  const names = collabRuleNames()
+  const bad = []
+  for (const v of j.variantRows || []) {
+    for (const row of v.rows) {
+      const ruleHit = (row.ruleTags || []).some((t) => names.includes(t))
+      if (row.crashed || row.status === 0 || !row.named || !row.lineHit || !ruleHit) {
+        bad.push(`${v.variant}/${row.guard} rc=${row.status} named=${row.named} line=${row.lineHit} rule=${ruleHit}`)
       }
     }
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
-  return `① 两守卫共用 _rules.mjs 且无本地表；② ${VARIANTS.length} 个变体 × 2 守卫全部拦住（真跑）`
+  }
+  must((j.variantRows || []).length === 8 && bad.length === 0,
+    `C165 ②：变体没被两闸点名到规则名与行号：${bad.slice(0, 4).join('；')}`)
+  return `① 两守卫共用 _rules.mjs 且无本地表；② 控制组两闸 rc=0；8 变体 × 2 闸全部 rc≠0 且点名规则名 + probe.txt:1`
 })
 
 // C166（2026-11-06）：EXEMPT 必须「按规则豁免」，不能整行放过。
@@ -8276,17 +8516,3055 @@ check('C194 F14-2 活锁不被 unknown 折叠：forceUnknown 也拦；仅 EACCES
   return `D1 活锁+EACCES+forceUnknown=1 → ok=${d1.ok}，why 两类信息齐，removeOwned 零调用（rootReads=${d1.probe?.rootReads} / deletes=${d1.probe?.deletes}）；D2 仅 EACCES 放行 / 仅活锁两向拒绝 / 双无正常清理`
 })
 
-// —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
-let pass = 0, fail = 0, skipN = 0
-for (const r of results) {
-  if (r.skip) skipN++
-  else if (r.ok) pass++
-  else fail++
-
-  const tag = r.skip ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'
-  console.log(`${tag}  ${r.name}${r.detail ? '  —  ' + r.detail : ''}`)
+// ── C195：最近一次调用必须显示退出码与耗时（0.4.9 B 桶 C1）─────────────────
+// 夹具把 client.js 的 lastRunDetail 原样抠出来真跑，同时验「该活时活」（正常输入带出
+// code/ms、缺字段不编数）与「该红时红」（退回旧实现时目标文本消失）。
+let c195Run = null
+const c195 = () => {
+  if (!c195Run) c195Run = runFixture('panel-c195-probe.mjs', 60000)
+  return c195Run
 }
-console.log(`\n${pass} 通过 / ${fail} 失败 / ${skipN} 跳过`)
+check('C195 最近一次调用显示退出码与耗时：正常两向正确、缺字段不编数、退回旧实现会被抓到', () => {
+  const r = c195()
+  must(r.status === 0 && r.json, `C195 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(/退出码 0/.test(j.goodFull) && /耗时 123ms/.test(j.goodFull), `成功调用没带退出码/耗时：${j.goodFull}`)
+  must(/退出码 2/.test(j.goodFail) && /耗时 45ms/.test(j.goodFail), `失败调用没带退出码/耗时：${j.goodFail}`)
+  must(!/退出码|耗时|undefined/.test(j.goodNoCode), `后端缺 code/ms 时编了数：${j.goodNoCode}`)
+  must(j.goodEmpty === '还没有记录' && j.goodNull === '还没有记录', `空记录文案不对：${j.goodEmpty} / ${j.goodNull}`)
+  must(!/退出码/.test(j.badFull), '退回旧实现后仍报退出码 —— 夹具抓不到退化，判据是纸老虎')
+  must(j.srcHasCall === true, 'client.js 只定义了 lastRunDetail 却没在「最近一次调用」里调用')
+  return `正常 "${j.goodFull}"；失败 "${j.goodFail}"；缺字段 "${j.goodNoCode}"；旧实现 "${j.badFull}"`
+})
+
+// ── C196：刷新按钮挂在页面级 head，不在任何 sechead（0.4.9 B 桶 C2）──────────
+// 夹具按括号平衡把两个 h(...) 调用真切出来，再在内存里把按钮「移回 sechead」重算一次，
+// 证明结构判定能抓到归位错误，而不是数「刷新」字数的纸老虎。
+let c196Run = null
+const c196 = () => {
+  if (!c196Run) c196Run = runFixture('panel-c196-probe.mjs', 60000)
+  return c196Run
+}
+check('C196 刷新按钮在页面级标题栏：head 内一处、sechead 零处、移回去会被抓到', () => {
+  const r = c196()
+  must(r.status === 0 && r.json, `C196 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const a = j.real
+  // 结构判定在前：扰动态下夹具可能抽不到 head 里的按钮（那正是要报的事），
+  //   不能让「夹具健康度」先红，把真正的位置错误遮成「测试自己坏了」。
+  must(a.headHasRefresh && a.headHasTitle, '刷新按钮不在页面级 data-bl-head 里')
+  must(a.headHasFresh && a.headHasDisabled && a.headHasFeedback, 'head 里的刷新按钮丢了 fresh=1 / 置灰 / 刷新中文案')
+  must(!a.secHasRefresh && a.secHasTitle, '「运行依赖」sechead 里仍留着刷新按钮')
+  must(a.refreshCount === 1, `全文 '刷新' 出现 ${a.refreshCount} 处（应恰好 1 处）`)
+  must(j.btnFound && j.anchorFound, 'C196 夹具没切出刷新按钮或没找到「运行依赖」锚点 —— 抽取点要跟着改')
+  must(j.moved && !j.moved.headHasRefresh && j.moved.secHasRefresh,
+    '把按钮移回 sechead 后夹具仍判 head 内有 —— 结构判定是纸老虎')
+  return `head ${a.headLen} 字符含刷新 / sechead ${a.secLen} 字符零刷新；全文 '刷新' ${a.refreshCount} 处；移回扰动 head=${j.moved.headHasRefresh} sec=${j.moved.secHasRefresh}`
+})
+
+// ── C197：默认值提示从 tuneMeta.defaults 取，秒→分钟只换算一处（0.4.9 B 桶 C3）──
+// 夹具把 tuneDefaultLabel 抠出来真跑：后端默认值从 1800 改成 2400，面板必须从
+// 「30 分钟」变成「40 分钟」；硬编码旧实现喂同样的输入仍是 30 分钟，必须被抓到。
+let c197Run = null
+const c197 = () => {
+  if (!c197Run) c197Run = runFixture('panel-c197-probe.mjs', 60000)
+  return c197Run
+}
+check('C197 默认值取 tuningDefaults：后端改值面板跟着变、秒转分钟只一处、缺 meta 退回兜底', () => {
+  const r = c197()
+  must(r.status === 0 && r.json, `C197 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.asr1800 === '30 分钟' && j.asr2400 === '40 分钟', `后端改默认值没跟着变：${j.asr1800} / ${j.asr2400}`)
+  must(j.frames500 === '500 张' && j.frames777 === '777 张', `普通键没从 defaults 取：${j.frames500} / ${j.frames777}`)
+  must(j.missing === '500 张' && j.nullMeta === '500 张', `缺 meta 没退回兜底：${j.missing} / ${j.nullMeta}`)
+  must(j.legacyAsr2400 === '30 分钟' && j.asr2400 !== j.legacyAsr2400, '硬编码旧实现没被区分 —— 判据是纸老虎')
+  must(j.noHardcodedDef === true, 'client.js 里仍留着 6 处硬编码 def 字面量')
+  must(j.callCount >= 13, `tuneDefaultLabel 调用点只有 ${j.callCount} 处（应 ≥13：5×def + 5×onRestore + ADV×3）`)
+  must(j.restoreCalls >= 6, `onRestore 文案里只有 ${j.restoreCalls} 处用了函数（应 ≥6）`)
+  must(j.convInFn === true && j.convAtDef === false, '秒→分钟换算没收敛在函数里（调用点各转一次会分叉）')
+  must(j.srcHasAsrCall === true, 'asrMaxSec 的 def 没有走 tuneDefaultLabel')
+  return `1800→${j.asr1800} / 2400→${j.asr2400}；旧实现 2400→${j.legacyAsr2400}；调用点 ${j.callCount} 处、onRestore ${j.restoreCalls} 处`
+})
+
+// C235 整机夹具给 C198 与 C235 共用，只跑一次（真渲染六组形态，约 1 秒）。
+let c235Run = null
+const c235 = () => {
+  if (!c235Run) c235Run = runFixture('panel-c235-probe.mjs', 90000)
+  return c235Run
+}
+
+// ── C198：六项运行依赖也要显示实际路径（0.4.9 B 桶 C6）──────────────────────
+// 夹具把 depPathNote 抠出来真跑：ffmpeg/model 都要带「路径：」，凭证仍用「文件：」，
+// 没有 path 不显示；旧实现（只认 credential）对 ffmpeg 返回空，必须被抓到。
+let c198Run = null
+const c198 = () => {
+  if (!c198Run) c198Run = runFixture('panel-c198-probe.mjs', 60000)
+  return c198Run
+}
+check('C198 依赖行显示 deps[].path：六项都显示、凭证措辞不变、旧实现会被抓到', () => {
+  const r = c198()
+  must(r.status === 0 && r.json, `C198 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.ids.length === 6 && j.allSix.every((s, i) => s === `路径：P/${j.ids[i]}`),
+    `六项运行依赖没有逐项显示路径：${JSON.stringify(j.allSix)}`)
+  must(j.ffmpeg === '路径：C:/bin/ffmpeg.exe' && j.model === '路径：D:/deps/model', `运行依赖没显示路径：${j.ffmpeg} / ${j.model}`)
+  must(j.cred === '文件：C:/home/cred.json', `凭证行措辞被改：${j.cred}`)
+  must(j.noPath === '' && j.emptyPath === '' && j.nullDep === '', `缺 path 时编了文字：${j.noPath}/${j.emptyPath}/${j.nullDep}`)
+  must(j.legacyFfmpeg === '' && j.ffmpeg !== j.legacyFfmpeg, '旧实现（只认 credential）没被区分 —— 判据是纸老虎')
+  must(j.srcNoOldBranch === true && j.srcUsesFn === true, 'DepRow 仍在用旧的 credential 分支，或没调用 depPathNote')
+  // C235 补的整机断言（原判据把 depPathNote 抠出来单跑，验的是零件；
+  //   重复显示发生在 DepRow 把 note 与 detail 同时渲染进同一行的那一刻）。
+  const whole = c235()
+  must(whole.status === 0 && whole.json, `C235 整机夹具自身失效（rc=${whole.status}）：${(whole.raw || '').slice(0, 400)}`)
+  const wholeRows = ((whole.json.cases || []).find((c) => c.label === 'normal') || {}).rows || []
+  must(wholeRows.length === 7, `normal 形态只渲染出 ${wholeRows.length} 行（应 7 行）`)
+  const wholeDup = wholeRows.filter((x) => x.path && x.rawCount > 1)
+  must(wholeDup.length === 0,
+    `整机渲染里这些行重复显示路径：${wholeDup.map((x) => `${x.id} 行路径出现 ${x.rawCount} 次`).join('；')}`)
+  return `ffmpeg="${j.ffmpeg}" model="${j.model}" cred="${j.cred}"；旧实现 ffmpeg="${j.legacyFfmpeg}"；整机七行至多一次`
+})
+
+// ── C235：依赖行不重复显示同一路径（0.4.9 发前，接 C198）──────────────────────
+// C198 抽纯函数单跑，验的是零件；这条验整机：整份 client.js 进受控宿主真渲染，
+//   逐行数 deps[].path 在整行纯文本里出现几次。判据放在数据里（detail 是否含 path），
+//   不另立「哪些行要显示路径」的白名单。反向能力由夹具内两处扰动自证，
+//   真源码双向扰动另在交卷前手工跑，见 T10 报告。
+check('C235 依赖行不重复显示同一路径：每行 path 至多出现一次，凭证行用「文件：」前缀且也只一次', () => {
+  const r = c235()
+  must(r.status === 0 && r.json, `C235 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const cases = j.cases || []
+  must(cases.length === 6, `形态数不对：${cases.length}`)
+  const broken = cases.filter((c) => !(c.nodes >= 50 && c.errors === 0 && c.realOk === true && (c.rows || []).length === 7))
+  must(broken.length === 0,
+    `这些形态没真渲染出七行：${broken.map((c) => `${c.label}(nodes=${c.nodes},errors=${c.errors},rows=${(c.rows || []).length})`).join('；')}`)
+  const byCase = (name) => (cases.find((c) => c.label === name) || {}).rows || []
+  const rowOf = (rows, id) => rows.find((x) => x.id === id) || {}
+
+  // 1 正向：normal 七行逐行 path 出现 ≤ 1，且都真的显示了路径
+  const rows = byCase('normal')
+  const over = rows.filter((x) => x.path && x.rawCount > 1)
+  must(over.length === 0, `${over.map((x) => `${x.id} 行路径出现 ${x.rawCount} 次`).join('；')}`)
+  const missing = rows.filter((x) => x.path && x.rawCount === 0)
+  must(missing.length === 0,
+    `这些行压根没显示路径：${missing.map((x) => x.id === 'credential' ? 'credential 行没有「文件：」' : `${x.id} 行没有路径`).join('；')}`)
+  const cred = rowOf(rows, 'credential')
+  must(cred.fileCount === 1 && cred.pathCount === 0,
+    `凭证行措辞或次数不对：文件：${cred.fileCount} 次 / 路径：${cred.pathCount} 次`)
+  const cuda = rowOf(rows, 'cuda')
+  must(cuda.pathCount === 1, `cuda 行没有「路径：${cuda.path}」：${cuda.pathCount} 次`)
+
+  // 附带形态：detail 不含 path 时仍显示路径、path 为空时不编文字
+  const partial = rowOf(byCase('modelPartial'), 'model')
+  must(partial.noteCount === 1 && partial.rawCount === 1,
+    `model 非 complete 时路径丢失或重复：note=${partial.noteCount} raw=${partial.rawCount}`)
+  const failed = byCase('probesFailed')
+  must(['ytdlp', 'asr', 'ocr'].every((id) => {
+    const x = rowOf(failed, id)
+    return x.noteCount === 1 && x.rawCount === 1
+  }), '探测失败态下 ytdlp/asr/ocr 的路径丢了')
+  const emptyPath = rowOf(byCase('cudaNoPath'), 'cuda')
+  must(emptyPath.rawCount === 0 && emptyPath.noteCount === 0, `path 为空时编了文字：${emptyPath.text}`)
+  const notLogin = rowOf(byCase('credNotLogin'), 'credential')
+  must(notLogin.fileCount === 1, '没登录时凭证行的「文件：」路径丢了')
+  // ffmpeg 在系统 PATH 时 path 是字面量 'ffmpeg'，name 与 detail 里各含一次，
+  //   整行 rawCount 自然是 2，与 depPathNote 无关；这里只判「没有再叠一行 note」。
+  const onPath = rowOf(byCase('ffmpegOnPath'), 'ffmpeg')
+  must(onPath.noteCount === 0, `ffmpeg 在 PATH 时仍叠了一行 note：${onPath.noteCount}`)
+
+  // 2 反向：锚点必须命中（没命中的「跳过」和通过一样绿）；A 抓重复、B 抓丢路径
+  must(j.poisonInjectedA === true && j.poisonInjectedB === true, '反向扰动锚点没命中 —— 证据是假的')
+  must(j.poisonA.errors === 0 && j.poisonB.errors === 0, '扰动形态自身渲染抛异常，反向证据不可用')
+  const aOver = (j.poisonA.rows || []).filter((x) => x.path && x.rawCount > 1)
+  must(aOver.length >= 5,
+    `删掉 includes 的提前 return 后没抓到重复：${aOver.map((x) => `${x.id}=${x.rawCount}`).join(' ')}`)
+  const bCuda = rowOf(j.poisonB.rows || [], 'cuda')
+  const bCred = rowOf(j.poisonB.rows || [], 'credential')
+  must(bCuda.rawCount === 0 && bCred.fileCount === 0,
+    `删掉 note 渲染行后 cuda / credential 没被判为丢路径：cuda=${bCuda.rawCount} cred=${bCred.fileCount}`)
+
+  return `normal 七行 raw=1；凭证「文件：」1 次 / cuda「路径：」1 次；A 扰动 ${aOver.length} 行 raw=2、B 扰动 cuda/credential 归 0；ffmpegOnPath raw=${onPath.rawCount}（name+detail，非 note）`
+})
+
+// ── C199：下载互斥要有「谁占着 / 为什么」文字（0.4.9 B 桶 C7）────────────────
+// 夹具把 lockNote 抠出来真跑：有下载时必须点名目标 id 并带上 why；没下载时不占版面；
+// 旧实现（只有图标，恒返回空串）必须被抓到。
+let c199Run = null
+const c199 = () => {
+  if (!c199Run) c199Run = runFixture('panel-c199-probe.mjs', 60000)
+  return c199Run
+}
+check('C199 下载锁状态给文字：点名目标、复用 why、无锁不占版面、旧实现会被抓到', () => {
+  const r = c199()
+  must(r.status === 0 && r.json, `C199 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.empty === '' && j.emptyArr === '' && j.nullSt === '', `无锁时仍报错：${j.empty}/${j.emptyArr}/${j.nullSt}`)
+  must(j.one.includes('ffmpeg') && !j.one.includes('undefined'), `单目标没点名：${j.one}`)
+  must(j.two.includes('ffmpeg') && j.two.includes('asr') && j.two.includes('拿不到 .part 文件'),
+    `多目标或 why 没带出：${j.two}`)
+  must(!/undefined/.test(j.noDownloadObj) && j.noDownloadObj.includes('model'), `缺 download 对象时坏了：${j.noDownloadObj}`)
+  must(j.legacyTwo === '' && j.two !== j.legacyTwo, '旧实现（只有图标）没被区分 —— 判据是纸老虎')
+  must(j.srcUsesFn === true && j.srcNoteAttr === true, 'client.js 没把 lockNote 挂到面板上')
+  return `单目标="${j.one}"；双目标="${j.two}"；无锁=""；旧实现=""`
+})
+
+// ── C200：面板显示插件版本（0.4.9 B 桶 C8）──────────────────────────────────
+// 夹具把 versionLabel 抠出来真跑：版本跟着后端值变、老回包没这字段时留空；
+// 同时静态核 /status 回包确实带 version 字段与 PLUGIN_VERSION 定义（本机不启停服务，
+// 后端只做源码核，未起 HTTP 真跑）。
+let c200Run = null
+const c200 = () => {
+  if (!c200Run) c200Run = runFixture('panel-c200-probe.mjs', 60000)
+  return c200Run
+}
+check('C200 面板显示插件版本：/status 带 version、前端跟着变、旧实现会被抓到', () => {
+  const r = c200()
+  must(r.status === 0 && r.json, `C200 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.v048 === '插件版本 0.4.8' && j.v049 === '插件版本 0.4.9', `版本没跟着后端值变：${j.v048} / ${j.v049}`)
+  must(j.empty === '' && j.nullSt === '' && j.badType === '', `老回包/异常类型时编了文案：${j.empty}/${j.nullSt}/${j.badType}`)
+  must(j.legacyV048 === '' && j.v048 !== j.legacyV048, '旧实现（恒空）没被区分 —— 判据是纸老虎')
+  must(j.srcIndexField === true && j.srcIndexDef === true, '/status 回包没带 version 字段，或 PLUGIN_VERSION 定义不在了')
+  must(j.srcClientUsesFn === true && j.srcClientNoteAttr === true, 'client.js 没把 versionLabel 挂到面板上')
+  return `0.4.8→"${j.v048}" / 0.4.9→"${j.v049}"；无字段=""；旧实现=""；后端字段静态核通过`
+})
+
+// ── C207：顶层函数不许引用 factory 内标识符（2026-11-08 P0 面板空白）───────────
+// 事发经过：C1 把 lastRunDetail 写成**顶层**函数，它调用的 fmtTime 却定义在
+//   MODULE_LOADER.load 的 factory 里。模块作用域取不到 factory 作用域，语法合法、
+//   node --check 通过、C195 全绿 —— 因为 C195 的夹具自己注入了假 fmtTime。
+//   真机上 Panel 一渲染就 ReferenceError: fmtTime is not defined，整个面板空白。
+// 教训：夹具给被测函数「补环境」时，补的每一样东西都在掩盖一个作用域错误。
+//   所以这里不跑函数，只做静态作用域对比：顶层函数体里出现的标识符，不许来自 factory 定义集。
+let c207Cache = null
+const c207Run = () => {
+  if (!c207Cache) c207Cache = runFixture('c207-scope-probe.mjs', 60000)
+  return c207Cache
+}
+check('C207【正面解析】顶层函数自由变量全在显式白名单内；四类注入各自必红', () => {
+  const r = c207Run()
+  must(r.status === 0 && r.json, `C207 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.realOk === true, '扫不到 MODULE_LOADER.load 边界 —— 正面解析的前提变了')
+  must(j.allBalanced === true, '夹具没报「函数体括号配平」结果 —— 旧夹具或函数体切分前提变了')
+  const bad = (j.realViolations || []).map((v) => `${v.fn}(L${v.line})→${v.ids.join(',')}`).join('；')
+  // 现状必须自足：这一条红就是「面板会在真机空白」的直接证据
+  must((j.realViolations || []).length === 0, `顶层函数出现未登记的自由变量（真机 ReferenceError，面板会白屏）：${bad}`)
+  must(j.realTopCount >= 15, `顶层函数只扫到 ${j.realTopCount} 个，抽取点可能变了`)
+  must(j.poisons && Object.keys(j.poisons).length === 4, 'C207：四类注入证据不齐，反证不完整')
+  // 四类：交集法漏掉的三类（悬空名 / 未来才加 / 解构声明）+ 旧法能抓的回归项，逐条点名
+  for (const [label, p] of Object.entries(j.poisons || {})) {
+    must(p.injected === true, `C207：${label} 扰动锚点没打进去，反证是空的`)
+    must(p.caught === true, `C207：${label} 注入后正面解析没报 —— ${p.name} 漏网`)
+    must((p.ids || []).includes(p.name), `C207：${label} 报的不是被注入的那个符号（${(p.ids || []).join(',')}）`)
+  }
+  // 控制组：把参数 / 本地声明误判成自由变量，会天天假红，比漏报更早毁掉这条判据
+  must(j.noFalsePositive && Object.keys(j.noFalsePositive).length === 2, 'C207：不误伤控制组不齐')
+  for (const [label, c] of Object.entries(j.noFalsePositive || {})) {
+    must(c.ok === true, `C207：${label} 被误判成自由变量（${(c.ids || []).join(',')}）`)
+  }
+  return `顶层函数 ${j.realTopCount} 个 / 自由变量并集 ${(j.freeRawUnion || []).length} 个全在白名单 / 违规 0；四类注入各自点名，两组控制不误伤`
+})
+
+// ── C208：面板真渲染，异常 status 形态不白屏（2026-11-08 P1，接 C207）────────
+// C207 守的是静态作用域，挡不住「只在某种数据形态下才炸」。这里把整份 client.js
+//   原样放进受控宿主真渲染，喂 13:45 段点名的四种异常形态；夹具不抽函数、不补
+//   client.js 内部符号，跨作用域引用会自然抛 ReferenceError —— 那正是 C195 漏掉的。
+// 判据不采信夹具自述：既验五种形态都渲染出节点且零异常，也验形态指纹互异，
+//   还验注入未定义符号后探针必须报红（该红时红），防「一进来就 return」式假绿。
+let c208Cache = null
+const c208Run = () => {
+  if (!c208Cache) c208Cache = runFixture('panel-c208-render-probe.mjs', 60000)
+  return c208Cache
+}
+check('C208 面板真渲染 + 五个非渲染函数逐个触发：五形态不白屏、五处单点污染各自必红', () => {
+  const r = c208Run()
+  must(r.status === 0 && r.json, `C208 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.normalRealOk === true, 'plugins.bundle.config 槽位没注册到组件 —— 渲染前提不成立')
+  must(Array.isArray(j.cases) && j.cases.length === 5, `形态数不对：${(j.cases || []).length}`)
+  const bad = j.cases.filter((c) => !(c.nodes > 0 && c.errors === 0 && c.realOk === true))
+  must(bad.length === 0, `这些形态渲染抛异常或没渲染出节点：${bad.map((c) => `${c.name}(nodes=${c.nodes},errors=${c.errors},${(c.throws || []).join('/')})`).join('；')}`)
+  // 前提断言：正常形态必须真渲染出成片节点，否则「一进来就 return」也能假绿
+  must(j.normalNodes >= 50, `正常形态只有 ${j.normalNodes} 个节点，渲染探针可能没真跑`)
+  // 五种形态必须真的不同，否则「喂了四种异常」是空话
+  const shapes = j.cases.map((c) => JSON.stringify(c.shape))
+  must(new Set(shapes).size === 5, `五种形态指纹不互异：${shapes.join(' / ')}`)
+  must(j.poisonInjected === true, '扰动锚点 function Panel() 找不到，反证没打进去')
+  must(j.poisonCaught === true, `注入未定义符号后渲染探针没报红（errors=${j.poisonErrors}）—— 这条判据抓不到白屏`)
+
+  // C240 第 3 条：五个非渲染路径函数逐个真调用，每个至少触发一次。
+  // 行为断言取 client.js 真跑实测值，不许是夹具自造的空壳函数。
+  const FNS = ['fmtDelMsg', 'fmtSkippedNote', 'missingDeps', 'pollStep', 'readDownloadResp']
+  must(Array.isArray(j.interactFns) && j.interactFns.join(',') === FNS.join(','), 'C208：五个非渲染函数名单被换过')
+  const EXPECT = {
+    fmtDelMsg: (v) => typeof v === 'string' && v.includes('已删除：ffmpeg') && v.includes('跳过：asr'),
+    fmtSkippedNote: (v) => typeof v === 'string' && v.includes('保留 1 项'),
+    missingDeps: (v) => Array.isArray(v) && v.length === 1 && v[0] && v[0].id === 'ffmpeg',
+    pollStep: (v) => v && v.act === 'ok',
+    readDownloadResp: (v) => v && v.allStarted === true && Array.isArray(v.good) && v.good.length === 1,
+  }
+  for (const n of FNS) {
+    const it = (j.interact || {})[n]
+    must(it && it.called === true && it.ok === true, `C208：${n} 没被真调用或调用抛了：${it && it.error}`)
+    let val = null
+    try { val = JSON.parse(it.result) } catch {}
+    must(EXPECT[n](val), `C208：${n} 返回的不是 client.js 的真实行为（可能是夹具自造的空壳）`)
+  }
+  // 五个函数各自注入一个**不同名**的悬空符号，各自必须让流程变红，且红在自己的调用路径上。
+  const P = j.interactPoisons || {}
+  must(Object.keys(P).length === 5, `C208：单点污染只做了 ${Object.keys(P).length} 处`)
+  for (const n of FNS) {
+    const p = P[n]
+    must(p && p.injected === true && p.caught === true && p.errors > 0,
+      `C208：${n} 注入悬空符号后没变红（errors=${p && p.errors}）`)
+    must(p.marker === '__c208Miss_' + n, `C208：${n} 的污染标记不专属自己 —— 五份可能复用了同一份源码`)
+    must(p.interactOk === false && String(p.interactError || '').includes(p.marker),
+      `C208：${n} 没在自己的调用路径上抛，红的是别处`)
+  }
+  return `5 种形态节点 ${j.cases.map((c) => `${c.name}:${c.nodes}`).join(' ')}，异常 0；五函数各触发 1 次、各单点污染 errors=1；注入 Panel 后 errors=${j.poisonErrors}`
+})
+
+// ── C209–C211：凭证行三处显示（0.4.9 P2，12:09 点名）──────────────────────
+// 一个夹具真渲染出依赖行，输出 real + 三组**单点退回**扰动；三条判据各验自己那处，
+// 避免「一次组合扰动把夹具弄崩」造成的假红。夹具只跑一次，三条共用。
+let credJ = null
+const credProbe = () => {
+  if (credJ) return credJ
+  const r = runFixture('panel-c209-cred-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C209 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  // 锚点不在这里当硬前置：修复前版本本来就没有这三处特征串，若在此抛异常，
+  // 三条判据会一起以「夹具前提失效」红，而不是以被测行为红 —— 那是弱证据。
+  // 锚点齐不齐交给各判据的反证断言去咬；real 断言先判行为。
+  must(j.real.bootstrapOk === true && j.real.credFound === true && j.real.errors === 0, `真渲染没拿到凭证行：${(j.real.throws || []).join('/')}`)
+  for (const k of ['legacySize', 'legacyTime', 'legacyOrder']) {
+    must(j[k].bootstrapOk === true && j[k].credFound === true && j[k].errors === 0, `${k} 扰动把夹具弄崩了，红的是脚本崩不是判据红`)
+  }
+  credJ = j
+  return j
+}
+
+check('C209 凭证行不显示 0.0 KB，其它依赖行照常显示体积', () => {
+  const j = credProbe()
+  must(j.real.credSizeIndex === -1, `凭证行仍渲染大小列（索引 ${j.real.credSizeIndex}）`)
+  must(j.real.otherHasSize === true, '其它依赖行也没了大小列 —— 这不是「凭证不显示」而是整列被删')
+  must(j.legacySize.credSizeIndex >= 0, '退回旧实现后大小列没回来 —— 判据抓不到退化')
+  return `凭证行 sizeIdx=-1 / 其它行有体积；退回后 sizeIdx=${j.legacySize.credSizeIndex}`
+})
+
+check('C210 凭证时间截到分钟；后端 updatedAt 保持 ISO 原样', () => {
+  const j = credProbe()
+  must(!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(j.real.credDetailText), `面板仍吐原始 ISO 串：${j.real.credDetailText}`)
+  must(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(j.real.credDetailText), `面板没渲染出「年-月-日 时:分」：${j.real.credDetailText}`)
+  must(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(j.legacyTime.credDetailText), '退回旧实现后 ISO 串没回来 —— 判据抓不到退化')
+  must(j.backendOk === true, '后端 index.js 的 updatedAt 被改了，或格式化函数被搬到后端')
+  return `${j.real.credDetailText}；后端未动`
+})
+
+check('C211 凭证行路径在更新时间之前', () => {
+  const j = credProbe()
+  must(j.real.credNoteIndex >= 0 && j.real.credDetailIndex >= 0, `路径或时间节点缺失（note=${j.real.credNoteIndex}, detail=${j.real.credDetailIndex}）`)
+  must(j.real.credNoteIndex < j.real.credDetailIndex, `路径(${j.real.credNoteIndex}) 没排在时间(${j.real.credDetailIndex}) 之前`)
+  must(j.legacyOrder.credNoteIndex > j.legacyOrder.credDetailIndex, '退回旧顺序后判据没抓到')
+  return `路径 idx=${j.real.credNoteIndex} < 时间 idx=${j.real.credDetailIndex}；退回后 ${j.legacyOrder.credDetailIndex}/${j.legacyOrder.credNoteIndex}`
+})
+
+// ── C212：findFfmpeg 回落必须告知（0.4.9 B 桶组 1 / B6）────────────────────
+// 首选候选失效、次选才跑通时静默回落，调用方会以为用的是自己指定的那份。
+// 直接 import lib 真跑：造一个「存在但跑不起来」的候选逼出回落，用 node 自身当次选，
+// 不依赖机器上装没装 ffmpeg。CLI 侧另验回调接到了带 ⚠ 的 track（不带 ⚠ 会被工具层丢）。
+check('C212 ffmpeg 静默回落要打 ⚠：次选成功必回调、首选成功不回调、CLI 侧接了 track', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c212-'))
+  try {
+    const dead = join(tmp, 'dead.exe')
+    writeFileSync(dead, 'not an executable', 'utf8')
+    const probe = ['-e', 'process.exit(0)']
+
+    const calls = []
+    const used = findFfmpeg(dead, [process.execPath], probe, (i) => calls.push(i))
+    must(used === process.execPath, `次选没被选中：${used}`)
+    must(calls.length === 1, `回落了却没通知（回调 ${calls.length} 次）`)
+    must(calls[0].used === process.execPath && calls[0].preferred.includes(dead), `回调内容不对：${JSON.stringify(calls[0])}`)
+
+    const calls2 = []
+    const used2 = findFfmpeg(process.execPath, [dead], probe, (i) => calls2.push(i))
+    must(used2 === process.execPath && calls2.length === 0, `首选成功却报了回落：${JSON.stringify(calls2)}`)
+
+    const calls3 = []
+    const used3 = findFfmpeg(dead, [dead], probe, (i) => calls3.push(i))
+    must(used3 === null && calls3.length === 0, `全失败却仍通知：used=${used3} calls=${calls3.length}`)
+
+    const look = readFileSync(join(ROOT, 'tools/look.mjs'), 'utf8')
+    const wrapAt = look.indexOf('const findFfmpeg = (arg) =>')
+    must(wrapAt >= 0, 'CLI 的 findFfmpeg 包装层找不到了')
+    const wrap = look.slice(wrapAt, wrapAt + 700)
+    must(wrap.includes('track(') && wrap.includes('⚠'), 'CLI 包装层没把回落接到带 ⚠ 的 track 上')
+    return '回落 1 次通知 / 首选成功 0 次 / 全失败 0 次；CLI 侧带 ⚠'
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── C213：text 路径缓存命中要标「（缓存）」（0.4.9 B 桶组 1 / B4）──────────
+// json 出口本来就有 cached: true（tools/look.mjs:1091），这批只补 text 路径。
+// 纯函数直接 import 真跑；另验这句只出现在 emitText 的 json 出口**之后**，防止污染 json。
+check('C213 text 路径缓存命中带「（缓存）」⚠ 标注，json 出口不受影响', () => {
+  const hit = cacheNotice(true)
+  must(hit.includes('（缓存）') && hit.includes('⚠'), `标注缺「（缓存）」或缺 ⚠：${hit}`)
+  must(cacheNotice(false) === '', `没命中缓存时不该有标注：${cacheNotice(false)}`)
+  const look = readFileSync(join(ROOT, 'tools/look.mjs'), 'utf8')
+  const asrAt = look.indexOf('const a = await transcribe(')
+  must(asrAt >= 0, 'cmdText 的 ASR 分支锚点找不到了')
+  const seg = look.slice(asrAt, asrAt + 4000)
+  const emitAt = seg.indexOf('emitText(opts, {')
+  const noticeAt = seg.indexOf('cacheNotice(')
+  must(emitAt >= 0, 'ASR 分支里找不到 emitText 的 json 出口')
+  must(noticeAt >= 0, 'text 路径找不到 cacheNotice() 标注 —— 缓存命中又静默了')
+  must(noticeAt > emitAt, '缓存标注落在 json 出口之前 —— 会污染 --format json')
+  must(/if \(a\.cached\) track\(`\[track\] \$\{cacheNotice\(a\.cached\)\}`\)/.test(seg), 'text 路径没按 a.cached 条件打标注')
+  must(look.includes('cached: true'), 'json 出口的 cached: true 不见了（这批不许动 json）')
+  return `标注「${hit.slice(0, 24)}…」；json 出口 cached: true 保持`
+})
+
+// ── C214：「已写入」路径不带括号注记（0.4.9 B 桶组 1 / E6）────────────────
+// index.js 原来用 (.+) 取到行尾，把「（source=text）」吞进路径，模型拿去 read 必失败。
+// 纯函数 import 真跑：既验注记被剥，也验文件名里的半角 () 与全角 （1）不被误削。
+check('C214 「已写入」路径剥掉注记：半角 () 文件名保留、全角路径不被误削', () => {
+  const cases = [
+    ['✓ 已写入 out/r.json（source=text）', 'out/r.json'],
+    ['✓ 已写入 out/r.json（12 条，官方时间戳）', 'out/r.json'],
+    ['✓ 已写入 out/r.json（3 行，纯文本）', 'out/r.json'],
+    ['✓ 已写入 out/r.json', 'out/r.json'],
+    ['✓ 已写入 out/fix (1).json（source=text）', 'out/fix (1).json'],
+    ['✓ 已写入 out/video（1）.json', 'out/video（1）.json'],
+    ['没有这行', null],
+  ]
+  for (const [input, want] of cases) {
+    const got = extractWrittenPath(input)
+    must(got === want, `输入 ${JSON.stringify(input)} → ${JSON.stringify(got)}，期望 ${JSON.stringify(want)}`)
+  }
+  must(extractWrittenPath('✓ 已写入 a.json（source=x）\n✓ 已写入 b.json（source=y）') === 'a.json', '多行 stderr 没只取第一条已写入')
+  const idx = readFileSync(join(ROOT, 'index.js'), 'utf8')
+  must(idx.includes('extractWrittenPath(err)'), 'index.js 没用上纯函数，修的可能不是它')
+  must(!idx.includes('err.match(/✓\\s*已写入'), 'index.js 里还留着吞括号的旧正则')
+  return `${cases.length} 种输入 + 多行旧值全对；index.js 已接纯函数`
+})
+
+// ── C215：sceneTimes 区分「零切点」与「扫描失败」（0.4.9 B 桶组 1 / B8）────
+// 原来两者都是 []，调用方一律静默回落等间隔。返回形状改成 { times, ok, why } 后，
+// 所有消费点必须跟着改；漏一个就是运行时炸。判据既真跑两种形态，也扫消费点。
+check('C215 sceneTimes 返回 {times,ok,why}：零切点 ok=true、扫描失败 ok=false，消费点全改', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c215-'))
+  try {
+    // ① 扫描失败：bin 不存在 → 不抛、ok=false、times=[]、why 不带本机路径
+    const bad = sceneTimes(join(tmp, 'nope.mp4'), 0.3, join(tmp, 'no-such-ffmpeg'))
+    must(bad.ok === false && Array.isArray(bad.times) && bad.times.length === 0, `扫描失败形状不对：${JSON.stringify(bad)}`)
+    must(typeof bad.why === 'string' && bad.why.length > 0 && !bad.why.includes(tmp), `why 为空或泄漏了本机路径：${bad.why}`)
+
+    // ② 零切点但扫描成功：真 ffmpeg 跑一段纯色片，ok 必须是 true（与 ① 区分）
+    const cands = [process.env.BILI_WATCH_FFMPEG, join(ROOT, 'deps', hostPlatform() === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')].filter(Boolean)
+    const bin = findFfmpeg(null, cands)
+    let zeroNote = '本机无 ffmpeg，零切点分支 skip'
+    if (bin) {
+      const file = join(tmp, 'flat.mp4')
+      runExecFileSync(bin, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=red:s=160x120:d=0.5', '-c:v', 'mpeg4', '-y', file], { stdio: 'ignore', timeout: 120000 })
+      const zero = sceneTimes(file, 0.3, bin)
+      must(zero.ok === true && Array.isArray(zero.times) && zero.times.length === 0 && zero.why === '', `零切点被误判成扫描失败/形状不对：${JSON.stringify(zero)}`)
+      zeroNote = '零切点 ok=true / times=[]'
+    } else {
+      skip('C215 零切点分支', '本机找不到 ffmpeg（PATH、BILI_WATCH_FFMPEG、deps 三处都看了）——装一个 ffmpeg 到 PATH 或设 BILI_WATCH_FFMPEG 指过去，这条会真跑；跳过不算通过')
+    }
+    must(bad.ok !== true, '扫描失败与零切点又混成同一种结果')
+
+    // ③ 消费点全改：look.mjs 用 sc.times/sc.ok 且失败打 ⚠；两处都不许残留 .length 旧用法
+    const look = readFileSync(join(ROOT, 'tools/look.mjs'), 'utf8')
+    const v = readFileSync(join(ROOT, 'tools/verify.mjs'), 'utf8')
+    // C225 之后调用点多了一个 onFallback 回调（默认 auto）；锚点跟着新形态走，
+    //   但「消费 sc.times / sc.ok」与「失败打 ⚠」两条断言一条没删，另加一条回落也要 ⚠。
+    must(/const sc = sceneTimes\(mp4, th, bin, \{[^\n]*onFallback/.test(look) && look.includes('sc.times') && look.includes('sc.ok'), 'look.mjs 的 frames --scene 消费点没跟着改')
+    must(/onFallback:[^\n]*⚠[^\n]*回落 scdet/.test(look), 'C225 的 HSV 失败回落没打带 ⚠ 的 track（工具层只回灌带 ⚠ 的行）')
+    must(/if \(!sc\.ok\) track\([^\n]*⚠/.test(look), '扫描失败没打带 ⚠ 的 track（不带 ⚠ 会被工具层丢）')
+    must(v.includes('sceneTimes(file, 0.08, bin).times'), 'C86 消费点没跟着改')
+    must(!/sceneTimes\([^)]*\)\.length/.test(look + v), '还有按旧数组形状直接取 .length 的消费点')
+    return `扫描失败 ok=false（${bad.why}）；${zeroNote}；3 处消费点全改`
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── C216：零切点不许把 undefined 喂给 -ss（B8 引入的回归，1650 段）─────────
+// B8 之前零切点走 else 等间隔，从不进 forEach；B8 之后 pickEvenly([], 0) → [undefined]，
+// frameTimes.length=1 让「没找到变化点」闸门失效，接着 -ss undefined 让 ffmpeg 全失败。
+// 夹具原样切出 tools/look.mjs 的真实消费链并桩 ffExec 计数，不许只测 pickEvenly([])。
+check('C216 零切点：闸门要抛、抽帧调用 0 次、frameTimes 不含 undefined', () => {
+  const r = runFixture('c216-zero-scene-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C216 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.anchorOk === true, '复刻消费链的切片前提不成立 —— 抽取标记漂移了')
+  // 行为断言在前：静态守卫断言放最后，否则删掉 continue 时会先红在「守卫没了」，
+  // 把「-ss undefined 被喂进 ffmpeg」这个真实现象遮住。
+  must(j.threw === true && /scene 检测没找到任何变化点/.test(j.msg), `零切点没抛闸门：threw=${j.threw} msg=${j.msg}`)
+  must(j.drawCalls === 0, `抽帧阶段被调用了 ${j.drawCalls} 次（-ss=${(j.ssValues || []).join(',')}）`)
+  must(j.hasUndefined === false, 'frameTimes 里出现了 undefined 时间点')
+  must(j.srcHasContinue === true, '调用点没有零切点 continue 守卫')
+  return `闸门抛出；抽帧 0 次；frameTimesLen=${j.frameTimesLen}`
+})
+
+// ── C218 / A5：六处 video 元信息统一走 videoMeta(bv, v) ────────────────────────
+// 1710 段硬要求：不许只验一处。夹具给六处各造一份不同的 v，逐处比对键集合。
+check('C218 A5 videoMeta：六处共用纯函数、键集合逐处一致、p/pages 不丢、两处异形未被收编', () => {
+  const r = runFixture('c218-video-meta-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C218 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  // 行为断言在前：删掉 pages 键时要红在「键集合不对」，不是红在静态守卫。
+  const EXPECT = 'bv,dur,p,pages,title,up'
+  const bad = j.cases.filter((c) => c.keys !== EXPECT)
+  must(bad.length === 0, `六处键集合不一致或缺键：${bad.map((c) => `${c.i}:${c.keys}`).join(' / ')}`)
+  const lost = j.cases.filter((c) => !c.hasOwnP || !c.hasOwnPages || !c.pagesIsSame)
+  must(lost.length === 0, `p/pages 被丢或值被改：${lost.map((c) => c.i).join(',')}`)
+  // C217 之后又多了三处合法复用（comments/danmaku 的 json payload）。这条守的是
+  // 「六处手写字面量全换掉」，不是「全仓只允许六处」；少于六处才说明有地方没换。
+  must(j.cases.length === 6 && j.callCount >= 6, `六处基线没保住：cases=${j.cases.length} calls=${j.callCount}`)
+  must(j.literalLeft === 0, `还有 ${j.literalLeft} 处手写字面量没换成 videoMeta`)
+  must(j.importOk === true, 'look.mjs 没有 import videoMeta')
+  must(j.cuesUntouched === true && j.commentsUntouched === true, '两处异形被误收进 videoMeta 了')
+  return `六处键集合 ${EXPECT}；调用行 ${j.callLines.join(',')}`
+})
+
+// ── C228 / E 徽章：dsh.so 两枚，且 install pin 的是内核版本 ────────────────────
+// 1720 段：版本适配徽章 pin 的是 DSH 内核版本 0.2.2-rc.1，不是插件版本 0.4.x。
+// 写成插件版本是最容易犯又最不容易被发现的错，所以单列一条格式断言。
+check('C228 README 徽章：既有四枚一字不动、dsh.so 两枚在 5/6 位、install pin 内核版本', () => {
+  const lines = readFileSync(new URL('../README.md', import.meta.url), 'utf8').split(/\r?\n/)
+  const badges = lines.filter((l) => l.startsWith('[!['))
+  must(badges.length === 6, `徽章数不是 6：${badges.length}`)
+  const orig = [
+    '[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/sacredbluedragon/dsh-bili-watch)',
+    '[![version](https://img.shields.io/npm/v/dsh-bili-watch?label=version)](https://www.npmjs.com/package/dsh-bili-watch)',
+    '[![node](https://img.shields.io/node/v/dsh-bili-watch?label=node)](https://www.npmjs.com/package/dsh-bili-watch)',
+    '[![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()',
+  ]
+  must(orig.every((s, i) => badges[i] === s), '既有四枚被改动或顺序变了')
+  must(badges[4] === '[![dsh.so risk](https://cdn.dsh.so/badge/dsh-bili-watch.svg)](https://www.dsh.so/artifact/dsh-bili-watch/)', '第 5 枚不是 risk 徽章')
+  const inst = badges[5]
+  must(inst.startsWith('[![dsh.so install](https://cdn.dsh.so/badge/install/dsh-bili-watch@') && inst.includes('https://www.dsh.so/data/install/'), `第 6 枚 install 徽章形态不对：${inst}`)
+  const m = inst.match(/@([^/]+?)\.svg/)
+  must(m && /^0\.\d+\.\d+-rc\.\d+$/.test(m[1]), `install 徽章 pin 的不是内核版本格式 0.x.y-rc.N（不许写插件版本）：${m ? m[1] : '没匹配到'}`)
+  return `6 枚；install pin ${m[1]}（内核版本）`
+})
+
+// ── C223 / ASR 覆盖度：rate<2 要说「为什么弃用」，且 AI 那层能看见 ─────────────
+check('C223 ASR 覆盖不足：低覆盖打带 ⚠ 的 track、正常覆盖不打、工具层回灌链路在', () => {
+  const r = runFixture('c223-asr-coverage-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C223 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const low = j.cases.find((c) => c.name === 'low')
+  const high = j.cases.find((c) => c.name === 'high')
+  const zero = j.cases.find((c) => c.name === 'zeroDur')
+  // 行为断言在前：删掉 track 这一行时必须红在「AI 看不到 ⚠」。
+  must(low.hasWarn === true && low.hasReason === true, `0.5 字/秒没打带 ⚠ 的覆盖说明：${JSON.stringify(low.trackLines)}`)
+  must(low.trackLines.some((s) => s.includes('0.5') && s.includes('阈值 2')), `覆盖说明里没有速率与阈值：${JSON.stringify(low.trackLines)}`)
+  must(high.trackLines.length === 0 && !high.hasWarn, `5 字/秒也打了 ⚠：${JSON.stringify(high.trackLines)}`)
+  must(zero.trackLines.length === 0, 'dur=0 时不该硬报覆盖不足')
+  must(j.callCount === 1, `asrCoverageNotice 调用点不是 1 处（${j.callCount}）——必须放分支前覆盖所有出口`)
+  must(j.placementOk === true && j.importOk === true, '通知没放在 ASR 分支内或没 import')
+  must(j.quietOk === true && j.filterOk === true, '工具层 --quiet / filter(⚠) 链路断了，⚠ 到不了模型')
+  must(j.anchorOk === true, '源码切片前提不成立 —— 抽取标记漂移了')
+  return `低覆盖「${low.trackLines[0].slice(0, 60)}…」；高覆盖 0 条`
+})
+
+// ── C226 / check-boundaries：四类禁词的新增散落调用必须被拦 ─────────────────────
+// 注意：本判据内不许出现完整禁词字面量，否则守卫扫 verify.mjs 时会自指命中。
+check('C226 边界守卫：现状过闸、三种造坏各红且点名、白名单文件不误报', () => {
+  const gp = join(HERE, '..', 'scripts', 'check-boundaries.mjs')
+  const g = spawnSync(process.execPath, [gp], { encoding: 'utf8', timeout: 30000 })
+  must(g.status === 0, `现状没过闸：rc=${g.status} ${`${g.stdout || ''}${g.stderr || ''}`.slice(0, 300)}`)
+  const r = runFixture('c226-boundaries-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C226 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.cleanRc === 0, `白名单文件被误报：${j.cleanOut}`)
+  for (const c of j.cases) {
+    must(c.badRc === 1, `${c.name} 造坏后守卫没红（rc=${c.badRc}）`)
+    must(c.named === true, `${c.name} 红了但没点名文件与禁词：${c.badOut.slice(0, 300)}`)
+    must(c.restoreRc === 0, `${c.name} 删掉坏行后没回到绿（rc=${c.restoreRc}）`)
+  }
+  const gs = readFileSync(gp, 'utf8')
+  must(gs.includes('const ALLOW_FILES = {') && /const LEGACY = [^\n]*new Set\(\[/.test(gs) && !gs.includes('__LEGACY__'), '白名单/基线不是脚本内固化的常量')
+  return `现状 0；三造坏 1→点名→恢复 0；命中 ${/扫 (\d+) 处/.exec(g.stdout || '')?.[1] || '?'} 处`
+})
+
+// ── C227-E / 把「临时基线清零」和「白名单不空指向」钉成判据 ─────────────────────
+// 读守卫源码里三个常量的**初始化表达式**，用 vm 真求值，不是照着手写一份常量比对：
+//   谁往 ALLOW_FILES 多写一行、往 LEGACY 放回一条，求值结果立刻变，判据就红。
+// 抠取只负责定位；断言全部落在求值出来的值上（自报式输出会被人改，源码常量不会凭空变）。
+function guardConstants() {
+  // C240：不再抠源码文本。旧写法把 `const LEGACY = …` 那一行单独求值，
+  // 运行期 `LEGACY.add(<真 key>)` 注入后，初始化值仍是空集 → C227-E 全绿，
+  // 而守卫 :66 用的是被污染的运行期 Set → 放行。现在让守卫自己 dump 最终集合。
+  const r = spawnSync(process.execPath,
+    [join(ROOT, 'scripts', 'check-boundaries.mjs'), '--dump-legacy'],
+    { encoding: 'utf8', timeout: 30000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024 })
+  const out = `${r.stdout || ''}${r.stderr || ''}`
+  must(r.status === 0 && (r.stdout || '').trim().startsWith('{'),
+    `守卫 --dump-legacy 自己起不来（rc=${r.status}）：${out.slice(0, 250)}`)
+  const j = JSON.parse(r.stdout)
+  must(Array.isArray(j.legacy) && Array.isArray(j.forbidden) &&
+    j.allowFiles && typeof j.allowFiles === 'object',
+  '自报形状不完整（legacy / forbidden / allowFiles 缺项）—— 不能拿半份数据当「空」')
+  return { forbidden: j.forbidden, allowFiles: j.allowFiles, legacySize: j.legacy.length, legacy: j.legacy }
+}
+
+check('C227-E LEGACY 清零：46 条现状豁免逐段搬完，这里不许再长回来', () => {
+  const j = guardConstants()
+  must(j.legacySize === 0,
+    `LEGACY.size=${j.legacySize}，里头又有豁免：${j.legacy.slice(0, 3).join(' / ')} —— A–D 段已把 46 条搬空，加一条就说明有人在绕过守卫`)
+  must(j.legacy.length === 0, `LEGACY 展开后还剩 ${j.legacy.length} 条`)
+  return `LEGACY.size=0（守卫源码真求值，不是文本比对）；${j.forbidden.length} 类禁词在守`
+})
+
+check('C227-E ALLOW_FILES 每个白名单路径都真实存在、四类禁词各有一份白名单', () => {
+  const j = guardConstants()
+  must(j.forbidden.length > 0, 'FORBIDDEN 是空的 —— 守卫没在守任何东西')
+  const keys = Object.keys(j.allowFiles)
+  must(j.forbidden.every((t) => keys.includes(t)),
+    `FORBIDDEN 里有禁词没有对应白名单：${j.forbidden.filter((t) => !keys.includes(t)).join(', ')}`)
+  must(keys.every((k) => j.forbidden.includes(k)),
+    `ALLOW_FILES 有拼错的 key：${keys.filter((k) => !j.forbidden.includes(k)).join(', ')}`)
+  const missing = []
+  let n = 0
+  for (const [token, files] of Object.entries(j.allowFiles)) {
+    must(Array.isArray(files) && files.length > 0, `${token} 的白名单是空的 —— 等于把这类禁词全放行`)
+    for (const rel of files) {
+      n++
+      if (typeof rel !== 'string' || !existsSync(join(ROOT, rel))) missing.push(`${token} → ${rel}`)
+    }
+  }
+  must(missing.length === 0,
+    `ALLOW_FILES 有 ${missing.length} 个路径在仓库里不存在（文件改名/删掉之后白名单成了空指向）：${missing.join('；')}`)
+  return `${n} 个白名单路径全部真实存在；${keys.length} 类禁词各有一份`
+})
+
+// ── C224 / sheet --dry-run：出计划不出图 ─────────────────────────────────────────
+check('C224 sheet --dry-run：0 次抽帧 / 0 次下载 / 0 个文件落盘、四行计划齐、token 标估', () => {
+  const r = runFixture('c224-sheet-dryrun-probe.mjs', 90000)
+  must(r.status === 0 && r.json, `C224 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  // 行为断言在前：摘掉短路时要红在「真抽帧了」，不是红在静态守卫。
+  must(j.grabCalls === 0, `dry-run 走到 grabFrames 了（${j.grabCalls} 次）：${j.chainError}`)
+  must(j.bodyLength > 100, `桩版消费链切片是空的（${j.bodyLength} 字节）—— 这条判据没在验真代码`)
+  must(j.newFiles.length === 0, `干跑写了 ${j.newFiles.length} 个文件：${j.newFiles.slice(0, 5).join(' / ')}`)
+  must(j.injectionCaught === true, '快照豁免了启动期台账后连注入的假拼图都抓不到 —— 三零判据没牙')
+  must(j.outJpgExists === false && j.outManifestExists === false, '拼图或 manifest 落盘了')
+  must(j.withDur.rc === 0, `dry-run CLI 没跑通（rc=${j.withDur.rc}）：${j.withDur.out.slice(0, 300)}`)
+  const o = j.withDur.out
+  must(o.includes('时长 123s') && o.includes('16 格') && o.includes('将抽帧时间点') && o.includes('预计 token'), `四行计划不齐：${o.slice(0, 300)}`)
+  must(/预计 token[^\n]*估/.test(o), 'token 那行没标「估」或没写估算依据')
+  must(!o.includes('拼图:') && !o.includes('索引：'), '出现了真实拼图/索引输出')
+  must(j.noDur.rc === 0 && j.noDur.out.includes('时长 未知') && j.noDur.out.includes('按 9 等分'), '不给 dur 的离线形态没如实说时长未知')
+  must(j.placementOk === true, '短路不在 grabFrames 之前')
+  must(j.chainLogs.filter((l) => l.startsWith('[dry-run]')).length === 4, '桩版消费链没打出四行计划')
+  must(j.planLines.length === 4 && j.planLines[3].includes('估'), '纯函数四行/估算标注不对')
+  must(j.planTimes.length === 16, `4x4 应给 16 个时间点，实得 ${j.planTimes.length}`)
+  must(j.cliSkipped === false, '夹具跳过了 CLI 真跑 —— 短路可能被摘掉')
+  return `rc=0；grabCalls=0；新增文件 0（台账 append ${j.changedFiles.length} 份，非短路写入；注入反证已抓到）；四行齐（token 约 ${j.planToken}，标估）`
+})
+
+// ── C217 / A4：comments 与 danmaku 的 json payload 也要带同一份 video ────────────
+check('C217 A4 json payload：comments/danmaku 三个出口带 video、键集合与 sub/text 一致、既有键不少', () => {
+  const r = runFixture('c217-video-payload-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C217 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  // 行为断言在前：换成手写 {bv,title} 时要红在 video 键集合上。
+  const wrong = j.candidates.filter((c) => c.videoKeys !== j.baseline)
+  must(wrong.length === 0, `payload 的 video 键集合与基准不一致：${wrong.map((c) => `${c.line}:${c.videoKeys}`).join(' / ')}（基准 ${j.baseline}）`)
+  must(j.count === 3, `该有三处 payload（comments 1 + danmaku 2），实得 ${j.count}`)
+  must(j.candidates.every((c) => c.hasLegacy === true), '既有键 ok/source/bv/count/items 有丢')
+  must(j.candidates.every((c) => c.error === ''), `payload 求值报错：${j.candidates.filter((c) => c.error).map((c) => c.line + ':' + c.error).join(' / ')}`)
+  must(j.candidates.every((c) => c.usesVideoMeta === true), '有一处 payload 没用 videoMeta(bv, v)（手写字面量会让形状分叉）')
+  must(j.videoMetaCalls === 9, `videoMeta 调用点应 9 处（sub/text 6 + 本次 payload 3），实得 ${j.videoMetaCalls}`)
+  return `3 处 payload 的 video 键集合 = ${j.baseline}；既有键全在`
+})
+
+// ── C219 / A6：sheet 的 stdout 要说出格位索引在哪 ──────────────────────────────
+check('C219 A6 格位索引：路径真存在、三种形态都点名、既有散文行一字不改', () => {
+  const r = runFixture('c219-manifest-probe.mjs', 90000)
+  must(r.status === 0 && r.json, `C219 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  // 行为断言在前：删掉 stdout 那行时要红在「没把路径打出来」。
+  must(j.logs.some((l) => l.startsWith('格位索引: ')), `sheet 没把格位索引路径打出来：${JSON.stringify(j.logs)}`)
+  must(j.fragmentLength > 50, '桩版两行切片是空的 —— 没在验真源码')
+  must(j.written === true && j.pathOk === true && j.keysOk === true && j.lineOk === true, '纯函数真写盘 / 路径形态 / JSON 键 / 提示行有一样不对')
+  must(j.grid33.rc === 0 && j.grid44.rc === 0 && j.names33 === true && j.names44 === true,
+    `3x3 / 4x4 的 dry-run 没都点名格位索引路径（33=${j.names33} 44=${j.names44}）`)
+  must(j.proseUntouched === true, '既有「拼图:」散文行被改了 —— 这批只许追加')
+  must(j.appendInSource === true, 'cmdSheet 里没有追加提示行')
+  return `真写盘 ✓；3x3/4x4/dry-run 都点名；散文行未改`
+})
+
+// ── C220 / A·B6：frames / ocr / sheet / substrip 的 --format json 新出口 ──────
+// 加字段＝兼容：既有散文一个字不改，json 是新增出口。四条各一条断言，
+// 行为断言（真 lib / 真源码 vm / 真 CLI 逐字节对照）在前，静态守卫在后。
+check('C220 A·B6 四条命令 --format json：可解析 / ok+source+video 齐 / 散文逐字节不变', () => {
+  const r = runFixture('c220-command-json-probe.mjs', 90000)
+  must(r.status === 0 && r.json, `C220 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const cmds = ['frames', 'ocr', 'sheet', 'substrip']
+  const keys = 'bv,dur,p,pages,title,up'
+  // ① 四条各一条：json 形状 + stdout 只有 json + 散文原样收进 prose
+  for (const c of cmds) {
+    const x = j.lib[c] || {}
+    must(x.parseOk === true && x.ok === true && x.source === c && x.videoKeys === keys && x.videoBv === 'BV19dJQ6sE9F',
+      `${c} 的 json 出口形状不对（video 必须走 videoMeta）：${JSON.stringify(x)}`)
+    must(x.stdoutOnlyJson === true && x.marker === `from-${c}` &&
+      JSON.stringify(x.prose) === JSON.stringify([`散文 1 · ${c}`, `散文 2 ${c} 3`]),
+      `${c} 的 stdout 混了散文，或散文被改写了：${JSON.stringify(x.prose)}`)
+  }
+  must(j.textMode.returned === false && JSON.stringify(j.textMode.prose) === JSON.stringify(['散文 A', '散文 B 2']),
+    `非 json 模式没走原样散文路径：${JSON.stringify(j.textMode)}`)
+  // ② 四条 cmd 函数体真跑：命令自报结果 + 散文照打（摘掉 opts.result 要红在这里，不是红在静态锚点）
+  for (const c of cmds) {
+    const v = j.vmOut[c] || {}
+    must(v.found === true && v.length > 200 && v.error === '' && v.hasResult === true && v.logs >= 3,
+      `${c} 的 cmd 函数真跑没过（切片 ${v.length} 字节 / 散文 ${v.logs} 行 / ${v.error}）`)
+  }
+  // ③ 真 CLI 离线对照：json.prose 要与散文版 stdout 逐字节一致
+  must(j.cli.parseOk === true && j.cli.plainRc === 0 && j.cli.jsonRc === 0, `sheet --dry-run CLI 没跑通：${JSON.stringify(j.cli)}`)
+  must(j.cli.proseEqual === true && j.cli.proseLines === 4,
+    `json 的 prose 与散文版 stdout 不一致（${j.cli.proseLines} vs ${j.cli.plainLines} 行）`)
+  must(j.cli.ok === true && j.cli.source === 'sheet' && j.cli.offline === true && j.cli.dryRun === true && j.cli.video === null,
+    '离线干跑的 json 形状不对（ok/source/offline/dryRun/video）')
+  // ④ 静态守卫放最后：分派链 / 参数表 / HELP 三处都接上 format
+  for (const c of cmds) {
+    const s = j.stat[c] || {}
+    must(Object.values(s).every((v) => v === true) && (j.resultLines[c] || 0) >= 1,
+      `${c} 的分派链/参数表/HELP 有一处没接上 format：${JSON.stringify(s)} / resultLines=${j.resultLines[c]}`)
+  }
+  return `四条 json 出口齐（video=${keys}）；vm 真源码四条各自自报结果；CLI dry-run 散文 4/4 行逐字节一致`
+})
+
+// ── C221 / A·B7：printText 三个落盘路径另落一份 json ─────────────────────────
+// 散文照写、json 另落：行为断言（真写盘 + 真源码 vm 三遍）在前，静态守卫在后。
+check('C221 A·B7 三处落盘另落 json：散文逐字节不变 / json 键齐 / stdout 说出路径', () => {
+  const r = runFixture('c221-text-json-probe.mjs', 60000)
+  must(r.status === 0 && r.json, `C221 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const keys = 'chars,source,text,timeline,video'
+  // ① 真 lib 纯函数 + 真写盘
+  must(j.lib.pathOk === true && j.lib.keys === keys && j.lib.textOk === true &&
+    j.lib.timelineNull === true && j.lib.sourceOk === true && j.lib.cuesOnlyWhenPresent === true,
+    `text-json 纯函数形状不对：${JSON.stringify(j.lib)}`)
+  must(j.lib.diskParseOk === true && j.lib.diskTextOk === true && j.lib.diskProseIntact === true && j.lib.line.startsWith('结构化: '),
+    '真写盘的 json 不可解析 / 正文与散文不一致 / 散文文件被覆盖 / 提示行不对')
+  // ② 三个落盘路径逐条验：散文与围栏逐字节不变、json 与散文同源、stdout 有路径
+  for (const kind of ['text', 'sub', 'asr']) {
+    const v = j.vmOut[kind] || {}
+    must(v.error === '' && v.proseIntact === true && v.wrappedIntact === true,
+      `${kind} 的散文文件或围栏文件被改了（切片真跑 ${v.error}）`)
+    must(v.jsonParseOk === true && v.jsonKeys === keys && v.jsonTextOk === true &&
+      v.jsonSourceOk === true && v.callTextOk === true,
+      `${kind} 的 json 不对（键/正文/source/落盘实参）：${JSON.stringify(v)}`)
+    must(v.stdoutLineOk === true && v.proseStillPrinted === true,
+      `${kind} 没在 stdout 说出 json 路径，或散文没照打：${v.stdoutLine}`)
+  }
+  // ③ 静态守卫放最后：两行散文写入原样、三处接线都在
+  must(Object.values(j.stat).every((x) => x === true), `printText 的落盘接线或散文写入行缺了：${JSON.stringify(j.stat)}`)
+  return `text/sub/asr 三份 json 键齐（${keys}），散文与围栏逐字节不变，stdout 各点名一次路径`
+})
+
+// ── C222 / doctor：六项只读环境检查 ──────────────────────────────────
+// 行为断言在前（真 CLI / 真 lib / 目录快照 / 六项造坏），静态守卫放最后。
+// 特别防「一进来就 return」：那样零写盘也成立，所以只读那层必须同时拿到六项结果。
+check('C222 doctor 六项环境检查：本机至少五项绿 / 每项独立造坏红并恢复 / 零写盘 / 两种输出形状', () => {
+  const r = runFixture('c222-doctor-probe.mjs', 180000)
+  must(r.status === 0 && r.json, `C222 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const ids = ['ffmpeg', 'ffprobe', 'asr', 'credential', 'cache', 'deps']
+  // ① 真 CLI 基线：可解析、六项齐、detail/fix 齐、修复命令可直接复制、本机 ≥5 项绿
+  const b = j.baseline || {}
+  must(b.parseOk === true && b.rc === 0 && b.total === 6 && JSON.stringify(b.ids) === JSON.stringify(ids),
+    `doctor --format json 形状不对（或命令没跑通）：${JSON.stringify(b)}`)
+  must(b.shapeOk === true && b.copyableFix === true,
+    `六项里有 detail/fix 缺失，或 fix 不是能复制的命令：${JSON.stringify(b.fixes)}`)
+  const green = ids.filter((id) => b.okMap?.[id] === true)
+  must(green.length >= 5, `本机六项至少五项要真绿，实际 ${green.length}/6：${JSON.stringify(b.okMap)}`)
+  // ② 人读：每项一行结论 + 一行修复命令，合计行，且 stdout 不是 JSON
+  const p = j.prose || {}
+  must(p.rc === 0 && p.verdicts === 6 && p.fixLines === 6 && p.noJsonBrace === true &&
+    /^合计 \d\/6 项可用/.test(p.summary || ''),
+    `人读输出没逐项点名或没给修复命令：${JSON.stringify(p)}`)
+  // ③ 只读：跑前后逐项快照相等；注入假文件验快照自己抓得到；没有 runs.jsonl / 写探针
+  const ro = j.readonly || {}
+  must(ro.equal === true && ro.injectionCaught === true && ro.cleanupEqual === true &&
+    ro.noRunLog === true && ro.snapCount > 0,
+    `doctor 碰了盘，或快照是纸老虎（注入抓不到）：${JSON.stringify(ro)}`)
+  must(ro.items === 6, 'doctor 若一进来就 return，快照同样零写盘 —— 必须真的吐出六项结果')
+  // ④ 六项各自「造坏 → 红 → 恢复 → 绿」，一次都不许拿别项的变化顶数
+  for (const id of ids) {
+    const x = j.breaks?.[id] || {}
+    must(x.before === true && x.bad === false && x.restored === true && x.items === 6,
+      `${id} 的造坏→红→恢复→绿没成立：${JSON.stringify(x)}`)
+  }
+  // ④b 真 lib 模块注入 probe 桩：探测链咬合，不是一张硬编码的 ✓ 表
+  const lp = j.libProbe || {}
+  must(JSON.stringify(lp.ids) === JSON.stringify(ids), `lib 的六项 id 与 CLI 不一致：${JSON.stringify(lp.ids)}`)
+  must(lp.noFfprobe?.ffprobe === false && lp.noFfprobe?.ffmpeg === true && lp.noFfprobe?.asr === true,
+    `只打坏 ffprobe 的桩没做到「只红这一项」：${JSON.stringify(lp.noFfprobe)}`)
+  must(lp.noPython?.asr === false && lp.noPython?.ffmpeg === true && lp.noPython?.ffprobe === true,
+    `只打坏 python 的桩没做到「只红 ASR」：${JSON.stringify(lp.noPython)}`)
+  must(lp.allFalse?.ffmpeg === false && lp.allFalse?.ffprobe === false && lp.allFalse?.asr === false &&
+    lp.allFalse?.credential === true && lp.allFalse?.cache === true && lp.allFalse?.deps === true,
+    `探测全废时，不依赖探测的三项也该照常绿：${JSON.stringify(lp.allFalse)}`)
+  // ⑤ 静态守卫放最后：接线、不进缓存命令集、lib 无网络与写入 API、退出钩子护栏
+  const st = j.stat || {}
+  must(Object.values(st).every((v) => v === true) && Object.keys(st).length >= 8,
+    `doctor 的接线或只读护栏缺了一处：${JSON.stringify(st)}`)
+  return `本机 ${green.length}/6 绿（${ids.map((id) => `${id}:${b.okMap[id] ? '✓' : '✗'}`).join(' ')}）；六项各造坏一次全真红并恢复；只读快照 ${ro.snapCount} 项零变化、假注入抓得到；人读 6 结论 + 6 修复命令`
+})
+
+// ── C225 / HSV 网格分：真跑两组合成片对照 + 保留 scdet 旧路 ───────────
+// 行为断言在前（真 ffmpeg 造片、两边时间点列表、回落），静态守卫在后。
+// 把 HSV 那路短路成 { times: [], ok: true } 必须红在这里的「同亮度组 HSV 命中数」。
+check('C225 HSV 网格分：同亮度换色 HSV 中 / scdet 不中，auto 优先且失败回落带 ⚠', () => {
+  const r = runFixture('c225-scene-hsv-probe.mjs', 240000)
+  must(r.status === 0 && r.json, `C225 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C225 实验没跑起来：${j.error}`)
+  const v = j.videos || {}
+  must(v.a?.rc === 0 && v.b?.rc === 0 && v.c?.rc === 0, `三组合成视频有一组没造出来：${JSON.stringify(v)}`)
+  const R = j.runs || {}
+  // ① 纯色切换：两边都要中，时间点列表都要给（不许只报「HSV 更好」）
+  must(R.plainScdet?.count >= 4 && R.plainHsv?.count >= 4 &&
+    Array.isArray(R.plainScdet?.times) && Array.isArray(R.plainHsv?.times),
+    `纯色切换组两边都应命中 ≥4：scdet=${JSON.stringify(R.plainScdet)} / hsv=${JSON.stringify(R.plainHsv)}`)
+  // ② 同亮度不同色：核心差距。HSV 中、scdet 不中
+  must(R.hueHsv?.count >= 4 && R.hueScdet?.count <= 1,
+    `同亮度换色组没拉开差距：hsv=${JSON.stringify(R.hueHsv)} / scdet=${JSON.stringify(R.hueScdet)}`)
+  must(R.hueScdet?.ok === true && R.hueHsv?.ok === true, '两组都必须「扫描成功」，不能拿扫描失败冒充零切点')
+  // ③ 规格举例红↔蓝的偏差要如实留证：th=0.3 两边都中，th=0.5 才只剩 HSV
+  const sp = j.spec || {}
+  must(sp.th03Scdet?.count >= 4 && sp.th03Hsv?.count >= 4 &&
+    sp.th05Scdet?.count === 0 && sp.th05Hsv?.count >= 4,
+    `规格原例红蓝的对照没记全：${JSON.stringify(sp)}`)
+  // ④ auto 成功不回落；阈值传导（0.99 下新路零命中）；旧路 C86 由全量 verify 另守
+  must(R.autoEqualsHsv === true && R.hueAutoEqualsHsv === true, 'auto 成功时结果必须与强制 hsv 逐字一致')
+  must(R.plainHighHsv?.count === 0, `0.99 阈值下 HSV 仍检出变化点，th 没传进新路：${JSON.stringify(R.plainHighHsv)}`)
+  // ⑤ 纯函数：换色 16 格全超阈，同色一格都不超
+  const pu = j.pure || {}
+  must(pu.change?.changed === 16 && pu.change?.cells === 16 && pu.same?.changed === 0 && pu.same?.mean === 0 &&
+    pu.h0 === 0 && pu.s0 === 1, `逐格直方图距离不对：${JSON.stringify(pu)}`)
+  // ⑥ 回落：把 HSV 打坏后 auto 拿出与旧路逐字一致的 times 并通知调用方；坏 bin 两路都失败但通知仍到
+  const fb = j.fallback || {}
+  must(fb.stubEqualsScdet === true && fb.stubOk === true && Array.isArray(fb.stubTimes) && fb.stubTimes.length >= 4,
+    `HSV 失败没真回落到 scdet：${JSON.stringify(fb)}`)
+  must(Array.isArray(fb.notes) && fb.notes.length === 2 && fb.notes.every((x) => typeof x === 'string' && x.length > 0),
+    `两次失败（桩 + 坏 ffmpeg 路径）都要通知调用方去打 ⚠：${JSON.stringify(fb.notes)}`)
+  must(fb.hardFailOk === false && fb.hardFailTimes?.length === 0,
+    `坏 ffmpeg 路径不该报成功：${JSON.stringify(fb)}`)
+  // ⑦ 静态守卫放最后：默认 auto、三条分支、回落通知、⚠ track、新 lib 不带执行器
+  const st = j.stat || {}
+  must(Object.values(st).every((x) => x === true) && Object.keys(st).length >= 7,
+    `HSV 接线或 lib 边界缺了一处：${JSON.stringify(st)}`)
+  return `纯色切换 scdet ${JSON.stringify(R.plainScdet.times)} / HSV ${JSON.stringify(R.plainHsv.times)}；同亮度换色 scdet ${JSON.stringify(R.hueScdet.times)} / HSV ${JSON.stringify(R.hueHsv.times)}；规格红蓝 th0.3 两边都 ${sp.th03Scdet.count} 中、th0.5 scdet ${sp.th05Scdet.count} / HSV ${sp.th05Hsv.count}；回落两次都通知到`
+})
+
+// ── C229 / HSV 分段扫描：长视频不 ENOBUFS，驻留内存不随时长增长 ──────────
+// DSH 22:38 段实测：旧实现一次收全片 rawvideo，160x90x3=43,200 B/帧 × 2 fps，
+// 64 MB maxBuffer 只够 1553 帧 ≈ 777 秒；13 分钟以上必然 ENOBUFS → ok:false
+// → auto 静默回落 scdet，功能对大多数真实视频失效而用户只看到一行 ⚠。
+// 行为断言在前：真造 800s / 30min / 2h 三片，必须 ok:true 且切点位置准；静态守卫最后。
+check('C229 HSV 分段扫描：30min/2h 不 ENOBUFS、驻留帧数不随时长增长、换色点误差 < 1s', () => {
+  const r = runFixture('c229-hsv-chunk-probe.mjs', 300000)
+  must(r.status === 0 && r.json, `C229 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C229 实验没跑起来：${j.error}`)
+  const v = j.videos || {}
+  must(['short', 's800', 's1800', 's7200'].every((k) => v[k]?.rc === 0),
+    `四组合成片有没造出来的：${JSON.stringify(v)}`)
+  const R = j.runs || {}
+
+  // ① 前提：短片行为不回退（6 秒 5 个切点），别拿「长片能跑」换掉「短片能跑」
+  must(R.short?.ok === true && R.short?.count === 5 && JSON.stringify(R.short.times) === JSON.stringify([1, 2, 3, 4, 5]),
+    `短片被改坏了：${JSON.stringify(R.short)}`)
+
+  // ② 行为断言：三组长片都必须「扫描成功」—— 一次性全量读会在这里 ENOBUFS
+  for (const k of ['s800', 's1800', 's7200']) {
+    must(R[k]?.ok === true,
+      `${k} 长视频 HSV 没跑通（${R[k]?.why || '无 why'}）—— 一次性全量读会 ENOBUFS，不许靠静默回落冒充：${JSON.stringify(R[k])}`)
+  }
+
+  // ③ 换色点命中数与位置：30min 5 个、2h 23 个，逐个误差 < 1 秒
+  const expect = j.expected || {}
+  const gap = (a, b) => Math.max(...a.map((x, i) => Math.abs(x - (b[i] ?? Infinity))))
+  for (const k of ['s800', 's1800', 's7200']) {
+    const want = expect[k] || []
+    const got = R[k]?.times || []
+    must(got.length === want.length,
+      `${k} 换色点数量不对：期望 ${want.length} 个，实得 ${got.length}（${JSON.stringify(got.slice(0, 8))}）`)
+    must(want.length > 0 && gap(got, want) < 1,
+      `${k} 换色点位置误差 ≥1s：期望 ${JSON.stringify(want.slice(0, 8))}，实得 ${JSON.stringify(got.slice(0, 8))}`)
+  }
+
+  // ④ 驻留上界：三组的同时驻留帧数/字节数都不许超过单段量级，也不许差一个量级
+  const S = ['s800', 's1800', 's7200'].map((k) => R[k]?.stats || {})
+  must(S.every((s) => typeof s.maxResidentFrames === 'number' && s.maxResidentFrames > 0 && s.maxResidentFrames <= 150),
+    `驻留帧数超过单段上界（60s × 2fps + 余量 = 122，判据放宽到 150）：${JSON.stringify(S.map((s) => s.maxResidentFrames))}`)
+  must(S.every((s) => typeof s.maxResidentBytes === 'number' && s.maxResidentBytes <= 8 * 1024 * 1024),
+    `驻留字节数超过 8 MB：${JSON.stringify(S.map((s) => s.maxResidentBytes))}`)
+  const peaks = S.map((s) => s.maxResidentFrames)
+  must(Math.max(...peaks) / Math.min(...peaks) < 10,
+    `800s / 30min / 2h 的驻留峰值差了一个量级，说明内存在随时长涨：${JSON.stringify(peaks)}`)
+
+  // ⑤ 交叉核对自报：真分段（chunks）、真扫完全片（totalFrames），峰值不小于平均每段帧数的 0.8 倍
+  const floors = { s800: [12, 1500], s1800: [25, 3500], s7200: [100, 14000] }
+  for (const k of Object.keys(floors)) {
+    const s = R[k]?.stats || {}
+    const [minChunks, minFrames] = floors[k]
+    must(s.chunks >= minChunks, `${k} 只扫了 ${s.chunks} 段，不是真分段：${JSON.stringify(s)}`)
+    must(s.totalFrames >= minFrames, `${k} 只扫了 ${s.totalFrames} 帧，没扫完全片就返回了：${JSON.stringify(s)}`)
+    must(s.maxResidentFrames >= (s.totalFrames / s.chunks) * 0.8,
+      `${k} 自报的驻留峰值与总帧数/段数对不上，别拿恒 1 的假数糊弄：${JSON.stringify(s)}`)
+  }
+
+  // ⑥ 静态守卫最后：分段常量、-ss/-t、maxBuffer 来自单段、旧 64MB 不在、onStats 透传
+  const st = j.stat || {}
+  must(st.chunkConst === true && st.chunkSecValue === 60 && st.hasSeekAndLimit === true &&
+    st.maxBufferFromChunk === true && st.noOldMaxBuffer === true && st.onStatsPassthrough === true,
+    `C229 静态接线缺了一处：${JSON.stringify(st)}`)
+  return `6s 5 中；800s/30min/2h 全 ok（${S.map((s) => s.chunks).join('/')} 段）；30min 换色点误差 ${gap(R.s1800.times, expect.s1800)}s；驻留峰值 ${peaks.join('/')} 帧、${S.map((s) => s.maxResidentBytes).join('/')} B`
+})
+
+// ── C230 / B3 缩小版：不接受的参数只给一行 ⚠（不改下发 / rc / schema / stdout）──────
+// DSH 2350 裁定：B1/B2 推 0.5.0，B3 只做「该命令不接受此参数」一行 ⚠；
+// rc 与 schema 由 verify-params 的既有断言 + 下面 A/B 逐字节对照兜住，不另写一条静态断言。
+check('C230 B3 缩小版：不接受的真打 ⚠、接受的不误伤、stdout 与 rc 逐字节不变', () => {
+  const r = runFixture('c230-unaccepted-flag-probe.mjs', 180000)
+  must(r.status === 0 && r.json, `C230 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C230 实验没跑起来：${j.error}`)
+  const R = j.runs || {}
+  must(Object.keys(R).length === 7, `七组真跑没齐：${Object.keys(R).join('/')}`)
+
+  // ① 行为断言在前：该命令不接受的参数必须真打 ⚠，且点名到参数
+  must(R.A?.hasWarn === true && R.A.warnLine.includes('--scene'),
+    `doctor --scene 没打 ⚠ 或没点名参数：${JSON.stringify(R.A)}`)
+  must(R.A.jsonOk === true, '⚠ 污染了 stdout，doctor --format json 不再可解析')
+
+  // ② 「只加一行」的硬证据：stdout 逐字节相同、rc 相同、stderr 只多这一行
+  must(j.stat?.aStdoutSame === true && j.stat?.aRcSame === true,
+    `加不接受参数后 stdout 或 rc 变了 —— B3 只允许加一行 ⚠：${JSON.stringify(j.stat)}`)
+  must(j.stat?.aStdoutLength > 100, 'doctor 的 stdout 是空的，逐字节对照没有意义')
+  must(j.stat?.warnOnlyLine === true,
+    `stderr 除了那一行 ⚠ 还多了别的东西：${JSON.stringify({ a: R.A?.err, b: R.B?.err })}`)
+
+  // ③ 不误伤：接受的、运行时全局读的、缺目标命令的全局参数、--help，都不许打
+  for (const k of ['B', 'C', 'E', 'G']) {
+    must(R[k]?.hasWarn === false, `${k} 组被误伤了（本命令接受 / 全局读 / --help）：${R[k]?.warnLine}`)
+  }
+  must(R.D?.hasWarn === true && R.D.rc === 2,
+    `缺目标命令没打 ⚠ 或 rc 被改了：${JSON.stringify(R.D)}`)
+
+  // ④ 多个不接受的参数合一行、按名字排序，别打 N 行
+  must(R.F?.hasWarn === true && R.F.warnLine.includes('--cues') && R.F.warnLine.includes('--grid') &&
+    R.F.warnLine.indexOf('--cues') < R.F.warnLine.indexOf('--grid') &&
+    (R.F.err.match(/本命令不接受/g) || []).length === 1,
+    `多参数没合一行 / 没排序：${R.F?.warnLine}`)
+
+  // ⑤ 纯函数真调用交叉核（期望写死在夹具里，不拿 COMMANDS 表当自己的答案）
+  const p = j.pure || {}
+  must(JSON.stringify(p.doctorScene) === '["scene"]', `纯函数 doctor --scene 判错：${JSON.stringify(p.doctorScene)}`)
+  must(JSON.stringify(p.doctorAccepted) === '[]' && JSON.stringify(p.sheetAccepted) === '[]',
+    `接受的参数被判成不接受：${JSON.stringify([p.doctorAccepted, p.sheetAccepted])}`)
+  must(JSON.stringify(p.globalOk) === '[]' && JSON.stringify(p.unknownCmd) === '[]' && JSON.stringify(p.unknownFlag) === '[]',
+    `豁免 / 未知命令 / 未知 flag 有一个没被正确放过：${JSON.stringify([p.globalOk, p.unknownCmd, p.unknownFlag])}`)
+  must(JSON.stringify(p.multiSorted) === '["cues","grid"]' && JSON.stringify(p.eqForm) === '["grid"]',
+    `排序或 --name=value 形态没处理：${JSON.stringify([p.multiSorted, p.eqForm])}`)
+
+  // ⑥ 静态守卫最后：warn 输出层、调用点在分派链之前、豁免由 GLOBAL_PARAMS 派生
+  const look = read('tools/look.mjs')
+  const params = read('lib/params.mjs')
+  const atCall = look.indexOf('const UNACCEPTED = unacceptedFlags(cmd, argv)')
+  const atDispatch = look.indexOf("if (flag('help') && cmd !== 'help'")
+  must(atCall > 0 && atDispatch > atCall, '⚠ 不在分派链之前，某些命令会漏报')
+  must(/warn\(`本命令不接受/.test(look), '⚠ 没走 warn()（会污染 stdout / 工具层看不到）')
+  must(!/const UNACCEPTED[\s\S]{0,400}process\.exitCode/.test(look), '⚠ 那段改了退出码')
+  must(params.includes('...GLOBAL_PARAMS') && params.includes("'asr-max', 'quiet'"),
+    '运行时豁免不是从 GLOBAL_PARAMS 派生，或漏了 asr-max / quiet')
+  return `7 组真跑：A 打 ⚠（--scene）、B/C/E/G 零误伤、D rc=2、F 合一行排序；stdout ${j.stat.aStdoutLength} B 与 rc 不变`
+})
+
+// ── C231 / A3 默认输出目录（最小版）：配置 / env / --out 三级优先，未配置零回归 ──────
+// DSH 2350 裁定：只做「配置项 + sheet/ocr/substrip 默认目录 + --out 仍可覆盖」，面板设置页排后。
+// C224 的三零承诺、C219 的格位索引、C221 的三处结构化落盘由既有判据交叉兜住。
+check('C231 A3 默认输出目录：配置/env/--out 三级优先、未配置逐字节零回归、ocr 走新键不动旧 out', () => {
+  const r = runFixture('c231-default-out-probe.mjs', 150000)
+  must(r.status === 0 && r.json, `C231 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C231 实验没跑起来：${j.error}`)
+  const n = (p) => String(p ?? '').replace(/\\/g, '/')
+  const C = j.cli || {}
+  const S = j.stat || {}
+  must(Object.keys(C).length === 5, `五组真 CLI 没齐：${Object.keys(C).join('/')}`)
+
+  // ① 行为断言在前：真 CLI 的 sheet --dry-run 第三行计划必须落在对应目录
+  for (const k of Object.keys(C)) must(C[k].rc === 0, `${k} 组 dry-run 没跑通（rc=${C[k].rc}）：${C[k].err.slice(0, 200)}`)
+  must(n(C.noCfg.path) === n(join(S.cache, 'sheets', S.file)),
+    `没配 defaultOut 时路径变了 —— 这一项必须零回归：${n(C.noCfg.path)}`)
+  must(n(C.cfg.path) === n(join(S.cfgDir, S.file)),
+    `deps-config.json 的 defaultOut 没生效（真 CLI）：${n(C.cfg.path)}`)
+  must(n(C.envOut.path) === n(join(S.envDir, S.file)),
+    `BILI_WATCH_OUT 没生效（真 CLI）：${n(C.envOut.path)}`)
+  must(n(C.explicit.path) === n(S.explicitPath),
+    `--out 没压过配置与环境变量：${n(C.explicit.path)}`)
+  must(n(C.blank.path) === n(C.noCfg.path), `空白配置没回落到缓存目录：${n(C.blank.path)}`)
+  // 干跑仍是四行计划、token 标估 —— 交叉核 C224 的三零承诺没被这一项破坏
+  for (const k of Object.keys(C)) {
+    const lines = C[k].out.split(/\r?\n/).filter((l) => l.startsWith('[dry-run]'))
+    must(lines.length === 4 && C[k].out.includes('预计 token'), `${k} 组四行计划或 token 行不齐：${C[k].out.slice(0, 200)}`)
+  }
+
+  // ② 真 lib 纯函数交叉核（期望写死在夹具里）
+  const p = j.pure || {}
+  must(n(p.plain) === n(p.legacy), `纯函数的无配置路径与旧公式不同：${n(p.plain)} vs ${n(p.legacy)}`)
+  must(n(p.cfg) === n(join(S.cfgDir, S.file)) && n(p.env) === n(join(S.envDir, S.file)),
+    `纯函数 cfg/env 分支不对：${JSON.stringify([n(p.cfg), n(p.env)])}`)
+  must(n(p.explicitWins) === n(S.explicitPath), `纯函数 --out 没压过 cfg+env：${n(p.explicitWins)}`)
+  must(p.blank === '' && p.textPlain === '',
+    `空白配置或 ocr 无配置时没回落到原路径：${JSON.stringify([p.blank, p.textPlain])}`)
+  must(n(p.textCfg) === n(join(S.cfgDir, 'x-ocr.txt')) && n(p.textExplicit) === n(S.explicitPath),
+    `ocr 文本落点不对：${JSON.stringify([n(p.textCfg), n(p.textExplicit)])}`)
+
+  // ③ 静态守卫最后：三方一致（verify-params 兜住对账）、三处成图接线、ocr 用新键不碰旧 out
+  const params = read('lib/params.mjs')
+  const look = read('tools/look.mjs')
+  const readme = read('README.md')
+  const lib = read('lib/default-out.mjs')
+  for (const c of ['sheet', 'substrip', 'ocr']) {
+    const m = new RegExp(`${c}: \\{[\\s\\S]{0,220}accepts: \\[[^\\]]*'out'`).exec(params)
+    must(Boolean(m), `COMMANDS.${c}.accepts 没加 out（verify-params 三方对账会散）`)
+  }
+  for (const c of ['sheet', 'substrip', 'ocr']) {
+    const line = look.split(/\r?\n/).find((l) => l.trim().startsWith(`node look.mjs ${c} `))
+    must(line && line.includes('[--out 文件]'), `HELP 的 ${c} 用法行没写 --out`)
+  }
+  must((look.match(/artifactOut\(`/g) || []).length === 3, 'sheet 两处 + substrip 一处的成图落点没都接上')
+  must(look.includes('opts?.textOut') && !/customTextOut\s*=\s*String\(opts\?\.out/.test(look),
+    'printText 落点复用了既有 opts.out —— 那会悄悄改掉 cmdText 的既有行为')
+  must(readme.includes('defaultOut') && !readme.includes('固定写缓存目录，不收 `--out`'),
+    'README 没同步默认输出目录说明')
+  must(lib.includes('if (explicit) return resolve(explicit)') && lib.includes("DEFAULT_OUT_KEY = 'defaultOut'"),
+    '三级优先或配置键名不见了')
+  return `5 组真 CLI：无配置零回归 / cfg / env / --out 压过两者 / 空白回落；ocr 走 textOut 新键，C224 四行计划仍齐`
+})
+
+// ── C232 / 成本回报一行：只加字段与一行，不改任何既有字段含义 ───────────────────
+// 裁定口径：「加字段＝兼容；改语义＝停下报」。分母不可信一律标估算，缓存没硬证据写「未知」。
+check('C232 成本回报一行：真 lib 形状 / emitTextJson 真源码加字段不覆盖 / 包装层穿透 / 估算标记', () => {
+  const r = runFixture('c232-cost-line-probe.mjs', 90000)
+  must(r.status === 0 && r.json, `C232 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C232 实验没跑起来：${j.error}`)
+  const p = j.pure || {}
+
+  // ① 真 lib 纯函数（行为断言在前）
+  const c = p.fixed || {}
+  must(c.ms === 2500 && c.frames === 24 && c.bytes === 2048 && c.cached === true && c.estimated === true,
+    `costOf 的形状或耗时算错了：${JSON.stringify(c)}`)
+  must(p.prose === '成本：2.5s · 帧 24 · 2.0 KiB · 缓存命中 是（估算）',
+    `散文没写全四项 / 没标估算：${p.prose}`)
+  must(p.unknownProse.includes('缓存命中 未知') && p.unknownProse.includes('（估算）'),
+    `没硬证据时把「不知道」写成了「否」，或漏标估算：${p.unknownProse}`)
+  must(p.noStart === 0 && p.notNegative === 0 && p.badNum === 0,
+    `没记起点 / 负耗时 / 非数字没被夹住：${JSON.stringify([p.noStart, p.notNegative, p.badNum])}`)
+  must(p.withCost?.ok === true && p.withCost?.text === 'T' && p.withCost?.cost?.ms === 2500,
+    `withCost 没做到「只加字段」：${JSON.stringify(p.withCost)}`)
+  must(p.noOverride?.cost === 'KEEP' && p.nullSafe === null,
+    'withCost 覆盖了已有 cost，或对 null payload 不安全')
+
+  // ② emitTextJson 真源码切片：json 多 cost、既有键一字不动、没给起点就不加字段
+  const e = j.emit || {}
+  must(e.bodyLength > 500, `抽出来的 emitTextJson 函数体只有 ${e.bodyLength} 字节 —— 这条判据没在验真代码`)
+  must(e.parseOk === true && e.keys === 'chars,cost,ok,source,text',
+    `text --format json 没多出 cost 或键集合不对：${JSON.stringify(e)}`)
+  must(e.baseIntact === true, '加 cost 时把既有 ok/source/text/chars 改了 —— 那是改语义不是加字段')
+  must(e.cost?.estimated === true && e.cost?.bytes === 9 && e.cost?.cached === true,
+    `text 的 cost 字段不对（字节应取正文字节数、缓存来自硬证据）：${JSON.stringify(e.cost)}`)
+  must(e.noStartHasCost === false, '没记起点也凭空加了 cost 字段')
+
+  // ③ 真包装层：frames/ocr 的 result.cost 必须能穿过 runCommandJson，既有键与散文不变
+  const q = j.pipe || {}
+  must(q.parseOk === true && q.keys.includes('cost') && q.cost?.frames === 7 && q.cost?.estimated === true,
+    `frames 的 cost 没穿过 json 出口：${JSON.stringify(q)}`)
+  must(q.frames === 7 && JSON.stringify(q.prose) === JSON.stringify(['散文 1', '散文 2']),
+    `加 cost 把既有 frames 或散文改了：${JSON.stringify(q)}`)
+
+  // ④ 静态守卫最后：三条命令接线、估算不许只在 json 里标、散文行真的打了
+  const look = read('tools/look.mjs')
+  const lib = read('lib/cost-line.mjs')
+  must(look.includes('cost: frameCost') && look.includes('cost: ocrCost'), 'frames / ocr 的 result 没接 cost')
+  must(look.includes('payload.cost = cost') && look.includes('opts.costT0 = t0'), 'text 的 json 出口或计时起点没接上')
+  must((look.match(/costT0: Date\.now\(\)/g) || []).length === 2, 'frames / ocr 的分派链没各给一个计时起点')
+  must((look.match(/console\.log\(costProse\(/g) || []).length === 2 && look.includes('say(costProse(cost))'),
+    '三条命令的散文末行少了一行成本')
+  must(lib.includes("'（估算）'") && lib.includes("'未知'"), '估算标记或「未知」口径不在 lib 里')
+  return `真 lib 形状齐；emitTextJson 真源码加 cost 且四键不变；frames 的 cost 穿透包装层；三条散文/字段接线齐`
+})
+
+check('C233 sheet 视觉 token 预算：默认 12000 只写一处 / 超预算只打 ⚠ 不阻断 / dry-run 四行与零写盘不变', () => {
+  const rC233 = runFixture('c233-sheet-token-probe.mjs', 180000)
+  must(rC233.status === 0 && rC233.json, `C233 夹具自身失效（rc=${rC233.status}）：${(rC233.raw || '').slice(0, 400)}`)
+  const j = rC233.json
+
+  // ① 行为断言在前：真 CLI 四组，超预算不许改 rc、不许改计划行数、不许写盘
+  for (const k of ['default', 'small', 'smallWithOut', 'bigGrid']) {
+    const r = j.cli[k]
+    must(r && r.rc === 0, `${k} 组 rc≠0：超预算只提示，不许阻断（rc=${r?.rc}）`)
+    must(r.planLines === 4, `${k} 组的 dry-run 四行计划变了（${r?.planLines} 行）`)
+    must((r.newFiles || []).length === 0, `${k} 组写出了文件 —— dry-run 零抽帧/零下载/零落盘被破坏：${JSON.stringify(r.newFiles)}`)
+    must(r.hasToken === true, `${k} 组没报预计 token`)
+  }
+  must(j.cli.default.hasOver === false, '默认预算下不该报超预算')
+  must(j.cli.small.hasOver === true && j.cli.smallWithOut.hasOver === true,
+    '小预算没触发提示，或 --out 把预算判定带偏了')
+  must(j.cli.bigGrid.hasOver === true, '4x4 更大估算没触发提示')
+
+  // ② 纯函数：默认值 / 配置生效 / 越界回落 / 估算与提示文案
+  const p = j.pure || {}
+  must(p.def === 12000 && p.fromDefault === 12000, `默认预算不是 12000：${p.def}/${p.fromDefault}`)
+  must(p.fromCfg === 100, `配置里写的预算没生效：${p.fromCfg}`)
+  must(p.belowMin === 12000, `低于下限的越界值没回落默认：${p.belowMin}`)
+  // C240：按成图面积折算（3×3=1920×1080 → 1000；4×4=2560×1440 → 1800），
+  // 不再是格子数线性外推的 2100/3700。期望值仍是精确等式，不许放宽成 >0。
+  must(p.token9 === 1000 && p.token16 === 1800, `估算没跟面积口径同口径：${p.token9}/${p.token16}`)
+  must(p.token16 > p.token9 && p.token9 > 0, '面积口径下 4×4 必须大于 3×3，且不许归零')
+  must(p.noWarn === '', '没超预算也给了提示')
+  must(/超过预算 100/.test(String(p.warn)), `超预算提示缺数字：${p.warn}`)
+
+  // ③ 真源码切片：非干跑时估算行必须排在九宫格标题之前（排在后面就等于没提前告知）
+  must(j.vm?.firstIsToken === true, `非干跑没先报估算行：${JSON.stringify(j.vm?.logs)}`)
+
+  // ④ 静态守卫最后：默认值唯一来源、不新增 CLI flag、超预算只走 warn 不碰 stdout
+  const lib = read('lib/sheet-token.mjs')
+  const tuning = read('lib/tuning.mjs')
+  const look = read('tools/look.mjs')
+  const params = read('lib/params.mjs')
+  must((tuning.match(/sheetTokenBudget: \{ def: 12000/g) || []).length === 1, 'tuning 里没把默认值写成唯一一处')
+  must(!/\b12000\b/.test(lib), 'sheet-token.mjs 里复制了第二个默认值常量')
+  must(!/token-budget/.test(params), '预算不该暴露成 CLI 参数')
+  must(look.includes('tokenBudget: tokenBudgetOf(tuning())'), '分派链没把预算注入 sheet')
+  must(/if \(budgetWarn\) warn\(budgetWarn\)/.test(look), '超预算没走 warn（会污染 stdout）')
+  return `四组真 CLI rc 全 0、计划仍 4 行、零写盘；预算 12000 / 配置 100 / 越界回落全对；估算 9 格 ${p.token9}、16 格 ${p.token16}`
+})
+
+check('C234 README 数据流披露：出网域名与「不出网」清单齐、无本机路径与凭证样例', () => {
+  const readme = read('README.md')
+  must(readme.includes('## 数据流'), 'README 没有「数据流」章节')
+  const domains = ['api.bilibili.com', 'passport.bilibili.com', 'comment.bilibili.com', 'pypi.org', 'hf-mirror.com', 'github.com']
+  for (const d of domains) must(readme.includes(d), `数据流表缺域名：${d}`)
+  must(/不出网的部分/.test(readme) && /ASR/.test(readme) && /OCR/.test(readme), '缺少「什么不会出网」那一段')
+  must(/带凭证/.test(readme) && /本地留下/.test(readme), '表格缺「带不带登录态」「本地留什么」两列')
+  // 只写通用路径模式：本文件是只进仓库的，写死本机用户名等于让 C114 撞自己。
+  must(!/[A-Za-z]:\\Users\\|\/home\/[A-Za-z0-9._-]+\//.test(readme), 'README 里出现了本机路径')
+  must(!/sessdata["':\s]+[A-Za-z0-9]{8,}/i.test(readme), 'README 里像是有凭证样例值')
+  return `数据流表 ${domains.length} 个域名齐、不出网清单在位、本机路径与凭证样例 0 命中`
+})
+
+// ── C201–C204：工具层 schema / execute 补 CLI 已有参数（0.4.9 B 桶第一批 A 面）──
+// 四个夹具把 index.js 的 extra 拼装段抠出来喂 args 真跑，输出 argv 原始数组；
+// 判据各自核自己那几个字段，不采信夹具自述。
+const bProbe = (f) => {
+  const r = runFixture(f, 60000)
+  must(r.status === 0 && r.json, `${f} 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  return r.json
+}
+
+check('C201 --cred 进工具层：schema 有字段、execute 真透传、空 args 不多拼', () => {
+  const j = bProbe('b-c201-probe.mjs')
+  must(j.schemaCred === true, 'schema 里没有 cred 字段')
+  must(j.argvCred.includes('--cred') && j.argvCred.includes('creds.json'), `cred 没透传：${JSON.stringify(j.argvCred)}`)
+  must(!j.argvEmpty.includes('--cred'), '空 args 也拼了 --cred')
+  return `cred → ${JSON.stringify(j.argvCred)}；空 args → ${JSON.stringify(j.argvEmpty)}`
+})
+
+check('C202 --order 进工具层：enum 两值齐、execute 真透传', () => {
+  const j = bProbe('b-c202-probe.mjs')
+  must(j.schemaOrder === true, 'schema 里没有 order 字段')
+  must(j.orderEnum.includes('pubdate') && j.orderEnum.includes('click'), `order enum 不对：${j.orderEnum}`)
+  must(j.argvOrder.includes('--order') && j.argvOrder.includes('pubdate'), `order 没透传：${JSON.stringify(j.argvOrder)}`)
+  must(!j.argvEmpty.includes('--order'), '空 args 也拼了 --order')
+  return `enum=${j.orderEnum}；order → ${JSON.stringify(j.argvOrder)}`
+})
+
+check('C203 E3 五个真落差参数进工具层：schema 齐、五个 flag 各自真透传', () => {
+  const j = bProbe('b-c203-probe.mjs')
+  const bad = j.schemaKeys.filter(([, ok]) => ok !== true).map(([k]) => k)
+  must(bad.length === 0, `schema 缺字段：${bad.join(' / ')}`)
+  const want = { at: '--at', ffmpeg: '--ffmpeg', asrMax: '--asr-max', markSeen: '--mark-seen', noTime: '--no-time' }
+  const miss = Object.keys(want).filter((k) => !j.argvCases[k].includes(want[k]))
+  must(miss.length === 0, `没透传：${miss.join(' / ')}`)
+  must(!j.argvEmpty.some((x) => Object.values(want).includes(x)), '空 args 拼了落差 flag')
+  return `五字段齐；argv=${JSON.stringify(j.argvCases)}`
+})
+
+check('C204 command enum 与 COMMANDS 白名单都补 local（E5 真实落点）', () => {
+  const j = bProbe('b-c204-probe.mjs')
+  must(j.enumHasLocal === true, `command enum 仍无 local：${JSON.stringify(j.commandEnum)}`)
+  must(j.whiteHasLocal === true, `COMMANDS 白名单仍无 local：${JSON.stringify(j.COMMANDS)}`)
+  return `enum ${j.commandEnum.length} 项 / 白名单 ${j.COMMANDS.length} 项，均含 local`
+})
+
+// ── C205/C206：日期与 clean 容量各收敛到一个单点（0.4.9 B 桶第一批 B 面）──
+check('C205 search/hot 的 UTC 截日期同源：只一处定义、两处调用、缺值不编日期', () => {
+  const j = bProbe('b-c205-probe.mjs')
+  must(/^\d{4}-\d{2}-\d{2}$/.test(j.normal), `正常时间戳格式不对：${j.normal}`)
+  must(j.zero === '?' && j.missing === '?', `缺 pubdate 时编了日期：${j.zero} / ${j.missing}`)
+  must(j.callSites === 2, `dayUtc 调用点 ${j.callSites} 处（应 2 处：search 与 hot）`)
+  must(j.defCount === 1, `toISOString().slice(0,10) 全文 ${j.defCount} 处（应只在函数里 1 处）`)
+  return `normal=${j.normal}；零/缺值='?'；调用 ${j.callSites} 处、定义 ${j.defCount} 处`
+})
+
+check('C206 clean 容量恒用 MB 且两处同源，下载进度仍用 fmtBytes 不误伤', () => {
+  const j = bProbe('b-c206-probe.mjs')
+  must(j.small === '0.0 MB' && j.half === '0.5 MB' && j.one === '1.0 MB' && j.big === '1024.0 MB',
+    `恒 MB 口径不对：${j.small}/${j.half}/${j.one}/${j.big}`)
+  must(j.cleanCallSites === 2, `清理回显用 fmtCleanMB 的只有 ${j.cleanCallSites} 处（应 2 处）`)
+  must(j.cleanUsesFmtBytes === false, '清理回显里仍混着 fmtBytes')
+  must(j.fmtBytesStillUsed === true, 'fmtBytes 被误删，下载进度与依赖体积会失去量级显示')
+  return `0→${j.small} / 1MiB→${j.one} / 1GiB→${j.big}；清理 2 处同源，fmtBytes 保留`
+})
+
+// ── C245/C236 · clean --dry-run：只枚举不删（条目数 + 总字节数双断言）──────────
+// 取证夹具只给「真 CLI 原始输出 + 逐项快照」，所有解析、比对与结论都在这条判据里做：
+//   夹具自述的「没删」不算数，快照逐项 rel/size/mtime/sha256 一致才算数。
+// 双断言的第二个来源是真删：干跑报的字节数必须等于真删前后快照的字节差。
+const c236Fixture = 'c236-clean-dryrun-probe.mjs'
+// 未落地时取到 undefined：让下面的断言逐条红，而不是在 import 阶段把整个主闸掀翻。
+const COMMANDS = paramsNs.COMMANDS || {}
+const unsupportedDryRun = (...a) => paramsNs.unsupportedDryRun?.(...a)
+const snapDiff = (a, b) => {
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})])
+  return [...keys].filter((k) => JSON.stringify(a?.[k]) !== JSON.stringify(b?.[k]))
+}
+const filesIn = (s, prefix) => Object.entries(s || {})
+  .filter(([k, v]) => v?.t === 'f' && (!prefix || k === prefix || k.startsWith(prefix + '/')))
+const sumBytes = (s, prefix) => filesIn(s, prefix).reduce((n, [, v]) => n + (v.s || 0), 0)
+
+check('C245 clean --dry-run 只枚举不删：点名哨兵 / 条目数与字节数双断言 / 干跑前后逐项快照一致 / 真删同源', () => {
+  const r = runFixture(c236Fixture, 180000)
+  must(r.status === 0 && r.json, `C245 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C245 实验没跑起来：${j.error}`)
+  const M = j.main
+  must(M && M.dry && M.before && M.after && M.real && M.realAfter,
+    '主态实验的原始输出或快照没给齐')
+  const names = j.stat?.own || []
+  must(names.length === 3, `哨兵条目数不是 3：${JSON.stringify(names)}`)
+  const USER = j.stat?.user
+  must(Boolean(USER) && M.before[USER]?.t === 'f', '用户文件没造出来，后面的「不许误删」没有意义')
+  must(!M.before.__error && !M.after.__error && !M.realAfter.__error,
+    `快照自身读失败：${M.before.__error || M.after.__error || M.realAfter.__error}`)
+
+  // ① 期望值由判据从「干跑前快照」独立算出，不采信夹具给的任何计数。
+  const files = names.reduce((n, p) => n + filesIn(M.before, p).length, 0)
+  const bytes = names.reduce((n, p) => n + sumBytes(M.before, p), 0)
+  must(files === 5 && bytes > 0, `哨兵树形态不对（${files} 文件 / ${bytes} 字节），断言失去意义`)
+
+  // ② 行为断言在前：干跑的输出要点名「这次会删什么」，且条目数 / 文件数 / 字节数三项都对。
+  must(M.dry.rc === 0, `clean --dry-run rc≠0：${M.dry.rc}；${(M.dry.err || '').slice(0, 200)}`)
+  const head = /\[dry-run\] 本次将删除 (\d+) 项 \/ (\d+) 个文件 \/ (\d+) 字节/.exec(M.dry.out)
+  must(Boolean(head), `干跑没写清「这次会删什么」：${(M.dry.out || '').slice(0, 240)}`)
+  must(+head[1] === names.length && +head[2] === files && +head[3] === bytes,
+    `干跑计数与快照不符：报 ${head?.slice(1, 4).join('/')}，实际 ${names.length}/${files}/${bytes}`)
+  const rows = [...M.dry.out.matchAll(/\[dry-run\][ \t]+(\S+)（(\d+) 个文件 \/ (\d+) 字节）/g)]
+  must(rows.length === names.length, `逐项计划只有 ${rows.length} 行（应 ${names.length} 行）`)
+  must(names.every((n) => rows.some((x) => x[1] === n)),
+    `逐项计划没点名到每个哨兵：${rows.map((x) => x[1]).join('/')}`)
+  must(rows.reduce((n, x) => n + Number(x[3]), 0) === bytes,
+    '逐项计划的字节数加总与头部不一致')
+  must(/没有删除任何内容/.test(M.dry.out), '干跑没写「一个文件都没删」')
+  must(!M.dry.err.includes('已按忽略处理'),
+    `干跑仍被当成「不接受的参数」忽略掉：${(M.dry.err || '').slice(0, 200)}`)
+  // 前提断言：实现改成「一进来就 return」也会给出空快照差，所以必须要求输出点名了哨兵。
+  must(names.every((n) => M.dry.out.includes(n)), '输出没点名哨兵，干跑可能是空转')
+  must(!/已清理/.test(M.dry.out), '干跑输出里出现了真删回显 —— 光看「没有删除任何内容」会被文案骗')
+
+  // ③ 「什么都没改」的硬证据：干跑前后逐项快照（类型/大小/mtime/内容哈希）逐字节一致。
+  const diff = snapDiff(M.before, M.after)
+  must(diff.length === 0, `干跑动了磁盘：${diff.slice(0, 8).join(' / ')}`)
+
+  // ④ 真删同源：干跑报的字节数必须等于真删释放的字节数，用户文件一字不动。
+  must(M.real.rc === 0, `真删 rc≠0：${M.real.rc}；${(M.real.err || '').slice(0, 200)}`)
+  const released = sumBytes(M.before) - sumBytes(M.realAfter)
+  must(released === bytes, `真删释放 ${released} 字节，与干跑报的 ${bytes} 字节不一致 —— 两套枚举分叉了`)
+  must(names.every((n) => !Object.keys(M.realAfter).some((k) => k === n || k.startsWith(n + '/'))),
+    '真删没把三个哨兵条目清掉')
+  must(M.realAfter[USER]?.h === M.before[USER]?.h, '用户文件被误删或改写')
+
+  // ⑤ 静态守卫最后：枚举与删除必须走同一个循环，不许另写一份干跑枚举。
+  const own = read('lib/cache-own.mjs')
+  const look = read('tools/look.mjs')
+  must(/export function removeOwned\(dir, opts = \{\}\)/.test(own), 'removeOwned 没接干跑选项')
+  must((own.match(/dryRun/g) || []).length >= 2, '干跑开关没有真正落到删除分支上')
+  must(!/function (?:plan|dryRun|enumerate)Owned\s*\(/.test(own),
+    '另写了一份干跑枚举函数 —— 两套判据迟早分叉')
+  must(look.includes("const dryRun = flag('dry-run')"), 'clean 分派链没读 --dry-run')
+  // C236b 放宽：删除调用现在还要带 mode。用正则认「同一个调用里同时有 dryRun 与 mode」，
+  //   不认死字面量——但放宽不是免检，下面两条把多出来的字段钉住，扰动里再验一次咬合。
+  must(/removeOwned\(cacheDir\(\), \{[^}]*\bdryRun\b[^}]*\}\)/.test(look), 'clean 没把干跑选项传进同一个删除函数')
+  must(/removeOwned\(cacheDir\(\), \{[^}]*\bmode\b/.test(look), 'clean 没把 deleteMode 传进删除函数（手动路径会绕过策略）')
+  must(/removeAllOwned\(cacheDir\(\), \{[^}]*\bmode\b/.test(look), 'clean --all 没走同一套 deleteMode（--all 会永远直删）')
+  return `干跑 rc=0、点名 3 项 / ${files} 文件 / ${bytes} 字节，前后快照 ${Object.keys(M.before).length} 项全等；真删释放 ${released} 字节，用户文件哈希不变`
+})
+
+check('C246 删除类命令的干跑契约：deletes 标记 / 不支持就 rc=2 拒绝 / 摘掉守卫必须重新真删', () => {
+  const r = runFixture(c236Fixture, 180000)
+  must(r.status === 0 && r.json, `C246 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C246 实验没跑起来：${j.error}`)
+  const R = j.reject
+  const T = j.mutated
+  const names = j.stat?.own || []
+
+  // ① 真参数表：deletes 标记只在删除类命令上，且 clean 自己确实支持干跑。
+  must(COMMANDS.clean?.deletes === true, 'COMMANDS.clean 没有 deletes: true 语义标记')
+  must(COMMANDS.clean.accepts.includes('dry-run'), 'clean 没在 accepts 里声明 --dry-run')
+  must(unsupportedDryRun('clean', ['clean', '--dry-run']) === null, '已支持干跑的删除类命令被误拒')
+  must(unsupportedDryRun('clean', ['clean']) === null, '没带干跑参数也拒绝，属于误伤')
+  must(unsupportedDryRun('view', ['view', '--dry-run']) === null, '非删除类命令被这条闸拦了')
+  const future = { 'future-clean': { deletes: true, accepts: [] } }
+  const reject = unsupportedDryRun('future-clean', ['future-clean', '--dry-run'], future)
+  must(typeof reject === 'string' && reject.includes('拒绝') && reject.includes('dry-run'),
+    '将来新增的删除类命令没实现干跑时，没给出拒绝原因')
+  must(unsupportedDryRun('future-clean', ['future-clean'], future) === null,
+    '将来新增的删除类命令不带干跑参数也被拒了')
+  must(typeof unsupportedDryRun('future-clean', ['future-clean', '--dry-run=1'], future) === 'string',
+    '--dry-run=1 这种带值写法绕过了拒绝')
+
+  // ② 副本树：删除类命令还在、参数表不再声明干跑 → 必须 rc=2 且一个字节不删。
+  must(R?.built === true, '副本参数表锚点没命中（实现改了要同步判据锚点，不许靠 built=false 蒙过去）')
+  must(R.dry.rc === 2, `不支持干跑的删除类命令没被拒绝（rc=${R.dry.rc}）`)
+  must(/拒绝执行/.test(R.dry.err), `拒绝原因没写清：${(R.dry.err || '').slice(0, 200)}`)
+  must(!R.dry.err.includes('已按忽略处理'), '拒绝的同时还打了「已按忽略处理」——那正是这次事故的措辞')
+  must(snapDiff(R.before, R.after).length === 0, '拒绝了却还是动了磁盘')
+
+  // ③ 反向证据：把守卫与干跑传递摘掉，同一组实验必须重新变成「打一行 ⚠ 后真删」。
+  //    若实现把拒绝写死在别处、扰动不生效，这条会红 —— 判据因此有牙。
+  must(T?.built === true, '副本守卫锚点没命中（实现改了要同步判据锚点）')
+  must(T.dry.rc !== 2, '摘掉守卫后仍拒绝 —— 扰动没真打坏，这条判据验不到守卫')
+  must(snapDiff(T.before, T.after).length > 0,
+    '摘掉守卫后干跑居然没删东西 —— 扰动没真打坏')
+  // 断「删掉了多少」而不是断输出文案：扰动形态下 CLI 还留着干跑的那几行字，
+  // 光看文案会得出「没删」的假结论，只有快照的字节差能证明它真打坏了。
+  const tOwnBytes = names.reduce((n, p) => n + sumBytes(T.before, p), 0)
+  must(sumBytes(T.before) - sumBytes(T.after) === tOwnBytes,
+    `扰动后释放的字节数与三个哨兵不符（${sumBytes(T.before) - sumBytes(T.after)} vs ${tOwnBytes}）`)
+  must(T.dry.err.includes('已按忽略处理'), '修前形态没复现那行「已按忽略处理」')
+
+  // ④ 静态守卫最后：分派前接线、HELP 与 README 同步、warn 不许叠在拒绝上。
+  const params = read('lib/params.mjs')
+  const look = read('tools/look.mjs')
+  const readme = read('README.md')
+  must(/export function unsupportedDryRun\(cmd, argv = \[\], commands = COMMANDS\)/.test(params),
+    '拒绝判定不是纯函数或没留可注入的命令表参数')
+  must(look.includes('const DRY_RUN_REJECT = unsupportedDryRun(cmd, argv)'), '分派前没接拒绝判定')
+  must(/ARG_ERRORS\.length \|\| DRY_RUN_REJECT/.test(look), '拒绝判定没进 rc=2 那条分支')
+  must(look.includes('!DRY_RUN_REJECT'), '拒绝时没抑制「不接受的参数」那行提示')
+  must(/node look\.mjs clean \[[^\]]*--dry-run/.test(look), 'HELP 的 clean 用法没写 --dry-run')
+  must(readme.includes('--dry-run') && /不删|预演/.test(readme), 'README 没同步 clean 的干跑说明')
+  return `deletes 标记与纯函数 6 组齐；副本 rc=2 / 零改动；摘守卫后 rc=${T.dry.rc} 且真删 ${snapDiff(T.before, T.after).length} 项`
+})
+
+// ── C236b · clean --all / deleteMode / 回收站（判据从 C248 起；C247 留给收口阶段的 --only）──
+// 取证夹具只给「真 CLI 原始输出 + 逐项快照 + SHQueryRecycleBin 前后计数 + 桩结果」，
+// 结论全部由下面五条判据自己算。夹具跑一次约 10 秒且真调回收站，跨 check 复用同一份 JSON。
+const c236bFixture = 'c236b-delete-mode-probe.mjs'
+let c236bJson = null
+const c236b = () => {
+  if (!c236bJson) {
+    const r = runFixture(c236bFixture, 300000)
+    must(r.status === 0 && r.json, `C236b 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+    must(!r.json.error, `C236b 实验没跑起来：${r.json.error}`)
+    for (const k of ['main', 'recycle', 'smart', 'conservative', 'pre', 'overflow', 'fallback', 'longPath', 'smartSplit', 'permanentNoApi']) {
+      must(r.json[k], `C236b 夹具缺 ${k} 组原始输出`)
+    }
+    must(r.json.pre.built === true, '等效修前态副本没建成（扰动锚点失效，修前证据不算数）')
+    c236bJson = r.json
+  }
+  return c236bJson
+}
+const bytesOf = (s) => Object.values(s || {}).reduce((n, x) => n + (Number(x?.s) || 0), 0)
+
+check('C248 clean --all 清到只剩标记：条目数 + 总字节数双断言，干跑零改动，用户文件不动', () => {
+  const j = c236b()
+  const M = j.main
+  const C = j.conservative
+  must(M.before.count > 3 && M.before.bytes > 0, '种子树没造出可清条目（修前证据无效）')
+  must(M.after.count === 0 && M.after.bytes === 0,
+    `--all 清完还剩 ${M.after.count} 项 / ${M.after.bytes} 字节（应只剩 .bili-watch-root）`)
+  must(M.binBefore.ok && M.binAfter.ok, '回收站计数没查到，不能拿它当凭证')
+  must(M.binBefore.count === M.binAfter.count, 'permanent 档动了回收站条目数（默认档不该碰回收站配额）')
+  must(bytesOf(M.snapBefore) === M.before.bytes, `快照字节 ${bytesOf(M.snapBefore)} 与目录统计 ${M.before.bytes} 不同源`)
+  must(bytesOf(M.snapAfter) === 0, '真删后快照里还有文件')
+  must(snapDiff(M.snapBefore, M.snapDry).length === 0, 'clean --all --dry-run 动了磁盘')
+  must(M.dry.rc === 0 && M.real.rc === 0, `干跑 / 真删退出码不对（${M.dry.rc}/${M.real.rc}）`)
+  must(/本次将删除 \d+ 项 \/ \d+ 个文件 \/ \d+ 字节/.test(M.dry.out), '干跑没写清「这次会删什么 / 多少文件 / 多少字节」')
+  must(/方式 permanent/.test(M.real.out), '真删没说明用的哪一档删除方式')
+  // 强制清空不等于「把这个目录里的一切都删掉」：用户误放的文件必须原样留着。
+  must(C.after.count === 1, `保守组清完剩 ${C.after.count} 项（应只剩用户的那个文件）`)
+  must(C.snapBefore['用户素材.psd'] && C.snapAfter['用户素材.psd']
+    && C.snapBefore['用户素材.psd'].h === C.snapAfter['用户素材.psd'].h,
+  '用户误放的文件被 --all 删掉或改写了（历史 P0 事故重演）')
+  return `--all ${M.before.count} 项 / ${M.before.bytes} 字节 → 0；干跑快照全等；permanent 回收站 ${M.binBefore.count}→${M.binAfter.count}；用户文件哈希不变`
+})
+
+check('C249 三档 deleteMode 真调回收站：permanent 不变 / recycle 增加且原位空 / smart 只进重要文件', () => {
+  const j = c236b()
+  const R = j.recycle
+  const S = j.smart
+  const P = j.pre
+  must(R.binBefore.ok && R.binAfter.ok, 'recycle 组回收站计数没查到')
+  must(R.binAfter.count > R.binBefore.count, `recycle 档回收站条目数没增加（${R.binBefore.count}→${R.binAfter.count}）`)
+  must(R.after.count === 0 && bytesOf(R.snapAfter) === 0, 'recycle 档原位置没清空')
+  must(S.binAfter.count > S.binBefore.count, 'smart 档重要文件没进回收站')
+  must(S.binAfter.count - S.binBefore.count < R.binAfter.count - R.binBefore.count,
+    'smart 档把非重要文件也塞进了回收站（与 recycle 增量相同）')
+  // 「重要进 / 非重要不进」用逐条记录的桩单独判：真回收站只给总数，看不出哪条被送进去。
+  must(j.smartSplit.sent.includes('asr.txt') && j.smartSplit.sent.includes('frames-dl'), 'smart 档漏了显式清单里的重要文件')
+  must(!j.smartSplit.sent.includes('frame.jpg') && j.smartSplit.direct.includes('frame.jpg'),
+    'smart 档把重跑就有的 jpg 也送进回收站，或没直删它')
+  // 等效修前态：摘掉 --all 与 deleteMode 接线后，--recycle 必须完全不生效。
+  must(P.binBefore.count === P.binAfter.count, '等效修前态的 --recycle 竟然生效了（副本扰动没真打坏）')
+  must(!/方式 recycle/.test(P.real.out), '等效修前态的输出里出现了 recycle（副本没回到修前形态）')
+  must(JSON.stringify(j.modes.normalized) === JSON.stringify(['permanent', 'recycle', 'smart', 'permanent', 'permanent', 'permanent']),
+    'deleteMode 归一没把坏值一律回默认')
+  return `recycle ${R.binBefore.count}→${R.binAfter.count} 且原位空；smart 只送 asr.txt/frames-dl；修前态 ${P.binBefore.count}→${P.binAfter.count} 不变`
+})
+
+check('C250 回收站三个失效面：容量不足跳过且不静默直删 / API 失效明说永久删除 / 长路径记 failed', () => {
+  const j = c236b()
+  const O = j.overflow
+  const F = j.fallback
+  const L = j.longPath
+  must(O.overflow.count === 1 && O.overflow.bytes === 20 && O.removed === 0,
+    '回收站放不下时没记 skippedOverflow，或者把它算成已删')
+  must(O.stillThere === true && O.direct.length === 0 && O.recycled.length === 0,
+    '容量不足时静默降级成直删了（原位置的文件没了）')
+  must(F.fallback.length === 1 && F.fallback[0].permanent === true && F.stillThere === false,
+    '回收站 API 失效后没回落直删，或没标记「这是永久删除」')
+  must(/已永久删除（不可恢复）/.test(read('tools/look.mjs')), 'CLI 没把回落直删明确告诉用户')
+  must(L.pathLen > 260 && L.failed.length === 1 && L.removed === 0,
+    '长路径没被记 failed，或当成功算了（回收站 API 明明不支持）')
+  // 容量闸「只在真要进回收站时才查」用计数桩验行为，比读源码猜字面量可靠：
+  //   permanent 档一次 binCount / capacityMB / recycle 都不许起。
+  must(j.permanentNoApi.apiCalls.length === 0 && j.permanentNoApi.removed === 1,
+    `permanent 档起了回收站探针（${JSON.stringify(j.permanentNoApi.apiCalls)}）或没直删`)
+  return `容量闸跳过 1 项 / 20 字节且原位置仍在；API 失效回落记 permanent；长路径 ${L.pathLen} 字符记 failed`
+})
+
+check('C251 手动 / 自动 / --all 三条路径同策略：自动清理真函数体把 mode 传进 deletePaths', () => {
+  const idx = read('index.js')
+  // 抠真函数体跑，不复制实现：注入最小桩，只问「这次把哪一档传给了统一删除入口」。
+  const runAuto = (mode) => {
+    const calls = []
+    const f = compile(idx, ['autoCleanCache'], {
+      prelude: `
+        const cacheDir = () => '/tmp/cache';
+        const cacheCfg = () => ({ days: 1, maxMb: 100, autoClean: true, deleteMode: MODE });
+        let lastCleanAt = 0;
+        let lastSkippedOverflow = null;
+        const existsSync = () => true;
+        const isOurCacheRoot = () => true;
+        const lockState = () => ({ state: 'idle', staleLocks: [], truncated: false, truncatedDirs: 0 });
+        const lockTtlMs = () => 1;
+        const walkEntries = () => [{ path: '/tmp/cache/a.txt', size: 10, mtime: 0 }];
+        const pruneEmptyDirs = () => {};
+        const invalidateCacheStat = () => {};
+        const relative = (a, b) => b;
+        const deletePaths = (entries, opts) => { CALLS.push(opts.mode); return { removed: entries.length, bytes: 10, failed: [], overflow: { count: 0, bytes: 0 } }; };
+      `,
+      params: ['MODE', 'CALLS'],
+      args: [mode, calls],
+    })
+    f.autoCleanCache({ force: true })
+    return calls
+  }
+  for (const m of ['permanent', 'recycle', 'smart']) {
+    const calls = runAuto(m)
+    must(calls.length === 1 && calls[0] === m,
+      `自动清理没把 deleteMode=${m} 传给统一删除入口（calls=${JSON.stringify(calls)}）`)
+  }
+  const own = read('lib/cache-own.mjs')
+  must(/deletePaths\(/.test(fnBody(own, 'removeOwned')), '手动常规 clean 没走统一删除入口')
+  must(/deletePaths\(/.test(fnBody(own, 'removeAllOwned')), '--all 没走统一删除入口')
+  must(/skippedOverflow: lastSkippedOverflow/.test(idx) && /lastSkippedOverflow = r\.overflow\.count/.test(idx),
+    '自动清理的容量闸结果没进 /status')
+  must(!/rmSync\(e\.path/.test(fnBody(idx, 'autoCleanCache')), '自动清理还在自己直删，绕过了 deleteMode')
+  return '三档真函数体各传对 mode；手动 / --all / 自动三处同源；容量闸结果进 /status'
+})
+
+check('C252 面板两步确认与 skippedOverflow：第一次只预览不删，第二次带 confirmed 才执行', () => {
+  const idx = read('index.js')
+  const cli = read('client.js')
+  const clearI = idx.indexOf("url.pathname === '/api/bili-watch/cache/clear'")
+  must(clearI > 0, '找不到 /cache/clear 分支')
+  // 用全文下标比先后：固定字符窗口会被中间新增的字段撑破，让删除调用落到窗口外变 -1，
+  //   判据就成了「永远红」的假闸（C20 已踩过一次同型）。
+  const guardAt = idx.indexOf('if (all && !confirmed)', clearI)
+  const removeAt = idx.indexOf('removeAllOwned(cacheDir()', clearI)
+  must(guardAt > clearI && removeAt > guardAt,
+    `确认守卫没排在删除之前（guard=${guardAt} / remove=${removeAt}）`)
+  must(/needConfirm: true/.test(idx.slice(clearI, removeAt)), '--all 不带 confirmed 没有先回预览（后端这道不能只靠前端）')
+  // 跳过项在路由末尾的返回体里，比删除调用还靠后；用全文唯一串判，不再用窗口。
+  must(/skippedOverflow: cleared\.overflow/.test(idx), '手动清理的跳过项没回给面板')
+  must(/url\.pathname === '\/api\/bili-watch\/cache\/preview'/.test(idx), '缺预览路由（确认框的 N 项 / X MB 没来源）')
+  must(cli.includes("jpost('/cache/preview'"), '面板没有先取预览')
+  must(/all: true, confirmed: true/.test(cli), '面板第二步没带 confirmed=1')
+  must(/mode: 'permanent'/.test(cli), '强制按钮没有锁定永久删除（会被 deleteMode 覆盖）')
+  must(cli.includes('将删除 ${allPreview?.count ?? 0} 项 /'), '确认框没写「将删除 N 项 / X MB」')
+  must(/st\.skippedOverflow\?\.count/.test(cli), '/status 的 skippedOverflow 面板没显示')
+  return '后端 needConfirm 守在删除前；前端预览→确认两步；强制档固定 permanent；跳过项面板标黄'
+})
+
+// ── C241 · 依赖行 note 与参数行 note 分开（判据 C253）──────────────────────
+// 只改全局 CSS 让两边一起变是假修：判据必须能指出「哪一类 note 独占整行」。
+check('C253 依赖行 note 与参数行 note 分开：只让参数行独占整行，两类都真渲染出来', () => {
+  const cli = read('client.js')
+  // ① CSS：独占整行的规则必须显式排除依赖行 note；参数行仍保留原行为。
+  const brokenCss = (s) => /\[data-bl-row\] \[data-bl-note\]\{flex-basis:100%/.test(s)
+  must(!brokenCss(cli), '全局 note 规则还在 flex-basis:100%，依赖行会被一起顶到第二行')
+  must(/\[data-bl-row\] \[data-bl-note\]:not\(\[data-bl-dep-note\]\)\{flex-basis:100%/.test(cli),
+    '参数行 note 没有保留独占整行（把两边一起改了）')
+  must(/\[data-bl-row\] \[data-bl-dep-note\]\{min-width:0;word-break:break-all;/.test(cli),
+    '依赖行 note 没有自己的排版规则（长路径会溢出）')
+  // 判据自身的咬合：把 :not(...) 摘掉就是修前形态，必须被上面那条认出来。
+  const before = cli.replace('[data-bl-note]:not([data-bl-dep-note]){flex-basis:100%', '[data-bl-note]{flex-basis:100%')
+  must(before !== cli && brokenCss(before), '判据认不出修前形态（把排除条件摘掉也不红）')
+  // ② 渲染层：整机夹具真渲染，两类 note 的属性集合必须不同，不能只改 CSS 不接标记。
+  const r = c235()
+  must(r.status === 0 && r.json, `C241 整机夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const notes = ((r.json.cases || []).find((c) => c.label === 'normal') || {}).notes || []
+  must(notes.length > 0, '整机夹具没收集到任何 note 节点（判据在验空集合）')
+  const dep = notes.filter((n) => n.keys.includes('data-bl-dep-note'))
+  const param = notes.filter((n) => !n.keys.includes('data-bl-dep-note') && /默认|范围/.test(n.text))
+  must(dep.length > 0, '依赖行 note 没打独立标记（CSS 的 :not 永远不命中）')
+  must(param.length > 0, '参数行 note 没渲染出来，或被打成了依赖行标记（两边一起变）')
+  must(dep.some((n) => /路径：|文件：/.test(n.text)), '带独立标记的 note 不是依赖行的路径说明')
+  return `CSS 排除命中；整机渲染 ${notes.length} 个 note，依赖行 ${dep.length} / 参数行 ${param.length}，修前形态会被判红`
+})
+
+// ── C242 · 四类「自己写、自己清不掉」的放开（判据 C254 起）────────────────
+// 夹具给真 CLI 的原始输出与逐项快照；条目数、字节数、哪一类留着全由判据自己算。
+let c242Run = null
+const c242 = () => {
+  if (!c242Run) {
+    const r = runFixture('c242-clean-all-probe.mjs', 240000)
+    must(r.status === 0 && r.json, `C242 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+    must(!r.json.error, `C242 实验没跑起来：${r.json.error}`)
+    for (const k of ['main', 'guarded', 'normal', 'source']) must(r.json[k], `C242 夹具缺 ${k} 组原始输出`)
+    c242Run = r.json
+  }
+  return c242Run
+}
+const stillPaths = (s, prefix) => Object.keys(s || {}).filter((k) => k === prefix || k.startsWith(prefix + '/'))
+
+check('C254 clean --all 清到只剩标记：五类未证明目录与 last-error.json 一并清掉（条目数 + 字节数）', () => {
+  const j = c242()
+  const M = j.main
+  const G = j.guarded
+  must(M.before.count > 10 && M.before.bytes > 0, '种子树没造出足够条目（修前证据无效）')
+  must(M.after.count === 0 && M.after.bytes === 0,
+    `--all 清完还剩 ${M.after.count} 项 / ${M.after.bytes} 字节（应只剩 .bili-watch-root）`)
+  for (const d of ['sheet-tmp', 'substrip-tmp', 'frames-dl', 'audio-dl', '_hot', 'BV0000000000']) {
+    must(stillPaths(M.snapAfter, d).length === 0, `${d} 没被 --all 清掉（自己写的产物自己清不动）`)
+  }
+  must(snapDiff(M.snapBefore, M.snapDry).length === 0, 'clean --all --dry-run 动了磁盘')
+  must(M.dry.rc === 0 && M.real.rc === 0, `干跑 / 真删退出码不对（${M.dry.rc}/${M.real.rc}）`)
+  must(/本次将删除 \d+ 项 \/ \d+ 个文件 \/ \d+ 字节/.test(M.dry.out), '干跑没写清「这次会删什么」')
+  // 放开不是无脑删：用户误放的文件、以及给不出正面凭证的目录，必须原样留着。
+  must(G.snapBefore['用户素材.psd'] && G.snapAfter['用户素材.psd']
+    && G.snapBefore['用户素材.psd'].h === G.snapAfter['用户素材.psd'].h, '用户文件被 --all 删了')
+  must(G.snapAfter['sheet-tmp/没有凭证目录/用户文件.psd'], '没正面凭证的目录也被删了（放开过头）')
+  return `--all ${M.before.count} 项 / ${M.before.bytes} 字节 → 0；五类目录 + last-error BV 全清；用户文件与无凭证目录保留`
+})
+
+check('C255 sheet-tmp / substrip-tmp 收尾删：两个 finally 都清本次的 tmp，不是清整个目录', () => {
+  const look = read('tools/look.mjs')
+  for (const [fn, dirName] of [['cmdSheet', 'sheet-tmp'], ['cmdSubstrip', 'substrip-tmp']]) {
+    const body = fnBody(look, fn)
+    const finallyAt = body.lastIndexOf('finally {')
+    must(finallyAt > 0, `${fn} 没有 finally（抛错时 tmp 会一直留着）`)
+    const tail = body.slice(finallyAt)
+    must(/rmSync\(tmp, \{ recursive: true, force: true \}\)/.test(tail), `${fn} 的 finally 没删本次 tmp 目录`)
+    must(/unlock\(lock\)/.test(tail), `${fn} 的 finally 把解锁弄丢了`)
+    must(new RegExp(`join\\(cacheDir\\(\\), '${dirName}'`).test(body), `${fn} 的 tmp 不在 ${dirName} 下`)
+    // tmp 必须定义在 try 外：定义在 try 内的话 finally 里根本取不到，会直接抛 ReferenceError。
+    const tmpAt = body.indexOf('const tmp =')
+    must(tmpAt > 0 && tmpAt < body.indexOf('try {'), `${fn} 的 tmp 定义在 try 内，finally 取不到`)
+  }
+  return '两个 finally 都 unlock + 删本次 tmp；tmp 定义在 try 外'
+})
+
+check('C256 frames-dl / audio-dl 谁写谁删：正常 / 抛错 / exit / SIGINT 全清，--keep-source 才留', () => {
+  const j = c242()
+  must(!j.source.missing, '下载产物收尾清理模块没落地（或夹具 import 失败）')
+  const s = j.source
+  for (const k of ['normal', 'thrown', 'exit', 'sigint']) {
+    must(s[k]?.gone === true, `${k} 路径下下载产物没被清掉`)
+  }
+  must(s.keep?.stillThere === true, '--keep-source 声明要留，却被删了')
+  must(s.exit.events.includes('exit') && s.exit.events.includes('SIGINT'), '进程退出 / 中断钩子没装全')
+  must(s.sigint.exits.length === 1 && s.sigint.exits[0] === 130, 'SIGINT 清完没按 130 退出')
+  const look = read('tools/look.mjs')
+  // 逐分支钉「三件套」，不是全文 grep 存在就算数。扰动实测过两处假绿：
+  //   ① 删掉两处 setKeepSource(flag(...)) → 真实 CLI 的 --keep-source 失效，旧断言全绿；
+  //   ② 只删 frames 分支那一处 releaseSource(outDir) → 旧断言仍见到另一处，全绿。
+  // 夹具是直调 lib 模块的，不经过 look.mjs，所以接线只能由这里的静态守卫守。
+  const gen = fnBody(look, 'runGeneric')
+  const framesAt = gen.indexOf("if (cmd === 'frames')")
+  const audioAt = gen.indexOf("if (cmd === 'text' || cmd === 'asr')")
+  must(framesAt > 0 && audioAt > framesAt, '通用 URL 的 frames / text|asr 两条下载分支找不到')
+  for (const [name, seg] of [
+    ['frames-dl', gen.slice(framesAt, audioAt)],
+    ['audio-dl', gen.slice(audioAt)],
+  ]) {
+    must(/setKeepSource\(flag\('keep-source'\)\)/.test(seg),
+      `${name} 分支没把 --keep-source 接进 setKeepSource（真实 CLI 里这个开关会失效）`)
+    must(/trackSource\(/.test(seg), `${name} 分支没登记产物目录`)
+    must(/releaseSource\(outDir\)/.test(seg), `${name} 分支正常收尾没清本次产物目录`)
+    const keepAt = seg.indexOf("setKeepSource(flag('keep-source'))")
+    const trackAt = seg.indexOf('trackSource(')
+    must(keepAt >= 0 && keepAt < trackAt,
+      `${name} 分支的 setKeepSource 排在 trackSource 之后（keep 状态没设就登记，语义反了）`)
+  }
+  must(/installSourceCleanup\(\)/.test(look), '退出钩子没接线')
+  must(read('lib/params.mjs').includes("'keep-source': { kind: 'bool'"), 'keep-source 没进参数表（C230 会警告后忽略）')
+  return '五形态真调通过；两条下载路径各自三件套 + 顺序 + exit/SIGINT 钩子齐全'
+})
+
+check('C257 放开只对 --all 生效：常规 clean 保守口径一字不动，last-error.json 进凭证表', () => {
+  const j = c242()
+  const N = j.normal
+  for (const d of ['sheet-tmp', 'substrip-tmp', 'frames-dl', 'audio-dl', '_hot']) {
+    must(stillPaths(N.snapAfter, d).length > 0, `常规 clean 把 ${d} 清掉了（放开越界）`)
+  }
+  // last-error.json 拿到凭证后，BV0000000000 常规 clean 就该清得掉：这是本条的修复目标，
+  //   不是「放开越界」。五个容器目录才必须继续保守。
+  must(stillPaths(N.snapAfter, 'BV0000000000').length === 0,
+    'last-error.json 的 BV 目录常规 clean 仍清不掉（凭证没生效）')
+  must(N.after.count > 0, '常规 clean 把整棵缓存根清空了（--all 之外不许这么干）')
+  const own = read('lib/cache-own.mjs')
+  // 行为断言（上面 BV0000000000 被清掉）已经在守效果；这条只钉「凭证写在同一张表里」，
+  //   不重复造第二条行为判据。查数组原文，别用会被源码转义绕开的正则。
+  must(own.includes("last-error\\\\.json"), 'last-error.json 没进 PROVEN_NAME_RE（同一张凭证表）')
+  must(/if \(!opts\.all\) return false/.test(own), 'UNPROVABLE_DIRS 没用 --all 开关收口（常规路径会跟着放开）')
+  must(/allProofDir\(/.test(own), '缺「目录由本插件创建」的正面凭证判据')
+  return '常规 clean 六类照旧保留；last-error.json 有凭证；放开显式挂在 --all 上'
+})
+
+// ── C237 · 会话残留词表（判据 C258 起；C247 留给收口阶段的 --only，本批不占）──
+//
+//   1255 段：拿包内现存的会话坐标当基线必须全红，再加一条同族新变体也必须红；
+//   Cxxx 缺陷追踪编号按 2026-11-01 拍板保留，词表不许把它们一起吃掉。
+//   1310 段：判据输入不许手写造坏样本 —— 基线由 c237-scan.mjs 用守卫同一口径现抽，
+//   逐行原样送进两道文本闸；当前包内是否清干净也由同一个函数现抽判定。
+const { RESIDUE_KINDS, collectRows, novelCheck, NOVEL } = await import('./fixtures/c237-scan.mjs')
+const { makeRepo, dropRepo, runGuards, control } = await import('./fixtures/c237-guards.mjs')
+const C237_RULE = '会话坐标 / 内部批次'
+const c237Baseline = () => JSON.parse(read('tools/fixtures/c237-residue-baseline.json'))
+
+check('C258【真求值】COLLAB_RULES 有第三类会话坐标，且 Cxxx 编号与干净行不被误伤', () => {
+  const modUrl = pathToFileURL(join(ROOT, 'scripts/_rules.mjs')).href
+  const probe = [
+    `import { COLLAB_RULES, scanCollab } from ${JSON.stringify(modUrl)}`,
+    'const names = COLLAB_RULES.map(r => r[0])',
+    'process.stdout.write(JSON.stringify({',
+    "  names, residue: scanCollab('本版边界'),",
+    "  cnum: scanCollab('// C206（清理回显）：修好了'),",
+    "  plain: scanCollab('// 缓存目录默认值见配置项')",
+    '}))',
+  ].join('\n')
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe],
+    { encoding: 'utf8', timeout: 60000, cwd: ROOT })
+  must(r.status === 0 && (r.stdout || '').startsWith('{'),
+    `C258：_rules.mjs 真求值失败 rc=${r.status} ${(r.stderr || '').slice(0, 200)}`)
+  const j = JSON.parse(r.stdout)
+  must(j.names.includes(C237_RULE),
+    `C258：COLLAB_RULES 只有 ${JSON.stringify(j.names)}，缺第三类会话坐标`)
+  must(j.residue.includes(C237_RULE), "C258：scanCollab('本版边界') 没命中第三类")
+  must(j.cnum.length === 0, `C258：Cxxx 编号被一起吃掉：${JSON.stringify(j.cnum)}`)
+  must(j.plain.length === 0, `C258：干净行被误伤：${JSON.stringify(j.plain)}`)
+  return `${j.names.length} 类规则求值；本版命中、C206 与干净行不命中`
+})
+
+check('C259【真跑】修前基线每一行都被两道文本闸点名（不只看 rc）', () => {
+  const base = c237Baseline()
+  must(Array.isArray(base.rows) && base.rows.length >= 20,
+    `C259：基线被清空或缩水（${base.rows?.length} 行）`)
+  for (const row of base.rows) {
+    must(RESIDUE_KINDS.some(([, re]) => { re.lastIndex = 0; return re.test(row.text) }),
+      `C259：基线 ${row.file}:${row.line} 不属于五类形态，基线被污染`)
+  }
+  const tmp = makeRepo()
+  try {
+    for (const c of control(ROOT, tmp)) {
+      must(c.clean, `C259 控制组：${c.detail} —— 假仓库没补齐时「rc≠0」是恒真的`)
+    }
+    const missed = []
+    for (const row of base.rows) {
+      for (const r of runGuards(ROOT, tmp, row.text)) {
+        if (r.crashed) missed.push(`${row.file}:${row.line} ${r.guard} 脚本崩`)
+        else if (r.status === 0 || !r.named) missed.push(`${row.file}:${row.line} ${r.guard} rc=${r.status} 没点名`)
+      }
+    }
+    must(missed.length === 0,
+      `C259：${missed.length} 处没被点名：${missed.slice(0, 6).join('；')}`)
+  } finally { dropRepo(tmp) }
+  return `${base.rows.length} 行 × 2 守卫全部点名；控制组干净行两闸 rc=0`
+})
+
+check('C260【真跑】同族新变体也必须被两道闸点名，且不是基线原行', () => {
+  const base = c237Baseline()
+  const nc = novelCheck(base.rows)
+  for (const n of nc) {
+    must(n.sameFamily, `C260：变体 ${n.text.slice(0, 28)} 不属于同族`)
+    must(n.notInBaseline, `C260：变体 ${n.text.slice(0, 28)} 是基线原行（等于重写旧样本）`)
+  }
+  const tmp = makeRepo()
+  try {
+    const missed = []
+    for (const v of NOVEL) {
+      for (const r of runGuards(ROOT, tmp, v)) {
+        if (r.crashed || r.status === 0 || !r.named) missed.push(`${r.guard}: ${v.slice(0, 30)} (rc=${r.status})`)
+      }
+    }
+    must(missed.length === 0,
+      `C260：${missed.length} 处新变体没被点名：${missed.slice(0, 5).join('；')}`)
+  } finally { dropRepo(tmp) }
+  return `${NOVEL.length} 条同族变体 × 2 守卫全部点名；均与基线逐字不同`
+})
+
+check('C261【现抽】当前包内会话坐标 0 行，且扫描面没塌', () => {
+  const { rows, textCount, skipped } = collectRows(ROOT)
+  const base = c237Baseline()
+  must(textCount >= 40, `C261：包内文本只有 ${textCount} 个，扫描面塌了`)
+  must(skipped.length === 0, `C261：${skipped.length} 个文件读不出来，不许当干净：${skipped.join(', ')}`)
+  must(base.textCount === textCount,
+    `C261：基线扫描面 ${base.textCount} 与当前 ${textCount} 不一致，口径漂移`)
+  must(rows.length === 0,
+    `C261：包内还有 ${rows.length} 行会话坐标：${rows.slice(0, 4).map((r) => `${r.file}:${r.line}`).join(', ')}`)
+  return `包内 ${textCount} 个文本 0 行命中；读不出来 0 个；与基线同口径`
+})
+
+// ── C239 · 禁词改裸词（判据 C262 起；C247 仍留给收口的 --only）──
+//
+//   1310 段 §一 / 1430 段 §五：带 fs. 前缀的旧禁词从立起来那天起一次都没守住过任何删除调用
+//   —— 按守卫自己的口径现数，字面量 0 行，裸调用 166 行 / 10 文件。禁词改裸词后，
+//   判据不许只验「常量换了字符串」，要验守卫真能点名白名单外的新增调用。
+//   现抽器 c239-scan.mjs 与守卫 walk 同口径，顺带把 1310 段 C238「不靠手写样本」
+//   在 rmSync 这一类上先落地；C238 再推广到四类。
+const c239 = await import('./fixtures/c239-scan.mjs')
+const BOUNDARY_GUARD = join(ROOT, 'scripts', 'check-boundaries.mjs')
+const C239_BARE = 'rm' + 'Sync('
+const c239Tmp = () => mkdtempSync(join(tmpdir(), 'c239-'))
+const runBoundary = (root) => {
+  const r = spawnSync(process.execPath, [BOUNDARY_GUARD, '--root', root],
+    { encoding: 'utf8', timeout: 60000, maxBuffer: 16 * 1024 * 1024 })
+  return { rc: r.status, out: `${r.stdout || ''}${r.stderr || ''}` }
+}
+
+check('C262【真跑】裸调用被边界守卫点名，干净树不误报', () => {
+  const tmp = c239Tmp()
+  try {
+    const P = (rel, text) => {
+      const abs = join(tmp, rel)
+      mkdirSync(dirname(abs), { recursive: true })
+      writeFileSync(abs, text, 'utf8')
+    }
+    P('tools/ok.mjs', 'export const ok = 1\n')
+    const clean = runBoundary(tmp)
+    must(clean.rc === 0, `C262 控制组：干净树没过闸 rc=${clean.rc} ${clean.out.slice(0, 200)}`)
+    P('lib/newthing.mjs', `export function f(p) { return ${C239_BARE}p, { recursive: true }) }\n`)
+    const bad = runBoundary(tmp)
+    must(bad.rc === 1,
+      `C262：白名单外新增裸调用没被拦（rc=${bad.rc}）——查两处：禁词是否退回带前缀的旧字面量、这条路径是否被白名单放行`)
+    must(bad.out.includes('lib/newthing.mjs:1') && bad.out.includes(`[${C239_BARE}]`),
+      `C262：红了但没点名文件/行/禁词：${bad.out.slice(0, 300)}`)
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+  return '干净树 rc=0；白名单外新增裸调用 rc=1 且点名文件:行与禁词'
+})
+
+check('C263【现抽真跑】四类禁词的真实调用行逐条被点名，命中为 0 必须红', () => {
+  const { rows, byToken } = c239.collect(ROOT)
+  must(rows.length >= 100, `C263：现抽只有 ${rows.length} 行，扫描面塌了`)
+  for (const t of c239.TOKENS) {
+    must(byToken[t] > 0, `C263：${t} 一条都没抽到 —— 这一类禁词的守卫废了`)
+  }
+  const tmp = c239Tmp()
+  try {
+    c239.mirror(tmp, rows)
+    const r = runBoundary(tmp)
+    must(r.rc === 1, `C263：镜像树没被拦（rc=${r.rc}）`)
+    const missed = rows.filter((x) => !r.out.includes(`probe/${x.rel}:${x.line}  [${x.token}]`))
+    must(missed.length === 0,
+      `C263：${missed.length} 条真实调用行没被点名：${missed.slice(0, 4).map((x) => `${x.rel}:${x.line} [${x.token}]`).join('；')}`)
+    return `${rows.length} 行 / ${c239.TOKENS.length} 类禁词逐条点名；任一类别命中 0 会红`
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+check('C264【求值】FORBIDDEN 四类都是裸词，ALLOW_FILES 每个条目旁都有永久豁免理由', () => {
+  const j = guardConstants()
+  must(j.forbidden.includes(C239_BARE), `C264：FORBIDDEN 没有裸词：${JSON.stringify(j.forbidden)}`)
+  const prefixed = j.forbidden.filter((t) => t.startsWith('fs.'))
+  must(prefixed.length === 0, `C264：还有带前缀的旧禁词：${prefixed.join(', ')}`)
+  const gs = readFileSync(BOUNDARY_GUARD, 'utf8').split('\n')
+  let n = 0
+  for (const [token, files] of Object.entries(j.allowFiles)) {
+    must(Array.isArray(files) && files.length > 0, `C264：${token} 白名单是空的`)
+    for (const rel of files) {
+      const line = gs.find((l) => l.includes(`'${rel}'`) && l.trim().startsWith("'"))
+      must(line && /\/\/\s*\S/.test(line),
+        `C264：${token} → ${rel} 旁边没写「为什么必须永久豁免」的注释`)
+      n++
+    }
+  }
+  return `${j.forbidden.length} 类裸禁词；${n} 个白名单条目逐条带理由`
+})
+
+check('C265【现抽】白名单与真实调用分布咬合：不空指向，也不预先放行无关文件', () => {
+  const { rows } = c239.collect(ROOT)
+  const j = guardConstants()
+  const allow = j.allowFiles[C239_BARE] || []
+  const realFiles = new Set(rows.filter((r) => r.token === C239_BARE).map((r) => r.rel))
+  const notAllowed = [...realFiles].filter((f) => !allow.includes(f))
+  const ghost = allow.filter((f) => !realFiles.has(f))
+  must(notAllowed.length === 0,
+    `C265：${notAllowed.length} 个文件有真实调用却不在白名单：${notAllowed.slice(0, 5).join(', ')}`)
+  must(ghost.length === 0,
+    `C265：${ghost.length} 个白名单文件没有真实调用（等于预先放行未来的散落调用）：${ghost.slice(0, 5).join(', ')}`)
+  return `真实调用文件 ${realFiles.size} 个 ⊆ 白名单 ${allow.length} 个，双向零差`
+})
+
+// ── C238 · 主判据不许再手写样本（判据 C266）──
+//
+//   1310 段 §二 / 1430 段 §五：六条 P1 的同一根因是「判据的手写样本与生产真实写法
+//   不同源」——样本用字面量、生产用解构，样本能触发的路径真实交互不触发。
+//   C239 已把 c239-scan.mjs 做成与守卫 walk 同口径的现抽器；这条主判据负责把
+//   C226 夹具也钉在现抽上，并交叉核「守卫自报的命中 == 判据现抽的命中」。
+check('C266【主判据】禁词守卫的判据输入取自生产代码，四类命中 0 必红', () => {
+  const { rows, byToken } = c239.collect(ROOT)
+  for (const t of c239.TOKENS) {
+    must((byToken[t] || 0) > 0, `C266：${t} 一条都没抓到 —— 这一类禁词守卫废了`)
+  }
+  must(rows.length >= 100, `C266：现抽只有 ${rows.length} 行，扫描面塌了`)
+  const fx = read('tools/fixtures/c226-boundaries-probe.mjs')
+  must(/from '\.\/c239-scan\.mjs'/.test(fx) && /collect\(/.test(fx),
+    'C266：禁词夹具没走生产现抽器 —— 又在手写造坏样本')
+  must(!/'(?:process\.plat|spa|execFile|fs\.rm|rm)'\s*\+\s*'/.test(fx),
+    'C266：禁词夹具还在手写拼接 token 构造串（样本与生产真实写法不同源）')
+  const j = runFixture('c226-boundaries-probe.mjs', 60000)
+  must(j.status === 0 && j.json,
+    `C266：夹具自身失效（rc=${j.status}）：${(j.raw || '').slice(0, 300)}`)
+  const texts = new Set(rows.map((r) => r.text))
+  const covered = new Set(j.json.cases.map((c) => c.token))
+  for (const t of c239.TOKENS) must(covered.has(t), `C266：夹具没覆盖 ${t}`)
+  const alien = j.json.cases.filter((c) => !texts.has(c.lineText))
+  must(alien.length === 0,
+    `C266：${alien.length} 条造坏行不是生产原文：${alien.slice(0, 2).map((c) => String(c.lineText).slice(0, 60)).join('；')}`)
+  // 守卫自己 --emit-legacy 报的命中，必须逐条落在现抽集合里：
+  // 两边口径一漂移，这里就红，而不是等下一种写法漏过去才发现。
+  const em = spawnSync(process.execPath, [BOUNDARY_GUARD, '--emit-legacy', '--root', ROOT],
+    { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 })
+  must(em.status === 0, `C266：守卫 --emit-legacy 起不来（rc=${em.status}）`)
+  const keys = JSON.parse(em.stdout)
+  const pairs = new Set(rows.map((r) => `${r.rel}|${r.text}`))
+  const off = keys.filter((k) => !pairs.has(k))
+  must(off.length === 0,
+    `C266：守卫自报 ${keys.length} 条命中里有 ${off.length} 条不在现抽集合：${off.slice(0, 2).join('；')}`)
+  must(keys.length > 0, 'C266：守卫一条命中都没自报 —— 命中为 0 不许绿')
+  return `${rows.length} 行现抽 / ${c239.TOKENS.length} 类全命中；夹具 ${j.json.cases.length} 条造坏行逐字同源；守卫自报 ${keys.length} 条与现抽零差`
+})
+
+// ── C240 · 四条假绿（判据 C267 起）──
+// 1430 段 §五 C240 / 1310 段 §二 C240：四条都是「实现被改坏了，判据照样绿」。
+check('C267 守卫自报运行期 LEGACY 最终集合；判据不再抠源码文本', () => {
+  const gs = read('scripts/check-boundaries.mjs')
+  must(/--dump-legacy/.test(gs), '守卫没有 --dump-legacy 开关')
+  const v = read('tools/verify.mjs')
+  const at = v.indexOf('function guardConstants()')
+  const gfn = at >= 0 ? v.slice(at, v.indexOf("check('C227-E LEGACY", at)) : ''
+  must(gfn.length > 0, 'guardConstants 抽不出来（函数形态变了，判据要跟着改）')
+  must(/--dump-legacy/.test(gfn), 'guardConstants 没读守卫自报 —— 还在用源码常量初始化值')
+  must(!/vm\.runInNewContext|src\.slice\(blockStart/.test(gfn),
+    'guardConstants 还在抠源码文本求值（运行期 .add() 污染看不见）')
+  const j = guardConstants()
+  must(j.legacySize === 0 && j.legacy.length === 0,
+    `运行期 LEGACY 非空：${j.legacy.slice(0, 3).join(' / ')}`)
+  // 前提断言：自报的另两字段形状完整，否则「空」可能只是没读到东西
+  must(Array.isArray(j.forbidden) && j.forbidden.length === 4,
+    `自报 FORBIDDEN 形状不对：${JSON.stringify(j.forbidden)}`)
+  must(Object.keys(j.allowFiles).length === 4, '自报 ALLOW_FILES 形状不对')
+  // 有牙：在守卫副本里运行期 .add() 一条真 key，自报必须看得见。
+  // 否则把 DUMP 输出改成写死的 `legacy: []`，上面每条断言照样绿 —— 又一个纸老虎。
+  // 拼接构造：判据源码里不许出现完整禁词字面量，否则守卫扫 verify.mjs 会自指命中
+  // （C239 已经在注释里踩过一次，这次是字符串常量）。
+  const POISON = 'lib/exec.mjs|return ' + 'spa' + 'wn(cmd, args, opts)'
+  const anchor = 'const LEGACY = EMIT ? new Set() : new Set([])'
+  must(gs.includes(anchor), 'LEGACY 定义形态变了，污染副本的注入锚点要跟着改')
+  const t2 = mkdtempSync(join(tmpdir(), 'c267-'))
+  try {
+    writeFileSync(join(t2, 'check-boundaries.mjs'),
+      gs.replace(anchor, `${anchor}\nLEGACY.add(${JSON.stringify(POISON)})`))
+    const pr = spawnSync(process.execPath,
+      [join(t2, 'check-boundaries.mjs'), '--dump-legacy', '--root', ROOT],
+      { encoding: 'utf8', timeout: 30000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024 })
+    must(pr.status === 0, `污染副本的 --dump-legacy 起不来（rc=${pr.status}）`)
+    const pj = JSON.parse(pr.stdout)
+    must(pj.legacy.includes(POISON),
+      '运行期污染没被自报看到 —— 自报的不是运行期最终集合，C227-E 会假绿')
+  } finally { rmSync(t2, { recursive: true, force: true }) }
+  return `LEGACY 运行期最终集合 0 条（守卫自报）；污染副本能看见 .add()；4 类禁词 / 4 份白名单形状完整`
+})
+
+check('C268【主判据】C207 走正面解析：自由变量与生产源码逐字对齐、白名单显式且不许预放行', () => {
+  const r = c207Run()
+  must(r.status === 0 && r.json, `C268：C207 夹具自身失效（rc=${r.status}）`)
+  const j = r.json
+  const fix = read('tools/fixtures/c207-scope-probe.mjs')
+
+  // —— 行为断言全部在前（DSH 2232 §二 P3）——
+  // 旧顺序把「全局白名单没显式列出」这类静态守卫排在最前：摘掉白名单里 Date 那一行，
+  // 会先红在「清单少了一行」，看不到「正面解析真的把 Date 当残留报出来了」。
+  // 现在行为断言先跑、静态守卫一律后置，红的时候第一眼看到的是被测行为。
+  // 逐函数清单与并集零差；解析面不塌（恒返空会在这里红）
+  const fromRows = [...new Set((j.perFunction || []).flatMap((x) => x.freeRaw || []))].sort()
+  must(fromRows.length >= 6, `C268：解析只列出 ${fromRows.length} 个自由变量 —— 正面解析可能恒返空`)
+  must(JSON.stringify(fromRows) === JSON.stringify(j.freeRawUnion),
+    'C268：逐函数自由变量清单与并集对不上 —— 夹具输出不是同一轮解析的结果')
+  must(j.parsedTokenTotal >= 1000, `C268：只切出 ${j.parsedTokenTotal} 个 token，解析面塌了`)
+  must(j.topDeclCount >= 16 && j.realTopCount >= 15, 'C268：顶层声明 / 顶层函数数不对')
+  must(j.allBalanced === true, 'C268：函数体括号不配平')
+
+  // 交叉核：每个自由变量必须真以独立标识符出现在**它所属函数**的源码正文里。
+  // 采信夹具自述等于没判；这里拿 client.js 原文当外部锚点。
+  const lines = read('client.js').split('\n')
+  const off = []
+  for (const row of j.perFunction || []) {
+    let end = lines.length - 1
+    for (let i = row.line; i < lines.length; i++) if (/^}/.test(lines[i])) { end = i; break }
+    const body = lines.slice(row.line - 1, end + 1).join('\n')
+    for (const v of row.freeRaw || []) {
+      const re = new RegExp('(?<![.\\w$\'"`])' + v.replace(/\$/g, '\\$') + '(?![\\w$])')
+      if (!re.test(body)) off.push(`${row.fn}:${v}`)
+    }
+  }
+  must(off.length === 0, `C268：夹具报的自由变量不在对应函数源码里：${off.slice(0, 3).join(' / ')}`)
+
+  // 减白名单前后：残留要**点名到名字**，不能只说「口径不对」。
+  // 摘掉白名单里 Date 那一行的扰动，应当在这里红成「把 Date 报成残留」。
+  must((j.freeRawUnion || []).length > 0,
+    'C268：减白名单前自由变量为空 —— 正面解析可能恒返空')
+  const residue = j.freeUnion || []
+  must(residue.length === 0,
+    `C268：正面解析把白名单外的自由变量报成残留：${residue.join(', ')}（全局白名单缺项，或源码出现新的悬空名）`)
+
+  // 副本验牙：改一个注入名，夹具输出必须跟着变。写死的 poisons 会在这里红。
+  const anchor = "dangling: '__c207Dangling'"
+  must(fix.includes(anchor), 'C268：污染名锚点变了，副本注入要跟着改')
+  const ALT = '__c268AltDangling'
+  const tmpName = 'c268-alt-probe.mjs'
+  const tmpPath = join(ROOT, 'tools', 'fixtures', tmpName)
+  try {
+    writeFileSync(tmpPath, fix.replace(anchor, `dangling: '${ALT}'`))
+    const alt = runFixture(tmpName, 60000)
+    must(alt.status === 0 && alt.json, `C268：副本夹具起不来（rc=${alt.status}）：${(alt.raw || '').slice(0, 250)}`)
+    const ap = alt.json.poisons && alt.json.poisons.dangling
+    must(alt.json.poisonNames.dangling === ALT && ap && ap.caught === true &&
+      ap.ids.includes(ALT) && !ap.ids.includes('__c207Dangling'),
+      'C268：改了注入名后夹具输出没跟着变 —— poisons 可能是写死的')
+  } finally { rmSync(tmpPath, { force: true }) }
+
+  // —— 静态守卫全部后置（P3）——
+  // 夹具不许退回「只枚举 factory 声明再求交集」的旧法
+  must(!/factoryDefs|\^ \{4\}\(\?:const/.test(fix),
+    'C268：夹具又退回 factory 声明交集法（悬空名 / 解构 / 未来才加三种会全漏）')
+  for (const fname of ['lex', 'bindingsOf', 'refsOf', 'analyze']) {
+    must(new RegExp(`export function ${fname}\\(`).test(fix), `C268：夹具缺正面解析的 ${fname}()`)
+  }
+  // 白名单：显式逐条列出、每条写理由注释、且不含任何注入名（防把扰动名预先放行）
+  must(Array.isArray(j.globalAllow) && j.globalAllow.length >= 6, 'C268：全局白名单没显式列出')
+  const block = fix.slice(fix.indexOf('export const GLOBAL_ALLOW'), fix.indexOf('const ALLOW'))
+  const entries = block.split('\n').filter((l) => /^\s*'/.test(l))
+  must(entries.length === j.globalAllow.length && entries.every((l) => /\/\//.test(l)),
+    'C268：GLOBAL_ALLOW 每条都要写理由注释，且不许有未登记项')
+  const poisonNames = Object.values(j.poisonNames || {})
+  must(poisonNames.length === 4 && poisonNames.every((n) => !j.globalAllow.includes(n)),
+    'C268：注入名被预先放进白名单 —— 扰动会假绿')
+
+  return `正面解析 ${j.realTopCount} 函数 / ${j.parsedTokenTotal} token；${fromRows.length} 个自由变量逐字对齐源码、全在 ${j.globalAllow.length} 条显式白名单内（行为断言前置，静态守卫后置）；副本改注入名后输出跟着变`
+})
+
+check('C269【主判据】五个非渲染函数是从原样源码导出的真引用，单点污染各自可证伪', () => {
+  const r = c208Run()
+  must(r.status === 0 && r.json, `C269：C208 夹具自身失效（rc=${r.status}）`)
+  const j = r.json
+  const cp = read('tools/fixtures/panel-c208-render-probe.mjs')
+  const FNS = ['fmtDelMsg', 'fmtSkippedNote', 'missingDeps', 'pollStep', 'readDownloadResp']
+
+  // 静态守卫：夹具不许自己重新定义这五个函数（那是在测夹具，正是 C195 的假绿成因）
+  must(!/^\s*function (fmtDelMsg|fmtSkippedNote|missingDeps|pollStep|readDownloadResp)\s*\(/m.test(cp),
+    'C269：夹具里出现了同名函数定义 —— 被测对象被换成了夹具自己的实现')
+  must(/;return \{ \$\{INTERACT_FNS\.join/.test(cp),
+    'C269：五函数引用不是从原样源码求值里导出的（不许抽函数、不许外部补环境）')
+  const tAnchor = "const POISON_TAG = '__c208Miss_'"
+  must(cp.includes(tAnchor), 'C269：单点污染标记常量变了，副本注入要跟着改')
+
+  // 五个 marker 必须互异，且各自出现在自己那份异常证据里
+  const P = j.interactPoisons || {}
+  const markers = FNS.map((n) => P[n] && P[n].marker)
+  must(new Set(markers).size === 5, `C269：五份单点污染标记不互异：${markers.join(' / ')}`)
+  for (const n of FNS) {
+    const p = P[n]
+    must(p && (p.throws || []).join(' ').includes(p.marker),
+      `C269：${n} 的异常里没有自己的标记 —— 五份可能复用了同一份污染源码`)
+    must((j.interact || {})[n] && j.interact[n].ok === true, `C269：干净源码下 ${n} 没触发成功`)
+  }
+
+  // 副本验牙：换掉标记常量，五份证据必须全跟着变。写死的 interactPoisons 会在这里红。
+  const tmpName = 'c269-alt-probe.mjs'
+  const tmpPath = join(ROOT, 'tools', 'fixtures', tmpName)
+  try {
+    writeFileSync(tmpPath, cp.replace(tAnchor, "const POISON_TAG = '__c269Alt_'"))
+    const alt = runFixture(tmpName, 60000)
+    must(alt.status === 0 && alt.json, `C269：副本夹具起不来（rc=${alt.status}）：${(alt.raw || '').slice(0, 250)}`)
+    const am = Object.values(alt.json.interactPoisons || {}).map((p) => p.marker)
+    must(am.length === 5 && am.every((m) => m.startsWith('__c269Alt_')),
+      'C269：改了标记常量后输出没跟着变 —— interactPoisons 可能是写死的')
+  } finally { rmSync(tmpPath, { force: true }) }
+  return `五函数真引用导出、各触发 1 次；五份 marker 互异且各在自己的异常里；副本换标记后 5/5 跟着变`
+})
+
+// ── C270 · C165 假绿敞口（DSH 2232 §三）──
+//   最小假仓库缺 tools/look.mjs / description/keywords 时，check-public-text
+//   对**干净行**也以「对外文案面未扫全」exit 1；C165 ② 原来只断 rc!==0，那一半恒真。
+//   修法按 2232 段三条：控制组 rc=0 / 变体点名到规则名与行号 /
+//   保留「缺 look.mjs 时按未扫全红」这条另一个正确行为。
+check('C270【主判据】C165 那半边不许再只断退出码：控制组、点名、未扫全三向都可证伪', () => {
+  const r = c165Run()
+  must(r.status === 0 && r.json, `C270：夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 300)}`)
+  const j = r.json
+  const names = collabRuleNames()
+
+  // 行为一（核心）：干净行控制组两闸必须 rc=0。
+  const ctl = j.controlRows || []
+  must(ctl.length === 2 && ctl.every((x) => x.clean),
+    `C270：干净行控制组没过（${ctl.map((x) => `${x.guard} rc=${x.status}`).join(' / ')}）—— 控制组红着时「变体被拦住」永远可以靠未扫全蒙过去`)
+  must(ctl.some((x) => x.guard === 'check-public-text' && x.status === 0),
+    'C270：控制组里没有 check-public-text 的 rc=0 —— 正是这一半原来恒真')
+
+  // 行为二：变体必须 rc≠0，且输出点名到**真规则名**与行号。
+  const bad = []
+  for (const v of j.variantRows || []) {
+    for (const row of v.rows) {
+      const ruleHit = (row.ruleTags || []).some((t) => names.includes(t))
+      if (row.crashed || row.status === 0 || !row.named || !row.lineHit || !ruleHit) {
+        bad.push(`${v.variant}/${row.guard} rc=${row.status} named=${row.named} line=${row.lineHit} rule=${ruleHit}`)
+      }
+    }
+  }
+  must((j.variantRows || []).length === 8 && bad.length === 0,
+    `C270：变体没被点名到具体规则名与行号：${bad.slice(0, 4).join('；')}`)
+  const hitNames = [...new Set((j.variantRows || []).flatMap((v) => v.rows.flatMap((x) => x.ruleTags || [])))].filter((t) => names.includes(t))
+  must(hitNames.length >= 2, `C270：8 个变体只命中 ${hitNames.length} 类规则名，规则名交叉核没有区分度`)
+
+  // 行为三：缺 tools/look.mjs 时确实按「未扫全」红，且另一闸不受影响。
+  // 这是 check-public-text 的另一个正确行为，不能因为修 C165 一起改掉。
+  const bare = j.bareRows || []
+  const pt = bare.find((x) => x.guard === 'check-public-text')
+  const rl = bare.find((x) => x.guard === 'check-release-leak')
+  must(pt && pt.status !== 0 && pt.unscanned && pt.lookMissing,
+    `C270：缺 look.mjs 的对照树没按未扫全红（rc=${pt?.status} unscanned=${pt?.unscanned}）—— 这条正确行为被一起改掉了`)
+  must(rl && rl.status === 0,
+    `C270：缺 look.mjs 的对照树在 check-release-leak 上也红了（rc=${rl?.status}）—— 那一半本来不受影响`)
+
+  // 副本验牙 A：把补齐树换成裸树，控制组必须跟着红（控制组不许是写死的）
+  const fix = read('tools/fixtures/c165-variants.mjs')
+  const anchorFull = 'const full = makeRepo()'
+  must(fix.includes(anchorFull), 'C270：补齐树锚点变了，副本注入要跟着改')
+  const anchorVar = "'WB-CN',"
+  must(fix.includes(anchorVar), 'C270：变体锚点变了，副本注入要跟着改')
+  const tmpName = 'c270-alt-probe.mjs'
+  const tmpPath = join(ROOT, 'tools', 'fixtures', tmpName)
+  try {
+    writeFileSync(tmpPath, fix.replace(anchorFull, 'const full = makeBareRepo()'))
+    const altA = runFixture(tmpName, 120000)
+    must(altA.status === 0 && altA.json, `C270：副本 A 起不来（rc=${altA.status}）：${(altA.raw || '').slice(0, 250)}`)
+    must((altA.json.controlRows || []).some((x) => !x.clean),
+      'C270：把补齐树换成裸树后控制组没变红 —— controlRows 可能是写死的')
+  } finally { rmSync(tmpPath, { force: true }) }
+
+  // 副本验牙 B：把第一个变体换成干净行，对应行必须不再命中（变体不许是写死的）
+  try {
+    writeFileSync(tmpPath, fix.replace(anchorVar, 'CLEAN_LINE,'))
+    const altB = runFixture(tmpName, 120000)
+    must(altB.status === 0 && altB.json, `C270：副本 B 起不来（rc=${altB.status}）：${(altB.raw || '').slice(0, 250)}`)
+    const first = (altB.json.variantRows || [])[0]
+    must(first && first.variant === j.cleanLine && first.rows.every((x) => x.status === 0 && !x.named),
+      'C270：把变体换成干净行后输出没跟着变 —— variantRows 可能是写死的')
+  } finally { rmSync(tmpPath, { force: true }) }
+
+  // 静态守卫后置：C165 ② 必须走同一个夹具，且不许退回「只断 rc!==0」的写法
+  const own = read('tools/verify.mjs')
+  const c165Block = own.slice(own.indexOf("check('C165 "), own.indexOf("check('C166 "))
+  must(c165Block.includes('c165Run()') && /\.clean/.test(c165Block) && /\.named/.test(c165Block),
+    'C270：C165 ② 没走补齐树夹具 / 没断控制组与点名 —— 修复可能回潮')
+  must(!/must\(\s*r\.status\s*!==\s*0\s*\)/.test(c165Block),
+    'C270：C165 ② 又退回只断退出码的写法')
+
+  return `控制组两闸 rc=0；8 变体 × 2 闸点名 ${hitNames.length} 类规则名 + 行号；缺 look.mjs 仍按未扫全红；两份副本扰动都跟着变；C165 ② 走同一夹具`
+})
+
+// ── C247 · `--only`（1615 段详述、2232 段重申三条不许省）──
+// 收益按「省上下文」算，不按「省时间」算：全量 stdout 约 13K token，
+// 每改一条判据重跑就再读一遍。这条自身是三条硬要求的持续守卫。
+check('C271【主判据】--only 只跑匹配判据、未跑提示必在、默认路径一行不多打', () => {
+  const CHILD = process.env.BW_VERIFY_C271_CHILD === '1'
+  if (PROBE_CHILD) { lightSkip('C271'); return }
+
+  // ① 真求值执行器：过滤必须发生在**断言体调用之前**，不是「跑了再过滤输出」
+  const probeResults = []
+  const called = []
+  const c = makeChecker(probeResults, (n) => n === 'C1')
+  c('C1', () => { called.push('C1'); return 'ok' })
+  c('C2', () => { called.push('C2'); return 'ok' })
+  must(called.length === 1 && called[0] === 'C1',
+    `C271：不匹配的断言体被调用了（${called.join(',')}）—— 过滤只在输出层，省不了上下文`)
+  must(probeResults.length === 1,
+    'C271：不匹配的判据被记进了 results —— 没跑的判据会污染退出码与汇总')
+
+  // ② 真求值三个纯函数（默认路径必须是「不过滤 / 不提示」）
+  must(parseOnlySpecs(['a', 'b']) === null, 'C271：无 --only 时不该解析出过滤条件')
+  must(JSON.stringify(parseOnlySpecs(['--only', 'C258,C259'])) === JSON.stringify(['C258', 'C259']),
+    'C271：逗号分隔没拆开')
+  must(JSON.stringify(parseOnlySpecs(['--only=c24'])) === JSON.stringify(['C24']),
+    'C271：--only= 形式 / 大小写归一没生效')
+  must(JSON.stringify(parseOnlySpecs(['--only'])) === JSON.stringify([]),
+    'C271：--only 没给值时应返回空数组（由调用方报错），不能悄悄全选')
+  must(matchOnly('C268【主判据】…', null) === true, 'C271：默认路径必须全选')
+  must(matchOnly('C268【主判据】…', ['C268']) === true &&
+    matchOnly('C269【主判据】…', ['C268']) === false, 'C271：精确编号匹配口径不对')
+  must(matchOnly('C240 a', ['C24']) === true && matchOnly('C241 x', ['C24']) === true &&
+    matchOnly('C250 x', ['C24']) === false, 'C271：编号前缀匹配口径不对')
+  must(matchOnly('版本号不是 0.2.22（P0：…）', ['C1']) === false,
+    'C271：名字不带 C 编号的判据不该被 C 前缀选中')
+  must(onlyNoticeLine(270, 3, false) === null, 'C271：默认路径冒出了未跑提示')
+  must(onlyNoticeLine(270, 3, true) === '[--only] 本 run 只跑了 3 / 270 条，其余 267 条未执行',
+    'C271：未跑提示的分子 / 分母 / 余数不守恒')
+
+  // ③ 真跑 CLI：只跑一条 / 逗号分隔 / 不存在的编号必须明确报错并 exit 1
+  const runOnly = (...args) => spawnSync(process.execPath, ['tools/verify.mjs', ...args],
+    { cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 16 * 1024 * 1024 })
+  const one = runOnly('--only', 'C258')
+  const o1 = `${one.stdout || ''}${one.stderr || ''}`
+  must(one.status === 0, `C271：--only C258 自己失败 rc=${one.status}：${o1.slice(0, 200)}`)
+  // 提示行只认 stdout：16:15 段明写「不许只写在 stderr」，拼 stdout+stderr 会放过这种退化。
+  const n1 = (one.stdout || '').match(/只跑了 (\d+) \/ (\d+) 条，其余 (\d+) 条未执行/)
+  must(n1 && Number(n1[1]) === 1 && Number(n1[1]) + Number(n1[3]) === Number(n1[2]),
+    'C271：--only C258 的提示行分子 / 分母 / 余数不守恒（或没打在 stdout）')
+  must((o1.match(/^PASS  /gm) || []).length === 1,
+    'C271：--only C258 实际跑了不止一条 —— 提示行的「1」是假的')
+  must(((one.stdout || '').match(/^\[--only\]/gm) || []).length === 1,
+    'C271：--only 路径的未跑提示没打在 stdout、或打了不止一次')
+  const m1 = o1.match(/(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/)
+  must(m1 && Number(m1[1]) === 1 && Number(m1[2]) === 0 && Number(m1[3]) === 0,
+    'C271：--only 的汇总行没反映「实际只跑了 1 条」')
+
+  const two = runOnly('--only', 'C258,C259')
+  const o2 = `${two.stdout || ''}${two.stderr || ''}`
+  must(two.status === 0 && /只跑了 2 \//.test(o2) &&
+    (o2.match(/^PASS  /gm) || []).length === 2,
+    'C271：逗号分隔没跑满两条，或计数与实际不一致')
+
+  const none = runOnly('--only', 'C999999')
+  const on = `${none.stdout || ''}${none.stderr || ''}`
+  must(none.status === 1, `C271：不存在的编号必须 exit 1，实际 rc=${none.status}`)
+  must(/没匹配到任何判据/.test(on), 'C271：不存在的编号没明确报「没匹配到任何判据」')
+  must(((none.stdout || '').match(/^\[--only\]/gm) || []).length === 1,
+    'C271：连一条都没跑时未跑提示也要打在 stdout、且只打一次')
+  must((on.match(/^PASS  /gm) || []).length === 0, 'C271：没匹配到却仍跑了判据')
+
+  // ④ 默认路径：真跑一次无参数主闸。子进程里本判据走轻量分支，防自举递归；
+  //    它仍记一笔 PASS，所以子进程汇总条数应与父进程完全一致。
+  //    C272 把默认路径的 PASS 明细换成「[N 条 PASS 未列明细]」一行后，「汇总 === 逐条
+  //    PASS 行数」不再成立（分母被折叠了），改成「汇总 === 逐条 PASS + 计数行里的 N」。
+  //    守的仍是同一件事：汇总行不许撒谎。牙没松 —— 计数行写错数照样红。
+  if (!CHILD) {
+    const full = runVerify([])
+    const o = full.stdout || ''
+    const childFail = (o.match(/^FAIL  .*$/m) || [''])[0]
+    must(full.status === 0,
+      `C271：默认路径子进程 rc=${full.status}：${childFail.slice(0, 200)} / ${(full.stderr || '').slice(0, 120)}`)
+    must(!o.includes('[--only]'), 'C271：默认路径冒出了未跑提示 —— 加参数改变了默认行为')
+    const m = o.match(/(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/)
+    const passLines = (o.match(/^PASS  /gm) || []).length
+    const failLines = (o.match(/^FAIL  /gm) || []).length
+    const folded = /^\[(\d+) 条 PASS 未列明细，加 --verbose 看\]$/m.exec(o)
+    must(m && Number(m[2]) === 0, 'C271：默认路径出现失败')
+    must(m && Number(m[1]) === passLines + (folded ? Number(folded[1]) : 0) && Number(m[2]) === failLines,
+      'C271：默认路径的汇总数字与逐条输出 + 折叠计数不一致（汇总行撒谎）')
+    // 1650 段必修 3：子进程里那 9 条改成 SKIP 后，只数 PASS 行会把它们数丢。
+    //   元判据必须三向都记：逐行 PASS（含折叠计数）、SKIP、FAIL 各自与汇总对齐且合计守恒。
+    //   这不是「把 SKIP 排除在证据外」——排除掉之后输出看起来少了几条，同样是假的。
+    const skipLines = (o.match(/^SKIP  /gm) || []).length
+    must(m && Number(m[3]) === skipLines,
+      `C271：子进程 SKIP 明细 ${skipLines} 行 ≠ 汇总跳过数 ${m && m[3]}（轻量分支改 SKIP 后元判据数少了）`)
+    must(m && Number(m[1]) + Number(m[2]) + Number(m[3]) ===
+      passLines + (folded ? Number(folded[1]) : 0) + failLines + skipLines,
+      'C271：子进程 PASS/SKIP/FAIL 三向逐行数与汇总合计不守恒')
+    // 确定性下界，不是概率阈值：每条 check 至少产出一行；个别判据在 check() 内部
+    //   调 skip() 只会让行数更多，不会更少。少跑任何一条都会把总数压到这个界以下。
+    must(m && Number(m[1]) + Number(m[3]) >= allNames.length,
+      `C271：默认路径输出条数少于 check 数 ${allNames.length} —— 有判据根本没跑`)
+  }
+
+  // 不读 verify.mjs 源码切块做静态守卫：锚点字符串会落在判据自己的字面量里，
+  //   indexOf 切进判据内部就自伤（实测连踩两次）。「默认路径一行不多打」由 ④ 真跑
+  //   无参数子进程守住（无提示行 + 汇总条数 + PASS 行数），比抠源码文本硬得多。
+
+  return `执行器只调匹配断言体；3 纯函数真求值；--only C258 跑 1 条 / 逗号 2 条 / C999999 exit 1；默认路径真跑无提示且条数自洽`
+})
+
+// ── C272–C274 · 第一层「输出瘦身」（0750 段 §二；§七 允许对派单错误按实测口径改）──
+// 改前两次全量的 sha256 不同（临时目录名 / 耗时毫秒 / 动态计数），所以「--verbose 与
+// 今天逐字节一致」不能写成常驻判据里的两文件相等 —— 那是随机红。这里改成三条
+// 确定性断言：真求值渲染函数 + 真跑双路径 + 归一动态字段后逐行比对。
+// 一次性的「改前基线 vs 改后 --verbose」逐行取证写在交付报告里，不写进常驻判据。
+
+slowCheck('C272【主判据】默认全量 stdout ≤ 2 KB（硬数 2048），PASS 折叠成一行计数', () => {
+  // ① 真求值被测对象：喂 271 条带长 detail 的 PASS，看渲染函数返回的字节数。
+  //    把 renderResults 改回「逐条打 PASS」时这一条立刻红，不看实现脸色。
+  const fake = Array.from({ length: 271 }, (_, i) => ({
+    name: `C${i} 判据名字`, ok: true, detail: '这是一段很长的说明串'.repeat(20),
+  }))
+  const rendered = renderResults(fake, { verbose: false })
+  const fakeBytes = Buffer.byteLength(rendered.lines.join('\n') + '\n', 'utf8')
+  must(fakeBytes <= 2048,
+    `C272：271 条长 PASS 渲染出 ${fakeBytes} B > 2048 B —— PASS 又被逐条打出来了`)
+  must(!rendered.lines.some((l) => l.startsWith('PASS  ')), 'C272：瘦身后仍出现逐条 PASS 明细')
+  must(rendered.lines.some((l) => l === '[271 条 PASS 未列明细，加 --verbose 看]'),
+    'C272：折叠计数行缺失或数字不对')
+
+  // ② 真跑：默认路径的 stdout 才是「全绿时」那句话指的 stdout。
+  if (!PROBE_CHILD) {
+    const r = runVerify([])
+    const out = r.stdout || ''
+    const bytes = Buffer.byteLength(out, 'utf8')
+    must(r.status === 0, `C272：默认路径真跑 rc=${r.status}`)
+    must(bytes <= 2048, `C272：默认全量 stdout ${bytes} B > 2048 B（硬数，不许改阈值）`)
+    const m = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(out)
+    must(m && Number(m[2]) === 0, 'C272：默认路径不是全绿，量字节数没意义')
+    const folded = /^\[(\d+) 条 PASS 未列明细/m.exec(out)
+    const passLines = (out.match(/^PASS  /gm) || []).length
+    must(folded && Number(folded[1]) === Number(m[1]) - passLines,
+      'C272：折叠数与汇总通过数不守恒')
+    must(!/^\[--only\]|^\[--fast\]/m.test(out), 'C272：默认路径冒出了分档提示')
+  }
+  return `真求值 271 条长 PASS → ${fakeBytes} B；默认路径真跑 stdout ≤2048 B`
+})
+
+check('C273【主判据】FAIL/SKIP 的 name 与 detail 逐字节保留，瘦身不许把失败信息也瘦掉', () => {
+  // 用真执行器造一条会红的判据（makeChecker 会把错误消息原文记成 detail），
+  // 再喂给真渲染函数。判据落在被测对象之外，不是拿 renderResults 验 renderResults。
+  const probe = []
+  const c = makeChecker(probe)
+  const NAME = 'C273-PROBE 一条故意红的判据（含中文、括号与 123 数字）'
+  const DETAIL = '故意抛出的失败细节：路径与 42ms 和标记甲都要逐字节出现'
+  c(NAME, () => { throw new Error(DETAIL) })
+  probe.push({ name: 'C273-PROBE 跳过项', ok: false, skip: true, detail: '跳过原因标记乙' })
+  probe.push({ name: 'C273-PROBE 通过项', ok: true, detail: '通过细节' })
+
+  const lean = renderResults(probe, { verbose: false })
+  const failLine = lean.lines.find((l) => l.startsWith('FAIL  '))
+  must(failLine === `FAIL  ${NAME}  —  ${DETAIL}`,
+    `C273：FAIL 行不是 name+detail 的逐字节拼接：${failLine}`)
+  must(failLine && failLine.includes(NAME) && failLine.includes(DETAIL),
+    'C273：FAIL 行丢了 name 或 detail 全文')
+  must(lean.lines.includes('SKIP  C273-PROBE 跳过项  —  跳过原因标记乙'),
+    'C273：SKIP 明细被改写或丢掉了')
+  must(!lean.lines.some((l) => l.startsWith('PASS  ')), 'C273：默认路径里 PASS 没被折叠')
+
+  const full = renderResults(probe, { verbose: true })
+  must(full.lines.filter((l) => l.startsWith('FAIL  '))[0] === failLine,
+    'C273：--verbose 的 FAIL 行与默认路径不一致')
+  must(full.lines.includes('PASS  C273-PROBE 通过项  —  通过细节'),
+    'C273：--verbose 没逐条打全 PASS 明细')
+  return 'FAIL/SKIP 的 name+detail 逐字节保留；--verbose 全明细'
+})
+
+slowCheck('C274【主判据】--verbose 逐条全明细，与默认路径只差 PASS 折叠且其余行归一后逐字节一致', () => {
+  // 归一的是「本来就每次不同」的动态字段，与 C247 的默认路径比对同一套规则。
+  const norm = (s) => s.split(/\r?\n/).map((l) => l
+    .replace(/[A-Za-z]:\\Users\\[^\\\s]+\\AppData\\Local\\Temp\\[^\s，；)"']*/g, '<TMP>')
+    .replace(/\bbw-[a-z0-9-]+-[A-Za-z0-9]+/gi, '<RAND>')
+    .replace(/\d+(?:\.\d+)?\s*ms/g, '<MS>')
+    .replace(/回收站 \d+→\d+/g, '回收站 <N>→<N>')
+    .replace(/recycle \d+→\d+/g, 'recycle <N>→<N>')
+    .replace(/修前态 \d+→\d+/g, '修前态 <N>→<N>')
+    .replace(/^\d+ 通过 \/ \d+ 失败 \/ \d+ 跳过$/, '<SUMMARY>')
+    .trimEnd())
+  if (PROBE_CHILD) { lightSkip('C274'); return }
+  const lean = runVerify([])
+  const full = runVerify(['--verbose'])
+  must(lean.status === 0 && full.status === 0, 'C274：双路径真跑有非 0 退出')
+  const a = lean.stdout || '', b = full.stdout || ''
+  // ① 全明细形态：每条 PASS 独立一行，行数 === 汇总通过数；不许有折叠行。
+  const m = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(b)
+  const passLinesB = (b.match(/^PASS  /gm) || []).length
+  must(m && passLinesB === Number(m[1]),
+    `C274：--verbose 的 PASS 明细 ${passLinesB} 行 ≠ 汇总通过 ${m && m[1]}`)
+  must(!/条 PASS 未列明细/.test(b), 'C274：--verbose 出现折叠计数行 —— 全明细没生效')
+  must((a.match(/^PASS  /gm) || []).length === 0, 'C274：默认路径仍有逐条 PASS 行')
+  must(/条 PASS 未列明细/.test(a), 'C274：默认路径缺折叠计数行')
+  // ② 去掉 PASS 明细与折叠行后，两条路径其余行归一后逐字节一致。
+  const strip = (s) => norm(s).filter((l) => l && !/^PASS  /.test(l) && !/条 PASS 未列明细/.test(l))
+  const la = strip(a), lb = strip(b)
+  const diffs = []
+  for (let i = 0; i < Math.max(la.length, lb.length); i++) {
+    if (la[i] !== lb[i]) diffs.push(`L${i + 1}: ${JSON.stringify(la[i])} vs ${JSON.stringify(lb[i])}`)
+  }
+  must(diffs.length === 0,
+    `C274：两条路径的非 PASS 行有 ${diffs.length} 处差异：${diffs.slice(0, 3).join(' | ')}`)
+  return `--verbose ${passLinesB} 行全明细；默认 0 行；其余 ${la.length} 行归一后逐字节一致`
+})
+
+// ── C275–C277 · 第二层「--fast 分档」（0750 段 §三；判据三条，行为断言在前、静态守卫在后）──
+slowCheck('C275【主判据】--fast 有跳过提示，两个数字都是运行时计数且守恒', () => {
+  // ① 纯函数真求值：默认路径不许冒提示，active 时格式与数字同源。
+  must(fastNoticeLine(93, 181, false) === null, 'C275：默认路径冒出了 --fast 提示')
+  const line = fastNoticeLine(7, 11, true)
+  must(line === '[--fast] 本次跳过 7 条含子进程判据，其余 11 条已跑',
+    'C275：提示行格式或数字不对')
+  if (PROBE_CHILD) { lightSkip('C275'); return }
+  // ② 真跑 --fast：一条提示、无 --only、跳过数 + 已跑数 === 总 check 数。
+  //    总数不写常量，从「--only 一个不存在的编号」的分母里拿，与提示行同源口径。
+  const fast = runVerify(['--fast'])
+  must(fast.status === 0,
+    `C275：--fast 真跑 rc=${fast.status}：${(fast.stdout || '').slice(0, 200)}`)
+  const fo = fast.stdout || ''
+  const fl = /^\[--fast\] 本次跳过 (\d+) 条含子进程判据，其余 (\d+) 条已跑$/m.exec(fo)
+  must(fl, 'C275：--fast 没有跳过提示行，或格式不符')
+  must((fo.match(/^\[--fast\]/gm) || []).length === 1, 'C275：--fast 提示行不止一条')
+  must(!fo.includes('[--only]'), 'C275：--fast 路径冒出了 --only 提示')
+  const skipped = Number(fl[1]), ran = Number(fl[2])
+  must(skipped > 0 && ran > 0, `C275：跳过 ${skipped} / 已跑 ${ran} —— 数字像写死的常量`)
+  const none = runVerify(['--only', 'C999999'])
+  must(none.status === 1, 'C275：不存在的编号没 exit 1')
+  const totalM = /共 (\d+) 条判据/.exec((none.stdout || '') + (none.stderr || ''))
+  must(totalM, 'C275：拿不到判据单元总数，无法核守恒')
+  const total = Number(totalM[1])
+  // C286 把分母统一成「判据单元数」后，total 含 extraUnits 条顶层独立 skip；
+  //   它们不走 check()/select、不参与 --fast 计数，守恒式要扣掉这几种单元。
+  must(skipped + ran + extraUnits.length === total,
+    `C275：跳过 ${skipped} + 已跑 ${ran} + 顶层独立 skip ${extraUnits.length} ≠ 判据单元总数 ${total}（提示行数字不是真实计数）`)
+  // ③ 清单必须真被用上：跳过数不能少于过渡清单长度。
+  must(skipped >= SLOW_CHECKS.length,
+    `C275：只跳过 ${skipped} 条，比过渡清单 ${SLOW_CHECKS.length} 条还少 —— 清单没接进 --fast`)
+  return `--fast 跳过 ${skipped} / 已跑 ${ran} / 总 ${total} 守恒；清单 ${SLOW_CHECKS.length} 条全在`
+})
+
+check('C276【主判据】SLOW_CHECKS 双向差集为空：清单每条真含子进程，含子进程的都在清单里', () => {
+  // ① 清单自身形态：冻结、无重复、一律大写（与 checkId() 同源）。
+  must(Object.isFrozen(SLOW_CHECKS), 'C276：SLOW_CHECKS 没冻结，运行时能被改')
+  must(SLOW_CHECKS.length === new Set(SLOW_CHECKS).size, 'C276：SLOW_CHECKS 有重复编号')
+  must(SLOW_CHECKS.every((s) => s === s.toUpperCase()),
+    'C276：清单编号不是大写，和 checkId() 不同源')
+  // ② 行为在前：真求值编号提取，先证明「清单能对上名字」。
+  must(checkId('C124b 读不出来必须变红') === 'C124B'
+    && checkId('W-07 所有命令的 --out') === 'W-07'
+    && checkId('中文开头的判据') === null
+    && SLOW_CHECKS.includes('C124B'), 'C276：编号提取或字母后缀登记不对')
+  // ③ slowCheck 不许是空实现（§五 点名的「同名重导出一份空实现」）。
+  const seen = []
+  const sc = makeSlowChecker((n, f) => { seen.push('c:' + n); return f() },
+    (n) => seen.push('r:' + n))
+  const v = sc('C276 假判据', () => 'ok')
+  must(v === 'ok' && seen.join('|') === 'r:C276 假判据|c:C276 假判据',
+    'C276：slowCheck 没「先登记、再调 check」，或是一份空实现')
+  // ④ 静态守卫在后：按 check(/slowCheck( 起点切块，块内数子进程调用。
+  //    排除 const runFixture 定义体本身 —— 它含 spawnSync，会被误算到前一个判据头上。
+  const src = readFileSync(join(HERE, 'verify.mjs'), 'utf8').split('\n')
+  const defStart = src.findIndex((l) => /^const runFixture\s*=/.test(l))
+  let defEnd = defStart
+  if (defStart >= 0) {
+    for (let i = defStart + 1; i < src.length; i++) {
+      if (/^\}/.test(src[i])) { defEnd = i; break }
+    }
+  }
+  must(defStart >= 0, 'C276：找不到 runFixture 定义体 —— 排除逻辑的锚点被删要红，不许静默放行')
+  const inDef = (i) => i >= defStart && i <= defEnd
+  const starts = []
+  src.forEach((l, i) => { if (/^\s*(?:check|slowCheck)\(/.test(l)) starts.push(i) })
+  const endMark = src.findIndex((l) => l.includes('// —— 汇总 ——'))
+  must(endMark > 0, 'C276：找不到汇总锚点，切块终点不可信')
+  const found = new Set()
+  let calls = 0
+  starts.forEach((s, k) => {
+    const e = k + 1 < starts.length ? starts[k + 1] : endMark
+    let hit = 0
+    for (let i = s; i < e; i++) {
+      if (inDef(i)) continue
+      hit += (src[i].match(/\b(?:spawnSync|execFileSync|runFixture)\(/g) || []).length
+    }
+    if (!hit) return
+    calls += hit
+    const m = /^\s*(?:check|slowCheck)\(\s*'([^']+)'/.exec(src[s])
+    must(m, `C276：L${s + 1} 的判据名解析不出来`)
+    const id = checkId(m[1])
+    must(id, `C276：L${s + 1} 的名字取不到编号：${m[1].slice(0, 40)}`)
+    found.add(id)
+  })
+  const missing = SLOW_CHECKS.filter((s) => !found.has(s))
+  const extra = [...found].filter((s) => !SLOW_CHECKS.includes(s))
+  must(missing.length === 0,
+    `C276：清单里 ${missing.length} 条在源码里不含子进程调用：${missing.slice(0, 5).join(',')}`)
+  must(extra.length === 0,
+    `C276：源码里 ${extra.length} 条含子进程调用却不在清单：${extra.slice(0, 5).join(',')}`)
+  return `双向差集都空：清单 ${SLOW_CHECKS.length} 条 / 源码 ${found.size} 条 / ${calls} 处子进程调用`
+})
+
+slowCheck('C277【主判据】不加 --fast 时仍是全量：默认路径无分档提示、一条不跳', () => {
+  // ① 真求值：默认路径的提示行必须是 null。
+  must(fastNoticeLine(0, 0, false) === null, 'C277：默认路径的提示行不是 null')
+  must(fastNoticeLine(3, 4, true) === '[--fast] 本次跳过 3 条含子进程判据，其余 4 条已跑',
+    'C277：active 提示行形态不对')
+  if (PROBE_CHILD) { lightSkip('C277'); return }
+  // ② 真跑双路径：默认无分档提示，且汇总通过数 === --verbose 逐条 PASS 行数（一条没跳）。
+  const lean = runVerify([])
+  const full = runVerify(['--verbose'])
+  must(lean.status === 0 && full.status === 0,
+    `C277：双路径真跑有非 0 退出（lean=${lean.status}, full=${full.status}）`)
+  const a = lean.stdout || '', b = full.stdout || ''
+  must(!a.includes('[--fast]') && !a.includes('[--only]'),
+    'C277：默认路径冒出了分档 / 过滤提示 —— 默认不再是全量')
+  const m = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(a)
+  const passLinesB = (b.match(/^PASS  /gm) || []).length
+  must(m && Number(m[1]) === passLinesB,
+    `C277：默认汇总通过 ${m && m[1]} ≠ --verbose 逐条 PASS ${passLinesB} —— 有判据被悄悄跳了`)
+  // ③ --fast 与默认确实不同：分档没生效时这条红。
+  const fast = runVerify(['--fast'])
+  must(fast.status === 0, 'C277：--fast 真跑非 0 退出')
+  const fm = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(fast.stdout || '')
+  must(fm && Number(fm[1]) < Number(m[1]),
+    'C277：--fast 与默认跑的条数一样 —— 分档没生效，或默认被跳过了')
+  return `默认 ${m[1]} 通过（全量、无分档提示）；--fast ${fm[1]} 通过，确实少跑`
+})
+
+// ── C281–C283 · issue #14（1028 段插入，判据号从 C281 起；C272–C277 已被 verify 三层占用）──
+// 夹具从 client.js 抠「原样函数体」在桩环境真求值：断最终值，不断 CSS 字面量 / 中间产物。
+function issue14ProbeJson() {
+  const r = runIssue14Probe()
+  must(r.status === 0, `探针 rc=${r.status}：${String(r.stderr || '').slice(0, 200)}`)
+  let j
+  try { j = JSON.parse(r.stdout) } catch {
+    throw new Error('探针没吐出 JSON：' + String(r.stdout || '').slice(0, 200))
+  }
+  must(j.cut && j.cut.missing.length === 0,
+    `client.js 里抠不到原样函数体（锚点被删/改名要红，不许静默放行）：${j.cut && j.cut.missing.join(',')}`)
+  return j
+}
+
+slowCheck('C281【主判据】issue #14 横幅起点：重排后内联 top 让开标题栏（三组变量场景）', () => {
+  const j = issue14ProbeJson()
+  must(j.tops && j.tops.length === 3, 'C281：三组变量场景没跑齐')
+  for (const t of j.tops) {
+    must(t.top === t.want,
+      `C281：${t.name} 重排后 el.style.top=${t.top}，应为 ${t.want}（内联覆盖没修或口径不对）`)
+    must(Number(t.start) === parseInt(t.want, 10),
+      `C281：${t.name} 起点函数算出 ${t.start}，与重排最终值不同源`)
+    must(t.second === (parseInt(t.want, 10) + 30) + 'px',
+      `C281：${t.name} 第二个横幅没从同一起点往下排：${t.second}`)
+  }
+  // 静态守卫在后：CSS 也得读变量，两处口径同源（只改一处会被 300ms 后的重排覆盖回去）。
+  const t = read('client.js')
+  must(/\[data-bl-overlay\]\{position:fixed;top:var\(--dsh-frame-overlay-top,/.test(t),
+    'C281：CSS 仍写死 top 或没读内核变量')
+  must(t.includes('let top = bannerTopStart(document, window)'),
+    'C281：relayoutBanners 没走同一个起点函数')
+  return '三组最终值 52/60/20px 全对；CSS 与内联重排同源'
+})
+
+slowCheck('C282【主判据】issue #14 /config 失败时横幅不许消失且必须给提示', () => {
+  const j = issue14ProbeJson()
+  const d = j.dismiss
+  must(d && d.length === 4, 'C282：四种服务端结果没跑齐')
+  const by = Object.fromEntries(d.map((x) => [x.mode, x]))
+  for (const m of ['okFalse', 'throw', 'null']) {
+    must(by[m] && by[m].result === 'kept' && by[m].gone === 0,
+      `C282：${m} 时横幅被关掉了（旧 bug：磁盘没写、刷新又回来）`)
+    must(by[m].fail === 1 && String(by[m].failMsg).length > 0,
+      `C282：${m} 时没给失败提示，用户看到的是静默`)
+  }
+  must(by.okTrue.result === 'gone' && by.okTrue.gone === 1 && by.okTrue.fail === 0,
+    'C282：ok:true 时横幅反而没消失')
+  const t = read('client.js')
+  must(t.includes('dismissHintForever(jpost, () => setDismissed(true), setHintErr)'),
+    'C282：「不再提示」按钮没接新函数')
+  must(!/await jpost\('\/config', \{ hintDismissed: true \}\)\s*setDismissed\(true\)/.test(t),
+    'C282：旧的「无条件消失」写法还在')
+  return 'okFalse / throw / null 三向保持且有提示；ok:true 才消失'
+})
+
+slowCheck('C283【主判据】issue #14 设置页能把 hintDismissed 写回 false 且横幅重新可见', () => {
+  const j = issue14ProbeJson()
+  const sa = j.showAgain, tg = j.toggle
+  must(sa.missing.ret === true, 'C283：仍有缺依赖时 showHintAgain 没返回 true')
+  must(sa.missing.calls.includes('visible=true') && sa.missing.calls.includes('dismissed=false'),
+    'C283：横幅没被复位到可见 —— 只加了写入点、没接线')
+  for (const k of ['none', 'bad', 'threw']) {
+    must(sa[k].ret === false, `C283：${k} 时不该强行显示横幅`)
+  }
+  must(tg.enable.posts.length === 1 && tg.enable.posts[0].body.hintDismissed === false,
+    'C283：开关打开时没写入 hintDismissed:false')
+  must(tg.enable.shown === 1 && tg.enable.done === 1,
+    'C283：写回 false 后没叫醒横幅，或没刷新设置页')
+  must(tg.disable.posts[0].body.hintDismissed === true && tg.disable.shown === 0,
+    'C283：开关关闭时写入值不对，或误叫醒横幅')
+  must(String(tg.rejected.err).length > 0 && tg.rejected.shown === 0,
+    'C283：服务端不确认时没报错，或仍叫醒了横幅')
+  const t = read('client.js')
+  must(t.includes("checked: st.ui?.hintDismissed !== true") && t.includes('缺依赖时显示顶部横幅'),
+    'C283：设置页「显示」区块里没有这个开关')
+  must(t.includes('__biliWatchShowHint'), 'C283：跨组件接线不存在')
+  must(read('index.js').includes('patch.hintDismissed = body.hintDismissed'),
+    'C283：后端 /config 不接受 hintDismissed')
+  return '写回 false + 叫醒横幅 + 服务端不确认不误显示，三向都对'
+})
+
+// ── C284–C286 · 第三层「修两个真 bug」（0750 段 §四；因 1028 插队，编号从 C284 起）──
+slowCheck('C284【主判据】--only C124b 能选中、C124 前缀不退化、W-07 也能选', () => {
+  if (PROBE_CHILD) { lightSkip('C284'); return }
+  const b = runVerify(['--only', 'C124b'])
+  must(b.status === 0,
+    `C284：--only C124b rc=${b.status}：${String(b.stderr || '').slice(0, 200)}`)
+  const ob = b.stdout || ''
+  must(/C124b/.test(ob), 'C284：--only C124b 输出里没点名 C124b')
+  const nb = /只跑了 (\d+) \/ (\d+) 条/.exec(ob)
+  must(nb && Number(nb[1]) >= 1, 'C284：--only C124b 一条都没跑')
+  const a = runVerify(['--only', 'C124'])
+  must(a.status === 0, `C284：--only C124 rc=${a.status}`)
+  const na = /只跑了 (\d+) \/ (\d+) 条/.exec(a.stdout || '')
+  must(na && Number(na[1]) >= Number(nb[1]),
+    `C284：--only C124 跑了 ${na && na[1]} 条，比 C124b 的 ${nb[1]} 还少（前缀语义退化）`)
+  const w = runVerify(['--only', 'W-07'])
+  must(w.status === 0,
+    `C284：--only W-07 rc=${w.status}：${String(w.stderr || '').slice(0, 200)}`)
+  must(/只跑了 1 \//.test(w.stdout || ''), 'C284：--only W-07 没精确选中那一条')
+  return `C124b ${nb[1]} 条 / C124 ${na[1]} 条（≥）/ W-07 1 条`
+})
+
+check('C285【主判据】matchOnly 保留字母后缀与 W- 编号，默认路径仍全选', () => {
+  must(matchOnly('C124b 读不出来必须变红', ['C124B']) === true, 'C285：C124b 精确没选中')
+  must(matchOnly('C124 读不出来…', ['C124B']) === false, 'C285：C124B 不该反过来选中 C124')
+  must(matchOnly('C124 读不出来…', ['C124']) === true
+    && matchOnly('C124b 读不出来必须变红', ['C124']) === true,
+    'C285：C124 前缀没同时选中 C124 与 C124b')
+  must(matchOnly('W-07 所有命令的 --out', ['W-07']) === true, 'C285：W-07 没被选中')
+  must(matchOnly('W-22 text/local 的 --format', ['W-07']) === false, 'C285：W-07 误选了 W-22')
+  must(matchOnly('C250 x', ['C24']) === false, 'C285：编号前缀口径退化')
+  must(matchOnly('版本号不是 0.2.22（P0：…）', ['C1']) === false, 'C285：中文名被 C 前缀选中')
+  must(matchOnly('C268【主判据】…', null) === true, 'C285：默认路径必须全选')
+  return '字母后缀 / W- 编号 / 前缀 / 中文名 / 默认全选 六向都对'
+})
+
+slowCheck('C286【主判据】--only 提示行分母与默认全量汇总行合计同源', () => {
+  if (PROBE_CHILD) { lightSkip('C286'); return }
+  const lean = runVerify([])
+  must(lean.status === 0, `C286：默认路径真跑 rc=${lean.status}`)
+  const m = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(lean.stdout || '')
+  must(m, 'C286：默认路径没有汇总行')
+  const sum = Number(m[1]) + Number(m[2]) + Number(m[3])
+  const none = runVerify(['--only', 'C999999'])
+  must(none.status === 1, 'C286：不存在的编号没 exit 1')
+  const d = /只跑了 (\d+) \/ (\d+) 条，其余 (\d+) 条未执行/.exec(none.stdout || '')
+  must(d, 'C286：--only 路径没有提示行')
+  must(Number(d[2]) === sum,
+    `C286：提示行分母 ${d[2]} ≠ 默认全量汇总合计 ${sum}（两处数字不同源）`)
+  must(Number(d[1]) + Number(d[3]) === Number(d[2]), 'C286：提示行自身不守恒')
+  const em = /共 (\d+) 条判据/.exec(none.stderr || '')
+  must(em && Number(em[1]) === sum,
+    `C286：报错行的「共 N 条」${em && em[1]} 与汇总合计 ${sum} 不同源`)
+  // 不写「extraUnits.length > 0」：VERIFY_ONLINE=1 时那两条顶层 skip 会换成
+  //   if (online) check(...)，extraUnits 本来就该是 0，写 >0 会让联网场景必然红
+  //   （条件性的必然红比永远绿更坏，下一个人会去调阈值或删掉它）。
+  //   上面「三处同源」这条真跑恒等式已经能抓住「登记断了」—— 扰动 P2 实证：
+  //   去掉 extraUnits.push 后分母 283 ≠ 汇总 285，第一条断言就红，不需要再叠一条。
+  return `提示行分母 = 报错行 = 默认汇总合计 = ${sum}（顶层独立 skip ${extraUnits.length} 条已登记）`
+})
+
+// ── C287-C289 · clean --keep-source：承诺与行为不许相反 ────────────────
+// 取证夹具只给「真 CLI 原始输出 + 逐项快照 + 副本树摘守卫的原始输出」，
+// 结论全部由下面三条判据自己算：夹具自述的「没删」不算数，快照逐项一致才算数。
+// PROBE_CHILD 下走轻量分支，与 C286 同口径：C272/C274/C277/C286 起的 verify 子进程
+//   是为了验输出与分母，不是重验这三条的行为；无该标记的正常全量与 --only 路径都真跑。
+slowCheck('C287【主判据】clean --all --keep-source 必须 rc=2 且磁盘一个字节没变', () => {
+  if (PROBE_CHILD) { lightSkip('C287'); return }
+  const r = c287()
+  must(r.status === 0 && r.json, `C287 夹具自身失效（rc=${r.status}）：${r.raw.slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C287 实验没跑起来：${j.error}`)
+  const K = j.keep
+  must(K && K.before && K.after && K.cli, 'C287 拒绝态的原始输出或快照没给齐')
+  must(!K.before.__error && !K.after.__error,
+    `C287 快照自身读失败：${K.before.__error || K.after.__error}`)
+  const gen = j.stat?.genFiles || []
+  must(gen.length === 2 && gen.every((f) => K.before[f]?.t === 'f'),
+    'C287 哨兵原片没造出来，后面的「不许删」没有意义')
+
+  // ① 行为断言在前：rc=2、点名参数、不许退化成「已按忽略处理」后照删。
+  must(K.cli.rc === 2,
+    `C287 clean --all --keep-source 没被拒绝（rc=${K.cli.rc}）：${K.cli.out.slice(0, 160)}`)
+  must(/拒绝执行/.test(K.cli.err) && K.cli.err.includes('--keep-source'),
+    `C287 拒绝原因没写清：${K.cli.err.slice(0, 200)}`)
+  must(!K.cli.err.includes('已按忽略处理'), 'C287 拒绝的同时还打了「已按忽略处理」')
+  must(!/已清理/.test(K.cli.out), 'C287 输出里出现真删回显 —— 光看 rc=2 会被文案骗')
+
+  // ② 磁盘零变化：类型 / 大小 / mtime / 内容哈希逐项一致。
+  const diff = snapDiff(K.before, K.after)
+  must(diff.length === 0, `C287 拒绝了却还是动了磁盘：${diff.slice(0, 8).join(' / ')}`)
+  must(gen.every((f) => K.after[f]?.t === 'f' && K.after[f].h === K.before[f].h),
+    'C287 gen-<hash> 下的原片被改写或删掉')
+  return `rc=2、点名 --keep-source、前后快照 ${Object.keys(K.before).length} 项全等，两个原片哈希不变`
+})
+
+slowCheck('C288【主判据】不带 --keep-source 时 clean --all 确实删掉原片：双向 + 带值写法 + --help 优先', () => {
+  if (PROBE_CHILD) { lightSkip('C288'); return }
+  const j = c287().json
+  must(j && !j.error, 'C288 夹具没跑起来')
+  const P = j.plain
+  const E = j.eqForm
+  const H = j.help
+  const gen = j.stat?.genFiles || []
+  const USER = j.stat?.user
+  must(P && E && H && USER, 'C288 双向对照 / 带值 / --help 三组原始输出没给齐')
+  must(gen.every((f) => P.before[f]?.t === 'f'), 'C288 双向树没造出原片')
+
+  // ① 双向：不带 keep-source 必须真删，防用「一律不删」蒙混过关。
+  must(P.cli.rc === 0,
+    `C288 不带 keep-source 的 clean --all 失败（rc=${P.cli.rc}）：${P.cli.err.slice(0, 160)}`)
+  const pDiff = snapDiff(P.before, P.after)
+  must(pDiff.length > 0, 'C288 双向对照没删任何东西 —— 拒绝闸可能把清理能力整体关了')
+  must(gen.every((f) => !(f in P.after)), 'C288 双向对照没删掉 gen-<hash> 下的两个原片')
+  must(P.after[USER]?.h === P.before[USER]?.h, 'C288 双向对照把顶层用户文件删了或改了')
+  must(!Object.keys(P.after).some((k) => k.startsWith(j.stat.bv)),
+    'C288 双向对照连 BV 目录都没清，实验可能是空转')
+
+  // ② 带值写法同样拒绝、同样零变化（防 --keep-source=1 绕过）。
+  must(E.cli.rc === 2 && snapDiff(E.before, E.after).length === 0,
+    'C288 --keep-source=1 绕过了拒绝或动了磁盘')
+  // ③ --help 优先：带 --help 只打帮助，不拒绝也不删（与 C236 的出口顺序一致）。
+  must(H.rc === 0 && /用法:/.test(H.out) && !/拒绝执行/.test(H.err),
+    'C288 clean --help --keep-source 没有只打帮助')
+  return `双向 rc=0 真删 ${pDiff.length} 项 / 两个原片消失；带值写法 rc=2；--help 仍只打帮助`
+})
+
+slowCheck('C289【主判据】拒绝判定是纯函数 / 摘掉守卫必须重新真删 / HELP 与 README 同步', () => {
+  if (PROBE_CHILD) { lightSkip('C289'); return }
+  const j = c287().json
+  must(j && !j.error, 'C289 夹具没跑起来')
+  const p = j.pure
+  const M = j.mutated
+  const gen = j.stat?.genFiles || []
+
+  // ① 真 lib 纯函数：期望写在调用点，不拿被测函数读的那张表当答案。
+  must(typeof p.cleanKeep === 'string' && p.cleanKeep.includes('拒绝') && p.cleanKeep.includes('--keep-source'),
+    'C289 clean 带 keep-source 没给拒绝原因')
+  must(p.cleanNoFlag === null, 'C289 没带参数也拒绝，属于误伤')
+  must(p.viewKeep === null, 'C289 非删除类命令被这条闸拦了')
+  must(typeof p.futureKeep === 'string', 'C289 将来新增的删除类命令不会被这条闸拦住')
+  must(p.futureNoFlag === null, 'C289 将来新增的删除类命令不带参数也被拒了')
+  must(typeof p.futureEq === 'string', 'C289 --keep-source=1 绕过了纯函数判定')
+  must(p.supported === null, 'C289 真把 keep-source 写进 accepts 的命令仍被拒')
+
+  // ② 副本树反向证据：摘掉拒绝判定，同一组实验必须重新变成「零警告后照删」。
+  must(M?.built === true, 'C289 副本守卫锚点没命中（实现改了要同步夹具锚点）')
+  must(M.cli.rc !== 2, 'C289 摘掉守卫后仍拒绝 —— 扰动没真打坏，判据验不到守卫')
+  const mDiff = snapDiff(M.before, M.after)
+  must(mDiff.length > 0, 'C289 摘掉守卫后没删东西')
+  must(gen.every((f) => !(f in M.after)), 'C289 摘掉守卫后原片没被删 —— 事故没复现')
+  must(!/本命令不接受/.test(M.cli.err) && !/拒绝执行/.test(M.cli.err),
+    'C289 副本形态不该有任何提示，正是「零警告后照删」')
+
+  // ③ 静态守卫最后：接线、出口、文案同步（不许只靠真跑，防有人把守卫挪走）。
+  const params = read('lib/params.mjs')
+  const look = read('tools/look.mjs')
+  const readme = read('README.md')
+  must(/export function unsupportedKeepSource\(cmd, argv = \[\], commands = COMMANDS\)/.test(params),
+    'C289 拒绝判定不是纯函数或没留可注入的命令表参数')
+  must(look.includes('const KEEP_SOURCE_REJECT = unsupportedKeepSource(cmd, argv)'),
+    'C289 分派前没接拒绝判定')
+  must(/ARG_ERRORS\.length \|\| DRY_RUN_REJECT \|\| KEEP_SOURCE_REJECT/.test(look),
+    'C289 拒绝判定没进 rc=2 那条分支')
+  must(look.includes('!KEEP_SOURCE_REJECT'), 'C289 拒绝时没抑制「已按忽略处理」那行')
+  must(/clean 不接受这个参数/.test(look), 'C289 HELP 的 --keep-source 段没同步')
+  must(readme.includes('`clean` 不接受 `--keep-source`'), 'C289 README 的 clean 行没同步')
+  return `纯函数 7 组齐；副本摘守卫后 rc=${M.cli.rc} 且真删 ${mDiff.length} 项；HELP/README/出口接线在位`
+})
+
+// ── C290-C292 · flag() 与 opt() 同源：--dry-run=1 不许静默失效后真删 ──────
+// 取证夹具只给「真 CLI 原始输出 + 逐项快照 + 副本树改回 argv.includes 的原始输出 +
+// flagFromArgv 真求值」；期望值由判据从干跑前快照独立算，不采信夹具给的任何计数。
+slowCheck('C290【主判据】clean --dry-run=1 必须 rc=0 且一个字节没删（flag 与 opt 同源）', () => {
+  const r = c290()
+  must(r.status === 0 && r.json, `C290 夹具自身失效（rc=${r.status}）：${r.raw.slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C290 实验没跑起来：${j.error}`)
+  const E = j.eqOne
+  const P = j.plain
+  const M = j.mutated
+  const own = j.stat?.own || []
+  const gen = j.stat?.genFiles || []
+  const USER = j.stat?.user
+  must(E && P && M && E.before && E.after && E.cli && USER, 'C290 原始输出 / 快照 / 副本树没给齐')
+  must(!E.before.__error && !E.after.__error, `C290 快照自身读失败：${E.before.__error || E.after.__error}`)
+
+  // ① 期望值从「干跑前快照」独立算，不采信 CLI 自报的数字。
+  const expectedFiles = own.reduce((n, p) => n + filesIn(E.before, p).length, 0)
+  const expectedBytes = own.reduce((n, p) => n + sumBytes(E.before, p), 0)
+  must(own.length === 3 && expectedFiles === 4 && expectedBytes > 0,
+    `C290 哨兵树形态不对（${own.length} 项 / ${expectedFiles} 文件 / ${expectedBytes} 字节），「零删除」失去意义`)
+  must(gen.length === 2 && gen.every((f) => E.before[f]?.t === 'f'), 'C290 gen-<hash> 原片没造出来')
+  must(E.before['login-qr.png']?.t === 'f', 'C290 login-qr.png 没造出来')
+
+  // ② 磁盘证据放在最前：把 flag 改回 argv.includes 时，第一条红的必须是「真删了 N 个文件」
+  //   这个带数字的断言，不许先红在「没打干跑计划」那种文案判断上。
+  const diff = snapDiff(E.before, E.after)
+  const goneFiles = Object.keys(E.before).filter((k) => E.before[k]?.t === 'f' && !(k in E.after)).length
+  must(diff.length === 0,
+    `C290 --dry-run=1 真删了 ${goneFiles} 个文件 / ${diff.length} 项快照差异（flag() 没认 = 形态）：${diff.slice(0, 6).join(' / ')}`)
+  must(gen.every((f) => E.after[f]?.h === E.before[f]?.h), 'C290 gen-<hash> 两个原片哈希变了')
+  must(E.after['login-qr.png']?.h === E.before['login-qr.png']?.h, 'C290 login-qr.png 被删或改写')
+  must(E.after[USER]?.h === E.before[USER]?.h, 'C290 顶层用户文件被误删或改写')
+
+  // ③ 输出断言在后：rc=0、输出是干跑、点名了会删什么、没有真删回显。
+  must(E.cli.rc === 0, `C290 clean --dry-run=1 rc≠0：${E.cli.rc}；${E.cli.out.slice(0, 160)}`)
+  const head = /\[dry-run\] 本次将删除 (\d+) 项 \/ (\d+) 个文件 \/ (\d+) 字节/.exec(E.cli.out)
+  must(Boolean(head), `C290 --dry-run=1 没打干跑计划：${E.cli.out.slice(0, 240)}`)
+  must(+head[1] === own.length && +head[2] === expectedFiles && +head[3] === expectedBytes,
+    `C290 干跑计数与快照不符：报 ${head.slice(1, 4).join('/')}，实际 ${own.length}/${expectedFiles}/${expectedBytes}`)
+  must(own.every((n) => E.cli.out.includes(n)), 'C290 干跑没点名哨兵，可能是空转')
+  must(/没有删除任何内容/.test(E.cli.out), 'C290 没写「一个文件都没删」')
+  must(!/已清理/.test(E.cli.out), 'C290 出现真删回显 —— 光看 rc=0 会被文案骗')
+  // 独立形态仍是干跑（防「只修 = 形态、把独立形态改坏」）。
+  must(P.cli.rc === 0 && snapDiff(P.before, P.after).length === 0 && /\[dry-run\]/.test(P.cli.out),
+    'C290 独立形态 clean --dry-run 不再预演')
+
+  // ④ 副本树反向证据：把 flag() 改回 argv.includes，--dry-run=1 必须重新真删。
+  must(M.built === true, 'C290 副本 flag 锚点没命中（实现改了要同步夹具锚点）')
+  const mDiff = snapDiff(M.before, M.after)
+  const mGone = Object.keys(M.before).filter((k) => M.before[k]?.t === 'f' && !(k in M.after)).length
+  must(mDiff.length > 0 && mGone === expectedFiles && /已清理/.test(M.cli.out),
+    `C290 副本把 flag 改回 argv.includes 后没真删（${mGone} 文件 / ${mDiff.length} 项）—— 扰动没打坏`)
+  return `--dry-run=1 预演 ${own.length} 项 / ${expectedFiles} 文件 / ${expectedBytes} 字节，前后 ${Object.keys(E.before).length} 项快照全等；副本改回 argv.includes 真删 ${mGone} 文件`
+})
+
+slowCheck('C291【主判据】clean --dry-run=0 必须真删（防一律当干跑蒙混）', () => {
+  const j = c290().json
+  must(j && !j.error, 'C291 夹具没跑起来')
+  const Z = j.eqZero
+  const F = j.eqFalse
+  const own = j.stat?.own || []
+  const gen = j.stat?.genFiles || []
+  const USER = j.stat?.user
+  must(Z && F && USER, 'C291 双向对照的两组原始输出没给齐')
+
+  // ① --dry-run=0 必须真删 3 项 / 4 文件，且不带 [dry-run] 行。
+  must(Z.cli.rc === 0, `C291 clean --dry-run=0 rc≠0：${Z.cli.rc}；${Z.cli.err.slice(0, 160)}`)
+  must(!/\[dry-run\]/.test(Z.cli.out) && /已清理/.test(Z.cli.out),
+    'C291 --dry-run=0 仍被当成干跑，或没打真删回显')
+  const goneFiles = own.reduce((n, p) => n + filesIn(Z.before, p).filter(([k]) => !(k in Z.after)).length, 0)
+  must(goneFiles === 4, `C291 --dry-run=0 真删 ${goneFiles} 个文件（应 4 个）`)
+  must(own.every((p) => !Object.keys(Z.after).some((k) => k === p || k.startsWith(p + '/'))),
+    'C291 三项哨兵没被清掉')
+  must(Z.after[USER]?.h === Z.before[USER]?.h, 'C291 顶层用户文件被误删或改写')
+  must(gen.every((f) => Z.after[f]?.h === Z.before[f]?.h), 'C291 常规 clean 不该动 gen-<hash> 原片')
+  // ② --dry-run=false 同族：FALSY 值也走真删。
+  must(F.cli.rc === 0 && !/\[dry-run\]/.test(F.cli.out) && snapDiff(F.before, F.after).length > 0,
+    'C291 --dry-run=false 没真删')
+  return `--dry-run=0 真删 ${own.length} 项 / ${goneFiles} 文件，无 [dry-run] 行；=false 同族；用户文件与 gen 原片未动`
+})
+
+slowCheck('C292【主判据】flagFromArgv 可注入 argv：独立 / =1 / =0 / 不传 / FALSY 五值', () => {
+  const j = c290().json
+  must(j && !j.error, 'C292 夹具没跑起来')
+  const p = j.pure
+  must(p.bare === true && p.eqOne === true && p.eqZero === false && p.none === false,
+    'C292 四组基线不对（--full / --full=1 / --full=0 / 不传）')
+  must(p.eqFalse === false && p.eqNo === false && p.eqOff === false && p.eqEmpty === false,
+    'C292 FALSY 值表没生效（false / no / off / 空值）')
+  must(p.eqYes === true, 'C292 非空非 FALSY 值应判 true')
+  must(p.otherName === false, 'C292 别的 flag 名不该命中')
+
+  // 静态守卫在后：可注入 argv、flag() 走同源纯函数、两处注释互相引用。
+  const cli = read('tools/cli-io.mjs')
+  must(/function flagFromArgv\(list, name\)/.test(cli), 'C292 flagFromArgv 不是可注入 argv 的纯函数')
+  must(cli.includes('const flag = (name) => flagFromArgv(argv, name)'), 'C292 flag() 没走同源纯函数')
+  must(cli.includes("new Set(['', '0', 'false', 'no', 'off'])"), 'C292 FALSY 值表被改坏')
+  must(/C290：布尔开关的同源实现见下面的 flagFromArgv/.test(cli), 'C292 opt 与 flag 的注释没互相引用')
+  return '纯函数 10 组齐；可注入 argv、flag() 同源、FALSY 表与注释引用在位'
+})
+
+// ── C293 · 两道包内容面闸递归展开目录项（1603 段必修 2） ──────────────────
+// 行为断言在前：夹具给的是两道闸在四棵最小包树上的原始 rc 与输出，夹具自述不算数；
+// 点名 / 退出码 / complain / junction 全部由下面自己算。静态守卫放最后。
+slowCheck('C293【主判据】files 目录项递归展开：nested 点名 / 平铺仍扫到 / 干净树 rc=0', () => {
+  const r = c293()
+  must(r.status === 0 && r.json, `C293 夹具自身失效（rc=${r.status}）：${r.raw.slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C293 实验没跑起来：${j.error}`)
+  const T = j.trees
+  must(T && T.dirty && T.clean && T.deep && T.link, 'C293 四棵包树没造齐')
+  const NESTED = 'lib/sub/leak.txt'
+  const FLAT = 'lib/top-leak.txt'
+  const GATES = ['leak', 'text']
+
+  // ① 前提：平铺必须被两闸点名。哨兵串失效时这条先红，免得后面「nested 没点名」
+  //    被误读成「递归没生效」——其实是整道闸都没在扫。
+  for (const g of GATES) {
+    const d = T.dirty[g]
+    must(d && d.rc !== 0, `C293 dirty/${g} 没报红（rc=${d && d.rc}），哨兵前提不成立`)
+    must(d.out.includes(FLAT), `C293 dirty/${g} 连平铺文件 ${FLAT} 都没点名（哨兵失效）`)
+  }
+
+  // ② 主断言：递归后子目录里的文本文档必须被两闸点名（1603 段的三向之一）。
+  for (const g of GATES) {
+    must(T.dirty[g].out.includes(NESTED),
+      `C293 dirty/${g} 没点名嵌套文件 ${NESTED}（目录项只展开了一层）`)
+  }
+
+  // ③ 反向：干净树必须 rc=0，防「递归后一律报红」蒙混过关。
+  for (const g of GATES) {
+    must(T.clean[g].rc === 0,
+      `C293 clean/${g} 干净树 rc=${T.clean[g].rc}（不许一律红）：${T.clean[g].out.slice(-200)}`)
+  }
+
+  // ④ 另三条硬约束也在行为层各验一次：目录没建进 ABSENT 不炸 / 深度超限记 complain
+  //    不静默截断 / junction 不跟出去。junction 本机造不出来时明说未核，不静默当通过。
+  for (const g of GATES) {
+    must(T.dirty[g].out.includes('not-created'),
+      `C293 dirty/${g} 没把「files 里写了但目录没建」记进 ABSENT`)
+  }
+  for (const g of GATES) {
+    must(/目录层数超过 8|可能不是 package layout/.test(T.deep[g].out),
+      `C293 deep/${g} 深度超限没记 complain，被静默截断了`)
+  }
+  if (T.link.link.created) {
+    for (const g of GATES) {
+      must(!T.link[g].out.includes('outside-leak.txt'),
+        `C293 link/${g} 跟着 junction 扫到树外文件了（没用 lstatSync 跳过）`)
+      must(T.link[g].rc === 0, `C293 link/${g} 跳过 junction 后仍 rc=${T.link[g].rc}`)
+    }
+  }
+
+  // 静态守卫在后：两处实现都得是 lstatSync + 深度上限，防「只在夹具里造对」。
+  const leak = read('scripts/check-release-leak.mjs')
+  const text = read('scripts/check-public-text.mjs')
+  must(/if \(st\.isSymbolicLink\(\)\) return/.test(leak) && /lstatSync\(full\)/.test(leak),
+    'C293 check-release-leak 没用 lstatSync 跳过符号链接')
+  must(/if \(st\.isSymbolicLink\(\)\) return/.test(text) && /lstatSync\(full\)/.test(text),
+    'C293 check-public-text 没用 lstatSync 跳过符号链接')
+  must(/MAX_DEPTH/.test(leak) && /MAX_PACKAGE_DEPTH/.test(text), 'C293 两道闸缺深度上限')
+  return `两闸点名 ${NESTED} + ${FLAT}、干净树双 rc=0、ABSENT/complain/lstat 三条在位${T.link.link.created ? '' : `（junction 本机造不出：${T.link.link.reason}，该项未核）`}`
+})
+
+// ── C294-C295 · 轻量分支记 SKIP + 元判据三向守恒（1650 段必修 3） ────────
+// 行为断言在前：两个方向都用真子进程输出，不读源码文本猜「应该记什么」。
+slowCheck('C294【主判据】轻量分支双向：PROBE_CHILD 记 SKIP / 不设时真跑记 PASS', () => {
+  const child = runVerifyEnv(['--only', 'C287'], true)
+  const father = runVerifyEnv(['--only', 'C287'], false)
+  const co = `${child.stdout || ''}${child.stderr || ''}`
+  const fo = `${father.stdout || ''}${father.stderr || ''}`
+  must(child.status === 0, `C294 设 env 的子进程 rc=${child.status}：${co.slice(-300)}`)
+  must(/^SKIP  C287/m.test(co), `C294 设 env 后 C287 没记 SKIP：${co.slice(0, 300)}`)
+  must(co.includes(LIGHT_SKIP_DETAIL), 'C294 设 env 后 SKIP 的 detail 没写「本次未真跑」')
+  must(!/^PASS  C287/m.test(co), 'C294 设 env 后 C287 仍记了 PASS（假绿没修掉）')
+  must(father.status === 0, `C294 不设 env 的子进程 rc=${father.status}：${fo.slice(-300)}`)
+  must(/^PASS  C287/m.test(fo), 'C294 不设 env 时 C287 没真跑记 PASS')
+  must(/前后快照/.test(fo), 'C294 不设 env 时 C287 的取证 detail 没出来（可能没真跑夹具）')
+  must(!/^SKIP  C287/m.test(fo), 'C294 不设 env 时 C287 混进了 SKIP')
+  return '设 env → SKIP 且点名未真跑；不设 env → PASS 且带前后快照，双向都成立'
+})
+
+slowCheck('C295【主判据】元判据解析子进程输出时 SKIP/PASS/FAIL 三向守恒', () => {
+  // 方向二（任何路径都跑，且不会自举递归）：不设 env 跑三条重夹具判据。
+  //   两条路都要守恒；「SKIP 数里不许混进这 9 条」由「不出现轻量 detail + 汇总 SKIP=0」守着。
+  const plain = runVerifyEnv(['--only', 'C287,C288,C289'], false)
+  const po = `${plain.stdout || ''}${plain.stderr || ''}`
+  must(plain.status === 0, `C295 方向二 rc=${plain.status}：${po.slice(-300)}`)
+  const pm = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(po)
+  must(pm && Number(pm[1]) === 3 && Number(pm[2]) === 0 && Number(pm[3]) === 0,
+    `C295 方向二：不设 env 的三条没全真跑（汇总 ${pm && pm.slice(1).join('/')}）`)
+  must(!po.includes(LIGHT_SKIP_DETAIL), 'C295 方向二：不设 env 却出现轻量分支 SKIP 明细')
+  const pPass = (po.match(/^PASS  /gm) || []).length
+  const pSkip = (po.match(/^SKIP  /gm) || []).length
+  const pFail = (po.match(/^FAIL  /gm) || []).length
+  must(pPass + pSkip + pFail === 3,
+    `C295 方向二：逐行三向 PASS/FAIL/SKIP ${pPass}/${pFail}/${pSkip} 合计 ≠ 3（不守恒）`)
+
+  // 方向一（只在父进程做）：runVerify([]) 是元判据的取证子进程，一律带 PROBE_CHILD=1。
+  //   在取证子进程里再调它会自举递归 —— 这不是「把 SKIP 排除在证据外」，是取证链的层次。
+  if (PROBE_CHILD || process.env.BW_VERIFY_C271_CHILD === '1') {
+    return '方向二 3 条全真跑且三向守恒；方向一在父进程取证（本进程是取证子进程，跳过防自举）'
+  }
+  const probe = runVerify([])
+  const o = `${probe.stdout || ''}${probe.stderr || ''}`
+  must(probe.status === 0, `C295 方向一 rc=${probe.status}：${o.slice(-300)}`)
+  const m = /(\d+) 通过 \/ (\d+) 失败 \/ (\d+) 跳过/.exec(o)
+  must(m, 'C295 方向一：取证子进程没有汇总行')
+  const P = Number(m[1]), F = Number(m[2]), S = Number(m[3])
+  const folded = /^\[(\d+) 条 PASS 未列明细，加 --verbose 看\]$/m.exec(o)
+  const passLines = (o.match(/^PASS  /gm) || []).length
+  const skipLines = (o.match(/^SKIP  /gm) || []).length
+  const failLines = (o.match(/^FAIL  /gm) || []).length
+  const passTotal = passLines + (folded ? Number(folded[1]) : 0)
+  must(passTotal === P, `C295 方向一：逐行 PASS ${passLines} + 折叠 ${folded ? folded[1] : 0} ≠ 汇总 ${P}`)
+  must(skipLines === S && failLines === F,
+    `C295 方向一：逐行 SKIP/FAIL ${skipLines}/${failLines} ≠ 汇总 ${S}/${F}`)
+  // 汇总后的「跳过明细」块会把同一句 detail 再打一遍，裸文本数会得到 18 条。
+  //   只认逐条结果行（行首 SKIP/PASS）：既数得准，也保住「不许记成 PASS」这一半。
+  const allLight = o.split('\n').filter((l) => l.includes(LIGHT_SKIP_DETAIL))
+  const lightLines = allLight.filter((l) => /^SKIP  /.test(l))
+  const lightOnPass = allLight.filter((l) => /^PASS  /.test(l))
+  must(lightLines.length === 9,
+    `C295 方向一：轻量分支 SKIP 行 ${lightLines.length} 条 ≠ 9（跳过明细块的重复行不算）`)
+  must(lightOnPass.length === 0, 'C295 方向一：轻量分支里混进了 PASS 行（又记成通过）')
+  // 判据单元总数不许取「本条执行到这一行时」的 allNames.length：check() 是边注册边跑，
+  //   本条之后再新增的判据（1905 轮 C296/C297）此刻还没登记，1905 全量实测 296 ≠ 294 就是这个坑。
+  //   与 C275/C286 同源：另起一个 --only 不存在编号的子进程，从它的报错分母取全集；
+  //   它数的是「注册单元数」，与取证子进程汇总的「执行结果合计 P+F+S」两次独立采集，不自证。
+  const none = runVerify(['--only', 'C999999'])
+  must(none.status === 1, `C295 方向一：全集分母取证 rc=${none.status}（应为 1）`)
+  const no = `${none.stdout || ''}${none.stderr || ''}`
+  const totalM = /共 (\d+) 条判据/.exec(no)
+  must(totalM, `C295 方向一：拿不到判据单元总数：${no.slice(-300)}`)
+  const total = Number(totalM[1])
+  must(P + F + S === total, `C295 方向一：汇总合计 ${P + F + S} ≠ 判据单元总数 ${total}`)
+  // 把「子进程 PASS 数」与「父进程判据单元数」分开记：差值必须正好是那 9 条 SKIP。
+  const baselineSkip = S - lightLines.length
+  const diff = total - P - F - baselineSkip
+  must(diff === 9,
+    `C295：父进程判据单元 ${total} − 子进程 PASS ${P} − FAIL ${F} − 基线 SKIP ${baselineSkip} = ${diff} ≠ 9 条 SKIP`)
+  return `方向一 P/F/S ${P}/${F}/${S} 三向守恒、9 条轻量全记 SKIP、差值 ${diff}；方向二 3 条全 PASS 且守恒`
+})
+
+// ── C296 · 两道闸深度超限不许假绿（1905 段 P1）───────────────────────────
+// 行为断言在前：四棵完整包树真跑两道闸，夹具只交原始 rc 与输出，结论全在这里算。
+//   「同源」只针对深度超限这一类；扫到脏东西时两闸历来是 2/1，不要求数值相等。
+//   完整树（README / look.mjs / description 齐）是前提，否则 public-text 会因别的
+//   incomplete 也红，控制组与同源都会变成凑出来的假绿。
+slowCheck('C296【主判据】深度超限不许假绿：两闸 rc≠0 且点名 / 8 层内控制组 rc=0 / 两闸同源', () => {
+  const r = c296()
+  must(r.status === 0 && r.json, `C296 夹具自身失效（rc=${r.status}）：${r.raw.slice(0, 400)}`)
+  const j = r.json
+  must(!j.error, `C296 实验没跑起来：${j.error}`)
+  const T = j.trees
+  must(T && T.deepDirty && T.deepClean && T.shallowClean && T.shallowDirty, 'C296 四棵包树没造齐')
+  const DEEP = '目录展开异常'
+  const PASS_LEAK = '✓ 敏感信息扫描通过'
+  const PASS_TEXT = '✓ 硬闸全过'
+
+  // ① 主断言：9 层树（深层塞了真泄漏串）两闸都必须红、点名「目录展开异常」、不许说通过。
+  for (const g of ['leak', 'text']) {
+    const d = T.deepDirty[g]
+    must(d.rc !== 0, `C296 deepDirty/${g} 深度超限仍 rc=${d.rc}（假绿没修掉）`)
+    must(d.out.includes(DEEP), `C296 deepDirty/${g} 没点名「${DEEP}」：${d.out.slice(-250)}`)
+    must(!d.out.includes(g === 'leak' ? PASS_LEAK : PASS_TEXT),
+      `C296 deepDirty/${g} 仍输出「通过」字样，与 rc≠0 打架`)
+  }
+
+  // ② 两闸同源：同一个 9 层树，rc 必须数值一致且都不为 0（选的是都 rc=2）。
+  for (const name of ['deepDirty', 'deepClean']) {
+    const L = T[name].leak.rc, X = T[name].text.rc
+    must(L === X && L !== 0,
+      `C296 ${name} 两闸深度超限 rc=${L}/${X} 不同源（不许一红一绿）`)
+  }
+
+  // ③ 没扫全就红，与树里有没有泄漏无关：防「只在有泄漏时才红」那种半修。
+  must(T.deepClean.leak.out.includes(DEEP) && T.deepClean.text.out.includes(DEEP),
+    'C296 deepClean 没把干净的深层子树记成未扫全')
+
+  // ④ 反向控制：8 层以内干净树两闸 rc=0 且真说通过，防「一律不通过」蒙混。
+  must(T.shallowClean.leak.rc === 0 && T.shallowClean.text.rc === 0,
+    `C296 shallowClean 控制组 rc=${T.shallowClean.leak.rc}/${T.shallowClean.text.rc}（不许一律红）`)
+  must(T.shallowClean.leak.out.includes(PASS_LEAK) && T.shallowClean.text.out.includes(PASS_TEXT),
+    'C296 shallowClean 控制组没说通过（控制组不许是写死的）')
+
+  // ⑤ 扫描面真有效：8 层以内塞真泄漏串，两闸都要红且点名浅层文件。
+  for (const g of ['leak', 'text']) {
+    const d = T.shallowDirty[g]
+    must(d.rc !== 0 && d.out.includes('lib/top.txt'),
+      `C296 shallowDirty/${g} 没点名浅层泄漏文件（rc=${d.rc}），哨兵前提不成立`)
+  }
+
+  // 静态守卫在后：不许靠改阈值把洞藏深；两边的非零退出分支都得在。
+  const leak = read('scripts/check-release-leak.mjs')
+  const text = read('scripts/check-public-text.mjs')
+  must(/const MAX_DEPTH = 8/.test(leak) && /const MAX_PACKAGE_DEPTH = 8/.test(text),
+    'C296 深度上限被改了（不许靠调阈值糊弄）')
+  const complainBlocks = leak.match(/if \(COMPLAIN\.length\) \{[\s\S]*?\n\}/g) || []
+  must(complainBlocks.some((b) => b.includes('process.exit(2)') && b.includes('这些子树没扫')),
+    'C296 check-release-leak 的 COMPLAIN 红段没走 exit(2) 或没说清没扫了什么')
+  must(/if \(incomplete\.length > 0\) process\.exit\(pkg\.complain\.length > 0 \? 2 : 1\)/.test(text),
+    'C296 check-public-text 的深度超限分支没走 exit(2)，或把所有「未扫全」一起改成 2（动了 C191 的语义）')
+  return `9 层树两闸 rc=${T.deepDirty.leak.rc}/${T.deepDirty.text.rc} 同源且点名未扫；8 层控制组双 rc=0；浅层哨兵两闸点名 lib/top.txt`
+})
+
+// ── C297 · 文案终审：事实说反的旧串不许回来（1905 段 §三）─────────────────
+// 断的是用户可见句子本身，不是规范文档里的措辞。零命中类断言必须配正向要求，
+// 否则「把整段提示删光」也会绿 —— 那是比旧串更坏的假绿。
+check('C297【主判据】下载提示不许再说「保持面板打开」：旧串零命中 + 真事实在位 + 保存报错改书面语', () => {
+  const ui = read('client.js')
+  const idx = read('index.js')
+  // ① R5 事实：关面板不中断，退出宿主才中断。旧前提不许回来。
+  must(!ui.includes('保持面板打开'),
+    'C297 client.js 又出现「保持面板打开」—— 关面板不中断，这个前提不存在')
+  // ② 正向：四处下载提示都得给真事实，防「一删了之」把提示也删没。
+  const truth = (ui.match(/退出宿主会中断/g) || []).length
+  must(truth >= 4,
+    `C297 只有 ${truth} 处写出「退出宿主会中断」（应 ≥4：两处已开始、一处已启动 N 个、一处依赖行说明）`)
+  // ③ 事实来源必须在代码里核得到，不许文案自己编前提（R5：每个前提有唯一代码来源）。
+  must(/KILL_ON_JOB_CLOSE/.test(idx) && /宿主一退出|宿主一停/.test(idx),
+    'C297 index.js 里 Job Object / 宿主退出回收整棵树的代码依据不在了，文案事实来源断了')
+  // ④ R1 书面语：「失败」是禁用词，改后不许新旧并存。
+  //    注释里「清理规则保存失败」「保存失败用户完全无感」是开发态描述、不带冒号，不算用户可见句子。
+  must(!ui.includes('保存失败：'),
+    'C297 client.js 里还有「保存失败：」旧串（R1 禁用「失败」→「无法…」）')
+  must((ui.match(/无法保存：/g) || []).length >= 8,
+    'C297 「无法保存：」没接上 8 处保存报错，或只改了一半造成新旧并存')
+  return `旧串「保持面板打开」「保存失败：」零命中；${truth} 处写明退出宿主会中断；8 处保存报错统一为「无法保存：」`
+})
+
+// —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
+// C247：这一整块只在 --only 时存在。未跑提示走 stdout、每次都在（包括一条都没匹配到时）；
+//   半年后有人拿这份结果当发版依据，这行是「那 N 条没跑」的唯一凭证。
+//   退出码只看 results —— 被过滤掉的判据根本没进 results，不可能把这次变绿或变红。
+if (onlySpec) {
+  // C286：分母 = 判据单元数（check 调用 + 顶层独立 skip），与默认全量汇总行合计同源。
+  console.log(onlyNoticeLine(allNames.length + extraUnits.length, ranChecks, true))
+  const bad = specs.length === 0
+    ? ['（--only 后面没给编号或前缀）']
+    : specs.filter((_, i) => !matchedSpecs.has(i))
+  if (bad.length) {
+    console.error(`✗ --only 没匹配到任何判据：${bad.join(', ')}（共 ${allNames.length + extraUnits.length} 条判据）`)
+    process.exit(1)
+  }
+}
+// C275：--fast 提示行走纯函数，两个数字都取运行时计数（skippedSlow / ranChecks），不写常量。
+//   默认路径 FAST=false 时这行根本不执行 —— C277 会真跑默认路径守这一点。
+if (FAST) console.log(fastNoticeLine(skippedSlow, ranChecks, true))
+// C272：输出渲染搬到 check-run.mjs 的 renderResults，为的是让判据能真求值被测对象
+//   （喂一个结果数组看返回的 lines），而不是读本文件源码文本猜 console.log 怎么写。
+//   默认瘦身后 stdout 约 1 KB；--verbose 与 --only 仍逐条全明细。
+const { lines, pass, fail, skipN } = renderResults(results, { verbose: RENDER_VERBOSE })
+for (const line of lines) console.log(line)
 
 // 跳过明细（2026-11-01，第三条）：汇总行只有一个数字，只看结尾的人不知道
 //   「跳过了哪几条、为什么、怎么才能让它跑」。跳过是最容易被当成「没问题」的状态，

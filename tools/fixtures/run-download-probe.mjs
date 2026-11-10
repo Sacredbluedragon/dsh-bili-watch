@@ -72,6 +72,9 @@ const stub = `
   const closeSync = () => {}
   let __spawnOpt = null
   const spawn = (cmd, args, opt) => { __spawnOpt = opt; return { pid: 4242, on(){}, once(){}, unref(){} } }
+  // C227-B：函数体现在调的是不同名别名，桩跟着改名（仍是同一个桩，调用次数/参数照收）。
+  const runSpawn = spawn
+  const isWin = () => process.platform === 'win32'
   ${body}
   globalThis.__result = (() => {
     let ret = null

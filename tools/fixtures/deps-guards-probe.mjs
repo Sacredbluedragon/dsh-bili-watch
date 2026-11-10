@@ -44,6 +44,11 @@ function sliceFn(src, sig) {
 function newCtx(extra) {
   const ctx = {
     process,
+    // C227-B：index.js 的平台判定改成 lib/platform.mjs 的别名后，切出来的函数体
+    //   在 vm 里少了一个自由变量。补的是真值（不是恒 true 的假桩），平台分支照常可测。
+    isWin: () => process.platform === 'win32',
+    isMac: () => process.platform === 'darwin',
+    hostPlatform: () => process.platform,
     console,
     Date,
     JSON,
@@ -261,7 +266,8 @@ if (section === 'C') {
     const downloadLockBusy = () => null
     const lockBusyText = () => ''
     const readFileSync = () => ({ subarray: () => ({ toString: () => '' }) })
-    const spawn = () => ({ pid: 4242, on() {}, once() {}, unref() {} })
+    // C227-B：runDownload 现在调 runSpawn 这个别名，桩跟着改名。
+    const runSpawn = () => ({ pid: 4242, on() {}, once() {}, unref() {} })
     ${runDownload}
     globalThis.__r = (() => {
       const a = runDownload('asr')

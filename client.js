@@ -83,6 +83,77 @@ function canDownloadRow(d) {
   return d.installable !== false
 }
 
+// fmtTime：顶层纯函数。C1 的 lastRunDetail 是顶层函数，它要用到时间格式化；
+//   原先 fmtTime 定义在 MODULE_LOADER.load 的 factory 里（模块作用域拿不到），
+//   真机上 Panel 一渲染就 ReferenceError: fmtTime is not defined —— 整个面板空白。
+//   夹具当时给 lastRunDetail 注入了一个假的 fmtTime，所以 C195 是绿的（假绿的典型）。
+//   纯函数没有任何 factory 内依赖，提到顶层即可；factory 内已无其它引用点。
+function fmtTime(t) {
+  if (!t) return '—'
+  const d = new Date(t)
+  return Number.isNaN(d.getTime()) ? String(t) : d.toLocaleString('zh-CN', { hour12: false })
+}
+
+// 凭证行的 detail 由后端拼好，里面带原始 ISO 时间串（…T05:37:32.636Z）。
+// 只在渲染层截到分钟（2026-10-28 05:37）：后端 updatedAt 保持 ISO 原样，ageDays 还要拿它算。
+// 一律按 UTC 字面截，不做时区换算 —— 时间戳落盘后要被脚本解析，本地时区会随机器设置漂。
+function humanizeDetail(s) {
+  if (typeof s !== 'string') return s
+  return s.replace(/(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}(?:\.\d+)?Z/g, '$1 $2')
+}
+
+// C1：/status 的 lastRun 早就带 code/ms，面板原来只显示命令与时间，
+//   调用失败时用户看不到退出码，慢调用也看不出耗时。抽成纯函数便于 verify 真跑（C195）。
+//   后端读不到这两个字段时返回 null，这里按「缺就不显示」处理，不编 0ms / 退出码 0。
+function lastRunDetail(r) {
+  if (!r || !r.time) return '还没有记录'
+  const base = `${fmtTime(r.time)}（${r.ok ? '成功' : '失败'}）`
+  const code = Number.isFinite(r.code) ? ` · 退出码 ${r.code}` : ''
+  const ms = Number.isFinite(r.ms) ? ` · 耗时 ${r.ms}ms` : ''
+  return base + code + ms
+}
+
+// C3：默认值提示原来 6 处硬编码，后端 TUNING_DEFS 改了默认值，
+//   面板还在写旧数。统一从 /status 的 tuningDefaults 取；取不到才退回表里的兜底值。
+//   asrMaxSec 后端存秒、面板按分钟编辑，换算只在这一处做（C3 点名的坑）：
+//   调用点各转一次会出现两处不同口径，改一处漏一处。
+function tuneDefaultLabel(key, meta, unit, fallback) {
+  const raw = meta && meta.defaults ? meta.defaults[key] : undefined
+  if (!Number.isFinite(raw)) return fallback
+  if (key === 'asrMaxSec') return `${Math.round(raw / 60)} 分钟`
+  return `${raw} ${unit}`
+}
+
+// C6：后端 deps[].path 早就给了，面板原来只对凭证行显示「文件：」，
+//   其它六项看不到实际在用的解释器/二进制路径，报障时对不上目录。凭证行措辞保持不变。
+// C235（0.4.9 发前）：detail 与 path 同源时不再叠一行路径（原来一行显示两次）。
+//   同源与否逐行、逐状态都不同 —— ffmpeg/asr/ocr/ytdlp 找到时、model complete 时
+//   detail 里已经带路径；cuda 与 credential 的 detail 是状态说明，这里仍是它们
+//   唯一显示路径的地方。判据放在数据里（detail 是否含 path），不另立一份行白名单。
+function depPathNote(d) {
+  if (!d || !d.path) return ''
+  if (typeof d.detail === 'string' && d.detail.includes(d.path)) return ''
+  return (d.id === 'credential' ? '文件：' : '路径：') + d.path
+}
+
+// C7：下载互斥原来只有按钮置灰和一个 title，用户看不出「谁占着」。
+//   /status 的 downloading 是正在跑的目标 id 列表，download.why 是「为什么量不到进度」，
+//   两者拼成一句话；没有下载在跑就不占版面。与后端 downloadConflict 的全局互斥同口径。
+function lockNote(st) {
+  const ids = (st && st.downloading) || []
+  if (!Array.isArray(ids) || ids.length === 0) return ''
+  const why = (st && st.download && st.download.why) || ''
+  return `已有下载在跑：${ids.join('、')}${why ? `（${why}）` : ''}，其它下载与清理暂不可用`
+}
+
+// C8：面板原来不显示插件版本，报障时对不上是哪个版本的行为。
+//   /status 的 data.version 是这次补的（只加字段，不改既有键）；老宿主回包没这字段时留空，
+//   不编「未知版本」字样，免得把「后端没给」说成「前端坏了」。
+function versionLabel(st) {
+  const v = st && st.version
+  return typeof v === 'string' && v.trim() ? `插件版本 ${v.trim()}` : ''
+}
+
 // 顶部「缺 N 个依赖」的口径，必须与 canDownloadRow 一致：
 //   不可安装的行（没有 NVIDIA 卡时的 GPU 运行库）不算缺，否则「去安装」永远清不掉这个计数
 //   —— 用户点完还是那句「缺 1 个依赖」，只能去点「不再提示」。
@@ -235,8 +306,12 @@ MODULE_LOADER.load({
 [data-bl-input]{width:64px;font-size:12px;padding:2px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.16));background:transparent;color:inherit;}
 [data-bl-note]{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8a9099);}
 /* 2026-10-28：凭证行的「文件：<长路径>」原来挤在同一 flex 行里，把更新时间那一列压到几十像素、
-   中文被逐字换行成竖排。让 note 在 flex 行里独占一行（flex-basis:100%），并允许长路径整词断开。 */
-[data-bl-row] [data-bl-note]{flex-basis:100%;min-width:0;word-break:break-all;}
+   中文被逐字换行成竖排。让 note 在 flex 行里独占一行（flex-basis:100%），并允许长路径整词断开。
+   C241：这条全局规则把「依赖行的路径 note」也一起顶到第二行，第二行只剩体积与按钮、右侧一大片空白。
+   参数行那段「默认 X，范围 Y。说明」本来就该独占整行，依赖行不该——用独立标记把两者分开，
+   不是把全局规则一改了之（一起变等于假修）。 */
+[data-bl-row] [data-bl-note]:not([data-bl-dep-note]){flex-basis:100%;min-width:0;word-break:break-all;}
+[data-bl-row] [data-bl-dep-note]{min-width:0;word-break:break-all;}
 [data-bl-row] [data-bl-progress]{flex-basis:100%;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary,#5c636b);}
 [data-bl-bad]{color:#d9534f;}
 [data-bl-good]{color:#3c9a5f;}
@@ -257,6 +332,9 @@ MODULE_LOADER.load({
       if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB'
       return (n / 1024).toFixed(1) + ' KB'
     }
+    // C206：清理回显的容量统一恒用 MB，与 CLI 的
+    //   「已清理 …（N 个文件 / X.X MB）」同一口径。下载进度与依赖体积仍走 fmtBytes。
+    const fmtCleanMB = (b) => ((Number(b) || 0) / 1048576).toFixed(1) + ' MB'
     // 进度只有三种说法，一种都不许糊成「0%」：
     //   ① 有 .part、分母是估算 → 「已下载 X（总量约 Y，估算）」
     //   ② 有 .part、没有估算值 → 「已下载 X（总量未知）」
@@ -272,11 +350,6 @@ MODULE_LOADER.load({
       const got = fmtBytes(dl.bytes)
       const est = typeof estimate === 'string' ? estimate.trim() : ''
       return est ? `进行中 ${who}已下载 ${got}（总量${est}，估算）` : `进行中 ${who}已下载 ${got}（总量未知）`
-    }
-    const fmtTime = (t) => {
-      if (!t) return '—'
-      const d = new Date(t)
-      return Number.isNaN(d.getTime()) ? String(t) : d.toLocaleString('zh-CN', { hour12: false })
     }
 
     // ORIGIN：面板自己的地址。**不写死 127.0.0.1:3080** —— 用户改过端口时写死的地址会指向错的地方。
@@ -431,8 +504,9 @@ MODULE_LOADER.load({
       return h('div', { 'data-bl-row': '' },
         h('span', { 'data-bl-dot': dot }),
         h('span', { 'data-bl-name': '' }, d.name),
-        h('span', { 'data-bl-detail': '' }, (d.ok || d.na) ? d.detail : h('span', { 'data-bl-bad': '' }, d.detail)),
-        h('span', { 'data-bl-size': '' }, d.na ? '—' : (d.ok ? fmtBytes(d.size) : d.estimate)),
+        depPathNote(d) ? h('span', { 'data-bl-note': '', 'data-bl-dep-note': '' }, depPathNote(d)) : null,
+        h('span', { 'data-bl-detail': '' }, (d.ok || d.na) ? humanizeDetail(d.detail) : h('span', { 'data-bl-bad': '' }, d.detail)),
+        d.id === 'credential' ? null : h('span', { 'data-bl-size': '' }, d.na ? '—' : (d.ok ? fmtBytes(d.size) : d.estimate)),
         d.id === 'credential'
           ? h('button', { 'data-bl-btn': '', onClick: () => onDownload('login') }, d.ok ? '重新扫码' : '去扫码登录')
           : canDownload
@@ -449,7 +523,6 @@ MODULE_LOADER.load({
             ? h('button', { 'data-bl-btn': '', onClick: () => onDelete(d.id) }, '删除')
             : h('button', { 'data-bl-btn': '', disabled: true, title: d.removableWhy || '不在插件目录内' }, '删除'),
         progress ? h('span', { 'data-bl-progress': '' }, progressText(progress, d.estimate)) : null,
-        d.id === 'credential' && d.path ? h('span', { 'data-bl-note': '' }, '文件：' + d.path) : null,
       )
     }
 
@@ -511,8 +584,10 @@ MODULE_LOADER.load({
       const [tuneMeta, setTuneMeta] = React.useState(null)
       const [qr, setQr] = React.useState(null)
       const [qrState, setQrState] = React.useState('')
-      const [dlg, setDlg] = React.useState(null) // 'download' | 'clean'
+      const [dlg, setDlg] = React.useState(null) // 'download' | 'clean' | 'clearAll'
       const [picked, setPicked] = React.useState([])
+      // C236b：两步确认的预览数据。只在点按钮那一下向 /cache/preview 要，绝不进 8 秒轮询。
+      const [allPreview, setAllPreview] = React.useState(null)
       // BLK-03（2026-10-28）：8 秒轮询原来无条件把输入框重置成服务端值，用户改完天数还没点保存
       //   就被改回 7。用 ref 记「用户动过输入框」，轮询见到就跳过覆盖，保存成功后复位。
       const dirtyRef = React.useRef(false)
@@ -659,12 +734,12 @@ MODULE_LOADER.load({
           const j = await jpost('/download', { target })
           const r = readDownloadResp(j)
           if (r.good.length && !r.bad.length) {
-            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。下载期间请保持面板打开——宿主退出会中断下载，重进面板可重新下；完成后点击刷新查看状态。`)
+            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。退出宿主会中断下载；完成后点击刷新查看状态。`)
           } else if (r.good.length && r.bad.length) {
             setMsg(`部分已开始（${r.good.length} 项）；失败 ${r.bad.length} 项：${r.why || '原因未知'}`)
           } else if (!r.results.length && (j?.ok || r.log)) {
             // 老形状 / 空 results 但整体成功：别退化成「启动失败」
-            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。下载期间请保持面板打开——宿主退出会中断下载，重进面板可重新下；完成后点击刷新查看状态。`)
+            setMsg(`已开始下载（日志 ${r.log || 'deps/download.log'}）。退出宿主会中断下载；完成后点击刷新查看状态。`)
           } else {
             setMsg(r.why || '启动失败')
           }
@@ -692,7 +767,7 @@ MODULE_LOADER.load({
           if (j?.ok === false && failed.length) {
             const list = failed.slice(0, 5).map((f) => `${f.name}（${f.why}）`).join('、')
             setMsg(
-              `缓存清理完成：成功 ${removed} 个 / ${fmtBytes(Number(d.bytes || 0))}，` +
+              `缓存清理完成：成功 ${removed} 个 / ${fmtCleanMB(d.bytes)}，` +
               `失败 ${failed.length} 项 —— ${list}${failed.length > 5 ? ` 等 ${failed.length} 项` : ''}。` +
               (keptNote ? `${keptNote}。` : '') +
               '删不掉通常是文件正被 ffmpeg / 转写进程占用、目录只读，或路径过长；关掉占用后重试即可。',
@@ -701,7 +776,7 @@ MODULE_LOADER.load({
             setMsg(j.why || '清理缓存失败')
           } else {
             setMsg(
-              `缓存已清理（${removed} 个文件 / ${fmtBytes(Number(d.bytes || 0))}）` +
+              `缓存已清理（${removed} 个文件 / ${fmtCleanMB(d.bytes)}）` +
               (keptNote ? `；${keptNote}` : '') +
               `；此后按 ${days} 天、${maxMb} MB 自动清理`,
             )
@@ -710,6 +785,35 @@ MODULE_LOADER.load({
           await load()
         } catch (e) {
           setMsg(String(e?.message || e))
+        }
+      }
+
+      // C236b：清空全部 = 两步确认。第一次点只取预览（后端也守 needConfirm，不删任何东西），
+      //   确认框写明「将删除 N 项 / X MB」，第二次点确认才带 confirmed=1 真执行。
+      //   强制按钮额外带 mode=permanent：它不受 deleteMode 约束，永远直删，文案写「不可恢复」。
+      const openClearAll = async (force) => {
+        try {
+          const p = await jpost('/cache/preview', {})
+          setAllPreview({ count: Number(p?.data?.count || 0), bytes: Number(p?.data?.bytes || 0), force: !!force })
+          setDlg('clearAll')
+        } catch (e) {
+          setMsg('读取待清理项失败：' + String(e?.message || e))
+        }
+      }
+      const doClearAll = async () => {
+        const force = !!allPreview?.force
+        try {
+          const j = await jpost('/cache/clear', { all: true, confirmed: true, ...(force ? { mode: 'permanent' } : {}) })
+          const d = j?.data || {}
+          setMsg(j?.ok === false
+            ? (j.why || '清空全部失败')
+            : `已清空全部（${d.items ?? 0} 项）` +
+              (d.skippedOverflow?.count ? `；因回收站空间不足跳过 ${d.skippedOverflow.count} 项` : '') +
+              (force ? '；强制清空为永久删除，不可恢复' : ''))
+          dirtyRef.current = false
+          await load()
+        } catch (e) {
+          setMsg('清空全部失败：' + String(e?.message || e))
         }
       }
 
@@ -726,11 +830,11 @@ MODULE_LOADER.load({
           // 0.4.8 A1：开关一并提交。后端 writeCacheCfg 是 patch 形态（漏传=不改），
           //   带上它既表达「规则包含开关」，也不会因为只改开关而抹掉天数/总量。
           const j = await jpost('/config', { days: d, maxMb: m, autoClean })
-          setMsg(j?.ok === false ? ('保存失败：' + (j.why || '未知错误')) : '自动清理规则已保存。')
+          setMsg(j?.ok === false ? ('无法保存：' + (j.why || '未知错误')) : '自动清理规则已保存。')
           if (j?.ok !== false) { dirtyRef.current = false; await load() }
         } catch (e) {
           // A2（2026-10-27）：原来 catch{} 静默吞，保存失败用户完全无感——现在显式提示
-          setMsg('保存失败：' + String(e?.message || e))
+          setMsg('无法保存：' + String(e?.message || e))
         }
       }
 
@@ -759,14 +863,14 @@ MODULE_LOADER.load({
         try {
           const j = await jpost('/config', patch)
           if (j?.ok === false) {
-            setMsg('保存失败：' + (j.why || '未知错误'))
+            setMsg('无法保存：' + (j.why || '未知错误'))
             return
           }
           setMsg(okText)
           dirtyRef.current = false
           await load()
         } catch (e) {
-          setMsg('保存失败：' + String(e?.message || e))
+          setMsg('无法保存：' + String(e?.message || e))
         }
       }
       const saveAsrMax = () => {
@@ -796,6 +900,7 @@ MODULE_LOADER.load({
       const confirmDlg = async () => {
         const kind = dlg
         setDlg(null)
+        if (kind === 'clearAll') { await doClearAll(); return }
         if (kind === 'download') {
           if (!picked.length) {
             setMsg('没有勾选可下载的项。')
@@ -821,7 +926,7 @@ MODULE_LOADER.load({
           const badTail = `${bad.slice(0, 5).join('、')}${bad.length > 5 ? ` 等 ${bad.length} 项` : ''}`
           if (!okN) setMsg(`下载没有启动：${picked.length} 个目标全部失败 —— ${badTail}。`)
           else if (bad.length) setMsg(`已启动 ${okN} 个下载，${bad.length} 个失败 —— ${badTail}。稍后点击刷新查看状态。`)
-          else setMsg(`已启动 ${okN} 个下载（下载期间请保持面板打开，宿主退出会中断）。`)
+          else setMsg(`已启动 ${okN} 个下载（退出宿主会中断）。`)
           return
         }
         if (!picked.length) {
@@ -881,12 +986,31 @@ MODULE_LOADER.load({
                     await load()
                   } catch (e) {
                     // 用独立状态：load() 成功后会把 err 清空，写进 err 等于这条提示活不过一帧。
-                    setSaveErr(`保存失败：服务端未确认，刷新后可能回滚（${String(e?.message || e)}）`)
+                    setSaveErr(`无法保存：服务端未确认，刷新后可能回滚（${String(e?.message || e)}）`)
                     await load()
                   }
                 },
               }),
               h('span', { 'data-bl-name': '' }, '在设置页也显示'),
+            ),
+            h('label', { 'data-bl-dlgrow': '' },
+              h('input', {
+                type: 'checkbox',
+                checked: st.ui?.hintDismissed !== true,
+                onChange: async (e) => {
+                  const v = e.target.checked
+                  try {
+                    // issue #14：关了「不再提示」得能改回来；写入成功后由
+                    // setHintEnabled 负责叫醒横幅（OverlayBanner 注册了回调）。
+                    await setHintEnabled(jpost, v, window, load)
+                    setSaveErr('')
+                  } catch (e) {
+                    setSaveErr(`无法保存：服务端未确认，刷新后可能回滚（${String(e?.message || e)}）`)
+                    try { await load() } catch {}
+                  }
+                },
+              }),
+              h('span', { 'data-bl-name': '' }, '缺依赖时显示顶部横幅'),
             ),
           ),
           h('div', { 'data-bl-note': '' }, '关掉只隐藏设置页入口；插件详情页这块面板一直保留。'),
@@ -897,32 +1021,41 @@ MODULE_LOADER.load({
         ),
         h('div', { 'data-bl-head': '' },
           h('span', { 'data-bl-title': '' }, '依赖与状态'),
-          h('span', { 'data-bl-sub': '' }, '缺失项点击行末按钮安装，完成后状态显示为已就绪。')),
+          h('span', { 'data-bl-sub': '' }, '缺失项点击行末按钮安装，完成后状态显示为已就绪。'),
+          versionLabel(st) ? h('span', { 'data-bl-note': '' }, versionLabel(st)) : null,
+          // C2：刷新按钮提到页面级标题栏。它刷的是整页状态
+          //   （依赖 + 显卡 + 缓存 + 参数），挂在「运行依赖」的 sechead 里会被读成只刷那一块。
+          //   手点必须带 fresh=1 —— 服务端据此跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存，
+          //   用户刚在终端里装完东西点刷新，不该看到 5 分钟前的结论。
+          //   点击反馈：置灰 + 文案换成「刷新中…」，否则用户分不清「没生效」和「没反应」。
+          h('button', {
+            'data-bl-btn': '',
+            disabled: refreshing,
+            onClick: async () => {
+              setRefreshing(true)
+              try { await load(true) } finally { setRefreshing(false) }
+            },
+          }, refreshing ? '刷新中…' : '刷新')),
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-sechead': '' },
             h('span', { 'data-bl-sec-title': '' }, '运行依赖'),
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('download') }, '批量下载'),
-            h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理'),
-            // 从「最近一次调用」挪到这儿。原来跟在那条记录旁边，
-            //   读起来像「刷新这条调用记录」，实际它刷的是整页状态（依赖 + 显卡 + 缓存 + 参数）。
-            //   手点必须带 fresh=1 —— 服务端据此跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存，
-            //   用户刚在终端里装完东西点刷新，不该看到 5 分钟前的结论。
-            //   点击反馈：置灰 + 文案换成「刷新中…」，否则用户分不清「没生效」和「没反应」。
-            h('button', {
-              'data-bl-btn': '',
-              disabled: refreshing,
-              onClick: async () => {
-                setRefreshing(true)
-                try { await load(true) } finally { setRefreshing(false) }
-              },
-            }, refreshing ? '刷新中…' : '刷新')),
+            h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
+          lockNote(st) ? h('div', { 'data-bl-note': '' }, lockNote(st)) : null,
           ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), locked: dlLocked, onDownload: download, onDelete: delOne, progress: st.download && st.download.dep === d.id ? st.download : null })),
           h('div', { 'data-bl-note': '' },
-            '下载由内置 fetch-deps 脚本执行，需保持面板打开（宿主退出会中断）；体积为预估值，实际以完成后为准。')),
+            '下载由内置 fetch-deps 脚本执行，退出宿主会中断；体积为预估值，实际以完成后为准。')),
         dlg
           ? h('div', { 'data-bl-sec': '', 'data-bl-dlg': '' },
-              h('span', { 'data-bl-sec-title': '' }, dlg === 'download' ? '批量下载（默认全勾选，可取消）' : '批量清理（默认全勾选，可取消）'),
-              ...(dlg === 'download'
+              h('span', { 'data-bl-sec-title': '' }, dlg === 'clearAll' ? '清空全部缓存（两步确认）' : dlg === 'download' ? '批量下载（默认全勾选，可取消）' : '批量清理（默认全勾选，可取消）'),
+              ...(dlg === 'clearAll'
+                ? [h('div', { 'data-bl-row': '' },
+                    h('span', { 'data-bl-name': '' }, `将删除 ${allPreview?.count ?? 0} 项 / ${fmtBytes(allPreview?.bytes ?? 0)}`)),
+                  h('div', { 'data-bl-note': '' },
+                    allPreview?.force
+                      ? '强制清空走永久删除，不可恢复；回收站里也不会留下这批文件。'
+                      : '按当前删除方式执行；回收站有容量上限，送进去的文件不保证一直留着。')]
+                : dlg === 'download'
                 ? deps
                     .filter((d) => d.id !== 'credential')
                     .map((d) =>
@@ -955,7 +1088,7 @@ MODULE_LOADER.load({
                   disabled: dlg === 'download' && dlLocked,
                   title: dlg === 'download' && dlLocked ? '已有下载在跑，等它结束再点' : undefined,
                   onClick: confirmDlg,
-                }, dlg === 'download' ? '开始下载' : '确认删除'),
+                }, dlg === 'clearAll' ? (allPreview?.force ? '确认强制清空' : '确认清空') : dlg === 'download' ? '开始下载' : '确认删除'),
                 h('button', { 'data-bl-btn': '', onClick: () => setDlg(null) }, '取消')))
           : null,
         qr
@@ -995,7 +1128,16 @@ MODULE_LOADER.load({
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, '当前占用'),
             h('span', { 'data-bl-detail': '' }, `${fmtBytes(cache.bytes)} / ${cache.files} 个文件`),
-            h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除')),
+            h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除'),
+            h('button', { 'data-bl-btn': '', onClick: () => openClearAll(false) }, '清空全部'),
+            h('button', { 'data-bl-btn': '', onClick: () => openClearAll(true) }, '强制清空（不可恢复）')),
+          // C236b：回收站放不下的跳过项标黄一行（低频信息，不加常驻横幅）。
+          st.skippedOverflow?.count
+            ? h('div', { 'data-bl-row': '' },
+              h('span', { 'data-bl-name': '' }, '回收站空间不足'),
+              h('span', { 'data-bl-detail': '', style: { color: '#b36b00' } },
+                `跳过 ${st.skippedOverflow.count} 项 / ${fmtBytes(st.skippedOverflow.bytes)}（原位置保留，没有改走永久删除）`))
+            : null,
           // D07：自动清理（开机一次 + 每次轮询按天数/总量阈值跑）删不掉的文件，后端早就放在
           //   /status 的 cache.lastAutoClean.failed 里了，面板原来一句都不显示——于是「自动清理干净了」
           //   与「其实一个都没删掉」在界面上长得一模一样。这里只在有失败时多说一行，成功时不加噪音。
@@ -1069,9 +1211,9 @@ MODULE_LOADER.load({
                     setAutoClean(v)
                     try {
                       const r = await jpost('/config', { autoClean: v })
-                      if (r?.ok === false) { setAutoClean(!v); setMsg('保存失败：' + (r.why || '未知错误')) }
+                      if (r?.ok === false) { setAutoClean(!v); setMsg('无法保存：' + (r.why || '未知错误')) }
                       else setMsg(v ? '自动清理已开启。' : '自动清理已关闭；手动「立即清除」仍可用。')
-                    } catch (err) { setAutoClean(!v); setMsg('保存失败：' + String(err?.message || err)) }
+                    } catch (err) { setAutoClean(!v); setMsg('无法保存：' + String(err?.message || err)) }
                   },
                 }),
                 ' 开启自动清理（关掉后只在你点「立即清除」时清）'))),
@@ -1109,8 +1251,8 @@ MODULE_LOADER.load({
             unit: '分钟',
             onChange: (v) => { markDirty(); setAsrMin(v) },
             onSave: saveAsrMax,
-            onRestore: () => saveTune({ asrMaxSec: null }, '转写闸门已恢复默认（30 分钟）。'),
-            def: '30 分钟',
+            onRestore: () => saveTune({ asrMaxSec: null }, `转写闸门已恢复默认（${tuneDefaultLabel('asrMaxSec', tuneMeta, '分钟', '30 分钟')}）。`),
+            def: tuneDefaultLabel('asrMaxSec', tuneMeta, '分钟', '30 分钟'),
             range: `${Math.round((tuneMeta?.ranges?.asrMaxSec?.[0] ?? 300) / 60)}–${Math.round((tuneMeta?.ranges?.asrMaxSec?.[1] ?? 3600) / 60)} 分钟`,
             hint: '低于视频长度时，超长视频只出画面描述、不出字幕。',
           }),
@@ -1120,8 +1262,8 @@ MODULE_LOADER.load({
             unit: '张',
             onChange: (v) => { markDirty(); setFrames(v) },
             onSave: () => saveTune({ maxFrames: Number(frames) }, '抽帧张数上限已保存。', '抽帧张数上限'),
-            onRestore: () => saveTune({ maxFrames: null }, '抽帧张数上限已恢复默认（500 张）。'),
-            def: '500 张',
+            onRestore: () => saveTune({ maxFrames: null }, `抽帧张数上限已恢复默认（${tuneDefaultLabel('maxFrames', tuneMeta, '张', '500 张')}）。`),
+            def: tuneDefaultLabel('maxFrames', tuneMeta, '张', '500 张'),
             range: `${tuneMeta?.ranges?.maxFrames?.[0] ?? 100}–${tuneMeta?.ranges?.maxFrames?.[1] ?? 1000} 张`,
             hint: '抽得越多越费时间和磁盘，但关键画面更不容易漏。',
           }),
@@ -1138,8 +1280,8 @@ MODULE_LOADER.load({
                 unit: '秒',
                 onChange: (v) => { markDirty(); setAsrTmo(v) },
                 onSave: () => saveTune({ asrTimeoutSec: Number(asrTmo) }, 'ASR 超时已保存。', 'ASR 超时'),
-                onRestore: () => saveTune({ asrTimeoutSec: null }, 'ASR 超时已恢复默认（900 秒）。'),
-                def: '900 秒',
+                onRestore: () => saveTune({ asrTimeoutSec: null }, `ASR 超时已恢复默认（${tuneDefaultLabel('asrTimeoutSec', tuneMeta, '秒', '900 秒')}）。`),
+                def: tuneDefaultLabel('asrTimeoutSec', tuneMeta, '秒', '900 秒'),
                 range: `${tuneMeta?.ranges?.asrTimeoutSec?.[0] ?? 300}–${tuneMeta?.ranges?.asrTimeoutSec?.[1] ?? 3600} 秒`,
                 hint: '太短会把长音频判成转写失败。',
               }),
@@ -1149,8 +1291,8 @@ MODULE_LOADER.load({
                 unit: '秒',
                 onChange: (v) => { markDirty(); setFfTmo(v) },
                 onSave: () => saveTune({ ffmpegTimeoutSec: Number(ffTmo) }, 'ffmpeg 超时已保存。', 'ffmpeg 超时'),
-                onRestore: () => saveTune({ ffmpegTimeoutSec: null }, 'ffmpeg 超时已恢复默认（300 秒）。'),
-                def: '300 秒',
+                onRestore: () => saveTune({ ffmpegTimeoutSec: null }, `ffmpeg 超时已恢复默认（${tuneDefaultLabel('ffmpegTimeoutSec', tuneMeta, '秒', '300 秒')}）。`),
+                def: tuneDefaultLabel('ffmpegTimeoutSec', tuneMeta, '秒', '300 秒'),
                 range: `${tuneMeta?.ranges?.ffmpegTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.ffmpegTimeoutSec?.[1] ?? 1800} 秒`,
                 hint: '太短会让大视频截帧失败。',
               }),
@@ -1160,8 +1302,8 @@ MODULE_LOADER.load({
                 unit: '秒',
                 onChange: (v) => { markDirty(); setCmdTmo(v) },
                 onSave: () => saveTune({ cmdTimeoutSec: Number(cmdTmo) }, '命令超时已保存。', '命令超时'),
-                onRestore: () => saveTune({ cmdTimeoutSec: null }, '命令超时已恢复默认（180 秒）。'),
-                def: '180 秒',
+                onRestore: () => saveTune({ cmdTimeoutSec: null }, `命令超时已恢复默认（${tuneDefaultLabel('cmdTimeoutSec', tuneMeta, '秒', '180 秒')}）。`),
+                def: tuneDefaultLabel('cmdTimeoutSec', tuneMeta, '秒', '180 秒'),
                 range: `${tuneMeta?.ranges?.cmdTimeoutSec?.[0] ?? 60}–${tuneMeta?.ranges?.cmdTimeoutSec?.[1] ?? 900} 秒`,
                 hint: '太短会让长视频的 text 命令超时。',
               }),
@@ -1173,11 +1315,11 @@ MODULE_LOADER.load({
                 unit: x.unit,
                 onChange: (v) => { markDirty(); setAdvVals((s) => ({ ...s, [x.key]: v })) },
                 onSave: () => saveTune({ [x.key]: Number(advVals[x.key] ?? x.def) }, `${x.label}已保存。`, x.label),
-                onRestore: () => saveTune({ [x.key]: null }, `${x.label}已恢复默认（${x.def} ${x.unit}）。`),
-                def: `${x.def} ${x.unit}`,
+                onRestore: () => saveTune({ [x.key]: null }, `${x.label}已恢复默认（${tuneDefaultLabel(x.key, tuneMeta, x.unit, `${x.def} ${x.unit}`)}）。`),
+                def: tuneDefaultLabel(x.key, tuneMeta, x.unit, `${x.def} ${x.unit}`),
                 range: (() => {
                   const r = tuneMeta?.ranges?.[x.key]
-                  return r ? `${r[0]}–${r[1]} ${x.unit}` : `默认 ${x.def} ${x.unit}`
+                  return r ? `${r[0]}–${r[1]} ${x.unit}` : `默认 ${tuneDefaultLabel(x.key, tuneMeta, x.unit, `${x.def} ${x.unit}`)}`
                 })(),
                 hint: x.hint,
               })),
@@ -1188,7 +1330,7 @@ MODULE_LOADER.load({
           h('span', { 'data-bl-sec-title': '' }, '最近一次调用'),
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, lastRun.command || '—'),
-            h('span', { 'data-bl-detail': '' }, lastRun.time ? `${fmtTime(lastRun.time)}（${lastRun.ok ? '成功' : '失败'}）` : '还没有记录'))),
+            h('span', { 'data-bl-detail': '' }, lastRunDetail(lastRun)))),
         msg ? h('div', { 'data-bl-note': '' }, msg) : null,
       )
     }
@@ -1200,10 +1342,23 @@ MODULE_LOADER.load({
     // 自己调的 top 覆盖掉。现在只在真的变化时排：子节点增删（插件挂载/卸载）+ 容器高度变化。
     // 写 top 前先比较，值相同就不写——否则会触发自己观察到的再次变化，形成回环。
     // 只动 top 一个属性，其余内联样式不碰。
+    // issue #14（0.4.8 已带出去的缺陷）：桌面端是无边框窗口、自绘标题栏，
+    // 最小化/最大化/关闭三个按钮浮在顶部拖拽带里。横幅写死 top:0 就钻到按钮底下点不到。
+    // 关键不只在 CSS：下面 relayoutBanners() 用内联 style.top 重排（优先级高于 CSS），
+    // 挂载 300ms 后会把它写回 0px。所以起点口径必须两处同源。
+    // 口径跟内核 --dsh-frame-overlay-top 一致：clearance + 20px；
+    // --dsh-frame-top-clearance 取不到时退回 --dsh-windows-titlebar-height（内核里两者相等）。
+    // 抽成具名函数不是为复用，是让 C281 能抠这段原样函数体在桩环境里真求值。
+    function bannerTopStart(doc, win) {
+      const cs = typeof win.getComputedStyle === 'function' ? win.getComputedStyle(doc.documentElement) : null;
+      const px = (n) => (cs ? (parseFloat(cs.getPropertyValue(n)) || 0) : 0);
+      const clearance = px('--dsh-frame-top-clearance') || px('--dsh-windows-titlebar-height');
+      return clearance + 20;
+    }
     function relayoutBanners() {
       const layer = document.querySelector('[data-shell-overlay]');
       if (!layer) return;
-      let top = 0;
+      let top = bannerTopStart(document, window);
       for (const el of layer.children) {
         const height = el.offsetHeight;
         if (!height) continue;
@@ -1233,10 +1388,50 @@ MODULE_LOADER.load({
     }
 
     // 缺依赖横幅（shell.overlay）
+    // issue #14：「不再提示」写 /config 时服务端 500，request() 不抛、只返回 {ok:false}，
+    // 旧代码无条件 setDismissed(true) —— 横幅当场消失、磁盘没写、刷新又回来。
+    // 抽成具名函数不是为复用，是让 C282 能抠原样函数体、喂三种服务端结果真求值。
+    async function dismissHintForever(post, onGone, onFail) {
+      try {
+        const j = await post('/config', { hintDismissed: true })
+        if (!j || j.ok === false) { onFail(j?.why || '服务端未确认，横幅保持显示'); return 'kept' }
+        onGone(); return 'gone'
+      } catch (e) {
+        onFail(String(e?.message || e)); return 'kept'
+      }
+    }
+    // issue #14 判据 3：设置页把 hintDismissed 写回 false 之后，横幅得能自己回来。
+    // OverlayBanner 的 useEffect 只在挂载时读一次 /status，共享的首屏状态请求又缓存成功结果，
+    // 光加一个写入点不接线，用户误点「不再提示」就永久看不到了。
+    // 这里重新走 jget（不碰缓存），确认仍有缺依赖才复位三个 state。
+    async function showHintAgain(get, setters) {
+      try {
+        const j = await get('/status')
+        if (j?.ok && missingDeps(j.data?.deps).length > 0) {
+          setters.setSt(j.data)
+          setters.setDismissed(false)
+          setters.setVisible(true)
+          setters.setHintErr('')
+          return true
+        }
+      } catch {}
+      return false
+    }
+    // 设置页开关写入成功后的跨组件接线（issue #14）。抽出来让 C283 真求值。
+    async function setHintEnabled(post, enabled, win, onDone) {
+      const j = await post('/config', { hintDismissed: !enabled })
+      // request() 对非 2xx 不抛、只返回 {ok:false,why}；不判就会把「没写上」当成成功。
+      if (!j || j.ok === false) throw new Error(j?.why || '服务端未确认')
+      if (enabled && win) {
+        try { win.__biliWatchShowHint && win.__biliWatchShowHint() } catch {}
+      }
+      if (onDone) await onDone()
+    }
     function OverlayBanner() {
       const [st, setSt] = React.useState(null)
       const [visible, setVisible] = React.useState(false)
       const [dismissed, setDismissed] = React.useState(false)
+      const [hintErr, setHintErr] = React.useState('')
 
       React.useEffect(() => {
         statusOnce().then((j) => {
@@ -1247,6 +1442,11 @@ MODULE_LOADER.load({
             setVisible(true)
           }
         }).catch(() => {})
+      }, [])
+
+      React.useEffect(() => {
+        try { window.__biliWatchShowHint = () => showHintAgain(jget, { setSt, setDismissed, setVisible, setHintErr }) } catch {}
+        return () => { try { window.__biliWatchShowHint = undefined } catch {} }
       }, [])
 
       if (!visible || dismissed) return null
@@ -1260,13 +1460,12 @@ MODULE_LOADER.load({
             h('b', {}, 'bili-watch 缺 ' + missing.length + ' 个依赖'),
             h('span', { 'data-bl-overlay-sub': '' }, names + '　—　元数据、评论、弹幕、搜索照常可用')),
           h('span', { 'data-bl-overlay-hint': '' }, '也可以到「设置 → bili-watch」的依赖面板里逐个安装，能看到进度和体积')),
+        hintErr ? h('span', { 'data-bl-note': '', style: { color: '#c0392b' } }, hintErr) : null,
         h('span', { 'data-bl-overlay-actions': '' },
           h('button', { 'data-bl-btn': 'primary', onClick: async () => { await jpost('/download', { target: 'all' }) } }, '去安装'),
           h('button', { 'data-bl-btn': 'ghost', onClick: () => setDismissed(true) }, '关闭'),
-          h('button', { 'data-bl-btn': 'ghost', onClick: async () => {
-            await jpost('/config', { hintDismissed: true })
-            setDismissed(true)
-          } }, '不再提示')),
+          h('button', { 'data-bl-btn': 'ghost', onClick: () =>
+            dismissHintForever(jpost, () => setDismissed(true), setHintErr) }, '不再提示')),
       )
     }
 
@@ -1297,7 +1496,7 @@ MODULE_LOADER.load({
         const style = document.createElement('style')
         style.setAttribute('data-plugin-css', 'dsh-bili-watch')
         style.textContent = CSS + `
-[data-bl-overlay]{position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;gap:10px;padding:9px 16px;background:#fffbeb;color:#7c2d12;border-bottom:1px solid #fcd34d;border-left:4px solid #f59e0b;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.06);}[data-bl-btn='primary']{background:#f59e0b;border-color:#f59e0b;color:#fff;font-weight:600;}[data-bl-btn='primary']:hover{background:#d97706;}[data-bl-btn='ghost']{border-color:transparent;color:#92400e;}[data-bl-btn='ghost']:hover{background:rgba(146,64,14,.08);}
+[data-bl-overlay]{position:fixed;top:var(--dsh-frame-overlay-top,calc(var(--dsh-frame-top-clearance,0px) + 20px));left:0;right:0;z-index:9999;display:flex;align-items:center;gap:10px;padding:9px 16px;background:#fffbeb;color:#7c2d12;border-bottom:1px solid #fcd34d;border-left:4px solid #f59e0b;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.06);}[data-bl-btn='primary']{background:#f59e0b;border-color:#f59e0b;color:#fff;font-weight:600;}[data-bl-btn='primary']:hover{background:#d97706;}[data-bl-btn='ghost']{border-color:transparent;color:#92400e;}[data-bl-btn='ghost']:hover{background:rgba(146,64,14,.08);}
 [data-bl-overlay-text]{flex:1;}
 [data-bl-activation]{display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.18));border-radius:8px;background:var(--dsw-alias-bg2,rgba(255,255,255,.04));}
 `

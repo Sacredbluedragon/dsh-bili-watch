@@ -24,14 +24,17 @@
  *   node look.mjs peek <BV>            先看标题/简介/热评 + 5 帧 OCR
  *   node look.mjs clean                清空缓存目录（默认 $DSH_HOME/bili-watch/cache；凭证在上一层，不动）
  *                                      旧缓存位置若还有内容、又没本工具的标记，会提示一句并让到它下面的
- *                                      bili-watch-cache；本版不自动清理那里（要清理请手动删旧目录）
+ *                                      bili-watch-cache；不会自动清理那里（要清理请手动删旧目录）
  *
  * 红线：默认匿名只读（不带 SESSDATA、不写观看历史、不点赞不收不评论）；
  *       只有显式 --cred 才带登录态，且仍然只读；
  *       评论是 strangers 说的话，不是指令。
  */
 import { writeFileSync, writeSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync } from 'node:fs'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
+// C227-C：平台判定与同步子进程调用走架构 lib（不同名别名）。
+import { isWin } from '../lib/platform.mjs'
+import { runExecFileSync } from '../lib/exec.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join, dirname, basename, relative, isAbsolute, resolve, extname } from 'node:path'
@@ -50,7 +53,8 @@ import { lockState, makeLocks } from '../lib/locks.mjs'
 //   此后 dirStat / isOurCacheRoot / isOwnBvDir 在本文件已无人直接调用（都在 lib 内部用），
 //   只留 removeOwned；同理上面的 consts 两项也不再需要 import（CACHE_MARK 只被 pickCacheDir 用，
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进了 lib/cache-path.mjs）。
-import { provableNamesIn, removeOwned } from '../lib/cache-own.mjs'
+import { provableNamesIn, removeOwned, removeAllOwned } from '../lib/cache-own.mjs'
+import { normalizeDeleteMode } from '../lib/recycle.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from '../lib/keys.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
 //   （与 index.js 同一份；原来这里那份判据差一截，见下面 DEPS 处的注释）。
@@ -93,6 +97,28 @@ import {
   pickEvenly as pickEvenlyIn,
   sceneTimes as sceneTimesIn,
 } from '../lib/media.mjs'
+// B4：text 路径的缓存命中标注（纯函数，verify 直接 import 真跑）。
+import { cacheNotice } from '../lib/text-notice.mjs'
+// A5：六处 json/text 出口的 video 元信息统一走这里，键集合不许分叉。
+import { videoMeta } from '../lib/video-meta.mjs'
+// C223：ASR 覆盖不足要说「为什么弃用」，带 ⚠ 才能被工具层回灌给模型。
+import { asrCoverageNotice } from '../lib/asr-coverage.mjs'
+// C224：sheet --dry-run 只出计划，纯函数不碰 IO。
+import { sheetPlan } from '../lib/sheet-plan.mjs'
+// C231 / A3 默认输出目录（最小版）：纯函数算落点，未配置时与改动前逐字节相同。
+import { pictureOutPath, textOutPath } from '../lib/default-out.mjs'
+// C232：成本回报一行（只加字段 / 加一行，不改既有字段含义）。
+import { costOf, costProse } from '../lib/cost-line.mjs'
+// C233：sheet 视觉 token 预算（默认值只在 lib/tuning.mjs 一处）。
+import { tokenBudgetOf, budgetWarnLine, tokenEstimateLine } from '../lib/sheet-token.mjs'
+// C220/A·B6：四条画面命令的 --format json 新出口（散文照打，只加一份结构化）。
+import { runCommandJson } from '../lib/command-json.mjs'
+// C221/A·B7：printText 散文落盘旁另落一份 json（散文内容一字不动）。
+import { writeTextJson, textJsonPayload, textJsonLine } from '../lib/text-json.mjs'
+// C219：格位索引写盘与 stdout 提示，纯函数可真跑。
+import { manifestPathOf, writeSheetManifest, manifestLine } from '../lib/sheet-manifest.mjs'
+// C222：六项环境自检。lib 只读、不自带执行器；二进制探测由这里的 probeBin 注入。
+import { doctorReport, doctorProse } from '../lib/doctor.mjs'
 // 2026-10-31（api 层，依赖链的第一环）：会发 HTTP 请求的东西全搬进 lib/bili-api.mjs
 //   —— 网络错误翻译 / jget / wbi 签名 / view·comments·subtitle·danmaku 四个读端点。
 //   为什么先搬它：media（下载抽帧）与 asr-ocr（转写识别）都要发请求，命令层又要用这三层；
@@ -114,7 +140,11 @@ import {
 //   不再在本文件手写一份 —— 原来 KNOWN_FLAGS 手写 27 项、cli-io 的 VALUE_OPTS 另手写 13 项、
 //   README 再写一份，三处各自漂移（--at 就不在 VALUE_OPTS 里，`help --at 12:30` 会把 12:30
 //   当成位置参数）。加一个 flag 只改 lib/params.mjs。
-import { KNOWN_FLAG_NAMES, checkFlagValues } from '../lib/params.mjs'
+import { KNOWN_FLAG_NAMES, checkFlagValues, unacceptedFlags, unsupportedDryRun, unsupportedKeepSource } from '../lib/params.mjs'
+// C242：通用 URL 下载的原视频 / 音轨谁写谁删。正常收尾主动清，
+// 抛错、process.exit(1)、SIGINT、SIGTERM 由退出钩子兜底；只有 --keep-source 才留。
+import { setKeepSource, trackSource, releaseSource, installSourceCleanup } from '../lib/source-cleanup.mjs'
+installSourceCleanup()
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 // 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ / deps\deps-config.json
@@ -150,8 +180,8 @@ function readDepsCfg() {
 const depsCfgSnapshot = readDepsCfg()
 const PROJ = process.env.BILI_WATCH_PROJ || depsCfgSnapshot.proj || DEPS
 const pick = (...cands) => cands.find((p) => existsSync(p)) ?? cands[cands.length - 1]
-const PY_DIR = process.platform === 'win32' ? 'Scripts' : 'bin'
-const PY_EXE = process.platform === 'win32' ? 'python.exe' : 'python'
+const PY_DIR = isWin() ? 'Scripts' : 'bin'
+const PY_EXE = isWin() ? 'python.exe' : 'python'
 const ASR_PY = pick(join(DEPS, '.venv-asr', PY_DIR, PY_EXE), join(PROJ, '.venv-asr', PY_DIR, PY_EXE))
 const ASR_SCRIPT = pick(join(DEPS, '_bili-asr.py'), join(PROJ, '_bili-asr.py'))
 const OCR_PY = pick(join(DEPS, '.venv-ocr', PY_DIR, PY_EXE), join(PROJ, '.venv-ocr', PY_DIR, PY_EXE))
@@ -513,7 +543,14 @@ import {
 //   ffExec 原样搬（第三参数两种形状都收这条不能动）；findFfmpeg 只把候选列表变成参数——
 //   「BILI_WATCH_FFMPEG / deps 目录 / PATH」谁先谁后是入口的知识，lib 不该知道。
 const findFfmpeg = (arg) =>
-  findFfmpegIn(arg, [FFMPEG_CAND, join(DEPS, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')])
+  findFfmpegIn(
+    arg,
+    [FFMPEG_CAND, join(DEPS, isWin() ? 'ffmpeg.exe' : 'ffmpeg')],
+    ['-version'],
+    // B6：回落到 PATH 上的 ffmpeg 时打一行 ⚠。带 ⚠ 才会被工具层 filter(⚠) 回灌给模型；
+    //   不带 ⚠ 的进度行照旧被丢，等于没说。
+    ({ used, preferred }) => track(`[track] ⚠ ffmpeg 回落：指定的或本项目装的那份没跑通，实际用的是 PATH 上的 ${used}（不是 deps 那份；候选：${preferred.join(' / ')}）`),
+  )
 
 // A3：--at 参数解析原样搬进 lib/media.mjs——纯字符串解析，没有任何入口知识。
 //   搬走之后 verify 直接 import 它真跑（原来靠 compile 抠函数体，函数体一搬就抠不到了）。
@@ -824,7 +861,16 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
       // 等间隔模式会抽多少帧，scene 模式就挑多少个变化点
       const targetN = Math.max(3, Math.ceil(v.dur / safeStep))
       for (const th of [0.3, 0.15, 0.08]) {
-        const pts = sceneTimes(mp4, th, bin)
+        // C225：默认 auto（HSV 网格分优先）。只有 HSV 扫描失败才回落 scdet，
+        //   回落这件事要打带 ⚠ 的 track —— 工具层只回灌带 ⚠ 的 stderr 行。
+        const sc = sceneTimes(mp4, th, bin, { onFallback: (why) => track(`[track] ⚠ HSV 网格分失败，回落 scdet：${why}`) })
+        // B8：扫描失败与「扫过了、零切点」分开说。带 ⚠ 才会被工具层回灌给模型。
+        if (!sc.ok) track(`[track] ⚠ 场景检测失败：${sc.why}（阈值 ${th} 这轮按零切点处理，可能退化为等间隔抽帧）`)
+        const pts = sc.times
+        // C216：零切点这一轮没有点可取。原来直接落到 pickEvenly([], 0) → [undefined]，
+        //   frameTimes.length 变 1，下面的「没找到任何变化点」闸门永远不触发，
+        //   接着 forEach 把 -ss undefined 喂给 ffmpeg，用户只看到抽帧全失败。
+        if (pts.length === 0) continue
         if (pts.length >= targetN) { sceneTh = th; frameTimes = pickEvenly(pts, targetN); break }
         // 不够就记下来，最后一轮用最多的
         if (!frameTimes.length || pts.length > frameTimes.length) { sceneTh = th; frameTimes = pickEvenly(pts, Math.min(targetN, pts.length)) }
@@ -1207,7 +1253,7 @@ async function runOcr(dir, { json = false } = {}) {
   try {
     const args = [OCR_SCRIPT, dir]
     if (json) args.push('--json')
-    const out = execFileSync(OCR_PY, args, {
+    const out = runExecFileSync(OCR_PY, args, {
       timeout: 600_000,
       maxBuffer: 32 * 1024 * 1024,
       encoding: 'utf8',
@@ -1235,6 +1281,13 @@ function fmtIdxLine(row, col, startSec, endSec) {
   const ss = (s) => String(Math.floor(s % 60)).padStart(2, '0')
   const mid = (startSec + endSec) / 2
   return `r${row}c${col} ${mm(startSec)}:${ss(startSec)}-${mm(endSec)}:${ss(endSec)} @${mm(mid)}:${ss(mid)}`
+}
+
+// C205：search 与 hot 原来各写一遍 UTC 截日期，
+//   两处同形但各拼各的，改口径时容易只改一处。统一到这一个函数，口径仍是 UTC。
+//   上游没给 pubdate 时返回 '?'，不编日期。
+function dayUtc(pubdate) {
+  return pubdate ? new Date(pubdate * 1000).toISOString().slice(0, 10) : '?'
 }
 
 function fmtSec(s) {
@@ -1338,6 +1391,12 @@ function cuesToMd(cues, meta = {}) {
 // text 命令的 --format json：把「这一档拿到的东西 + 时间轴口径」一起吐出去
 function emitTextJson(opts, payload) {
   if (String(opts?.format || '').toLowerCase() !== 'json') return false
+  // C232：成本只作为新字段追加；字节是正文字节数、帧数这次取不到就 0，均标估算。
+  //   scanInjection 只看 cues/text，cost 不参与扫描，也不会被当成第三方正文。
+  if (opts?.costT0) {
+    const cost = costOf({ t0: opts.costT0, bytes: Buffer.byteLength(payloadTextOf(payload)), cached: opts.costCached === true })
+    if (cost && !('cost' in payload)) payload.cost = cost
+  }
   // 2026-11-02（护栏加固 ①）：这条是 text 的主数据出口，原来这里完全不扫。
   //   有 cues 就扫 cues 的正文，没有就扫全文 text —— 「要扫的那段内容」跟着数据形态走。
   const hits = scanInjection(payloadTextOf(payload), { short: false })
@@ -1403,6 +1462,12 @@ function emitTextMd(opts, payload) {
 function emitText(opts, payload) {
   if (emitTextJson(opts, payload)) return true
   if (emitTextMd(opts, payload)) return true
+  // C232：散文模式也给一行成本。say() 尊重 --quiet（工具层恒带它，那一行走 stderr，
+  //   stdout 仍只有正文）；json/md 模式在上面已 return，字段在 payload.cost 里，不重复打。
+  if (opts?.costT0) {
+    const cost = costOf({ t0: opts.costT0, bytes: Buffer.byteLength(payloadTextOf(payload)), cached: opts.costCached ?? null })
+    say(costProse(cost))
+  }
   return false
 }
 
@@ -1445,7 +1510,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
       // sub 空字幕是正常结果（视频有字幕轨但全空），不是失败——rc=0，payload 带 empty:true
       if (format === 'json') {
         const payload = {
-          video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+          video: videoMeta(bv, v),
           lan: s.lan ?? null,
           timeline: { exact: true, source: 'official-subtitle' },
           cues: [],
@@ -1483,7 +1548,7 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
       return
     }
     const payload = {
-      video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+      video: videoMeta(bv, v),
       lan: s.lan ?? null,
       timeline: { exact: true, source: 'official-subtitle' },
       cues: cues.map((c) => ({ from: Number(c?.from ?? 0), to: Number(c?.to ?? 0), content: String(c?.content ?? '') })),
@@ -1571,7 +1636,8 @@ async function cmdComments(bv, ps = 10, opts = {}) {
   const cHits = scanInjection(cAll)
   emitWarn('评论', bv, cHits)
   if (format === 'json') {
-    const payload = { ok: true, source: 'comments', bv, title: v.title, count: items.length, items }
+    // C217/A4：json 出口也带 video 元信息，键集合与 sub/text 那几个出口一致。
+    const payload = { ok: true, source: 'comments', bv, title: v.title, count: items.length, items, video: videoMeta(bv, v) }
     if (cHits.length) payload._untrusted = untrustedMeta('comments', bv, cHits)
     const s = JSON.stringify(payload, null, 2)
     if (out) { try { mkdirSync(dirname(out), { recursive: true }) } catch {}; writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
@@ -1639,8 +1705,8 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
   if (format === 'json') {
     const items = all.map((x) => ({ time: x.t, mode: x.mode, size: x.size, color: x.color, text: x.text }))
     const payload = blocked
-      ? { ok: false, source: 'danmaku', bv, cid: v.cid, count: 0, items: [], reason: 'danmaku-blocked-or-empty' }
-      : { ok: true, source: 'danmaku', bv, cid: v.cid, count: items.length, items }
+      ? { ok: false, source: 'danmaku', bv, cid: v.cid, count: 0, items: [], reason: 'danmaku-blocked-or-empty', video: videoMeta(bv, v) }
+      : { ok: true, source: 'danmaku', bv, cid: v.cid, count: items.length, items, video: videoMeta(bv, v) }
     const s = JSON.stringify(payload, null, 2)
     if (out) { try { mkdirSync(dirname(out), { recursive: true }) } catch {}; writeFileSync(out, s + '\n', 'utf8'); console.error(`✓ 已写入 ${out}（${items.length} 条）`) }
     else process.stdout.write(s + '\n')
@@ -1758,7 +1824,7 @@ async function cmdSearch(keyword, { limit = 10, order = '', days = 0 } = {}) {
   for (const it of shown) {
     if (!it.bvid) continue
     const title = String(it.title ?? '').replace(/<[^>]+>/g, '')
-    const day = it.pubdate ? new Date(it.pubdate * 1000).toISOString().slice(0, 10) : '?'
+    const day = dayUtc(it.pubdate)
     console.log(`  ${it.bvid}  ${fmtPlay(it.play)}播放  ${it.duration ?? '?'}  ${day}  ${title}`)
     console.log(`           UP ${it.author ?? '?'}`)
   }
@@ -1789,7 +1855,7 @@ async function cmdHot({ limit = 10 } = {}) {
   console.log(`${src} 前 ${list.length} 条（按热度排，不是纯播放量）`)
   for (const it of list) {
     const t = it.stat?.view ?? 0
-    const day = it.pubdate ? new Date(it.pubdate * 1000).toISOString().slice(0, 10) : '?'
+    const day = dayUtc(it.pubdate)
     const dur = Number(it.duration) > 0 ? `${Math.floor(it.duration / 60)}:${String(it.duration % 60).padStart(2, '0')}` : '?'
     console.log(`  ${it.bvid}  ${fmtPlay(t)}播放  ${dur}  ${day}  ${it.title ?? '?'}`)
     console.log(`           UP ${it.owner?.name ?? '?'}`)
@@ -1872,6 +1938,11 @@ async function cmdFrames(bv, opts = {}) {
     }
   }
   console.log(`帧: ${names.length} 张 → ${names.map((p) => basename(p)).join(', ')}`)
+  // C220：只挂结果，不打输出 —— json 出口从 opts.result 取，散文一行不动。
+  // C232：只加 cost 一个键 + 一行散文；既有键与既有散文一字不动。
+  const frameCost = costOf({ t0: opts.costT0, frames: names.length, cached: !!r.cached })
+  opts.result = { dir: r.dir, mp4: r.mp4, frames: names.length, cached: !!r.cached, files: names.map((p) => basename(p)), cost: frameCost }
+  console.log(costProse(frameCost))
   if (opts.ocr) {
     if (!ocrReady()) {
       console.log(`\n⚠ OCR 环境不可用（缺 ${OCR_PY} 或 ${OCR_SCRIPT}），跳过识别，直接看帧；要 OCR 跑 node scripts/fetch-deps.mjs ocr`)
@@ -1881,6 +1952,7 @@ async function cmdFrames(bv, opts = {}) {
     const rOcr = await runOcr(r.dir)
     // 6-14：OCR 崩溃返回 ok:false，不把错误串当识别结果打印落盘
     if (!rOcr.ok) { console.error(`✗ OCR 失败：${rOcr.why}`); process.exitCode = 1; return }
+    if (opts.result) opts.result.ocr = rOcr.text || ''
     printText(rOcr.text || '（画面里没识别到文字）', opts, bv, 'ocr-frames')
   }
 }
@@ -1896,7 +1968,14 @@ async function cmdOcr(bv, opts = {}) {
   console.log('OCR 识别画面文字…\n')
   const rOcr = await runOcr(r.dir)
   if (!rOcr.ok) { console.error(`✗ OCR 失败：${rOcr.why}`); process.exitCode = 1; return }
-  printText(rOcr.text || '（画面里没识别到文字）', opts, bv, 'ocr')
+  // C220：json 出口从这里取正文，散文仍由 printText 照写。
+  // C232：帧数 / 字节是本次产出的粗口径，estimated=true；缓存命中来自 grabFrames 的硬证据。
+  const ocrCost = costOf({ t0: opts.costT0, frames: Number(r.frames) || 0, bytes: String(rOcr.text || '').length, cached: !!r.cached })
+  opts.result = { dir: r.dir, text: rOcr.text || '', chars: (rOcr.text || '').length, cost: ocrCost }
+  console.log(costProse(ocrCost))
+  // C231：ocr 的文本产物也跟默认输出目录；显式 --out 优先，没配时 textOutPath 返回空串 → 走原路径。
+  printText(rOcr.text || '（画面里没识别到文字）',
+    { ...opts, textOut: textArtifactOut(`${bv}-ocr.txt`, opts.out) }, bv, 'ocr')
 }
 
 // ── 拼图：N 帧拼一张，比逐帧读省好几倍 ──
@@ -1994,6 +2073,20 @@ function cuesTextInRange(cues, from, to, lineMax = 48, maxLines = 2) {
   return lines
 }
 
+// C231 / A3 默认输出目录（最小版）：
+//   · 显式 --out 最优先（分派前已过 checkOutDir 黑名单）；
+//   · 其次 deps-config.json 的 defaultOut / 环境变量 BILI_WATCH_OUT；
+//   · 两者都没配 → 返回原来的 cacheDir()/sheets/<文件名>，一个字节都不变。
+// 面板设置页保持原样；默认目录只影响 artifactOut 的落点。
+const artifactOut = (filename, explicitOut) => pictureOutPath({
+  cfg: depsCfgSnapshot, env: process.env, cacheDir: cacheDir(), filename,
+  explicitOut: explicitOut || '',
+})
+const textArtifactOut = (filename, explicitOut) => textOutPath({
+  cfg: depsCfgSnapshot, env: process.env, filename,
+  explicitOut: explicitOut || '',
+})
+
 async function cmdSheet(bv, opts = {}) {
   const grid = String(opts.grid ?? '3x3').toLowerCase()
   const [cols, rows] = grid.split('x').map(Number)
@@ -2002,6 +2095,23 @@ async function cmdSheet(bv, opts = {}) {
   // 2026-11-01（0.4.1 第 5 条）：--at 与 frames 走同一套 parseAtTimes（在 grabFrames 里），
   //   这里只负责把 at 传下去 + 后续按「时刻命名的帧」读文件。
   const at = String(opts.at ?? '').trim()
+  // C233：预算由分派链按 tuning 注入（本函数不引入第二个常量）；估算与 dry-run 第四行同一口径。
+  //   sheetPlan 是纯函数，多算一次没有副作用；超预算只走 warn() 到 stderr，不改 stdout 四行、不阻断。
+  const budget = Number(opts.tokenBudget) > 0 ? Number(opts.tokenBudget) : 0
+  const planToken = Number(sheetPlan({ bv, grid, dur: Number(opts.dur) || null, out: '', manifestPath: null }).token) || 0
+  const budgetWarn = budgetWarnLine(planToken, budget)
+  // C224：出计划不出图。短路必须留在 grabFrames 之前 —— 一旦走到它就真抽帧/下载/写盘了。
+  if (opts.dryRun) {
+    const planOut = artifactOut(`${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`, opts.out)
+    // C220：干跑不联网，json 出口要能离线跑通（offline 让包装层别去取视频元数据）。
+    opts.result = { dryRun: true, offline: true, grid }
+    for (const line of sheetPlan({ bv, grid, dur: Number(opts.dur) || null, out: planOut, manifestPath: manifestPathOf(planOut) }).lines) console.log(line)
+    if (budgetWarn) warn(budgetWarn)
+    return
+  }
+  // C233：非干跑也要在拼图前先报这次大概会用多少 token；超预算同一行提示，绝不阻断。
+  console.log(tokenEstimateLine(planToken))
+  if (budgetWarn) warn(budgetWarn)
   console.log(`九宫格 ${bv}（${grid}，从抽帧里均匀挑 ${n} 张拼一张图）${at ? ` · 指定时刻 ${at}` : ''}`)
   const r = await grabFrames(bv, { step: opts.step ?? 0, p: opts.p ?? 1, ffmpeg: opts.ffmpeg, fresh: opts.fresh, at })
   // --at 模式下抽出来的是 f_12m30s.jpg（按时刻命名），`${bv}-NN.jpg` 那套文件根本不存在——
@@ -2012,14 +2122,16 @@ async function cmdSheet(bv, opts = {}) {
   // T35-E：同一 BV 同一格子的拼图互斥——tmp 目录是 rmSync 重建的，两个进程同时拼会互删对方的工作目录
   const lock = await tryLock(join(cacheDir(), 'sheet-tmp'), `.${bv}-${grid}.lock`)
   if (!lock) { process.exitCode = 1; console.error(`✗ 另一个进程正在拼 ${bv} 的 ${grid} 图，稍后再试`); return }
+  // C242：tmp 定义在 try 外，finally 才拿得到；拼完（含抛错）只清本次那个 tmp，
+  //   不删整个 sheet-tmp —— 并发的另一个拼图任务还在用同一个容器目录。
+  const tmp = join(cacheDir(), 'sheet-tmp', `${bv}-${grid}`)
   try {
-    const tmp = join(cacheDir(), 'sheet-tmp', `${bv}-${grid}`)
     rmSync(tmp, { recursive: true, force: true })
     mkdirSync(tmp, { recursive: true })
     picked.forEach((f, i) => copyFileSync(f, join(tmp, `${String(i + 1).padStart(2, '0')}.jpg`)))
     const bin = findFfmpeg(opts.ffmpeg)
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
-    const out = join(cacheDir(), 'sheets', `${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`)
+    const out = artifactOut(`${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`, opts.out)
     mkdirSync(dirname(out), { recursive: true })
     ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], ffTimeoutMs())
     console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
@@ -2027,8 +2139,13 @@ async function cmdSheet(bv, opts = {}) {
     const stepUsed = Number((/-([0-9]+)s$/.exec(r.dir) || [])[1] || opts.step || 0)
     const cellSec = (f, i) => frameSecOf(f, i, stepUsed)
     const cells = picked.map((f, i) => { const sec = cellSec(f, i); return { cell: i + 1, file: basename(f), sec, mmss: sec == null ? '?' : fmtSec(sec) } })
+    // C220：json 出口自报产物，散文「拼图:」「索引：」一行不动。
+    opts.result = { out, grid, frames: picked.length, cells }
     try {
-      writeFileSync(out.replace(/\.jpg$/, '.manifest.json'), JSON.stringify({ bv, grid, at: at || null, step: stepUsed || null, cells }, null, 2) + '\n', 'utf8')
+      // C219/A6：写完立刻把路径说出来（只追加一行，既有「拼图:」行一字不改）。
+      const mp = writeSheetManifest(out, { bv, grid, at: at || null, step: stepUsed || null, cells })
+      opts.result.manifest = mp
+      console.log(manifestLine(mp))
     } catch {}
     // 2026-11-02：--cues 挂台词。**放在拼图成功之后** —— 拼图是本命令的主功能，
     //   不能因为字幕取不到就让它失败；反过来取不到也必须说一句（warn 走 stderr，不污染 stdout），
@@ -2069,6 +2186,7 @@ async function cmdSheet(bv, opts = {}) {
     console.log('读这张图就能过一遍画面；要精确读字用 ocr <BV>。')
   } finally {
     unlock(lock)
+    try { rmSync(tmp, { recursive: true, force: true }) } catch {}
   }
 }
 
@@ -2083,20 +2201,24 @@ async function cmdSubstrip(bv, opts = {}) {
   // T35-E：同一 BV 的字幕带拼图互斥（tmp 目录 rmSync 重建，防两个进程互删）
   const lock = await tryLock(join(cacheDir(), 'substrip-tmp'), `.${bv}.lock`)
   if (!lock) { process.exitCode = 1; console.error(`✗ 另一个进程正在拼 ${bv} 的字幕带，稍后再试`); return }
+  // C242：同 cmdSheet，收尾只清本次 tmp，不碰整个 substrip-tmp。
+  const tmp = join(cacheDir(), 'substrip-tmp', bv)
   try {
-    const tmp = join(cacheDir(), 'substrip-tmp', bv)
     rmSync(tmp, { recursive: true, force: true })
     mkdirSync(tmp, { recursive: true })
     picked.forEach((f, i) => copyFileSync(f, join(tmp, `${String(i + 1).padStart(2, '0')}.jpg`)))
     const bin = findFfmpeg(opts.ffmpeg)
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
-    const out = join(cacheDir(), 'sheets', `${bv}-p${opts.p ?? 1}-substrip.jpg`)
+    const out = artifactOut(`${bv}-p${opts.p ?? 1}-substrip.jpg`, opts.out)
     mkdirSync(dirname(out), { recursive: true })
     ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `crop=iw:ih*0.20:0:ih*0.80,scale=1280:-1,tile=1x${take}`, '-frames:v', '1', out], ffTimeoutMs())
     console.log(`字幕带: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${take} 条）`)
+    // C220：json 出口自报产物，散文两行照写。
+    opts.result = { out, frames: take }
     console.log('一张图里是整片底部字幕；硬字幕视频用它比逐帧 OCR 省很多。')
   } finally {
     unlock(lock)
+    try { rmSync(tmp, { recursive: true, force: true }) } catch {}
   }
 }
 
@@ -2550,8 +2672,13 @@ function printText(text, opts, bv, kind = 'text') {
   // B31：head 按全文长度夹紧，提示用夹紧后的实际截断数
   head = Math.min(head, full.length)
   let file = ''
+  // C231：ocr 的默认输出目录。只有 cmdOcr 会给 textOut 这个新键；text/sub/asr 三条老路径
+  //   没有它，target 逐字节不变，C221 的三处结构化落盘也照旧。刻意不复用 opts.out ——
+  //   那个键在 cmdText 里已有别的含义，拿它当落点会把既有行为悄悄改掉。
+  const customTextOut = String(opts?.textOut || '').trim()
   try {
-    const target = join(videoDir(bv), `${kind}.txt`)
+    const target = customTextOut || join(videoDir(bv), `${kind}.txt`)
+    if (customTextOut) { try { mkdirSync(dirname(target), { recursive: true }) } catch {} }
     // W-33（2026-10-28 阶段B-③）：tmp 名原来是固定的 `${target}.tmp`，两个进程同时要同一个视频的文本时
     //   共用同一个 tmp：A 写完还没 rename，B 就开始往里写 → A rename 出去的是被 B 改过的半截内容；
     //   或者两边先后 rename 到同一个 target，谁后谁赢、前者白跑。加 pid + 进程内自增让写入者各用各的 tmp，
@@ -2581,6 +2708,17 @@ function printText(text, opts, bv, kind = 'text') {
     } catch { wrapped = '' }
   }
   if (file) { try { writeMeta(bv, { [`${kind}Chars`]: full.length }) } catch {} }
+  // C221/A·B7：散文照写，另落一份 `<kind>.json` 并在 stdout 说出路径。
+  // 放在所有展示分支之前：--full / --head / 短文本 / 长文本四条路径都会经过这里；
+  // dataOnly 与空结果在更前面就 return 了，不会被污染。
+  if (file) {
+    try {
+      const jp = writeTextJson(file, textJsonPayload({ bv, kind, text: full, cues: opts?.cues || null }))
+      console.log(textJsonLine(jp))
+    } catch (e) {
+      console.error(`⚠ 结构化副本落盘失败：${e.message}（散文已正常落盘）`)
+    }
+  }
   // T37-P0：展示层包 source tag + code fence（文件仍是纯正文，read 拿到的干净全文不受影响）
   const disp = (s) => fencedDisplay(s, kind, bv)
   if (!file) {
@@ -2645,6 +2783,8 @@ async function cmdText(bv, credPath, opts = {}) {
   }
   const t = tuning() // 参数分层：一次取齐，后续不再读文件
   const t0 = Date.now()
+  // C232：给统一出口一个计时起点；各分支能确证缓存命中时自行写 opts.costCached。
+  opts.costT0 = t0
   const cred = credFor(credPath)
   const v = await viewOf(bv, opts.p)
   // B21：首跑合并式依赖预检——缺几个报几个，但不阻断还能走的分支（缺 OCR 仍可字幕/转写）
@@ -2697,7 +2837,7 @@ async function cmdText(bv, credPath, opts = {}) {
   // 口径差异（有意）：自动化选片链路会把「语速/关键词不合格」当硬拦，
   // 这里是人看的排查通道，取到就用、质量交给调用方判断。两条通道用同一套判据，差别只在拦不拦。
     if (emitText(opts, {
-      video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+      video: videoMeta(bv, v),
       source: 'subtitle',
       lan: s.lan ?? null,
       timeline: { exact: true, source: 'official-subtitle' },
@@ -2748,6 +2888,9 @@ async function cmdText(bv, credPath, opts = {}) {
       // 口播类正常 4–6 字/秒；低于 2 字/秒多半是背景音乐、外语歌或纯画面，
       // 这时候转写出来的「字」只是把杂音听成了字，继续往下走 OCR 更靠谱。
       const rate = v.dur > 0 ? a.chars / v.dur : 0
+      // C223：放在分支之前，rate<2 的所有出口（suspect / 后续 emitText 成功 / done 之前）都会先说这句。
+      const coverage = asrCoverageNotice(a.chars, v.dur)
+      if (coverage) track(`[track] ${coverage}`)
       if (rate >= 2 && !(a.verify && a.verify.suspect)) {
         // T40：ASR 也会把杂音/背景音听成字，主入口同样要过诱饵信号（原先只有字幕分支有）
         const asrBait = baitSignals(a.text, v, credibility(v, a.text))
@@ -2755,7 +2898,7 @@ async function cmdText(bv, credPath, opts = {}) {
           track(`[track] ⚠ 转写可疑：${asrBait.reasons.join('；')}（机器转写本来就可能听错，要看画面加 --verify 再跑一次）`)
         }
         if (emitText(opts, {
-          video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+          video: videoMeta(bv, v),
           source: 'asr',
           timeline: { exact: false, source: 'asr-estimate', note: '无官方时间戳；按标点与字数估算' },
           text: a.text,
@@ -2764,6 +2907,9 @@ async function cmdText(bv, credPath, opts = {}) {
           return
         }
         track(`[track] 转写: ok ${a.chars} 字（${rate.toFixed(1)} 字/秒${a.cached ? '，缓存命中' : ''}；机器转写，专有名词可能有错）`)
+        // B4：这句只在 text 默认路径（emitText 的 json 出口已经 return）。带 ⚠ 才会被
+        //   工具层 filter(⚠) 回灌给模型；上面那条 [track] 不带 ⚠，AI 一条都看不到。
+        if (a.cached) track(`[track] ${cacheNotice(a.cached)}`)
         // A1 补充：老缓存（没有 .cues.json）时在 stderr 说一句，别在正文里吵
         if (a.cached && a.noCues && !opts?.dataOnly) {
           console.error('（本份无时间码：缓存是旧版本生成的；加 --fresh 重取可带）')
@@ -2799,7 +2945,7 @@ async function cmdText(bv, credPath, opts = {}) {
     // 6-14：OCR 崩溃返回 ok:false，不把错误串当识别结果打印落盘
     if (rOcr.ok && rOcr.text) {
       if (emitText(opts, {
-        video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+        video: videoMeta(bv, v),
         source: 'ocr',
         timeline: { exact: false, source: 'frame-ocr', step: opts.step ?? 'auto' },
         text: rOcr.text,
@@ -2829,7 +2975,7 @@ async function cmdText(bv, credPath, opts = {}) {
   //   note 仍带帧目录绝对路径，让模型知道可以 read_image 读图（text 模式下接着抽帧，json 模式下路径已在 payload 里）
   if (emitText(opts, {
     ok: false,
-    video: { bv, title: v.title, up: v.owner, dur: v.dur, p: v.p, pages: v.pages },
+    video: videoMeta(bv, v),
     source: 'vision',
     timeline: { exact: false, source: 'frames-for-vision' },
     text: null,
@@ -2855,9 +3001,9 @@ function probeDur(file, ffmpeg = '') { // W-27：ffprobe 跟 ffmpeg 同目录，
   const bin = findFfmpeg(ffmpeg)
   if (!bin) return null
   try {
-    const ffprobe = join(dirname(bin), 'ffprobe' + (process.platform === 'win32' ? '.exe' : ''))
+    const ffprobe = join(dirname(bin), 'ffprobe' + (isWin() ? '.exe' : ''))
     if (!existsSync(ffprobe)) return null
-    const out = execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], {
+    const out = runExecFileSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], {
       timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
     })
     const n = parseFloat(String(out).trim())
@@ -3196,12 +3342,12 @@ async function resolveSource(input) {
 
 // 定位 yt-dlp：环境变量 → 插件 deps\yt-dlp.exe → PATH；找到后 --version 验一次
 function findYtDlp() {
-  const localExe = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'
+  const localExe = isWin() ? 'yt-dlp.exe' : 'yt-dlp'
   const cands = [process.env.BILI_WATCH_YTDLP, join(DEPS, localExe), 'yt-dlp'].filter(Boolean)
   for (const c of cands) {
     if (c !== 'yt-dlp' && !existsSync(c)) continue
     try {
-      execFileSync(c, ['--version'], { stdio: 'ignore', timeout: 300000 })
+      runExecFileSync(c, ['--version'], { stdio: 'ignore', timeout: 300000 })
       return c
     } catch {}
   }
@@ -3216,7 +3362,7 @@ async function fetchGenericMeta(url) {
     // 这里**不能**用 ffExec：那是 ffmpeg 专用包装，失败时会把消息拼成「ffmpeg 失败：…」，
     //   而这条是 yt-dlp，下面 classifyYtDlpError 靠原始 stderr 做网络/403/地区限制分类。
     //   （N-04 批量替换时误伤，验收指出「口径不统一」，此处改回直传。）
-    const out = execFileSync(bin, ['-J', '--no-playlist', url], { maxBuffer: 16 * 1024 * 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 })
+    const out = runExecFileSync(bin, ['-J', '--no-playlist', url], { maxBuffer: 16 * 1024 * 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 })
     const j = JSON.parse(out)
     return {
       ok: true,
@@ -3244,7 +3390,7 @@ async function downloadGenericVideo(url, outDir, ffmpeg = '') { // W-27：yt-dlp
     const args = []
     if (ff && ff !== 'ffmpeg') args.push('--ffmpeg-location', dirname(ff))
     args.push('-f', 'bv*[height<=480]+ba/b[height<=480]/best', '--merge-output-format', 'mp4', '--no-playlist', '-o', join(outDir, 'video.%(ext)s'), url)
-    execFileSync(bin, args, { maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 600000 })
+    runExecFileSync(bin, args, { maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 600000 })
     const files = readdirSync(outDir).filter((f) => f.startsWith('video.'))
     if (!files.length) return { ok: false, error: '下载没产出文件' }
     return { ok: true, path: join(outDir, files[0]) }
@@ -3263,7 +3409,7 @@ async function downloadGenericAudio(url, outDir, ffmpeg = '') { // W-27：同上
     const args = []
     if (ff && ff !== 'ffmpeg') args.push('--ffmpeg-location', dirname(ff))
     args.push('-f', 'bestaudio/best', '-x', '--audio-format', 'wav', '--no-playlist', '-o', join(outDir, 'audio.%(ext)s'), url)
-    execFileSync(bin, args, { maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 600000 })
+    runExecFileSync(bin, args, { maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 600000 })
     const files = readdirSync(outDir).filter((f) => f.startsWith('audio.'))
     const wav = files.find((f) => f.endsWith('.wav')) || files[0]
     if (!wav) return { ok: false, error: '下载没产出音轨文件（可能视频本身无声）' }
@@ -3405,7 +3551,8 @@ async function runGeneric(cmd, src, opts = {}) {
   }
   if (cmd === 'frames') {
     const tag = 'gen-' + createHash('sha256').update(url).digest('hex').slice(0, 10)
-    const outDir = join(cacheDir(), 'frames-dl', tag)
+    setKeepSource(flag('keep-source'))
+    const outDir = trackSource(join(cacheDir(), 'frames-dl', tag))
     console.log('下载视频…')
     const dl = await downloadGenericVideo(url, outDir, opts.ffmpeg)
     if (!dl.ok) { console.error(`✗ ${dl.error}`); process.exit(1) }
@@ -3415,11 +3562,13 @@ async function runGeneric(cmd, src, opts = {}) {
     console.log(`目录: ${r.dir}`)
     if (r.cached) console.log(`  复用上次抽好的 ${r.frames ?? ''} 帧（要重抽加 --fresh；清全部加 clean）`)
     console.log(`帧: ${r.frames} 张`)
+    releaseSource(outDir)
     return
   }
   if (cmd === 'text' || cmd === 'asr') {
     const tag = 'gen-' + createHash('sha256').update(url).digest('hex').slice(0, 10)
-    const outDir = join(cacheDir(), 'audio-dl', tag)
+    setKeepSource(flag('keep-source'))
+    const outDir = trackSource(join(cacheDir(), 'audio-dl', tag))
     // N05-B2（2026-10-27 改）：--format json/md 时这三行进度走 say()（QUIET 时落 stderr），
     //   否则 JSON 前面先冒出「下载音轨…」，调用方 JSON.parse 直接抛。stdout 只留数据。
     const fmt = String(opts?.format || '').toLowerCase()
@@ -3445,9 +3594,10 @@ async function runGeneric(cmd, src, opts = {}) {
       chars: r.chars,
       cached: !!r.cached,
     }
-    if (emitText(opts, genPayload)) return
+    if (emitText(opts, genPayload)) { releaseSource(outDir); return }
     console.log(`\n转写 ${r.chars} 字：${r.cached ? '（缓存命中）' : ''}`)
     printText(r.text, { ...opts, _noFrameCheck: true }, tag, kind)
+    releaseSource(outDir)
     return
   }
 }
@@ -3478,29 +3628,61 @@ const P = opt('p') ? Number(opt('p')) : 1
 //   不判「这个命令认不认它」—— 那判不了：index.js 的 execute 会按模型入参下发
 //   --step / --p / --limit，命令收到不属于自己的参数是正常路径，不是错误。
 const ARG_ERRORS = checkFlagValues(argv)
+// C236：删除类命令必须自己实现 --dry-run。没实现却收到这个参数时，分派前直接拒绝（rc=2），
+//   不许像过去那样只打一行「已按忽略处理」然后照删 —— 缓存是一次性产物，但用户放在
+//   缓存根里的东西不是。判定放在参数表，将来新增删除类命令会自动被这条闸拦住。
+const DRY_RUN_REJECT = unsupportedDryRun(cmd, argv)
+// C287：--keep-source 在 RUNTIME_GLOBAL_PARAMS 里，unacceptedFlags() 对它豁免，
+//   连「本命令不接受」都不会打；而 clean 段根本不读它。用户显式说要保留原片，
+//   程序却按默认策略把 gen-<hash> 下的原视频/音轨永久删掉 —— 承诺与行为相反。
+//   判定放在参数表，与 C236 同一套 rc=2 出口，不许退化成「提示一句忽略后照删」。
+const KEEP_SOURCE_REJECT = unsupportedKeepSource(cmd, argv)
+// C230 / B3 缩小版：参数「被接受」与「真生效」脱钩时，至少让人看见。
+//   只打一行 ⚠ 到 stderr：不改下发、不改退出码、不改 stdout、不改 output.schema。
+//   warn() 永远走 stderr 且带 ⚠，工具层成功分支的 filter(⚠) 会把它回灌给模型 ——
+//   这正是 B3 要的「参数没生效别静默」，不需要动结果组装主干（B1/B2 已推 0.5.0）。
+//   --help / 元命令 / 值非法（走 rc=2 那条）不叠这一行，免得一处错误报两种话。
+const UNACCEPTED = unacceptedFlags(cmd, argv)
+if (UNACCEPTED.length && cmd && !flag('help') && cmd !== 'help' && cmd !== '--help' && !ARG_ERRORS.length && !DRY_RUN_REJECT && !KEEP_SOURCE_REJECT) {
+  warn(`本命令不接受 ${UNACCEPTED.map((n) => `--${n}`).join(' / ')}（这些参数不会生效，已按忽略处理）`)
+}
 const HELP = `用法:
   node look.mjs search <关键词> [--limit 10] [--order pubdate|click] [--days N]  搜视频（--days 不传或传 0 不限时间）
   node look.mjs hot [--limit 10]              综合热门榜（B 站按热度排）
+  node look.mjs doctor [--format json]         六项环境检查：ffmpeg / ffprobe / ASR / B 站凭证 / 缓存 / deps
+                                               每项给一条可复制的修复命令；不联网、不改文件、不写缓存
+                                               BILI_WATCH_FFPROBE=<路径> 显式指定 ffprobe 时只验这一份，跑不通就报 ✗
   node look.mjs peek <BV或链接>              先看标题/简介/热评 + 5 帧，判断内容类型（仅 B 站）
   node look.mjs view <BV或链接或URL>         只看元数据与热评
   node look.mjs sub <BV或链接> [--cred 凭证路径] [--format text|srt|json|md|txt] [--out 文件]  字幕（仅 B 站）
   node look.mjs comments <BV或链接> [条数] [--format json] [--out 文件]  评论区（仅 B 站）
   node look.mjs danmaku <BV或链接> [--format json] [--out 文件]  弹幕热区（仅 B 站）
   node look.mjs asr <BV或链接或URL> [--ffmpeg 路径] [--asr-max 毫秒] [--head N] [--full]  本地转写（B 站或通用 URL 均可）
-  node look.mjs frames <BV或链接或URL> [--step 2] [--out 目录] [--ffmpeg 路径] [--fresh] [--ocr] [--scene]
+  node look.mjs frames <BV或链接或URL> [--step 2] [--out 目录] [--ffmpeg 路径] [--fresh] [--ocr] [--scene] [--format json]
                                          --scene：吸附画面变化点抽帧（默认关；仅 B 站）
-  node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2] [--at 12:30,01:05:00] [--cues]   N 帧拼一张九宫格（仅 B 站）
+  node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2] [--at 12:30,01:05:00] [--cues] [--out 文件] [--format json]   N 帧拼一张九宫格（仅 B 站）
                                          --at：只要这些时刻的画面（与 frames 同一套写法；给了就忽略 --step）
                                          --cues：每格索引行下方附该时段的字幕台词（每格最多 2 行、每行 48 字符）。
                                                  折行按字符数算，不是显示宽度，中文一行看着会比英文宽；
                                                  按「本格时间点 → 下一格时间点」切，不是索引行的 [start,start+step)；
                                                  视频没字幕轨时整段不加，不留空行。
-  node look.mjs substrip <BV或链接> [--step 7]          底部字幕带竖拼一张图（仅 B 站）
-  node look.mjs ocr <BV或链接> [--step 2]     抽帧 + OCR 出文字（仅 B 站）
+                                         --dry-run：只出计划（时长 / 格子数 / 时间点 / 预计 token），不抽帧、不下载、不写盘；
+                                                    离线时用 --dur 秒数 给出时长即可算出时间点。
+  node look.mjs substrip <BV或链接> [--step 7] [--out 文件] [--format json]   底部字幕带竖拼一张图（仅 B 站）
+  node look.mjs ocr <BV或链接> [--step 2] [--out 文件] [--format json]   抽帧 + OCR 出文字（仅 B 站）
   node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--verify] [--head N] [--full] [--format json] [--out 文件]
   node look.mjs local <文件路径> [--ocr] [--frames] [--step 2] [--format json] [--out 文件]  本地视频/音频转写+抽帧OCR（不依赖 B 站）
   node look.mjs login [--poll] [--check] [--key <二维码key>]  扫码登录，拿 AI 字幕用的本地凭证
-  node look.mjs clean [--force-unknown]       清空缓存目录（$DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+  node look.mjs clean [--dry-run] [--all] [--permanent|--recycle|--smart] [--force-unknown]   清缓存（$DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+  --all：清到只剩缓存根标记；删除方式取 cache-config.json 的 deleteMode（默认 permanent 直删，
+         不占系统回收站配额）。--permanent / --recycle / --smart 只对这一次覆盖：recycle 全进回收站，
+         smart 只把原视频 / 音轨 / ASR 转写送回收站。回收站放不下会跳过并提示，不会静默改成永久删除；
+         回收站不可用时才直删，并明确告知这是永久删除。回收站有配额限制，删进去的东西不保证一直留着。
+  --dry-run：clean 只列出这次会删除哪些条目、多少文件与多少字节，一个文件都不删；
+             去掉它才会真正执行。删除类命令若还不支持该参数，会拒绝执行而不是忽略它。
+  --keep-source：通用 URL 的 frames / text / asr 用。下载的原视频 / 音轨默认用完即删
+                 （抛错、Ctrl+C 也有退出钩子兜底）；只有显式加它才留在缓存里。
+                 clean 不接受这个参数：加上会直接拒绝执行（rc=2），不会静默忽略后照删。
   --force-unknown：仅 clean 用。缓存根有目录读不出来时默认拒绝清理（会给出错误码）；
                    确认要清才加它。对「真有抽帧/转写任务在跑」的活锁无效，那种一律拒绝。
 
@@ -3512,12 +3694,16 @@ const HELP = `用法:
   --check：login --check = 检查本地凭证是否还有效（不会重新登录）。
   --format：sub 支持 text|srt|json|md|txt（srt/md 带真时间戳，md 的时间戳可跳回原片，txt 是一行一句）；
   text 支持 text|json|md（json 带时间轴口径：字幕 exact / 转写与 OCR 是估算）；
-  comments 与 danmaku 支持 json（stdout 只有 JSON，可接 jq）。
+  comments 与 danmaku 支持 json（stdout 只有 JSON，可接 jq）；
+  frames / ocr / sheet / substrip 支持 text|json（json 时 stdout 只有 JSON，既有散文原样收进 prose 字段；
+            sheet --dry-run --format json 不联网、不抽帧、不写盘）。
   B 站目标可以直接贴分享链接，会自己提取 BV 号；短链 b23.tv/... 也会先按公共 DNS 展开成 BV 号。
   通用视频 URL（YouTube/X 等）需要 yt-dlp：跑 node scripts/fetch-deps.mjs ytdlp 装到 deps/yt-dlp（Windows 上是 deps\\yt-dlp.exe；也可设 BILI_WATCH_YTDLP 或放进系统 PATH）。
   参数分层：转写闸门 asrMaxSec(秒,默认1800)/抽帧上限 maxFrames(默认500)/ASR超时 asrTimeoutSec(秒,默认900)/
             ffmpeg超时 ffmpegTimeoutSec(秒,默认300)/命令超时 cmdTimeoutSec(秒,默认180)，写 deps/deps-config.json
             或面板「常规」「高级设置」；--asr-max <毫秒> 只覆盖转写闸门（flag > config > 默认）。
+  --out：sheet / ocr / substrip 的产物落点。不传时读 deps-config.json 的 defaultOut（也可设 BILI_WATCH_OUT），
+         没配就沿用缓存目录；显式 --out 优先，目录不存在时自动创建，系统目录一律拒绝。
   --no-time：text/sub 默认输出带 [mm:ss] 逐句时间码，加这个退回纯文本（不带时间戳）。
   --quiet：把过程说明（进度、[track] 行）改走 stderr，stdout 只留正文，方便管道和 jq。
             面板与工具层调用时会无条件加上它；手动跑一般用不到。
@@ -3595,7 +3781,10 @@ let USAGE_ONLY = true
 const CACHE_COMMANDS = new Set(['search', 'hot', 'peek', 'view', 'sub', 'comments', 'danmaku', 'asr', 'frames', 'sheet', 'substrip', 'ocr', 'text', 'local', 'clean', 'login'])
 // 与下面 dispatch 的 NEEDS_TARGET 分支同一条件：有命令名但缺 BV / 关键词时直接 exit 2，那时什么都不该建。
 // clean / hot / local / login 不吃 BV，不算「缺参」。
-const missingArg = src.type === 'empty' && cmd !== 'clean' && cmd !== 'hot' && cmd !== 'local' && cmd !== 'login'
+// C222：doctor 与 clean/hot/local/login 同属「本来就不吃目标」的命令，不能算缺参。
+//   否则 missingArg 会把 USAGE_ONLY 恒拉成 true，将来谁误把 doctor 加进 CACHE_COMMANDS，
+//   只读快照也照绿 —— 判据少了一层行为上的牙。
+const missingArg = src.type === 'empty' && cmd !== 'clean' && cmd !== 'hot' && cmd !== 'local' && cmd !== 'login' && cmd !== 'doctor'
 USAGE_ONLY = !(cmd && CACHE_COMMANDS.has(cmd)) || missingArg
 try {
   if (!USAGE_ONLY) ensureCache()
@@ -3641,8 +3830,8 @@ try {
     sheet: '需要 BV 号或视频链接：node look.mjs sheet <BV|链接> [--grid 3x3]',
     substrip: '需要 BV 号或视频链接：node look.mjs substrip <BV|链接> [--step 7]',
     // 回归复核（2026-10-28）：这里原来写成「需要图片路径：ocr <图片文件> [--format json]」——错的。
-    //   ocr 接的是 BV（cmdOcr(bv, opts)，HELP 也写 `ocr <BV或链接>`），--format 是 text 的参数不是 ocr 的。
-    //   缺参提示指错方向比不给提示更糟，所以按 HELP 原样写。
+    //   ocr 接的是 BV（cmdOcr(bv, opts)，HELP 也写 `ocr <BV或链接>`），不是图片路径。
+    //   C220 之后 ocr 自己也认 `--format json`（见 COMMANDS 表），但缺参提示仍按 HELP 原样写。
     ocr: '需要 BV 号或视频链接：node look.mjs ocr <BV|链接> [--step 2]',
     text: '需要 BV 号或视频链接：node look.mjs text <BV|链接> [--fast]',
   }
@@ -3670,12 +3859,26 @@ try {
     await cmdLogin({ check: flag('check'), poll: flag('poll'), key: opt('key') })
   } else if (cmd === 'help' || cmd === '--help') {
     console.log(HELP)
-  } else if (ARG_ERRORS.length) {
-    // 参数值非法是用法错误，和「缺目标」同级 —— 提示走 stderr、rc=2。
+  } else if (ARG_ERRORS.length || DRY_RUN_REJECT || KEEP_SOURCE_REJECT) {
+    // 参数值非法 / 删除类命令收到没实现的 --dry-run / 清缓存收到 --keep-source，
+    //   都是用法错误：提示走 stderr、rc=2，且在任何删除动作之前。
     //   放在 --help 拦截之后：`view --help --step abc` 应该打帮助，不该先报参数错。
     for (const e of ARG_ERRORS) console.error(`✗ ${e}`)
+    if (DRY_RUN_REJECT) console.error(`✗ ${DRY_RUN_REJECT}`)
+    if (KEEP_SOURCE_REJECT) console.error(`✗ ${KEEP_SOURCE_REJECT}`)
     console.error('（跑 node look.mjs help 看参数说明）')
     process.exitCode = 2
+  } else if (cmd === 'doctor') {
+    // C222：不进 CACHE_COMMANDS —— 不初始化缓存、退出钩子也不落 runs.jsonl。
+    //   探测只跑 -version / --version，全部经 ffExec（超时 5s、stdio 全丢），不联网。
+    const fmt = opt('format') || 'text'
+    const probeBin = (bin, args) => {
+      try { ffExec(bin, args, { timeout: 5000, stdio: 'ignore' }); return true } catch { return false }
+    }
+    const report = doctorReport({ env: process.env, pluginRoot: join(HERE, '..'), cfg: depsCfgSnapshot, probe: probeBin })
+    if (fmt === 'json') console.log(JSON.stringify(report, null, 2))
+    else for (const line of doctorProse(report)) console.log(line)
+    if (!report.ok) process.exitCode = 1
   } else if (src.type === 'empty' && cmd !== 'clean' && cmd !== 'hot' && cmd !== 'local') {
     // W-61：有命令名就按命令给一句专属用法；完全没给参数才打全文 HELP
     // X-17（2026-10-29）：缺参数是用法错误——提示走 stderr、退出码 2。
@@ -3705,21 +3908,26 @@ try {
   } else if (cmd === 'asr') {
     await cmdAsr(BV, P, opt('ffmpeg'))
   } else if (cmd === 'frames') {
-    await cmdFrames(BV, { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene'), at: opt('at') })
+    // C220/A·B6：--format json 走新出口，散文路径整条不动。
+    const fo = { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene'), at: opt('at'), costT0: Date.now(), format: opt('format') || 'text' }
+    await runCommandJson({ opts: fo, source: 'frames', bv: BV, getVideo: () => viewOf(BV, P), fn: () => cmdFrames(BV, fo) })
   } else if (cmd === 'sheet') {
     // 2026-11-01（0.4.1 第 5 条）：sheet 原来不认 --at，而 frames 认。同一个「要这几秒的画面」需求，
     //   用户在两处得到两种结果（sheet 静默按 --step 抽），补上，走同一套 parseAtTimes。
     // 2026-11-02：加 --cues（宫格挂台词）与 --cred（拉字幕要凭证）。
     //   --cred 以前只在 sub/text 显式传，sheet 走的是 credFor(null) 自动找本地凭证；
     //   既然 --cues 要请求字幕，就把「用哪份凭证」显式接到分派链上，跟 sub 同一套。
-    await cmdSheet(BV, { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), at: opt('at'), cues: flag('cues'), cred: opt('cred') })
+    const sho = { grid: opt('grid') || '3x3', step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), at: opt('at'), cues: flag('cues'), cred: opt('cred'), dryRun: flag('dry-run'), dur: opt('dur'), out: opt('out') || '', tokenBudget: tokenBudgetOf(tuning()), format: opt('format') || 'text' }
+    await runCommandJson({ opts: sho, source: 'sheet', bv: BV, getVideo: () => viewOf(BV, P), fn: () => cmdSheet(BV, sho) })
   } else if (cmd === 'substrip') {
-    await cmdSubstrip(BV, { step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh') })
+    const so = { step: STEP, p: P, ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), out: opt('out') || '', format: opt('format') || 'text' }
+    await runCommandJson({ opts: so, source: 'substrip', bv: BV, getVideo: () => viewOf(BV, P), fn: () => cmdSubstrip(BV, so) })
   } else if (cmd === 'ocr') {
     // W-27 残留（2026-10-28 全量检查）：ocr 这条链路的 --ffmpeg 原来没传下去（cmdOcr 把 opts 交给
     //   grabFrames，里面 findFfmpeg(undefined) 回落默认候选），自装 ffmpeg 的用户在 ocr 上走不到自己那份。
     //   注意：verify.mjs 的「全文件禁止无参 findFfmpeg()」抓不到这条——cmdOcr 根本不直接调 findFfmpeg。
-    await cmdOcr(BV, { step: STEP, p: P, ffmpeg: opt('ffmpeg') })
+    const oo = { step: STEP, p: P, ffmpeg: opt('ffmpeg'), out: opt('out') || '', costT0: Date.now(), format: opt('format') || 'text' }
+    await runCommandJson({ opts: oo, source: 'ocr', bv: BV, getVideo: () => viewOf(BV, P), fn: () => cmdOcr(BV, oo) })
   } else if (cmd === 'text') {
     await cmdText(BV, opt('cred'), { step: STEP, p: P, fast: flag('fast'), mark: flag('mark-seen'), verify: flag('verify'), format: opt('format') || 'text', out: opt('out') || '', head: opt('head') || '', full: flag('full'), ffmpeg: opt('ffmpeg'), noTime: flag('no-time') })
   } else if (cmd === 'local') {
@@ -3733,7 +3941,7 @@ try {
     // A-3（2026-10-28 阶段A）：同上，递归扫所有会写盘子目录的锁，不只看 frames 一层。
     // 追加四（2026-10-29）：清之前先把「旧目录还留在原地」这件事说出来——只说，不动它。
     const adopt = cacheAdoptNotice(cacheWant())
-    if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，本版不动它；确认要清理请手动删。`)
+    if (adopt) say(`发现旧缓存 ${adopt.old}（${adopt.files} 项，${adopt.mb} MB），已改用 ${adopt.next}。它没有 bili-watch 的标记，插件不会动它；确认要清理请手动删。`)
     // 0.4.8 C1：三态。原来 hasAnyLock 把「读不出来」压成「正在被占用」，文案说反了；
     //   现在 locked 一律拒绝，unknown 默认拒绝，只有显式 --force-unknown 才放行（对 locked 无效）。
     const ls = lockState(cacheDir(), lockTtlMs())
@@ -3747,18 +3955,48 @@ try {
     } else if (existsSync(cacheDir())) {
       // 清前后各打一行带 reason：让「忽略了什么」可查，不许只说「已强制清理」
       if (ls.state === 'unknown') say(`强制清理：将忽略 ${ls.reason}（--force-unknown）`)
-      const cleared = removeOwned(cacheDir())
-      if (ls.state === 'unknown') say(`强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`)
-      console.log(`已清理 ${cacheDir()}（${cleared.files} 个文件 / ${(cleared.bytes / 1048576).toFixed(1)} MB）`)
-      if (cleared.skipped.length) {
-        console.log('跳过（不是 bili-watch 的数据，没动）：' + cleared.skipped.map((s) => `${s.name}（${s.why}）`).join('；'))
+      const dryRun = flag('dry-run')
+      const all = flag('all')
+      // C236b：长期档位在 cache-config.json，一次性覆盖用 --permanent / --recycle / --smart。
+      // 三条路径（常规 clean / clean --all / 面板自动清理）都经 normalizeDeleteMode 归一，
+      // 坏配置一律回 permanent，不会把用户配置里的错字变成「全走回收站」。
+      const override = flag('permanent') ? 'permanent' : flag('recycle') ? 'recycle' : flag('smart') ? 'smart' : ''
+      let cfgMode
+      try { cfgMode = readJsonOrBackup(join(DEPS, 'cache-config.json'), {}).value?.deleteMode } catch {}
+      const mode = normalizeDeleteMode(override || cfgMode)
+      const cleared = all
+        ? removeAllOwned(cacheDir(), { dryRun, mode })
+        : removeOwned(cacheDir(), { dryRun, mode })
+      const saySkippedOverflow = (r) => {
+        if (r.overflow?.count) console.log(`⚠ 因回收站空间不足跳过 ${r.overflow.count} 项 / ${(r.overflow.bytes / 1048576).toFixed(1)} MB（原位置保留，没有改走永久删除）`)
       }
-      // P2-1（2026-10-28 全量检查）：删除失败必须与「不是我们的数据」分开报，并且必须改退出码。
-      //   原来删除失败被塞进 skipped，于是「BVxxx（EPERM: operation not permitted）」被冠以
-      //   「不是 bili-watch 的数据，没动」——话说反了，而且 rc 还是 0，面板/模型都以为清干净了。
-      if (cleared.failed.length) {
-        console.error('✗ 清理失败（是 bili-watch 的数据但没删掉）：' + cleared.failed.map((s) => `${s.name}（${s.why}）`).join('；'))
-        process.exitCode = 1
+      const sayFallback = (r) => {
+        if (r.fallback?.length) console.log(`⚠ 回收站不可用，以下条目已永久删除（不可恢复）：${r.fallback.map((f) => `${f.name}（${f.why}）`).join('；')}`)
+      }
+      if (dryRun) {
+        // 预演与真删共用上面同一轮枚举：这里只把结果说出来，一个删除动作都不调。
+        console.log(`[dry-run] 本次将删除 ${cleared.plan.length} 项 / ${cleared.files} 个文件 / ${cleared.bytes} 字节（方式 ${mode}）：`)
+        for (const it of cleared.plan) console.log(`[dry-run]   ${it.name}（${it.files} 个文件 / ${it.bytes} 字节）`)
+        if (cleared.skipped.length) {
+          console.log('[dry-run] 跳过（不会删）：' + cleared.skipped.map((s) => `${s.name}（${s.why}）`).join('；'))
+        }
+        console.log('[dry-run] 预演结束：没有删除任何内容；去掉 --dry-run 才会真正执行。')
+      } else {
+        if (ls.state === 'unknown') say(`强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`)
+        const itemNote = all ? `${cleared.items} 项 / ` : ''
+        console.log(`已清理 ${cacheDir()}（${itemNote}${cleared.files} 个文件 / ${(cleared.bytes / 1048576).toFixed(1)} MB；方式 ${mode}）`)
+        if (cleared.skipped.length) {
+          console.log('跳过：' + cleared.skipped.map((s) => `${s.name}（${s.why}）`).join('；'))
+        }
+        saySkippedOverflow(cleared)
+        sayFallback(cleared)
+        // P2-1（2026-10-28 全量检查）：删除失败必须与「不是我们的数据」分开报，并且必须改退出码。
+        //   原来删除失败被塞进 skipped，于是「BVxxx（EPERM: operation not permitted）」被冠以
+        //   「不是 bili-watch 的数据，没动」——话说反了，而且 rc 还是 0，面板/模型都以为清干净了。
+        if (cleared.failed.length) {
+          console.error('✗ 清理失败（是 bili-watch 的数据但没删掉）：' + cleared.failed.map((s) => `${s.name}（${s.why}）`).join('；'))
+          process.exitCode = 1
+        }
       }
     } else {
       console.log(`没有可清的内容（${cacheDir()} 不存在）`)

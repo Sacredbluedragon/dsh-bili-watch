@@ -350,6 +350,36 @@ check('参数契约-11【单元】每个带值 flag 的值，都不许被 positi
   return `${VALUE_FLAG_NAMES.length} 个带值 flag 的值都不进位置参数；布尔 flag 后面的词仍进`
 })
 
+// ── ⑫ 生效中的参数不许被 C230 判成「不接受」 ────────────────────
+// 起因（C242 收口）：--keep-source 在分派链之前的 runGeneric() 里被 flag() 读，
+//   dispatchParams 扫不到它，所以它不能写进 asr/frames/text 的 accepts（那是 BV 路径，
+//   分派链没传，写了就是假声明，契约-8 会红）。正确归属是 RUNTIME_GLOBAL_PARAMS。
+// 但如果只把 accepts 里的假声明删掉、忘了往 RUNTIME_GLOBAL_PARAMS 补，
+//   契约-8 会变绿、GAPS check 仍为 true、C256 五形态也仍绿 —— 三条全绿，
+//   而 `frames <URL> --keep-source` 会被 C230 打成「本命令不接受（不会生效）」，
+//   参数其实正在生效。这比静默忽略更坏：是**说反了**。
+// 所以这条不看表、只看真跑的 stderr：三条命令各跑一次，不许出现那句 warn。
+// 修前红证据：把 RUNTIME_GLOBAL_PARAMS 里的 'keep-source' 摘掉，本条立刻红。
+check('参数契约-12【真跑】生效中的 --keep-source 不许被 C230 判成「本命令不接受」', () => {
+  // ① 行为断言在前：真跑三命令，stderr 不许出现「本命令不接受 --keep-source」
+  const bad = []
+  for (const c of ['frames', 'asr', 'text']) {
+    const r = run([c, '--keep-source']) // run() 起子进程失败会自己抛，不需要恒真断言兜底
+    if (/本命令不接受[^\n]*keep-source/.test(r.err)) bad.push(`${c}: ${r.err.trim().slice(0, 140)}`)
+  }
+  must(bad.length === 0, `这些命令把生效中的 --keep-source 判成了「不接受」：\n      - ${bad.join('\n      - ')}`)
+
+  // ② 静态守卫在后：豁免与两端咬登记都要在，accepts 里不许回潮假声明
+  const params = read('lib/params.mjs')
+  const rgLine = params.match(/export const RUNTIME_GLOBAL_PARAMS[^\n]*/)?.[0] || ''
+  must(rgLine.includes("'keep-source'"), 'RUNTIME_GLOBAL_PARAMS 没豁免 keep-source')
+  must(params.includes("id: 'keep-source-off-dispatch'"), '消费点不在分派链这件事没登记，位置偏差会腐烂')
+  const cmdsBlock = params.slice(params.indexOf('export const COMMANDS'), params.indexOf('// ── 现状偏差登记'))
+  must(!/accepts:[^\n]*'keep-source'/.test(cmdsBlock),
+    'keep-source 被写回命令 accepts —— 三段都是 BV 路径，分派链没传，属于假声明')
+  return '三条命令真跑零误伤；豁免 + GAPS 登记在位；accepts 无假声明'
+})
+
 // ── 汇总 ──────────────────────────────────────────────────────
 // 与 verify.mjs 同一套口径：跳过不进通过数、也不算失败；失败才 exit 1。
 let pass = 0, fail = 0, skipN = 0

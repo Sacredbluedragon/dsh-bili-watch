@@ -70,10 +70,12 @@ import net from 'node:net'
 import { createInterface } from 'node:readline'
 import { resolveDepsDir, depsLockFile, DEPS_LOCK_STALE_MS } from '../lib/plugin-paths.mjs'
 import { inspectModelHomes } from '../lib/model-integrity.mjs'
+// C227-B：平台判定收敛到 lib/platform.mjs。
+import { isMac, isWin } from '../lib/platform.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const IS_WIN = process.platform === 'win32'
-const IS_MAC = process.platform === 'darwin'
+const IS_WIN = isWin()
+const IS_MAC = isMac()
 
 // ── 参数 ────────────────────────────────────────────────────────
 // 位置参数也收（旧 .sh 的用法 `bash fetch-deps.sh all`），因为 README 里两种写法都出现过。

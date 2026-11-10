@@ -111,12 +111,27 @@ function positional(list) {
 const pos = positional(argv)
 const opt = (name, dflt) => {
   // 兼容 `--name value` 与 `--name=value`（后者以前会被静默忽略，退回默认值）
+  //   C290：布尔开关的同源实现见下面的 flagFromArgv —— 两处都认 `=` 形态，别只修一处。
   const eq = argv.find((a) => a.startsWith(`--${name}=`))
   if (eq) return eq.slice(name.length + 3)
   const i = argv.indexOf(`--${name}`)
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : dflt
 }
-const flag = (name) => argv.includes(`--${name}`)
+// C290：--dry-run=1 被静默忽略后真删，根因是 flag() 只认独立 token 而 opt() 认 `=` 形态。
+//   纯函数 flagFromArgv 可注入 argv（C292 单元判据真求值用），flag() 只是它的默认实参版本。
+//   FALSY 表与 opt 的「值形态」注释同源：--dry-run=0 应真删，--permanent=0 不应永久删。
+//   --quiet 不在这里：它由本文件顶层的 argv.includes('--quiet') 直接读，见 B33 那条链。
+const FALSY_FLAG_VALUES = new Set(['', '0', 'false', 'no', 'off'])
+function flagFromArgv(list, name) {
+  for (const a of list) {
+    if (a === `--${name}`) return true
+    if (a.startsWith(`--${name}=`)) {
+      return !FALSY_FLAG_VALUES.has(a.slice(name.length + 3).trim().toLowerCase())
+    }
+  }
+  return false
+}
+const flag = (name) => flagFromArgv(argv, name)
 
 // X-18（2026-10-29）：--format json/md 时，异常或提前退出也必须吐出可解析的 payload。
 //   原来这类路径直接 console.error + process.exit(1)，stdout 0 字节，调用方 JSON.parse 直接崩
@@ -164,4 +179,4 @@ function emitFailureJson(why) {
 
 // 统一在这里导出，而不是给上面每一行加 export：搬运的块保持与 look.mjs 原样逐字相同，
 //   diff 才能证明「一行没改」（判据：真搬运 = 新增只来自函数声明头 + 调用行 + import）。
-export { DIAG, TRACK_BUF, argv, cmd, pos, opt, flag, positional, say, warn, track, recordDiag, checkOutDir, emitFailureJson }
+export { DIAG, TRACK_BUF, argv, cmd, pos, opt, flag, flagFromArgv, positional, say, warn, track, recordDiag, checkOutDir, emitFailureJson }

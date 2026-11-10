@@ -10,14 +10,15 @@
  *     缺陷追踪编号（E4-02 / C26 / P0-1）按既定尺度保留：拿它们当 HARD 会把随包源码里
  *     「为什么这么写」的索引一起判红，等于逼人删技术理由。
  *
- * 硬闸命中 → rc=1（必须删或改写）；软闸只提示，不拦。
+ * 硬闸命中 → rc=1（必须删或改写）；「没扫全」→ rc=1，其中由深度超限引起的 → rc=2
+ *   （与 check-release-leak.mjs 的目录展开异常同源，release.ps1 只判 Rc -ne 0）；软闸只提示，不拦。
  *
  * 用法：
  *   node scripts/check-public-text.mjs                      # 扫 README + --help + files 全部文本
  *   node scripts/check-public-text.mjs body.md              # 再扫一个 release body 文件
  *   node scripts/check-public-text.mjs --repo <插件目录>     # 指定插件目录（默认自动找）
  */
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, lstatSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -110,8 +111,9 @@ const SOFT = [
 ]
 
 /** 展开 package.json.files 成实际待发布文本；与 check-release-leak.mjs 的 listTargets 同口径 */
+const MAX_PACKAGE_DEPTH = 8
 function listPackageTexts(root) {
-  const out = { texts: [], binary: [], absent: [], noFiles: false }
+  const out = { texts: [], binary: [], absent: [], complain: [], noFiles: false }
   const pkgPath = join(root, 'package.json')
   if (!existsSync(pkgPath)) { out.noFiles = true; return out }
   let pkg
@@ -123,15 +125,33 @@ function listPackageTexts(root) {
   for (const d of ['package.json', 'README.md', 'LICENSE']) {
     if (existsSync(join(root, d))) rels.add(d)
   }
+  // C293：目录项递归展开（npm 会递归打包）。两条硬规矩与 check-release-leak.mjs 同源：
+  //   lstatSync 判符号链接并跳过（statSync 会跟进去，junction 把扫描面带出仓库）；
+  //   深度上限 8，超了记 complain 并点名、进 incomplete，绝不静默截断。
+  // 改前平铺分支没有 basename 排除，这里沿用同一个 isFile()，不另写一份。
+  const walk = (rel, depth) => {
+    if (depth > MAX_PACKAGE_DEPTH) {
+      out.complain.push(`${rel}：目录层数超过 ${MAX_PACKAGE_DEPTH}，可能不是 package layout，已停止向下展开`)
+      return
+    }
+    const full = join(root, rel)
+    let st
+    try { st = lstatSync(full) } catch { out.absent.push(`${rel}(读不出来)`); return }
+    if (st.isSymbolicLink()) return
+    if (st.isDirectory()) {
+      let names
+      try { names = readdirSync(full) } catch { out.absent.push(`${rel}(读不出来)`); return }
+      for (const name of names) walk(`${rel}/${name}`, depth + 1)
+      return
+    }
+    if (st.isFile()) rels.add(rel)
+  }
   for (const entry of entries) {
-    const p = join(root, entry)
+    const rel = entry.replace(/\/$/, '')
+    const p = join(root, rel)
+    // files 里写了但目录没建：进 absent，不抛异常。
     if (!existsSync(p)) { out.absent.push(entry); continue }
-    if (statSync(p).isDirectory()) {
-      for (const f of readdirSync(p)) {
-        const rel = `${entry.replace(/\/$/, '')}/${f}`
-        if (statSync(join(root, rel)).isFile()) rels.add(rel)
-      }
-    } else rels.add(entry)
+    walk(rel, 1)
   }
   for (const rel of [...rels].sort()) {
     let buf
@@ -162,7 +182,7 @@ function scan(label, text, rules, withSoft = false, collab = false) {
     if (!line.trim()) continue
     let hit = false
     const isExempt = (rule) => exemptFor(EXEMPT_RULES, exemptFile, line, rule)
-    // 包内容面：协作两类走唯一那份（含 NFKC 归一化），不在本地存正则。
+    // 包内容面：协作三类走唯一那份（含 NFKC 归一化），不在本地存正则。
     if (collab) {
       const cr = scanCollab(line).filter((name) => !isExempt(name))
       if (cr.length) {
@@ -260,6 +280,7 @@ if (!pkgMeta.trim()) console.log('  [warn] package.json 的 description/keywords
 console.log('')
 if (pkg.binary.length) console.log(`  [skip] ${pkg.binary.length} 个二进制文件没做文本扫描：${pkg.binary.join(', ')}`)
 if (pkg.absent.length) console.log(`  [warn] ${pkg.absent.length} 个 files 清单项不在盘上/读不出来、没扫：${pkg.absent.join(', ')}`)
+if (pkg.complain.length) console.log(`  [warn] ${pkg.complain.length} 处目录展开异常：${pkg.complain.join('；')}`)
 if (pkg.noFiles) console.log('  [warn] package.json 的 files 没解析出任何条目 —— 包内容这一面没扫，不许当成「扫过没问题」')
 
 // 身份扫描覆盖度（2026-11-01 定的）：三个来源全空时**放行但必须明说少扫了什么**。
@@ -279,6 +300,8 @@ if (metaScanned === 0) incomplete.push('description/keywords 没读到')
 // files 解析出 0 条时包内容面一份都没扫，与「扫过没问题」不能同码。
 // 措辞沿用 :249 那句 warn，且只进 incomplete 不进 hard：语义是「没扫到」，不是「扫到脏东西」。
 if (pkg.noFiles) incomplete.push('package.json 的 files 没解析出任何条目')
+// 深度超限是「这一面没扫全」，不是「扫到脏东西」：进 incomplete 让 rc=1，措辞与命中分开。
+if (pkg.complain.length) incomplete.push(`目录展开异常 ${pkg.complain.length} 处（${pkg.complain[0]}）`)
 if (hard.length > 0) {
   console.log(`✗ 硬闸命中 ${hard.length} 行（必须删或改写）：\n`)
   for (const h of hard) {
@@ -299,4 +322,13 @@ if (soft.length > 0) {
   if (soft.length > 12) console.log(`  …还有 ${soft.length - 12} 行`)
 }
 
-process.exit(hard.length === 0 && incomplete.length === 0 ? 0 : 1)
+// C296：深度超限（pkg.complain）进 incomplete，与 scripts/check-release-leak.mjs 的
+//   COMPLAIN 同属「没扫到的面」。**这一类**两道闸统一判 rc=2，注释互相引用。
+//   其余「未扫全」（--help 跳过 / description 没读到 / files 空）仍是原来的 rc=1：
+//   C191 钉死了「tools/look.mjs 缺失不是 exit 2 硬失败」，不能因为修深度超限一起改掉。
+//   硬闸命中（扫到脏东西）也是 rc=1，措辞与「没扫全」分开。
+//   release.ps1 只判 Rc -ne 0，所以 1/2 的细分不改变发版链判定；
+//   不许用改 MAX_PACKAGE_DEPTH 阈值糊弄 —— 洞还在，只是藏得更深。
+if (hard.length > 0) process.exit(1)
+if (incomplete.length > 0) process.exit(pkg.complain.length > 0 ? 2 : 1)
+process.exit(0)
