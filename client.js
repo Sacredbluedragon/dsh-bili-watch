@@ -322,8 +322,23 @@ MODULE_LOADER.load({
 [data-bl-sechead]{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 [data-bl-sechead] [data-bl-sec-title]{margin-right:auto;}
 [data-bl-dlg]{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));border-radius:8px;padding:10px;gap:8px;}
+[data-bl-dlg][data-bl-danger]{border-color:#d9534f;background:rgba(217,83,79,.06);}
+[data-bl-dlg][data-bl-danger] [data-bl-sec-title]{color:#d9534f;}
 [data-bl-dlgrow]{display:flex;align-items:center;gap:8px;font-size:12px;min-height:24px;}
 [data-bl-dlgrow] input{accent-color:#3c9a5f;}
+/* 0.4.10 面板布局（老大 23:51 设置页 + 插件页两张截图）：
+   ① 窄容器里 flex-wrap 把行末按钮折到下一行最左（强制清空 / 清除凭证 / 删除）；
+   ② [data-bl-head] 把说明文字、版本号、刷新按钮全挤在标题同一行；
+   ③ word-break:break-all 把 Windows 长路径从单词中间折断。
+   只追加收窄规则，不改上面既有字面量（C241 钉着 data-bl-dep-note 那条）。 */
+[data-bl-head] [data-bl-sub]{flex-basis:100%;line-height:16px;}
+[data-bl-sechead] [data-bl-sub]{flex-basis:100%;line-height:16px;}
+[data-bl-row] > [data-bl-btn]:first-of-type{margin-left:auto;}
+[data-bl-detail]{word-break:normal;overflow-wrap:anywhere;}
+[data-bl-row] [data-bl-dep-note]{word-break:normal;overflow-wrap:anywhere;}
+[data-bl-name]{min-width:120px;}
+[data-bl-row] [data-bl-size]{white-space:nowrap;}
+[data-bl-row] select[data-bl-input]{width:auto;min-width:110px;}
 `
 
     const fmtBytes = (b) => {
@@ -563,12 +578,15 @@ MODULE_LOADER.load({
       const [msg, setMsg] = React.useState('')
       const [busy, setBusy] = React.useState('')
       // 2026-11-04：手点刷新的进行态。它只服务「点了有没有反应」——8 秒轮询不碰它，
-      //   否则轮询会把标签反复在「刷新中…」和「刷新」之间闪。
+      //   否则轮询会把标签反复在「正在刷新」和「刷新」之间闪。
       const [refreshing, setRefreshing] = React.useState(false)
       const [days, setDays] = React.useState('7')
       const [maxMb, setMaxMb] = React.useState('2048')
       // 0.4.8 A1：自动清理开关。默认 true 与老配置一致（后端 j?.autoClean !== false）。
       const [autoClean, setAutoClean] = React.useState(true)
+      // 0.4.10 第 3/4 项：两个已存在于配置文件、但面板没有入口的键。
+      const [deleteMode, setDeleteMode] = React.useState('permanent')
+      const [defaultOut, setDefaultOut] = React.useState('')
       // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
       const [asrMin, setAsrMin] = React.useState('30')
       // 第十条（2026-10-29）：ASR 推理设备。面板上是「转写时用 GPU」一个开关（开=auto / 关=cpu），
@@ -612,6 +630,8 @@ MODULE_LOADER.load({
               setMaxMb(String(j.data.cache?.maxMb ?? 2048))
               // 0.4.8 A1：/status.cache 由 ...cacheCfg() 带出 autoClean，老配置没这字段 → 默认开
               setAutoClean(j.data.cache?.autoClean !== false)
+              setDeleteMode(String(j.data.cache?.deleteMode || 'permanent'))
+              setDefaultOut(String(j.data.cache?.defaultOut || ''))
               const sec = Number(tv.asrMaxSec ?? td.asrMaxSec ?? 1800)
               setAsrMin(String(Math.round(sec / 60)))
               setAsrDev(String(tv.asrDevice ?? td.asrDevice ?? 'auto'))
@@ -791,6 +811,24 @@ MODULE_LOADER.load({
       // C236b：清空全部 = 两步确认。第一次点只取预览（后端也守 needConfirm，不删任何东西），
       //   确认框写明「将删除 N 项 / X MB」，第二次点确认才带 confirmed=1 真执行。
       //   强制按钮额外带 mode=permanent：它不受 deleteMode 约束，永远直删，文案写「不可恢复」。
+      // 0.4.10（23:38 段第 1 项）：强制清空的确认框原来复用普通 [data-bl-dlg] 样式，
+      //   且固定插在「运行依赖」下面，离触发按钮隔了四段。抽成具名纯函数，
+      //   让判据能抠原样函数体在桩环境真求值；调用点放到「抽帧缓存」区紧邻按钮。
+      function clearAllConfirmNode(h, o) {
+        const force = !!o.preview?.force
+        const allPreview = o.preview
+        const fmtBytes = o.fmt
+        return h('div', { 'data-bl-sec': '', 'data-bl-dlg': '', 'data-bl-danger': '' },
+          h('span', { 'data-bl-sec-title': '' }, force ? '确认强制清空（不可恢复）' : '清空全部缓存（两步确认）'),
+          h('div', { 'data-bl-row': '' },
+            h('span', { 'data-bl-name': '' }, `将删除 ${allPreview?.count ?? 0} 项 / ${fmtBytes(allPreview?.bytes ?? 0)}`)),
+          h('div', { 'data-bl-note': '' }, force
+            ? '强制清空使用永久删除，文件不可恢复，也不会进入回收站'
+            : '按当前删除方式执行；回收站容量有限，其中的文件可能被后续清理覆盖'),
+          h('div', { 'data-bl-row': '' },
+            h('button', { 'data-bl-btn': '', onClick: o.confirm }, force ? '确认强制清空' : '确认清空'),
+            h('button', { 'data-bl-btn': '', onClick: o.cancel }, '取消')))
+      }
       const openClearAll = async (force) => {
         try {
           const p = await jpost('/cache/preview', {})
@@ -817,6 +855,13 @@ MODULE_LOADER.load({
         }
       }
 
+      const saveDefaultOut = async () => {
+        try {
+          const r = await jpost('/config', { defaultOut: String(defaultOut || '').trim() })
+          if (r?.ok === false) setMsg('无法保存：' + (r.why || '未知错误'))
+          else { setDefaultOut(String(r.data?.defaultOut || '')); setMsg('默认输出目录已保存；未指定 --out 时生效。') }
+        } catch (e) { setMsg('无法保存：' + String(e?.message || e)) }
+      }
       const saveRule = async () => {
         // D-09（2026-10-29）：保留天数/总量上限填了非数字时，以前照样发、照样弹「已保存」，
         //   服务端 Number.isFinite(null)=false 直接跳过，规则其实没变。
@@ -1013,7 +1058,7 @@ MODULE_LOADER.load({
               h('span', { 'data-bl-name': '' }, '缺依赖时显示顶部横幅'),
             ),
           ),
-          h('div', { 'data-bl-note': '' }, '关掉只隐藏设置页入口；插件详情页这块面板一直保留。'),
+          h('div', { 'data-bl-note': '' }, '关闭后仅隐藏设置页入口；插件详情页中的面板仍保留'),
           saveErr ? h('div', { 'data-bl-note': '', style: { color: '#c0392b' } }, saveErr) : null,
           (st.warnings || []).length
             ? h('div', { 'data-bl-note': '', style: { color: '#b36b00' } }, st.warnings.join('；'))
@@ -1021,13 +1066,13 @@ MODULE_LOADER.load({
         ),
         h('div', { 'data-bl-head': '' },
           h('span', { 'data-bl-title': '' }, '依赖与状态'),
-          h('span', { 'data-bl-sub': '' }, '缺失项点击行末按钮安装，完成后状态显示为已就绪。'),
+          h('span', { 'data-bl-sub': '' }, '依赖缺失，可点击按钮下载'),
           versionLabel(st) ? h('span', { 'data-bl-note': '' }, versionLabel(st)) : null,
           // C2：刷新按钮提到页面级标题栏。它刷的是整页状态
           //   （依赖 + 显卡 + 缓存 + 参数），挂在「运行依赖」的 sechead 里会被读成只刷那一块。
           //   手点必须带 fresh=1 —— 服务端据此跳过 GPU 的 5 分钟缓存与 import 探针的 30 秒缓存，
           //   用户刚在终端里装完东西点刷新，不该看到 5 分钟前的结论。
-          //   点击反馈：置灰 + 文案换成「刷新中…」，否则用户分不清「没生效」和「没反应」。
+          //   点击反馈：置灰 + 文案换成「正在刷新」，否则用户分不清「没生效」和「没反应」。
           h('button', {
             'data-bl-btn': '',
             disabled: refreshing,
@@ -1035,7 +1080,7 @@ MODULE_LOADER.load({
               setRefreshing(true)
               try { await load(true) } finally { setRefreshing(false) }
             },
-          }, refreshing ? '刷新中…' : '刷新')),
+          }, refreshing ? '正在刷新' : '刷新')),
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-sechead': '' },
             h('span', { 'data-bl-sec-title': '' }, '运行依赖'),
@@ -1045,17 +1090,10 @@ MODULE_LOADER.load({
           ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), locked: dlLocked, onDownload: download, onDelete: delOne, progress: st.download && st.download.dep === d.id ? st.download : null })),
           h('div', { 'data-bl-note': '' },
             '下载由内置 fetch-deps 脚本执行，退出宿主会中断；体积为预估值，实际以完成后为准。')),
-        dlg
+        dlg && dlg !== 'clearAll'
           ? h('div', { 'data-bl-sec': '', 'data-bl-dlg': '' },
-              h('span', { 'data-bl-sec-title': '' }, dlg === 'clearAll' ? '清空全部缓存（两步确认）' : dlg === 'download' ? '批量下载（默认全勾选，可取消）' : '批量清理（默认全勾选，可取消）'),
-              ...(dlg === 'clearAll'
-                ? [h('div', { 'data-bl-row': '' },
-                    h('span', { 'data-bl-name': '' }, `将删除 ${allPreview?.count ?? 0} 项 / ${fmtBytes(allPreview?.bytes ?? 0)}`)),
-                  h('div', { 'data-bl-note': '' },
-                    allPreview?.force
-                      ? '强制清空走永久删除，不可恢复；回收站里也不会留下这批文件。'
-                      : '按当前删除方式执行；回收站有容量上限，送进去的文件不保证一直留着。')]
-                : dlg === 'download'
+              h('span', { 'data-bl-sec-title': '' }, dlg === 'download' ? '批量下载' : '批量清理（默认全勾选，可取消）'),
+              ...(dlg === 'download'
                 ? deps
                     .filter((d) => d.id !== 'credential')
                     .map((d) =>
@@ -1063,7 +1101,7 @@ MODULE_LOADER.load({
                         h('input', { type: 'checkbox', checked: picked.includes(d.id), disabled: d.ok, onChange: () => toggle(d.id) }),
                         h('span', { 'data-bl-name': '' }, d.name),
                         h('span', { 'data-bl-size': '' }, d.estimate),
-                        d.ok ? h('span', { 'data-bl-good': '' }, '已就绪，跳过') : null),
+                        d.ok ? h('span', { 'data-bl-good': '' }, '已就绪') : null),
                     )
                 : deps.map((d) =>
                     h('label', { 'data-bl-dlgrow': '' },
@@ -1088,7 +1126,7 @@ MODULE_LOADER.load({
                   disabled: dlg === 'download' && dlLocked,
                   title: dlg === 'download' && dlLocked ? '已有下载在跑，等它结束再点' : undefined,
                   onClick: confirmDlg,
-                }, dlg === 'clearAll' ? (allPreview?.force ? '确认强制清空' : '确认清空') : dlg === 'download' ? '开始下载' : '确认删除'),
+                }, dlg === 'download' ? '开始下载' : '确认删除'),
                 h('button', { 'data-bl-btn': '', onClick: () => setDlg(null) }, '取消')))
           : null,
         qr
@@ -1131,6 +1169,7 @@ MODULE_LOADER.load({
             h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除'),
             h('button', { 'data-bl-btn': '', onClick: () => openClearAll(false) }, '清空全部'),
             h('button', { 'data-bl-btn': '', onClick: () => openClearAll(true) }, '强制清空（不可恢复）')),
+          dlg === 'clearAll' ? clearAllConfirmNode(h, { preview: allPreview, fmt: fmtBytes, confirm: confirmDlg, cancel: () => setDlg(null) }) : null,
           // C236b：回收站放不下的跳过项标黄一行（低频信息，不加常驻横幅）。
           st.skippedOverflow?.count
             ? h('div', { 'data-bl-row': '' },
@@ -1198,6 +1237,39 @@ MODULE_LOADER.load({
               h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => { markDirty(); setMaxMb(e.target.value) }, inputMode: 'numeric' }),
               ' MB 时从最旧的删。'),
             h('button', { 'data-bl-btn': '', onClick: saveRule }, '保存规则')),
+          // 0.4.10 第 4 项：三档删除方式。写进 cache-config.json 的 deleteMode，
+          //   与 clean 命令同一份配置；服务端不确认时回滚勾选态。
+          h('div', { 'data-bl-row': '' },
+            h('span', { 'data-bl-name': '' }, '删除方式'),
+            h('span', { 'data-bl-detail': '' },
+              h('select', {
+                'data-bl-input': '', value: deleteMode,
+                onChange: async (e) => {
+                  const v = e.target.value
+                  const before = deleteMode
+                  setDeleteMode(v)
+                  try {
+                    const r = await jpost('/config', { deleteMode: v })
+                    if (r?.ok === false) { setDeleteMode(before); setMsg('无法保存：' + (r.why || '未知错误')) }
+                    else setMsg('删除方式已保存；下次清理按此方式执行。')
+                  } catch (err) { setDeleteMode(before); setMsg('无法保存：' + String(err?.message || err)) }
+                },
+              },
+                h('option', { value: 'permanent' }, '直删'),
+                h('option', { value: 'recycle' }, '回收站'),
+                h('option', { value: 'smart' }, '智能')),
+              ' 选择清理缓存时使用的方式，与 clean 命令一致。')),
+          // 0.4.10 第 3 项（C231 面板侧）：与 CLI 共用 deps-config.json 的 defaultOut，
+          //   面板不另存一份；留空恢复为缓存目录下的 sheets/。
+          h('div', { 'data-bl-row': '' },
+            h('span', { 'data-bl-name': '' }, '默认输出目录'),
+            h('span', { 'data-bl-detail': '' },
+              h('input', {
+                'data-bl-input': '', style: { width: '260px' }, value: defaultOut,
+                placeholder: '留空则使用缓存目录',
+                onChange: (e) => { markDirty(); setDefaultOut(e.target.value) },
+              }),
+              h('button', { 'data-bl-btn': '', onClick: saveDefaultOut }, '保存目录'))),
           // 0.4.8 A1：开关即时生效，走 /config → writeCacheCfg({autoClean})（与「保存规则」同一入口）。
           //   失败回滚勾选态，不许界面显示已关而后端还是开着。
           h('div', { 'data-bl-row': '' },
@@ -1346,14 +1418,16 @@ MODULE_LOADER.load({
     // 最小化/最大化/关闭三个按钮浮在顶部拖拽带里。横幅写死 top:0 就钻到按钮底下点不到。
     // 关键不只在 CSS：下面 relayoutBanners() 用内联 style.top 重排（优先级高于 CSS），
     // 挂载 300ms 后会把它写回 0px。所以起点口径必须两处同源。
-    // 口径跟内核 --dsh-frame-overlay-top 一致：clearance + 20px；
+    // 08:40 段：横幅是通栏贴顶控件，不需要下拉菜单 / toast 那种贴边呼吸空间。
+    //   内核 --dsh-frame-overlay-top 的公式给小浮层留了 20px 余量，照抄会让横幅上沿
+    //   悬空 20 逻辑像素（150% 缩放下 30 物理像素）。这里只返回 clearance。
     // --dsh-frame-top-clearance 取不到时退回 --dsh-windows-titlebar-height（内核里两者相等）。
     // 抽成具名函数不是为复用，是让 C281 能抠这段原样函数体在桩环境里真求值。
     function bannerTopStart(doc, win) {
       const cs = typeof win.getComputedStyle === 'function' ? win.getComputedStyle(doc.documentElement) : null;
       const px = (n) => (cs ? (parseFloat(cs.getPropertyValue(n)) || 0) : 0);
       const clearance = px('--dsh-frame-top-clearance') || px('--dsh-windows-titlebar-height');
-      return clearance + 20;
+      return clearance;
     }
     function relayoutBanners() {
       const layer = document.querySelector('[data-shell-overlay]');

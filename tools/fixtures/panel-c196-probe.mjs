@@ -55,7 +55,7 @@ const analyse = (s) => {
     headHasRefresh: t.includes("'刷新'"),
     headHasFresh: /await load\(true\)/.test(t),
     headHasDisabled: /disabled:\s*refreshing/.test(t),
-    headHasFeedback: t.includes('刷新中'),
+    headHasFeedback: t.includes('正在刷新'),
     headHasTitle: t.includes('依赖与状态'),
     secHasRefresh: u.includes("'刷新'"),
     secHasTitle: u.includes('运行依赖'),
@@ -71,7 +71,7 @@ const real = analyse(src)
 // 内存扰动：把 head 里的刷新按钮整块抽出来，塞回「运行依赖」sechead，再算一次。
 const heads = blocksOf(src, "h('div', { 'data-bl-head': '' }")
 const head = heads.find((b) => b.text.includes('依赖与状态')) || heads[0]
-const btnRe = /h\('button', \{\s*'data-bl-btn': '',\s*disabled: refreshing,[\s\S]*?\}, refreshing \? '刷新中…' : '刷新'\)/
+const btnRe = /h\('button', \{\s*'data-bl-btn': '',\s*disabled: refreshing,[\s\S]*?\}, refreshing \? '正在刷新' : '刷新'\)/
 const btnM = btnRe.exec(head ? head.text : '')
 const anchor = "h('span', { 'data-bl-sec-title': '' }, '运行依赖'),"
 let moved = null

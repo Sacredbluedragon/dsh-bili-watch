@@ -11,7 +11,7 @@
 //   三处各 80ms，GPU 探测与别的一律立即返回，避免把本机 nvidia-smi 拖进夹具。
 //
 // 输出一行 JSON：defect（修好前 false、修好后 true）/ capability（改的时候最易弄坏的反向能力）。
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -92,10 +92,13 @@ try {
     d.C185_ytdlpSpawnOnce = quad.spawns.filter((s) => s.kind === 'ytdlp').length === 1
     d.C185_noSyncSpawn = quad.spawns.every((s) => s.kind !== 'sync')
     c.C185_singleSpawnsOnce = single.spawns.filter((s) => s.kind === 'ytdlp').length === 1
-    // D2：路径不存在 → detail 必须是「没找到」，ok=false，不能拿 Promise/对象糊上去
+    // D2：路径不存在 → detail 必须是「没找到」，ok=false，不能拿 Promise/对象糊上去。
+    //   0.4.10 文案 #15 把 index.js 的缺文件 detail 改成规范句，断言随之更新；
+    //   末条独立读被测源码查旧串零命中（不拿运行时输出自比），防新旧文案并存。
     c.C185_missingYtDetail = missing.ytdlpRow !== null
-      && missing.ytdlpRow.detail === '没找到，非 B 站 URL 不可用'
+      && missing.ytdlpRow.detail === '未找到 yt-dlp，通用 URL 无法处理；可执行 node scripts/fetch-deps.mjs ytdlp 安装'
       && missing.ytdlpRow.ok === false
+      && !readFileSync(INDEX, 'utf8').includes('没找到，非 B 站 URL 不可用')
     // D2 反面：子进程失败但文件在 → detail 仍是确定字符串，不许出现 undefined / [object ...]
     c.C185_execFailDetailClean = execFail.ytdlpRow !== null
       && typeof execFail.ytdlpRow.detail === 'string'

@@ -69,14 +69,23 @@ if (missing.length === 0) {
 
   // ① 位置：断 relayoutBanners() 写进内联 style.top 的**最终值**，不断 CSS 字面量。
   out.tops = [
-    { name: 'titlebar32', vars: { '--dsh-windows-titlebar-height': '32px' }, want: '52px' },
-    { name: 'clearance40', vars: { '--dsh-frame-top-clearance': '40px' }, want: '60px' },
-    { name: 'browser', vars: {}, want: '20px' },
+    { name: 'titlebar32', vars: { '--dsh-windows-titlebar-height': '32px' }, want: '32px' },
+    { name: 'clearance40', vars: { '--dsh-frame-top-clearance': '40px' }, want: '40px' },
+    { name: 'browser', vars: {}, want: '0px' },
   ].map((c) => {
     const { api, children } = makeEnv(c.vars)
     const start = api.bannerTopStart({ documentElement: {} }, { getComputedStyle: () => ({ getPropertyValue: (n) => c.vars[n] ?? '' }) })
     api.relayoutBanners()
     return { name: c.name, want: c.want, start, top: children[0].style.top, second: children[1].style.top }
+  })
+
+  // 08:40 段 / C309：任意 clearance N 都必须恰好返回 N（不许带常量偏移）。
+  //   用原样函数体在桩环境真求值，覆盖 0 / 小数 / 非 20 的正数，防「只测一个恰好值」。
+  const arbitraryNs = [0, 1, 7, 13.5, 32, 47, 91, 128, 256]
+  out.arbitrary = arbitraryNs.map((N) => {
+    const { api } = makeEnv({ '--dsh-frame-top-clearance': N + 'px' })
+    const win = { getComputedStyle: () => ({ getPropertyValue: (n) => n === '--dsh-frame-top-clearance' ? N + 'px' : '' }) }
+    return { N, start: api.bannerTopStart({ documentElement: {} }, win) }
   })
 
   // ② 「不再提示」：非 2xx 返回 {ok:false} 不抛、ok:true、网络抛错、返回 null 四种。

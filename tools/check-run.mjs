@@ -146,12 +146,20 @@ export function parseOnlySpecs(argv) {
  *   --only C124B 只选 C124b 一条（精确）；--only C124 选 C124 与 C124b 两条（前缀）。
  *   W-07 这类非 C 编号同样支持 --only W-07 —— 派单要求「支持或文档写明不支持」，
  *   这里选支持，不改 README。
+ *
+ * 1300 §二② 新增精确 spec：'=C20' 只命中 checkId === 'C20' 的一条判据。
+ *   旧 spec 是「相等或前缀」，短编号（C1 / C2 / C20 / C29 / C124）会连带命中一大片，
+ *   没办法「单独跑一条」量墙钟；精确 spec 给 3c 的分档实测用。
+ *   不带 '=' 的分支逐字节不变：C305 精确、C302,C305,C306 多选、C999999 空集、C1 前缀
+ *   四种既有形态都不进新分支。C314 真跑这几种形态对照，改动这里必须同步看它。
  */
 export function matchOnly(name, specs) {
   if (specs === null) return true
   const id = checkId(name)
   if (id === null) return false
-  return specs.some((s) => id === s || id.startsWith(s))
+  return specs.some((s) => s.startsWith('=')
+    ? id === s.slice(1)
+    : id === s || id.startsWith(s))
 }
 
 /** 默认路径（active=false）必须返回 null —— 不许天天冒出这行凭证变成噪音。 */
@@ -212,11 +220,21 @@ export function checkId(name) {
 }
 
 /**
- * 过渡清单：默认全量时含子进程调用的 93 条老判据编号。
+ * 过渡清单：存量 92 条（3a 移除 C271 后）含子进程调用的老判据，
+ * 加上 3c 按 1300 口径归位的 6 条实测慢条目/产出判据。
  * 为什么慢：块内真起子进程（spawnSync / execFileSync / runFixture），或真跑一遍发布链 /
  * 真跑另一个主闸。每项都不按「名字长得像」挑，是同一份扫描脚本切块扫出来的。
  * 编号一律大写，与 checkId() 的返回值同源；C276 会验「每项 === 自身 toUpperCase()」。
  */
+// 1300 §二/§三：C276 的判据源从「含子进程」扩成「含子进程 ∪ 实测慢」。
+// 下面两组常量是「实测慢」的独立来源，取自 _临时/20261111-0938/probe-3c-full.json
+// 的逐条 =Cxxx 真跑（202 条全量核）。C316 再逐条验证本轮新增条目 >= 3 秒，
+// C315 守它们全部进清单 —— 不是「数出多少就断言多少」的同义反复。
+//   SLOW_BY_TIMING  = 本轮按 10 秒线归位的分档条目（不含产出判据自身）；
+//   TIMING_PRODUCERS = 产出/执行实测的判据自身，按 1300 §三 必须 slowCheck 声明且在清单内。
+export const SLOW_BY_TIMING = Object.freeze(['C248', 'C249', 'C250'])
+export const TIMING_PRODUCERS = Object.freeze(['C313', 'C314', 'C316'])
+
 export const SLOW_CHECKS = Object.freeze([
   'W-07', 'W-22', 'W-25', 'C20', 'C29', 'C133', 'C40', 'C53', 'C54', 'C115',
   'C116', 'C55', 'C56', 'C58', 'C59', 'C64', 'C65', 'C67', 'C68', 'C69',
@@ -227,7 +245,9 @@ export const SLOW_CHECKS = Object.freeze([
   'C235', 'C199', 'C200', 'C207', 'C208', 'C216', 'C218', 'C223', 'C226', 'C224',
   'C217', 'C219', 'C220', 'C221', 'C222', 'C225', 'C229', 'C230', 'C231', 'C232',
   'C233', 'C234', 'C245', 'C246', 'C253', 'C258', 'C261', 'C266', 'C267', 'C268',
-  'C269', 'C270', 'C271',
+  'C269', 'C270',
+  // 3c 新增（1300 §二②/§三）：全量核归位的实测慢条目 + 产出判据自身。
+  'C248', 'C249', 'C250', 'C313', 'C314', 'C316',
 ])
 
 /**

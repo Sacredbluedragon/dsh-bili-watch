@@ -33,7 +33,7 @@ import { lockState, classifyLock } from './lib/locks.mjs'
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
 import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll } from './lib/cache-own.mjs'
 // C236b：三档 deleteMode 的唯一实现；手动 / 自动 / --all 三条路径都从这里取策略。
-import { normalizeDeleteMode, deletePaths } from './lib/recycle.mjs'
+import { normalizeDeleteMode, deletePaths, DELETE_MODES } from './lib/recycle.mjs'
 import { modelRow } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
@@ -328,7 +328,7 @@ function depsPathSnapshot() {
  */
 // ── 0.4.7 / issue #11：迁移与下载的互斥（2026-11-05）──────────────────────
 // 原来迁移由 setTimeout(3000) 触发、下载是独立 spawn 的进程，两者能同时动同一个 deps：
-// 用户刚下好的 yt-dlp.exe / last-bin.json 被 `rmSync(dst)` 整棵删掉（CBlazed 的现场日志）。
+// 用户刚下好的 yt-dlp.exe / last-bin.json 被 `rmSync` 整棵删掉（CBlazed 的现场日志）。
 // 两道一起做，缺一不可：① 迁移前**真抢**这把锁（只检查不占有，挡不住「检查完才开始写」）；
 //                      ② 不再删 dst，先合并再换位（合并解决「已经在那里的」）。
 let depsMigrationInFlight = false  // 幂等：重试期间不许第二条链并跑同一个 tmp
@@ -1729,11 +1729,11 @@ async function depRows(gpuVal, opts = {}) {
       name: 'ffmpeg（抽帧 / 取音轨）',
       ok: Boolean(ffmpeg),
       detail: ffmpeg
-        ? (ffmpegOnPath ? '在系统 PATH 里（ffmpeg -version 可执行）' : maskAbs(ffmpeg))
-        : '没找到，抽帧与转写取音轨会失败',
+        ? (ffmpegOnPath ? '已就绪，来自系统 PATH' : maskAbs(ffmpeg))
+        : '未找到 ffmpeg，抽帧与转写无法执行；可通过 --ffmpeg 指定路径，或执行 node scripts/fetch-deps.mjs 安装',
       path: ffmpegOnPath ? 'ffmpeg' : maskAbs(ffmpeg),
       removable: false,
-      removableWhy: ffmpegOnPath ? '来自系统 PATH，插件不管它' : '在插件目录外，这里不删',
+      removableWhy: ffmpegOnPath ? '来自系统 PATH，不由本插件管理' : '位于插件目录外，不从此处删除',
       size: ffmpegSize,
       estimate: ESTIMATES.ffmpeg,
     },
@@ -1744,7 +1744,7 @@ async function depRows(gpuVal, opts = {}) {
       // 2026-10-28：原先 detail 只写「版本 X」，与其它依赖行（detail 都是路径）不一致，
       // 面板上就变成「只有版本号、看不出装在哪」。改成路径，版本拼在括号里。
       detail: (() => {
-        if (!existsSync(ytdlp)) return '没找到，非 B 站 URL 不可用'
+        if (!existsSync(ytdlp)) return '未找到 yt-dlp，通用 URL 无法处理；可执行 node scripts/fetch-deps.mjs ytdlp 安装'
         return `${maskAbs(ytdlp)}${ytdlpVer ? `（v${ytdlpVer}）` : ''}`
       })(),
       path: maskAbs(ytdlp),
@@ -1754,11 +1754,11 @@ async function depRows(gpuVal, opts = {}) {
     },
     {
       id: 'asr',
-      name: 'ASR 环境（本地转写）',
+      name: 'ASR 环境',
       ok: Boolean(asrPython) && asrProbe.ok,
       detail: !asrPython
-        ? '没找到 python 环境，无字幕视频无法转写'
-        : (asrProbe.ok ? maskAbs(asrPython) : `python 在，但 import faster_whisper 失败：${asrProbe.why || '未知原因'}`),
+        ? '未找到 Python 环境，无字幕视频无法转写；可执行 node scripts/fetch-deps.mjs asr 安装'
+        : (asrProbe.ok ? maskAbs(asrPython) : `Python 环境存在，但无法导入 \`faster_whisper\`：${asrProbe.why || '未知原因'}`),
       path: maskAbs(asrPython),
       removable: false,
       // P1-2（2026-10-28 全量检查）：文案原来写「在插件目录外」——错的，默认就装在 deps/.venv-asr。
@@ -1772,8 +1772,8 @@ async function depRows(gpuVal, opts = {}) {
       name: 'OCR 环境（画面文字）',
       ok: Boolean(ocrPython) && ocrProbe.ok,
       detail: !ocrPython
-        ? '没找到 python 环境，画面文字无法识别'
-        : (ocrProbe.ok ? maskAbs(ocrPython) : `python 在，但 import rapidocr 失败：${ocrProbe.why || '未知原因'}`),
+        ? '未找到 Python 环境，画面文字无法识别；可执行 node scripts/fetch-deps.mjs ocr 安装'
+        : (ocrProbe.ok ? maskAbs(ocrPython) : `Python 环境存在，但无法导入 \`rapidocr\`：${ocrProbe.why || '未知原因'}`),
       path: maskAbs(ocrPython),
       removable: false,
       removableWhy: '环境目录不从这里删（删了要重跑 fetch-deps 装回来）',
@@ -1782,7 +1782,7 @@ async function depRows(gpuVal, opts = {}) {
     },
     {
       id: 'model',
-      name: '转写模型（faster-whisper small）',
+      name: '转写模型',
       ok: modelStatus.ok,
       detail: modelStatus.detail,
       path: modelStatus.path,
@@ -1814,12 +1814,12 @@ async function depRows(gpuVal, opts = {}) {
     detail: gpu.noCard
       ? '不适用：本机无 NVIDIA 显卡，转写走 CPU'
       : (gpu.unknown && !gpu.dllReady)
-      ? '找不到 nvidia-smi，无法确认是否有显卡；运行库已装但没能验证加载，转写走 CPU'
+      ? '未找到显卡检测工具，无法确认显卡状态；运行库已安装但未能验证加载，转写将使用 CPU'
       : gpu.dllReady
-      ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 卡）` : ''}，转写走 GPU`
+      ? `已就绪${gpu.deviceCount ? `（${gpu.deviceCount} 块 NVIDIA 显卡）` : ''}`
       : (gpu.deviceCount
         ? (isWin()
-          ? `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——装上转写约快 2 倍`
+          ? `检测到 ${gpu.deviceCount} 块 NVIDIA 显卡，但运行库未就绪；安装完成后转写速度约为当前的 2 倍`
           : `检测到 ${gpu.deviceCount} 块 NVIDIA 卡，但运行库没装好——在 ASR 环境里装 nvidia-cublas-cu12 / nvidia-cudnn-cu12（见 README 的 Linux 装法）`)
         : (gpu.note || '没有 NVIDIA 卡，转写走 CPU')),
     path: gpu.dllReady ? (isWin() ? 'cublas64_12.dll' : 'libcublas.so.12') : '',
@@ -2693,11 +2693,11 @@ function registerTool(ctx) {
       },
       head: {
         type: 'number',
-        description: '只取前 N 字（text/sub/asr 用）。默认超过 800 字只回 400 字摘要 + 全文路径；要一次性看完改传这个。',
+        description: '只取前 N 字（text/sub/asr 用）。超过默认上限时返回摘要与全文路径；需要完整内容时传入该参数',
       },
       full: {
         type: 'boolean',
-        description: '把全文直接返回（text/sub/asr 用）。长视频可能几万字，只在你确定需要全文时用，否则会挤爆上下文。',
+        description: '直接返回全文（text/sub/asr 用）。长视频文本较长，会占用较多上下文；仅在需要完整内容时使用',
       },
       verify: {
         type: 'boolean',
@@ -2851,7 +2851,7 @@ function registerPanelRoute(ctx) {
                     // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
-                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(cacheDir()), lastAutoClean: cleaned },
+                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(cacheDir()), lastAutoClean: cleaned, defaultOut: String(depsCfg()?.defaultOut || '') },
                     tuning: readTuning(),
                     tuningDefaults: tuningDefaults(),
                     tuningRanges: tuningRanges(),
@@ -3016,12 +3016,33 @@ function registerPanelRoute(ctx) {
                 if (Number.isFinite(body?.days) && body.days > 0) cachePatch.days = Math.max(1, Math.floor(body.days))
                 if (Number.isFinite(body?.maxMb) && body.maxMb > 0) cachePatch.maxMb = Math.max(100, Math.floor(body.maxMb))
                 if (typeof body?.autoClean === 'boolean') cachePatch.autoClean = body.autoClean
+                // 0.4.10 第 4 项：三档删除方式进面板。非法值直接 400，不静默回落成 permanent，
+                //   否则用户选了 A、界面显示 B、clean 又按 B 执行，失败时无从定位。
+                if (typeof body?.deleteMode === 'string') {
+                  if (!DELETE_MODES.includes(body.deleteMode)) {
+                    return sendJson(res, 400, { ok: false, why: '删除方式须为 permanent / recycle / smart' })
+                  }
+                  cachePatch.deleteMode = body.deleteMode
+                }
+                // 0.4.10 第 3 项：默认输出目录与 CLI 共用 deps-config.json 的 defaultOut，
+                //   走 writeDepsCfg 合并写（保留用户原有配置），不另开第四份配置文件。
+                let outErr = null
+                let outValue = null
+                if (typeof body?.defaultOut === 'string') {
+                  const v = body.defaultOut.trim()
+                  if (v.length > 500) return sendJson(res, 400, { ok: false, why: '默认输出目录过长（上限 500 字符）' })
+                  const w = writeDepsCfg({ defaultOut: v })
+                  if (!w.ok) outErr = w.why || '未知错误'
+                  else outValue = v
+                }
                 if (Object.keys(cachePatch).length) {
                   const wc = writeCacheCfg(cachePatch)
                   if (!wc.ok) cacheErr = wc.why || '未知错误'
                   const saved = cacheCfg()
                   rule = { days: saved.days, maxMb: saved.maxMb, autoClean: saved.autoClean }
+                  if (typeof body?.deleteMode === 'string') rule.deleteMode = saved.deleteMode
                 }
+                if (outErr) return sendJson(res, 500, { ok: false, why: `默认输出目录保存失败：${outErr}` })
                 // 参数分层（阶段B）：白名单键写进 deps-config.json，表外的键忽略、不报错。
                 // 值为 null = 恢复默认（从文件里删掉该键，回落到常量）；值非法 = 400 报错（D-01/D-02）。
                 let tuneErr = null
@@ -3032,7 +3053,7 @@ function registerPanelRoute(ctx) {
                 }
                 if (tuneErr) return sendJson(res, tuneCode, { ok: false, why: `参数保存失败：${tuneErr}` })
                 if (cacheErr) return sendJson(res, 500, { ok: false, why: `清理规则保存失败：${cacheErr}` })
-                return sendJson(res, 200, { ok: true, data: { ...next, ...(rule || {}), tuning: readTuning() } })
+                return sendJson(res, 200, { ok: true, data: { ...next, ...(rule || {}), ...(outValue !== null ? { defaultOut: outValue } : {}), tuning: readTuning() } })
               }
               sendJson(res, 404, { ok: false, why: 'not found' })
             } catch (e) {

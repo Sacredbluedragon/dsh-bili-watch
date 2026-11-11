@@ -22,7 +22,7 @@
  *                                      超过 800 字只给开头 400 字摘要，全文落 <缓存目录>/<BV>/<命令>.txt
  *                                      （--head N 自定义摘要长度，--full 打全文）
  *   node look.mjs peek <BV>            先看标题/简介/热评 + 5 帧 OCR
- *   node look.mjs clean                清空缓存目录（默认 $DSH_HOME/bili-watch/cache；凭证在上一层，不动）
+ *   node look.mjs clean                清理缓存目录（$DSH_HOME/bili-watch/cache；凭证位于上一层，不处理）
  *                                      旧缓存位置若还有内容、又没本工具的标记，会提示一句并让到它下面的
  *                                      bili-watch-cache；不会自动清理那里（要清理请手动删旧目录）
  *
@@ -140,7 +140,7 @@ import {
 //   不再在本文件手写一份 —— 原来 KNOWN_FLAGS 手写 27 项、cli-io 的 VALUE_OPTS 另手写 13 项、
 //   README 再写一份，三处各自漂移（--at 就不在 VALUE_OPTS 里，`help --at 12:30` 会把 12:30
 //   当成位置参数）。加一个 flag 只改 lib/params.mjs。
-import { KNOWN_FLAG_NAMES, checkFlagValues, unacceptedFlags, unsupportedDryRun, unsupportedKeepSource } from '../lib/params.mjs'
+import { KNOWN_FLAG_NAMES, checkFlagValues, unacceptedFlags, unsupportedDryRun, unsupportedKeepSource, nearFlagHit, unsupportedNearFlag } from '../lib/params.mjs'
 // C242：通用 URL 下载的原视频 / 音轨谁写谁删。正常收尾主动清，
 // 抛错、process.exit(1)、SIGINT、SIGTERM 由退出钩子兜底；只有 --keep-source 才留。
 import { setKeepSource, trackSource, releaseSource, installSourceCleanup } from '../lib/source-cleanup.mjs'
@@ -723,7 +723,7 @@ async function cmdPeek(bv, opts = {}) {
   console.log(`UP: ${v.owner}  时长 ${fmtSec(v.dur)}  播放 ${v.view ?? '?'}  评论 ${v.reply ?? '?'}${pTag}`)
   if (v.desc) console.log(`简介: ${v.desc.replace(/\s+/g, ' ').slice(0, 260)}`)
   // 目录名带标题（view 通常最先跑，正好把目录定下来）
-  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error('✗ 写元数据失败：' + e.message) }
+  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error('✗ 无法写入元数据；请检查缓存目录权限' + e.message) }
   const c = await topComments(v.aid, 5)
   if (!c.ok) {
     console.error(`[track] 评论拉取失败，已跳过（${c.why}）`)
@@ -759,13 +759,13 @@ async function cmdPeek(bv, opts = {}) {
         console.log(`  ${label}: ${g.text || '（无文字）'}`)
       }
     } else {
-      console.log('  （OCR 环境不可用，只给了帧路径；要读画面用 ocr 或直接读图）')
+      console.log('  OCR 环境不可用，仅提供帧路径；如需读取画面文字，请执行 ocr 命令或直接查看图片')
     }
   } catch (e) {
-    console.log(`\n✗ 抽帧失败: ${e.message}`)
+    console.log(`\n✗ 无法抽取帧：${e.message}；请确认 ffmpeg 可用`)
     process.exitCode = 1 // T04/T17/T20：抽帧失败不许再报 ok（插件靠退出码判断成功）
   }
-  console.log('\n判据：画面文字多/图表/歌词 → 再跑 ocr；口播为主 → 再跑 text；先粗看就停在这里。')
+  console.log('\n含较多画面文字、图表或歌词时，请执行 ocr；以口播为主时，请执行 text；仅需初步查看时可在此结束')
 }
 
 // B39：抽帧数硬上限——模型传极小 --step 会把磁盘抽爆；预计帧数超此值就直接中止
@@ -1082,7 +1082,7 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
   // 3-6：首次跑要下 faster-whisper-small（约 460 MB），提前打中文提示，别让用户面对英文栈
   try {
     if (!existsSync(join(HF_HOME_DIR, 'hub', 'models--Systran--faster-whisper-small'))) {
-      console.error('[track] 首次转写需下载 faster-whisper-small（约 460 MB），从 hf-mirror.com 拉取，请耐心等几分钟…')
+      console.error('[track] 首次转写需下载 faster-whisper-small（约 460 MB），预计需要数分钟')
     }
   } catch {}
   const v = await viewOf(bv, page)
@@ -1303,7 +1303,7 @@ async function cmdView(bv, p = 1) {
   console.log(`aid=${v.aid} cid=${v.cid}`)
   if (v.desc) console.log(`简介: ${v.desc.replace(/\s+/g, ' ').slice(0, 300)}`)
   // 目录名带标题（view 常是第一个跑的，正好把目录定下来）
-  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error('✗ 写元数据失败：' + e.message) }
+  try { writeMeta(bv, { title: v.title, up: v.owner, dur: v.dur, aid: v.aid }, nameVideoDir(bv, v.title)) } catch (e) { console.error('✗ 无法写入元数据；请检查缓存目录权限' + e.message) }
   const c = await topComments(v.aid, 5)
   if (!c.ok) {
     // 9-9：评论接口失败要打 [track] 说明已跳过，别一声不响少一栏
@@ -1476,13 +1476,13 @@ async function cmdSub(bv, credPath, p = 1, opts = {}) {
   const format = String(opts.format || 'text').toLowerCase()
   const out = String(opts.out || '')
   if (out && format !== 'json' && format !== 'srt' && format !== 'md' && format !== 'txt') {
-    say('✗ --out 要配合 --format srt|json|md|txt；纯文本会直接打印到标准输出')
+    say('✗ 使用 --out 时需指定 --format（srt|json|md|txt）；纯文本结果会直接打印到标准输出')
     process.exitCode = 1
     return
   }
   if (!['text', 'json', 'srt', 'md', 'txt'].includes(format)) {
     // B6：坏格式错误必须走 stderr——QUIET 只对 srt/json/md/txt 为 true，坏格式时 say() 会写进 stdout
-    console.error(`✗ 不认识的 --format：${format}（可选 text|srt|json|md|txt）`)
+    console.error(`✗ 不支持 --format ${format}；可选 text|srt|json|md|txt`)
     process.exitCode = 1
     return
   }
@@ -1603,7 +1603,7 @@ async function cmdComments(bv, ps = 10, opts = {}) {
   const format = String(opts.format || 'text').toLowerCase()
   const out = String(opts.out || '')
   if (!['text', 'json'].includes(format)) {
-    process.exitCode = 1; console.error(`✗ 不认识的 --format：${format}（comments 可选 text|json）`)
+    process.exitCode = 1; console.error(`✗ 不支持 --format ${format}；comments 可选 text|json`)
     return
   }
   // W-25（2026-10-28 阶段B-②）：--out 只在 json 分支被用掉，text 分支直接 print 到 stdout，
@@ -1666,7 +1666,7 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
   const format = String(opts.format || 'text').toLowerCase()
   const out = String(opts.out || '')
   if (!['text', 'json'].includes(format)) {
-    process.exitCode = 1; console.error(`✗ 不认识的 --format：${format}（danmaku 可选 text|json）`)
+    process.exitCode = 1; console.error(`✗ 不支持 --format ${format}；danmaku 可选 text|json`)
     return
   }
   // W-25（2026-10-28 阶段B-②）：同 cmdComments——text 分支不写文件，--out 会被静默丢掉
@@ -1677,12 +1677,12 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
   }
   const log = format === 'json' ? console.error : console.log
   const v = await viewOf(bv, p)
-  if (!v.cid) { process.exitCode = 1; log('✗ 没有 cid，拉不到弹幕'); return }
+  if (!v.cid) { process.exitCode = 1; log('✗ 无法获取弹幕：该视频缺少必要标识；请确认视频地址'); return }
   log(`弹幕热区: ${v.title}  UP ${v.owner}  时长 ${fmtSec(v.dur)}`)
 
   let xml = ''
   try { xml = await fetchDanmakuXml(v.cid) }
-  catch (e) { process.exitCode = 1; log(`✗ 弹幕拉取失败：${e.message}（可能被风控或该视频关闭弹幕）`); return }
+  catch (e) { process.exitCode = 1; log(`✗ 无法获取弹幕：${e.message}；请稍后重试或确认该视频是否关闭弹幕`); return }
 
   const all = [...xml.matchAll(/<d p="([^"]*)">([^<]*)<\/d>/g)].map((m) => {
     const a = String(m[1] ?? '').split(',')
@@ -1715,9 +1715,9 @@ async function cmdDanmaku(bv, p = 1, opts = {}) {
 
   if (!all.length) {
     if (blocked) {
-      console.error('✗ 弹幕接口返回了非 XML 页面（疑似风控）：没有解析到任何 <d> 弹幕节点')
+      console.error('✗ 无法解析弹幕数据；请稍后重试，或确认该视频是否允许读取弹幕')
     } else {
-      console.log('（没解析到弹幕：该视频可能关闭了弹幕，或当前确实没有弹幕）')
+      console.log('未获取到弹幕：该视频可能已关闭弹幕，或当前没有弹幕')
     }
     return
   }
@@ -3637,13 +3637,20 @@ const DRY_RUN_REJECT = unsupportedDryRun(cmd, argv)
 //   程序却按默认策略把 gen-<hash> 下的原视频/音轨永久删掉 —— 承诺与行为相反。
 //   判定放在参数表，与 C236 同一套 rc=2 出口，不许退化成「提示一句忽略后照删」。
 const KEEP_SOURCE_REJECT = unsupportedKeepSource(cmd, argv)
+// 少一个连字符这类「近似已知参数」也必须走同一套 rc=2 出口。判定放在参数表，
+//   基准是「本命令接受的参数 ∪ 运行时全局参数」，不拿全项目参数表当拼错基准 ——
+//   别的脚本的合法参数不该在删除类命令上被判成拼错。
+const NEAR_FLAG_REJECT = unsupportedNearFlag(cmd, argv)
+// 拒绝文案与「已按忽略处理」不许并排。取同一个命中对象给下面的
+//   拼写提示用 —— 被这条闸拦下的 token 不再打第二句自相矛盾的「已忽略」。
+const NEAR_FLAG_HIT = nearFlagHit(cmd, argv)
 // C230 / B3 缩小版：参数「被接受」与「真生效」脱钩时，至少让人看见。
 //   只打一行 ⚠ 到 stderr：不改下发、不改退出码、不改 stdout、不改 output.schema。
 //   warn() 永远走 stderr 且带 ⚠，工具层成功分支的 filter(⚠) 会把它回灌给模型 ——
 //   这正是 B3 要的「参数没生效别静默」，不需要动结果组装主干（B1/B2 已推 0.5.0）。
 //   --help / 元命令 / 值非法（走 rc=2 那条）不叠这一行，免得一处错误报两种话。
 const UNACCEPTED = unacceptedFlags(cmd, argv)
-if (UNACCEPTED.length && cmd && !flag('help') && cmd !== 'help' && cmd !== '--help' && !ARG_ERRORS.length && !DRY_RUN_REJECT && !KEEP_SOURCE_REJECT) {
+if (UNACCEPTED.length && cmd && !flag('help') && cmd !== 'help' && cmd !== '--help' && !ARG_ERRORS.length && !DRY_RUN_REJECT && !KEEP_SOURCE_REJECT && !NEAR_FLAG_REJECT) {
   warn(`本命令不接受 ${UNACCEPTED.map((n) => `--${n}`).join(' / ')}（这些参数不会生效，已按忽略处理）`)
 }
 const HELP = `用法:
@@ -3661,30 +3668,29 @@ const HELP = `用法:
   node look.mjs frames <BV或链接或URL> [--step 2] [--out 目录] [--ffmpeg 路径] [--fresh] [--ocr] [--scene] [--format json]
                                          --scene：吸附画面变化点抽帧（默认关；仅 B 站）
   node look.mjs sheet <BV或链接> [--grid 3x3] [--step 2] [--at 12:30,01:05:00] [--cues] [--out 文件] [--format json]   N 帧拼一张九宫格（仅 B 站）
-                                         --at：只要这些时刻的画面（与 frames 同一套写法；给了就忽略 --step）
+                                         --at：仅抽取指定时刻的画面（与 frames 写法一致；指定后将忽略 --step）
                                          --cues：每格索引行下方附该时段的字幕台词（每格最多 2 行、每行 48 字符）。
                                                  折行按字符数算，不是显示宽度，中文一行看着会比英文宽；
                                                  按「本格时间点 → 下一格时间点」切，不是索引行的 [start,start+step)；
-                                                 视频没字幕轨时整段不加，不留空行。
+                                                 视频没有字幕轨时不添加该行，也不插入空行
                                          --dry-run：只出计划（时长 / 格子数 / 时间点 / 预计 token），不抽帧、不下载、不写盘；
-                                                    离线时用 --dur 秒数 给出时长即可算出时间点。
+                                                    离线时可通过 --dur 传入秒数，用于计算时间点
   node look.mjs substrip <BV或链接> [--step 7] [--out 文件] [--format json]   底部字幕带竖拼一张图（仅 B 站）
   node look.mjs ocr <BV或链接> [--step 2] [--out 文件] [--format json]   抽帧 + OCR 出文字（仅 B 站）
   node look.mjs text <BV或链接或URL> [--cred 凭证路径] [--step 2] [--fast] [--mark-seen] [--verify] [--head N] [--full] [--format json] [--out 文件]
   node look.mjs local <文件路径> [--ocr] [--frames] [--step 2] [--format json] [--out 文件]  本地视频/音频转写+抽帧OCR（不依赖 B 站）
   node look.mjs login [--poll] [--check] [--key <二维码key>]  扫码登录，拿 AI 字幕用的本地凭证
-  node look.mjs clean [--dry-run] [--all] [--permanent|--recycle|--smart] [--force-unknown]   清缓存（$DSH_HOME/bili-watch/cache；凭证在上一层，不动）
-  --all：清到只剩缓存根标记；删除方式取 cache-config.json 的 deleteMode（默认 permanent 直删，
-         不占系统回收站配额）。--permanent / --recycle / --smart 只对这一次覆盖：recycle 全进回收站，
-         smart 只把原视频 / 音轨 / ASR 转写送回收站。回收站放不下会跳过并提示，不会静默改成永久删除；
-         回收站不可用时才直删，并明确告知这是永久删除。回收站有配额限制，删进去的东西不保证一直留着。
+  node look.mjs clean [--dry-run] [--all] [--permanent|--recycle|--smart] [--force-unknown]   清理缓存目录（$DSH_HOME/bili-watch/cache；凭证位于上一层，不处理）
+  --all：清理到仅保留缓存目录标记；删除方式由 cache-config.json 决定（默认永久删除）
   --dry-run：clean 只列出这次会删除哪些条目、多少文件与多少字节，一个文件都不删；
-             去掉它才会真正执行。删除类命令若还不支持该参数，会拒绝执行而不是忽略它。
+             移除该参数后才会执行删除。尚不支持该参数的删除类命令会拒绝执行，不会忽略该参数
   --keep-source：通用 URL 的 frames / text / asr 用。下载的原视频 / 音轨默认用完即删
-                 （抛错、Ctrl+C 也有退出钩子兜底）；只有显式加它才留在缓存里。
+                 （异常或中断时由退出钩子清理）；仅显式指定该参数时保留在缓存目录
                  clean 不接受这个参数：加上会直接拒绝执行（rc=2），不会静默忽略后照删。
-  --force-unknown：仅 clean 用。缓存根有目录读不出来时默认拒绝清理（会给出错误码）；
+  --force-unknown：仅 clean 用。缓存目录中有条目无法读取时默认拒绝清理（会返回错误码）
                    确认要清才加它。对「真有抽帧/转写任务在跑」的活锁无效，那种一律拒绝。
+  近似参数名：clean 上写出与它接受的参数只差一点的开关（如 --dryrun）会直接拒绝执行（rc=2），
+                   不会只提示一句就照删；请写完整的参数名。
 
   多 P 视频加 --p N 指定第几个分P（默认 P1）。
   --verify：text 拿到字幕后，若字幕可疑（语速不在 2–8.5 字/秒、关键词命中过低、字幕自称实验/钓鱼）
@@ -3698,15 +3704,15 @@ const HELP = `用法:
   frames / ocr / sheet / substrip 支持 text|json（json 时 stdout 只有 JSON，既有散文原样收进 prose 字段；
             sheet --dry-run --format json 不联网、不抽帧、不写盘）。
   B 站目标可以直接贴分享链接，会自己提取 BV 号；短链 b23.tv/... 也会先按公共 DNS 展开成 BV 号。
-  通用视频 URL（YouTube/X 等）需要 yt-dlp：跑 node scripts/fetch-deps.mjs ytdlp 装到 deps/yt-dlp（Windows 上是 deps\\yt-dlp.exe；也可设 BILI_WATCH_YTDLP 或放进系统 PATH）。
+  通用视频 URL（YouTube、X 等）需要 yt-dlp。执行 node scripts/fetch-deps.mjs ytdlp 安装到 deps/yt-dlp（Windows 为 deps\\yt-dlp.exe）；也可设置 BILI_WATCH_YTDLP 或加入系统 PATH
   参数分层：转写闸门 asrMaxSec(秒,默认1800)/抽帧上限 maxFrames(默认500)/ASR超时 asrTimeoutSec(秒,默认900)/
             ffmpeg超时 ffmpegTimeoutSec(秒,默认300)/命令超时 cmdTimeoutSec(秒,默认180)，写 deps/deps-config.json
             或面板「常规」「高级设置」；--asr-max <毫秒> 只覆盖转写闸门（flag > config > 默认）。
   --out：sheet / ocr / substrip 的产物落点。不传时读 deps-config.json 的 defaultOut（也可设 BILI_WATCH_OUT），
-         没配就沿用缓存目录；显式 --out 优先，目录不存在时自动创建，系统目录一律拒绝。
+         未配置时使用缓存目录；显式 --out 优先，目录不存在时自动创建，系统目录一律拒绝
   --no-time：text/sub 默认输出带 [mm:ss] 逐句时间码，加这个退回纯文本（不带时间戳）。
   --quiet：把过程说明（进度、[track] 行）改走 stderr，stdout 只留正文，方便管道和 jq。
-            面板与工具层调用时会无条件加上它；手动跑一般用不到。
+            面板与工具层调用时会自动启用该参数；手动执行时通常无需使用
   --at <时刻>：frames 精看某一刻，支持三种写法——750（秒）、12:30（分:秒）、12:30-13:10（区间）。
   画面索引：frames --at / sheet / peek 的输出带一行索引，格式 r1c1 00:00-00:05 @00:02
             = 第 1 行第 1 列 / 这一格覆盖视频 0-5 秒 / 实际取的是第 2 秒那一帧。
@@ -3762,6 +3768,9 @@ try {
     if (!a.startsWith('--')) continue
     const name = a.slice(2).split('=')[0].toLowerCase()
     if (!name || KNOWN_FLAGS.has(name) || warned.has(name)) continue
+    // 这个 token 已经被近似闸明确拒绝（rc=2），再打一句「已按忽略处理」就是自相矛盾。
+    //   跳过的判定与拒绝同源（nearFlagHit / unsupportedNearFlag 共用 findNearFlag）。
+    if (NEAR_FLAG_HIT && name === NEAR_FLAG_HIT.name.toLowerCase()) continue
     warned.add(name)
     let best = '', bestScore = 99
     for (const k of KNOWN_FLAGS) {
@@ -3859,13 +3868,15 @@ try {
     await cmdLogin({ check: flag('check'), poll: flag('poll'), key: opt('key') })
   } else if (cmd === 'help' || cmd === '--help') {
     console.log(HELP)
-  } else if (ARG_ERRORS.length || DRY_RUN_REJECT || KEEP_SOURCE_REJECT) {
-    // 参数值非法 / 删除类命令收到没实现的 --dry-run / 清缓存收到 --keep-source，
-    //   都是用法错误：提示走 stderr、rc=2，且在任何删除动作之前。
+  } else if (ARG_ERRORS.length || DRY_RUN_REJECT || KEEP_SOURCE_REJECT || NEAR_FLAG_REJECT) {
+    // 参数值非法 / 删除类命令收到没实现的 --dry-run / 清缓存收到 --keep-source /
+    //   删除类命令收到近似已知参数名，都是用法错误：提示走 stderr、rc=2，
+    //   且在任何删除动作之前。
     //   放在 --help 拦截之后：`view --help --step abc` 应该打帮助，不该先报参数错。
     for (const e of ARG_ERRORS) console.error(`✗ ${e}`)
     if (DRY_RUN_REJECT) console.error(`✗ ${DRY_RUN_REJECT}`)
     if (KEEP_SOURCE_REJECT) console.error(`✗ ${KEEP_SOURCE_REJECT}`)
+    if (NEAR_FLAG_REJECT) console.error(`✗ ${NEAR_FLAG_REJECT}`)
     console.error('（跑 node look.mjs help 看参数说明）')
     process.exitCode = 2
   } else if (cmd === 'doctor') {
@@ -3950,7 +3961,7 @@ try {
       console.error(`✗ 正在被占用：检测到正在运行的抽帧/转写任务（锁 ${ls.lockPath}，pid ${ls.owner?.pid}），已取消清理。等任务跑完再清。`)
       process.exitCode = 1
     } else if (ls.state === 'unknown' && !forceUnknown) {
-      console.error(`✗ 缓存根有目录读不出来（${ls.code}），已拒绝。确认要清可加 --force-unknown`)
+      console.error(`✗ 缓存目录中有条目无法读取（${ls.code}），已拒绝。确认要清可加 --force-unknown`)
       process.exitCode = 1
     } else if (existsSync(cacheDir())) {
       // 清前后各打一行带 reason：让「忽略了什么」可查，不许只说「已强制清理」

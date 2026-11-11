@@ -2,6 +2,8 @@
 
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/sacredbluedragon/dsh-bili-watch)
 [![version](https://img.shields.io/npm/v/dsh-bili-watch?label=version)](https://www.npmjs.com/package/dsh-bili-watch)
+[![downloads](https://img.shields.io/npm/dt/dsh-bili-watch?label=downloads)](https://www.npmjs.com/package/dsh-bili-watch)
+[![downloads per week](https://img.shields.io/npm/dw/dsh-bili-watch?label=weekly)](https://www.npmjs.com/package/dsh-bili-watch)
 [![node](https://img.shields.io/node/v/dsh-bili-watch?label=node)](https://www.npmjs.com/package/dsh-bili-watch)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
 [![dsh.so risk](https://cdn.dsh.so/badge/dsh-bili-watch.svg)](https://www.dsh.so/artifact/dsh-bili-watch/)
@@ -11,16 +13,16 @@ DSH 插件 / CLI 工具：把 B 站视频解析成模型可消费的结构化内
 
 ## 为什么用它
 
-- **本地跑不上传**：ASR 转写 + OCR 抽帧全在本机，不依赖云 API、不花钱
+- **本地处理**：ASR 转写与 OCR 抽帧均在本机完成，不依赖云端服务，也不产生调用费用
 - **防字幕诱饵**：语速异常或字幕自称「实验/钓鱼」即判可疑；关键词命中率只在语速也异常时才作补充；可疑时加 `--verify` 抽 5 帧 OCR 比对画面（不加只提示一句）
-- **二次读瞬时**：缓存目录 + 文件锁，同一视频二次读取秒出
+- **缓存复用**：缓存目录与文件锁保证同一视频再次读取时直接返回已有结果
 - **为 AI 设计**：manifest 落盘 + 摘要输出，agent 直接消费不用再解析
 
 ## 一条链接进来之后
 
 ![一条链接进来之后](docs/workflow.png)
 
-给它一个链接，它按成本从低到高找文本：**官方字幕 → 本地转写 → 画面认字**。字幕几秒就有；没有字幕才下模型转写；连音轨都没有才逐帧认画面。哪一级没成都会记在输出的「来源」行，不会把截图的字当成台词。
+输入链接后，按成本从低到高依次尝试：官方字幕、本地转写、画面文字识别。官方字幕可直接返回；没有字幕时才进行本地转写；音轨也不可用时才逐帧识别画面文字。哪一级没成都会记在输出的「来源」行，不会把截图的字当成台词。
 
 想改代码、想知道模块怎么分层，见文末[「模块架构」](#模块架构)。
 
@@ -42,9 +44,9 @@ dsh plugin --profile web add dsh-bili-watch
 
 重启 DSH 后生效。DSH ≥ 0.2.0-rc.2 自动写入 `dsh.profile.bundles`；更早版本需手动在 profile `package.json` 的 `dsh.profile.bundles` 数组追加 `"dsh-bili-watch"`。
 
-> **装完重启即可用。** 本插件的 bundle patch 不带 `disabled`，装进 profile 的 `dsh.profile.bundles` 后重启 DSH 就生效，命令直接存在。
+> **安装完成后重启即可使用。** 本插件的 bundle patch 不含 `disabled`；加入 profile 的 `dsh.profile.bundles` 后重启 DSH 即生效
 >
-> 0.3.1 及更早的版本不是这样：包在装的那一刻就被写进 `dsh.profile.bundles`（`reconcile()` 干的），所以插件页显示「已启用」，但实际不加载——因为层里那行 `disabled: true` 是插件页开关碰不到的位置。症状是「显示已启用但命令不存在，点开关也没用」。那个 `disabled` 是 0.2.17 应急修 bug 时误加的，带了 7 个版本，0.3.2 已去掉。
+> 0.3.1 及更早的版本不是这样：包在装的那一刻就被写进 `dsh.profile.bundles`（`reconcile()` 干的），所以插件页显示「已启用」，但实际不加载——因为层里那行 `disabled: true` 是插件页开关碰不到的位置。表现为插件页显示已启用，但命令不可用，切换开关也无法解决。那个 `disabled` 是 0.2.17 应急修 bug 时误加的，带了 7 个版本，0.3.2 已去掉。
 
 > **从旧版本升级的注意**：`reconcile()` 只在「新增依赖」时跑，所以以前手动从 `dsh.profile.bundles` 删过包名的人，`pnpm update` 到 0.3.2 之后包名不会自动补回来，需要重跑一次 `dsh plugin --profile web add dsh-bili-watch`。
 
@@ -88,7 +90,7 @@ node tools/look.mjs view BV1EPnG6DEJC
 | `search <关键词> [--days N] [--limit 10] [--order pubdate\|click]` | 视频搜索。`--days` 不传或传 0 表示不限时间；传了则只留最近 N 天发布的，并按播放量降序（最多抓 3 页，结果仍按 `--limit` 截断） |
 | `hot [--limit 10]` | 综合热门榜 |
 | `login [--check] [--poll] [--key <key>]` | 扫码登录。`--check` 校验凭证有效性；`--key` 需配合 `--poll` |
-| `clean` | 清空缓存根。加 `--dry-run` 只列出这次会删除哪些条目、多少文件与多少字节，不删除任何文件；加 `--all` 清到只剩缓存根标记，删除方式取 `cache-config.json` 的 `deleteMode`（默认 `permanent` 直删），可用 `--permanent` / `--recycle` / `--smart` 只覆盖这一次；任务进行中（锁文件存活）时拒绝并返回非零退出码。`clean` 不接受 `--keep-source`（它是通用 URL 下载产物的保留开关），加上会拒绝执行并返回非零退出码，不会当作没给、照常删除 |
+| `clean` | 清理缓存目录。使用 `--dry-run` 时仅列出待删除的条目、文件数与字节数，不删除任何文件；使用 `--all` 时清理到仅保留缓存目录标记，删除方式取 `cache-config.json` 的 `deleteMode`（默认 `permanent` 直删），可用 `--permanent` / `--recycle` / `--smart` 只覆盖这一次；任务进行中（锁文件存活）时拒绝并返回非零退出码。`clean` 不接受 `--keep-source`（它是通用 URL 下载产物的保留开关），加上会拒绝执行并返回非零退出码，不会当作没给、照常删除 |
 | `help` | 打印完整用法（所有命令、全部参数） |
 
 `<target>` 接受 BV 号、`b23.tv` 短链、av 号或 URL。
@@ -152,8 +154,8 @@ r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
 - **哪些能删**：yt-dlp、转写模型、登录凭证可以直接删；ffmpeg / ASR 环境 / OCR 环境不给删除按钮——环境删了要重跑 `fetch-deps` 装回来，代价比省下的空间大，面板只在旁边标出实际位置。
 - **批量操作**：标题行的「批量下载 / 批量清理」打开勾选清单，删除前会再确认一次。
 - **排查提示词**：面板里点一下按钮，把一段现成的排查指令复制到剪贴板，粘给你自己机器上的 agent 就行——它会按里面的步骤只读排查（不改你的配置、不删东西），最后整理成一份现象 / 环境 / 日志 / 已排查项 / 怀疑点的报告。按症状分成几段：「依赖装不上」「转写/OCR 失败」「面板打不开」，各对应自己那一种情况，不会混着给你。
-- **抽帧缓存**：显示当前占用与文件数，「立即清除」按归属判据清理（哪些目录会清、哪些暂不清见下方「缓存路径」）；不点则按规则自动清理（保留天数、总量上限），超过从最旧的删起。规则存 `deps/cache-config.json`，启动时与打开面板时各查一次。
-- **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `"cache"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——插件不会动那些文件，要清理得你自己删。
+- **抽帧缓存**：显示当前占用与文件数，「立即清除」按归属判据清理（哪些目录会清、哪些暂不清见下方「缓存路径」）；不点则按规则自动清理（保留天数、总量上限），超过从最旧的删起。规则存 `deps/cache-config.json`，启动时与打开面板时各查一次。同一节里还能直接选删除方式（直删 / 回收站 / 智能），选中后写入该文件的 `deleteMode`；命令行的 `--permanent` / `--recycle` / `--smart` 配合 `clean --all` 只对当次生效，不改这个设置。
+- **缓存位置**：默认 `$DSH_HOME/bili-watch/cache`（`$DSH_HOME` 是 DSH 家目录，Windows 下通常是用户目录里的 `.dsh`）。登录凭证是它的兄弟文件，清缓存时别把上一层一起删。换位置用环境变量 `BILI_WATCH_CACHE`，或 `deps/deps-config.json` 里的 `"cache"`；指到还不是缓存根的目录时，插件会在里面建 `bili-watch-cache/`，不会直接拿你的目录当缓存根。`clean` 与面板发现旧位置还有东西、又没本工具的标记时会提示一句——插件不会动那些文件，要清理得你自己删。产物的默认落点在面板「抽帧缓存」一节的「默认输出目录」里改，写入 `deps/deps-config.json` 的 `defaultOut`；命令行的 `--out` 与它是同一份设置，只对当次生效。
 - **运行时参数**：转写闸门、抽帧张数上限这类常改的放常规组，其余收在「高级设置」里（默认收起），每项都标了范围和「调大/调小会怎样」。
 - **最近一次调用**：显示命令、时间、成败，用来判断上一次是不是卡住了。
 
