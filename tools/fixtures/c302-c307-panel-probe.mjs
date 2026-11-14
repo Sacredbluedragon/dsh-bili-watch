@@ -100,11 +100,10 @@ function call(method, path, body) {
 // 从 client.js 抠原样函数体真求值：只有 clearAllConfirmNode 是本次新增的展示层函数，
 //   其余三个（dismissHintForever / showHintAgain / setHintEnabled）由 C282/C283 的
 //   issue14-probe.mjs 覆盖，本夹具不重复造。
-function evalClearAllConfirm() {
-  const src = readFileSync(CLIENT, 'utf8')
-  const sig = 'function clearAllConfirmNode(h, o) {'
+// 原样抠出一段具名函数体（按花括号配平），不替被测函数造环境、不注入假实现。
+function grabFn(src, sig) {
   const i = src.indexOf(sig)
-  if (i < 0) return { error: '抠不到 clearAllConfirmNode 签名' }
+  if (i < 0) return null
   const open = src.indexOf('{', i)
   let depth = 0, end = -1
   for (let k = open; k < src.length; k++) {
@@ -112,8 +111,18 @@ function evalClearAllConfirm() {
     if (c === '{') depth++
     else if (c === '}') { depth--; if (depth === 0) { end = k + 1; break } }
   }
-  if (end < 0) return { error: 'clearAllConfirmNode 花括号不配平' }
-  const body = src.slice(i, end) + '\nreturn clearAllConfirmNode'
+  return end > 0 ? src.slice(i, end) : null
+}
+
+function evalClearAllConfirm() {
+  const src = readFileSync(CLIENT, 'utf8')
+  // clearAllConfirmNode 引用了模块级的 clearAllLabel / clearAllConfirmWording。
+  //   按夹具纪律「依赖一起原样抽出」，不能只抽一个函数再给它塞假实现。
+  const need = ['function clearAllLabel(deleteMode) {', 'function clearAllConfirmWording(deleteMode) {', 'function clearAllConfirmNode(h, o) {']
+  const parts = need.map((sig) => grabFn(src, sig))
+  const missing = need.filter((_, k) => !parts[k])
+  if (missing.length) return { error: '抠不到函数签名：' + missing.join(' / ') }
+  const body = parts.join('\n') + '\nreturn { clearAllConfirmNode, clearAllLabel, clearAllConfirmWording }'
   let F
   try { F = new Function(body)() } catch (e) { return { error: 'new Function 失败：' + String(e?.message || e) } }
   const nodes = []
@@ -130,13 +139,23 @@ function evalClearAllConfirm() {
     return acc
   }
   try {
-    const o = { preview: { count: 12, bytes: 3 * 1048576, force: true }, fmt: (b) => (b / 1048576).toFixed(1) + ' MB', confirm() {}, cancel() {} }
-    const root = F(h, o)
+    const { clearAllConfirmNode, clearAllLabel, clearAllConfirmWording } = F
+    const o = { preview: { count: 12, bytes: 3 * 1048576 }, deleteMode: 'permanent',
+      breakdown: { unrecognizedCount: 2 },
+      fmt: (b) => (b / 1048576).toFixed(1) + ' MB', confirm() {}, cancel() {} }
+    const root = clearAllConfirmNode(h, o)
+    // 三档各真求值一次：按钮名与确认框人话必须跟着 deleteMode 变，不许写死。
+    const perMode = {}
+    for (const m of ['permanent', 'recycle', 'smart']) {
+      const n = clearAllConfirmNode(h, { ...o, deleteMode: m })
+      perMode[m] = { label: clearAllLabel(m), wording: clearAllConfirmWording(m), texts: texts(n) }
+    }
     return {
       hasDanger: Object.prototype.hasOwnProperty.call(root.props || {}, 'data-bl-danger'),
       hasDlg: Object.prototype.hasOwnProperty.call(root.props || {}, 'data-bl-dlg'),
       texts: texts(root),
       nodeCount: nodes.length,
+      perMode,
     }
   } catch (e) { return { error: '真求值失败：' + String(e?.message || e) } }
 }

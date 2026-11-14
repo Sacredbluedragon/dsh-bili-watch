@@ -122,20 +122,22 @@ try {
   }
 
   // ── B（capability）：纯我们自己的目录还得清得掉 ─────────────────────────────
-  //   2026-11-05：`0001.jpg` / `0002.jpg` 刻意不改成真实命名，让它们**只能靠
-  //   manifest.files 的书面记账**过判。补零帧序号那条弱凭证已从判据里删干净
-  //   （DSH 1457 裁定），若它还在，这组就会变成「靠形状猜」而不是「靠记账」。
+  //   第二件把归属台账统一到 meta.json v2 后（lib/frames.mjs:139 ledgerFilesOf 只在
+  //   ledgerVersion===2 时读 files），manifest.json 不再是凭证。这里只写一份 v2 meta
+  //   台账，把 0001.jpg / 0002.jpg 登记成「刚写成功的产物」——靠逐写盘点记账过判，
+  //   不靠名字形状猜，也不靠已经作废的 manifest.files 书面记账（两条留一条）。
   {
     const root = makeRoot('rootB')
     const bv = join(root, 'frames', `${BV}-p1-2s`)
     mkdirSync(bv, { recursive: true })
-    writeFileSync(join(bv, 'meta.json'), JSON.stringify({ bv: BV }), 'utf8')
-    writeFileSync(join(bv, 'manifest.json'), JSON.stringify({ ok: true, files: ['0001.jpg', '0002.jpg'] }), 'utf8')
+    writeFileSync(join(bv, 'meta.json'), JSON.stringify({ bv: BV, ledgerVersion: 2, files: [{ name: '0001.jpg', bytes: 5 }, { name: '0002.jpg', bytes: 5 }] }), 'utf8')
     writeFileSync(join(bv, '0001.jpg'), 'frame', 'utf8')
     writeFileSync(join(bv, '0002.jpg'), 'frame', 'utf8')
     const r = removeOwned(root)
     out.capability.B_ourBvDirGone = !existsSync(bv)
-    out.capability.B_countedFiles = r.files >= 4
+    // 迁移后目录内是 3 个文件（v2 meta 台账 + 0001.jpg + 0002.jpg）；删掉 manifest.json
+    //   那行后文件数从 4 变 3，阈值随之同步降到 3 —— 仍要求真删掉整棵，防「一律不删」的假绿。
+    out.capability.B_countedFiles = r.files >= 3
     out.notes.B = { skipped: r.skipped, files: r.files, bytes: r.bytes }
   }
 
@@ -309,11 +311,34 @@ try {
   //   产物名逐处 grep 自生产代码，来源行号写进《逐目录凭证表》。
   //   frames 由 A–D + 下面 Frames 组共同覆盖；其余九个按「给得出/给不出凭证」分两类。
 
-  provableDir('Logs', '_logs', (r) => {
-    // index.js:515 / tools/look.mjs:883 runsFile()；tools/look.mjs:3530 失败现场
-    put(r, '_logs/runs.jsonl', '{}\n')
-    put(r, '_logs/last-error.json', '{}')
-  })
+  // Logs 组：日志不参与任何清理，只计入面板物理占用。
+  //   原来走 provableDir 断言「纯产物目录必须被清掉」，现在方向相反。保留两棵根
+  //   （纯产物 / 混用户图），capability 改成「必须还在 + skipped 说清原因」，
+  //   让 C162 的 capBad 继续能抓「把日志改回可删」。
+  {
+    const root = makeRoot('root-Logs-ours')
+    const d = join(root, '_logs')
+    mkdirSync(d, { recursive: true })
+    put(root, '_logs/runs.jsonl', '{}\n')
+    put(root, '_logs/last-error.json', '{}')
+    const r = removeOwned(root)
+    out.capability.Logs_keptForDiagnosis = existsSync(d)
+    out.capability.Logs_skipExplained = (r.skipped || [])
+      .some((s) => s?.name === '_logs' && /日志不参与清理/.test(String(s?.why || '')))
+    out.notes.Logs_ours = { files: r.files, skipped: r.skipped }
+  }
+  {
+    const root = makeRoot('root-Logs-mixed')
+    const d = join(root, '_logs')
+    mkdirSync(d, { recursive: true })
+    put(root, '_logs/runs.jsonl', '{}\n')
+    put(root, '_logs/last-error.json', '{}')
+    put(root, '_logs/1.jpg', 'user-photo-in-mixed-dir')
+    const r = removeOwned(root)
+    out.defect.Logs_userSurvived = existsSync(join(d, '1.jpg'))
+    out.capability.Logs_mixedDirKept = existsSync(d)
+    out.notes.Logs_mixed = { files: r.files, skipped: r.skipped }
+  }
 
   provableDir('Frames', 'frames', (r) => {
     // tools/look.mjs:855 writeManifest({ files })；:838 `${bv}-NN.jpg`

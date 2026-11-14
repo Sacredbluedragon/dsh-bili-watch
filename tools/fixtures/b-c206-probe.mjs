@@ -17,7 +17,10 @@ console.log(JSON.stringify({
   big: fmtCleanMB(1073741824),
   cleanCallSites: (src.match(/fmtCleanMB\(d\.bytes\)/g) || []).length,
   cleanUsesFmtBytes: /fmtBytes\(Number\(d\.bytes/.test(clean),
-  fmtBytesStillUsed: ['fmtBytes(dl.bytes)', 'fmtBytes(d.size)', 'fmtBytes(cache.bytes)']
+  fmtBytesStillUsed: ['fmtBytes(dl.bytes)', 'fmtBytes(d.size)']
     .every((s) => src.includes(s)),
+  // 0.4.11 收口（方案 B）：旧行读 cache.bytes（不含 _logs）已删，三笔数只由
+  //   cacheFactsNode 渲染。原来把它列进「不误伤」清单守的是旧契约，这里改成反向钉住。
+  oldCacheRowGone: !src.includes('fmtBytes(cache.bytes)'),
   fmtBytesCallSites: (src.match(/fmtBytes\(/g) || []).length,
 }))

@@ -140,10 +140,62 @@ function depPathNote(d) {
 //   /status 的 downloading 是正在跑的目标 id 列表，download.why 是「为什么量不到进度」，
 //   两者拼成一句话；没有下载在跑就不占版面。与后端 downloadConflict 的全局互斥同口径。
 function lockNote(st) {
+  // issue #11 问题 3：跨进程锁优先读 /status.data.lock（后端复用 downloadLockBusy()）。
+  //   老宿主回包没这个字段时，退回原来的 downloading 那一句，不编「没有锁」。
+  const lk = st && st.lock
+  if (lk && lk.pid != null) {
+    const target = typeof lk.target === 'string' && lk.target.trim() ? lk.target.trim() : '目标未知'
+    const since = Number.isFinite(lk.startedAt) && lk.startedAt > 0
+      ? new Date(lk.startedAt).toLocaleString() : '未知时间'
+    return `另一个进程正在装依赖（pid=${lk.pid}，目标 ${target}，开始于 ${since}），其它下载与清理暂不可用`
+  }
   const ids = (st && st.downloading) || []
   if (!Array.isArray(ids) || ids.length === 0) return ''
   const why = (st && st.download && st.download.why) || ''
   return `已有下载在跑：${ids.join('、')}${why ? `（${why}）` : ''}，其它下载与清理暂不可用`
+}
+
+// 0.4.11：删除方式改了，按钮名跟着改。写死「不可恢复」在回收站档下是假话，
+//   会让不敢点的人放弃一个其实能还原的操作。三个具名纯函数供判据抠出来真求值。
+function clearAllLabel(deleteMode) {
+  return deleteMode === 'permanent' ? '彻底清空（不可恢复）' : '彻底清空'
+}
+
+function clearAllConfirmWording(deleteMode) {
+  if (deleteMode === 'recycle') return '将移到回收站，可从回收站还原'
+  if (deleteMode === 'permanent') return '将永久删除，不可恢复'
+  return '重要文件会移到回收站（可还原），其余将永久删除'
+}
+
+/**
+ * 占用 X / 本次可删 Y / 认不出 Z 三数常驻。三个数都由后端 cacheBreakdown 一次给出，
+ *   Z = X − Y；不许把「可删数」当成「占用数」显示，也不许前端自己拿两个数相减。
+ *   Z 非零时给一句解释——「16 MB / 0 项」这个差额正是清空 P0 的症状。
+ */
+function cacheFactsNode(h, o) {
+  const b = o && o.breakdown
+  if (!b) return null
+  const fmt = o.fmt || ((n) => String(n))
+  const X = Number(b.occupied?.bytes || 0)
+  const Y = Number(b.removable?.bytes || 0)
+  const Z = Number(b.unrecognized?.bytes || 0)
+  const count = Number(b.unrecognizedCount || 0)
+  const rows = [
+    h('div', { 'data-bl-row': '' },
+      h('span', { 'data-bl-name': '' }, '当前占用'),
+      h('span', { 'data-bl-detail': '', 'data-bl-fact-x': '' }, `${fmt(X)} / ${Number(b.occupied?.files || 0)} 个文件`)),
+    h('div', { 'data-bl-row': '' },
+      h('span', { 'data-bl-name': '' }, '本次可删'),
+      h('span', { 'data-bl-detail': '', 'data-bl-fact-y': '' }, `${fmt(Y)} / ${Number(b.removable?.count || 0)} 项`)),
+    h('div', { 'data-bl-row': '' },
+      h('span', { 'data-bl-name': '' }, '认不出归属'),
+      h('span', { 'data-bl-detail': '', 'data-bl-fact-z': '' }, `${fmt(Z)} / ${count} 项`)),
+  ]
+  if (Z !== 0 || count > 0) {
+    rows.push(h('div', { 'data-bl-note': '', 'data-bl-fact-note': '' },
+      `这 ${count} 项认不出归属，可能是你放进来的文件，也可能是本插件产物；默认一律保留不删，只有在「彻底清空」确认框里勾选「连同这些文件一起删除」才会一并清理`))
+  }
+  return h('div', { 'data-bl-facts': '' }, ...rows)
 }
 
 // C8：面板原来不显示插件版本，报障时对不上是哪个版本的行为。
@@ -606,6 +658,14 @@ MODULE_LOADER.load({
       const [picked, setPicked] = React.useState([])
       // C236b：两步确认的预览数据。只在点按钮那一下向 /cache/preview 要，绝不进 8 秒轮询。
       const [allPreview, setAllPreview] = React.useState(null)
+      // 0.4.11 三数：占用 X / 本次可删 Y / 认不出 Z。只在挂载与清理动作后取一次，
+      //   绝不放进 load()（那是 8 秒轮询）。Z 可见时「16 MB / 0 项」这类 P0 第一眼就能看出。
+      const [cacheFacts, setCacheFacts] = React.useState(null)
+      // 第三件（0.4.11）：第二类「明确可疑」文件的勾选通道。unknownFiles 来自预览的
+      //   breakdown.unknownFiles（相对缓存根路径 + 字节数）；includeUnknown 是用户在确认框
+      //   勾选后一次性显式授权——不是按扩展名判定归属，是用户自己点头的那一下。
+      const [includeUnknown, setIncludeUnknown] = React.useState(false)
+      const [unknownFiles, setUnknownFiles] = React.useState([])
       // BLK-03（2026-10-28）：8 秒轮询原来无条件把输入框重置成服务端值，用户改完天数还没点保存
       //   就被改回 7。用 ref 记「用户动过输入框」，轮询见到就跳过覆盖，保存成功后复位。
       const dirtyRef = React.useRef(false)
@@ -649,11 +709,22 @@ MODULE_LOADER.load({
         }
       }, [])
 
+      // 三数单独取一次，不并进 load() 的 8 秒轮询（previewAll 会全量 walk 缓存根）。
+      const refreshFacts = React.useCallback(async () => {
+        try {
+          const p = await jpost('/cache/preview', {})
+          if (p?.data?.breakdown) setCacheFacts(p.data.breakdown)
+        } catch (e) {
+          setMsg('读取缓存占用失败：' + String(e?.message || e))
+        }
+      }, [])
+
       React.useEffect(() => {
         load()
+        refreshFacts()
         const t = setInterval(load, 8000)
         return () => clearInterval(t)
-      }, [load])
+      }, [load, refreshFacts])
 
       // 二维码出现后每 2.5 秒问一次扫码结果；成功就刷新依赖状态（凭证会变绿）
       React.useEffect(() => {
@@ -770,9 +841,11 @@ MODULE_LOADER.load({
         }
       }
 
-      const saveCache = async () => {
+      // 「立即清理」= removeOwned（不带 all），删掉所有认得出归属的缓存条目，
+      //   含未过期的、不看 days/maxMb 阈值。规则本身由输入框失焦自动保存，这个按钮不再写配置。
+      const doCleanNow = async () => {
         try {
-          const j = await jpost('/cache/clear', { days: Number(days), maxMb: Number(maxMb) })
+          const j = await jpost('/cache/clear', {})
           // D07（2026-10-29）：后端从 767528f 起就会把「本插件的数据但没删掉」收进 data.failed
           //   （removeOwned / autoCleanCache 两处同口径），路由层因此回 ok:false + why「部分失败：N 项」。
           //   但面板原来只显示 why 那半句：成功删了几个、失败的是哪几个文件、为什么删不掉，全丢了，
@@ -797,61 +870,123 @@ MODULE_LOADER.load({
           } else {
             setMsg(
               `缓存已清理（${removed} 个文件 / ${fmtCleanMB(d.bytes)}）` +
-              (keptNote ? `；${keptNote}` : '') +
-              `；此后按 ${days} 天、${maxMb} MB 自动清理`,
+              (keptNote ? `；${keptNote}` : ''),
             )
           }
-          dirtyRef.current = false
           await load()
+          await refreshFacts()
         } catch (e) {
           setMsg(String(e?.message || e))
         }
       }
 
-      // C236b：清空全部 = 两步确认。第一次点只取预览（后端也守 needConfirm，不删任何东西），
+      // 彻底清空 = 两步确认。第一次点只取预览（后端也守 needConfirm，不删任何东西），
       //   确认框写明「将删除 N 项 / X MB」，第二次点确认才带 confirmed=1 真执行。
-      //   强制按钮额外带 mode=permanent：它不受 deleteMode 约束，永远直删，文案写「不可恢复」。
-      // 0.4.10（23:38 段第 1 项）：强制清空的确认框原来复用普通 [data-bl-dlg] 样式，
+      //   删除方式一律跟 deleteMode 走，按钮不覆盖 mode。
+      // 0.4.10（23:38 段第 1 项）：彻底清空的确认框原来复用普通 [data-bl-dlg] 样式，
       //   且固定插在「运行依赖」下面，离触发按钮隔了四段。抽成具名纯函数，
       //   让判据能抠原样函数体在桩环境真求值；调用点放到「抽帧缓存」区紧邻按钮。
       function clearAllConfirmNode(h, o) {
-        const force = !!o.preview?.force
         const allPreview = o.preview
         const fmtBytes = o.fmt
-        return h('div', { 'data-bl-sec': '', 'data-bl-dlg': '', 'data-bl-danger': '' },
-          h('span', { 'data-bl-sec-title': '' }, force ? '确认强制清空（不可恢复）' : '清空全部缓存（两步确认）'),
+        const mode = o.deleteMode
+        const unknown = Number(o.breakdown?.unrecognizedCount || 0)
+        // 第三件（0.4.11）：第二类「明确可疑」文件。foreign 为空时一字节都不新增，
+        //   返回结构与改前完全相同（C302 原样函数体真求值比对的就是这条）。
+        const foreign = Array.isArray(o?.unknownFiles) ? o.unknownFiles : []
+        const kids = [
+          h('span', { 'data-bl-sec-title': '' }, `确认${clearAllLabel(mode)}（两步确认）`),
           h('div', { 'data-bl-row': '' },
             h('span', { 'data-bl-name': '' }, `将删除 ${allPreview?.count ?? 0} 项 / ${fmtBytes(allPreview?.bytes ?? 0)}`)),
-          h('div', { 'data-bl-note': '' }, force
-            ? '强制清空使用永久删除，文件不可恢复，也不会进入回收站'
-            : '按当前删除方式执行；回收站容量有限，其中的文件可能被后续清理覆盖'),
+          h('div', { 'data-bl-note': '', 'data-bl-clearall-wording': '' }, clearAllConfirmWording(mode)),
+          h('div', { 'data-bl-note': '' },
+            // 两值归属后没有第三类「灰区」：没有正向凭证的一律按 foreign 默认保留，
+            //   不进「将删除」；只有在确认框勾选「连同这些文件一起删除」才会一并清理。
+            //   旧句「认不出形状的中间产物已计入将删除」是三值时代的假话，本批撤回。
+            `另有 ${unknown} 项没有归属凭证，默认一律保留不删；勾选上方「连同这些文件一起删除」后才会一并清理；回收站容量有限时可能跳过部分条目`),
+        ]
+        if (foreign.length) {
+          const names = foreign.slice(0, 5).map((f) => String(f.name || '')).join('、')
+          const tail = foreign.length > 5 ? ` 等 ${foreign.length} 个` : ''
+          const totalBytes = foreign.reduce((s, f) => s + (Number(f.bytes) || 0), 0)
+          kids.push(
+            h('div', { 'data-bl-note': '', 'data-bl-unknown': '' },
+              `检测到 ${foreign.length} 个可能不是本插件的文件（${fmtBytes(totalBytes)}）：${names}${tail}`),
+            h('div', { 'data-bl-row': '', 'data-bl-unknown-check': '' },
+              h('input', { type: 'checkbox', checked: !!o.includeUnknown, onChange: o.onToggleUnknown }),
+              h('span', { 'data-bl-name': '' }, '连同这些文件一起删除')))
+        }
+        kids.push(
           h('div', { 'data-bl-row': '' },
-            h('button', { 'data-bl-btn': '', onClick: o.confirm }, force ? '确认强制清空' : '确认清空'),
+            h('button', { 'data-bl-btn': '', onClick: o.confirm },
+              o.includeUnknown ? '确认彻底清空（含无法识别的文件）' : `确认${clearAllLabel(mode)}`),
             h('button', { 'data-bl-btn': '', onClick: o.cancel }, '取消')))
+        return h('div', { 'data-bl-sec': '', 'data-bl-dlg': '', 'data-bl-danger': '' }, ...kids)
       }
-      const openClearAll = async (force) => {
+      const openClearAll = async () => {
         try {
           const p = await jpost('/cache/preview', {})
-          setAllPreview({ count: Number(p?.data?.count || 0), bytes: Number(p?.data?.bytes || 0), force: !!force })
+          setAllPreview({ count: Number(p?.data?.count || 0), bytes: Number(p?.data?.bytes || 0) })
+          if (p?.data?.breakdown) setCacheFacts(p.data.breakdown)
+          // 第三件（0.4.11）：把第二类「明确可疑」清单收进 state（用 Array.isArray 兜底）；
+          //   每次开确认框都把勾选复位成不勾——上次勾过不代表这次还想删。
+          setUnknownFiles(Array.isArray(p?.data?.breakdown?.unknownFiles) ? p.data.breakdown.unknownFiles : [])
+          setIncludeUnknown(false)
           setDlg('clearAll')
         } catch (e) {
           setMsg('读取待清理项失败：' + String(e?.message || e))
         }
       }
+      // 「彻底清空」→ removeAllOwned（all:true）。删除方式一律跟 deleteMode 走，
+      //   任何按钮都不许自己覆盖 mode —— 原来那个写死永久删除的按钮会让选了回收站的用户被直删。
+      //   第三件（0.4.11）：确认框勾了「连同这些文件一起删除」才在请求体挂 includeUnknown，
+      //   没勾就不挂——第二类文件靠用户一次性显式授权，不是按扩展名判定归属。
       const doClearAll = async () => {
-        const force = !!allPreview?.force
         try {
-          const j = await jpost('/cache/clear', { all: true, confirmed: true, ...(force ? { mode: 'permanent' } : {}) })
+          const clearBody = { all: true, confirmed: true }
+          if (includeUnknown) clearBody.includeUnknown = true
+          const j = await jpost('/cache/clear', clearBody)
           const d = j?.data || {}
-          setMsg(j?.ok === false
-            ? (j.why || '清空全部失败')
-            : `已清空全部（${d.items ?? 0} 项）` +
-              (d.skippedOverflow?.count ? `；因回收站空间不足跳过 ${d.skippedOverflow.count} 项` : '') +
-              (force ? '；强制清空为永久删除，不可恢复' : ''))
+          // 回收站失效回落：这些条目已永久删除、不可恢复，不能用完成态措辞盖过去。
+          //   容量溢出、0 项、删除失败、按设计保留也各说人话，不许只留一句「部分失败」。
+          const fallbackList = Array.isArray(d.fallback) ? d.fallback : []
+          const failedList = Array.isArray(d.failed) ? d.failed : []
+          const overflowCount = Number(d.skippedOverflow?.count || 0)
+          const items = Number(d.items ?? 0)
+          const namesOf = (list) => {
+            const names = list.slice(0, 3).map((f) => String(f?.name || '')).join('、')
+            return names + (list.length > 3 ? ' 等' : '')
+          }
+          const fallbackNote = fallbackList.length
+            ? `回收站不可用：${fallbackList.length} 项已永久删除（不可恢复）—— ${namesOf(fallbackList)}`
+            : ''
+          let msg
+          if (j?.ok === false) {
+            msg = j.why || '彻底清空失败'
+          } else if (fallbackList.length) {
+            msg = `已清理 ${items} 项，但${fallbackNote}`
+          } else if (items === 0) {
+            msg = `没有可清理的条目${overflowCount ? `；因回收站空间不足跳过 ${overflowCount} 项` : ''}`
+          } else {
+            msg = `已彻底清空（${items} 项）` + (overflowCount ? `；因回收站空间不足跳过 ${overflowCount} 项` : '')
+          }
+          // 失败明细与回落明细不论 ok 与否都要点名：why 只给数量，用户还得知道
+          //   哪些条目没删成、哪些已经被永久删除。
+          if (failedList.length) msg += `；删除失败 ${failedList.length} 项（${namesOf(failedList)}）`
+          if (j?.ok === false && fallbackNote) msg += `；${fallbackNote}`
+          // 按设计保留的条目也要点名，否则「已彻底清空」和目录里还有文件互相打脸。
+          //   容量溢出那条已在上面单独计数，这里不重复列。
+          const kept = (Array.isArray(d.skipped) ? d.skipped : [])
+            .filter((s) => !/回收站空间不足/.test(String(s?.why || '')))
+          if (kept.length) {
+            msg += `；另有 ${kept.length} 项按设计保留（${namesOf(kept)}）`
+          }
+          setMsg(msg)
           dirtyRef.current = false
           await load()
+          await refreshFacts()
         } catch (e) {
-          setMsg('清空全部失败：' + String(e?.message || e))
+          setMsg('彻底清空失败：' + String(e?.message || e))
         }
       }
 
@@ -1162,14 +1297,19 @@ MODULE_LOADER.load({
           h('div', { 'data-bl-note': '' },
             '这一份会要求你打开浏览器的开发者工具（Console 和 Network 两个标签页）。')),
         h('div', { 'data-bl-sec': '' },
-          h('span', { 'data-bl-sec-title': '' }, '抽帧缓存'),
-          h('div', { 'data-bl-row': '' },
-            h('span', { 'data-bl-name': '' }, '当前占用'),
-            h('span', { 'data-bl-detail': '' }, `${fmtBytes(cache.bytes)} / ${cache.files} 个文件`),
-            h('button', { 'data-bl-btn': '', onClick: saveCache }, '立即清除'),
-            h('button', { 'data-bl-btn': '', onClick: () => openClearAll(false) }, '清空全部'),
-            h('button', { 'data-bl-btn': '', onClick: () => openClearAll(true) }, '强制清空（不可恢复）')),
-          dlg === 'clearAll' ? clearAllConfirmNode(h, { preview: allPreview, fmt: fmtBytes, confirm: confirmDlg, cancel: () => setDlg(null) }) : null,
+          h('div', { 'data-bl-sechead': '' },
+            h('span', { 'data-bl-sec-title': '' }, '抽帧缓存'),
+            // 两个按钮放在标题行：不带 all 的走 removeOwned，带 all 的走 removeAllOwned。
+            //   按钮名按 deleteMode 动态变，不再写死「强制清空（不可恢复）」。
+            h('button', { 'data-bl-btn': '', 'data-bl-clean-now': '', onClick: doCleanNow }, '立即清理'),
+            h('button', { 'data-bl-btn': '', 'data-bl-clear-all': '', onClick: openClearAll }, clearAllLabel(deleteMode))),
+          // 三个数常驻：占用 X / 本次可删 Y / 认不出 Z（Z = X − Y），只由 cacheFactsNode 渲染。
+          cacheFactsNode(h, { breakdown: cacheFacts, fmt: fmtBytes }),
+          dlg === 'clearAll' ? clearAllConfirmNode(h, {
+            preview: allPreview, breakdown: cacheFacts, deleteMode,
+            fmt: fmtBytes, confirm: confirmDlg, cancel: () => setDlg(null),
+            unknownFiles, includeUnknown, onToggleUnknown: () => setIncludeUnknown((v) => !v),
+          }) : null,
           // C236b：回收站放不下的跳过项标黄一行（低频信息，不加常驻横幅）。
           st.skippedOverflow?.count
             ? h('div', { 'data-bl-row': '' },
@@ -1232,11 +1372,10 @@ MODULE_LOADER.load({
             h('span', { 'data-bl-name': '' }, '自动清理规则'),
             h('span', { 'data-bl-detail': '' },
               '保留 ',
-              h('input', { 'data-bl-input': '', value: days, onChange: (e) => { markDirty(); setDays(e.target.value) }, inputMode: 'numeric' }),
+              h('input', { 'data-bl-input': '', value: days, onChange: (e) => { markDirty(); setDays(e.target.value) }, onBlur: saveRule, inputMode: 'numeric' }),
               ' 天；总量超过 ',
-              h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => { markDirty(); setMaxMb(e.target.value) }, inputMode: 'numeric' }),
-              ' MB 时从最旧的删。'),
-            h('button', { 'data-bl-btn': '', onClick: saveRule }, '保存规则')),
+              h('input', { 'data-bl-input': '', value: maxMb, onChange: (e) => { markDirty(); setMaxMb(e.target.value) }, onBlur: saveRule, inputMode: 'numeric' }),
+              ' MB 时从最旧的删（字段失焦自动保存）。')),
           // 0.4.10 第 4 项：三档删除方式。写进 cache-config.json 的 deleteMode，
           //   与 clean 命令同一份配置；服务端不确认时回滚勾选态。
           h('div', { 'data-bl-row': '' },
@@ -1284,13 +1423,13 @@ MODULE_LOADER.load({
                     try {
                       const r = await jpost('/config', { autoClean: v })
                       if (r?.ok === false) { setAutoClean(!v); setMsg('无法保存：' + (r.why || '未知错误')) }
-                      else setMsg(v ? '自动清理已开启。' : '自动清理已关闭；手动「立即清除」仍可用。')
+                      else setMsg(v ? '自动清理已开启。' : '自动清理已关闭；手动「立即清理」仍可用。')
                     } catch (err) { setAutoClean(!v); setMsg('无法保存：' + String(err?.message || err)) }
                   },
                 }),
-                ' 开启自动清理（关掉后只在你点「立即清除」时清）'))),
+                ' 开启自动清理（关掉后只在你点「立即清理」时清）'))),
           h('div', { 'data-bl-note': '' },
-            '开启时按上述规则自动执行（每次打开面板与插件启动时检查一次）；关掉后只有手动「立即清除」会清。')),
+            '开启时按上述规则自动执行（每次打开面板与插件启动时检查一次）；关掉后只有手动「立即清理」会清。')),
         // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),

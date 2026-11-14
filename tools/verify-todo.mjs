@@ -44,6 +44,8 @@ const F = {
   // 2026-10-31 第二步：downloadTo（B13 的 content-type 判据）与 cachedMp4（B16 的前缀）
   //   搬进 lib/media.mjs，判据要跟着搬，否则 fnBody 抠不到函数体 = 假红。
   media: join(ROOT, 'lib/media.mjs'),
+  // 2026-11-13：逐写盘点台账搬到 lib/frames.mjs，B35 改为扫 mergeLedger 函数体。
+  frames: join(ROOT, 'lib/frames.mjs'),
 }
 
 // ── 读文件（缺失不抛，返回 null） ───────────────────────────────────────
@@ -179,6 +181,7 @@ function guard(id, name, fn) {
 const LOOK = SRC.look
 const INDEX = SRC.index
 const CLI = SRC.cli
+const FRAMES = SRC.frames
 const PKG = (() => {
   try {
     return JSON.parse(SRC.pkg || '{}')
@@ -835,19 +838,31 @@ guard('B34', '2-28 误导性 stderr 提示', () => {
 
 // ══════════════════════════════════════════════════════════════════════
 // B35  5-8  .tool.txt 进 meta.files
+//   2026-11-13（0112 段缺口一）：writeMeta 的 readdirSync 全目录快照已删，
+//   逐写盘点搬到 lib/frames.mjs 的 mergeLedger。守卫跟着迁到新实现点：
+//   只认 if(...) continue 的完整条件，且先剥注释 —— 注释里贴字面不算数。
 // ══════════════════════════════════════════════════════════════════════
 guard('B35', '5-8 .tool.txt 进 meta.files', () => {
-  const body = fnBody(LOOK, 'writeMeta')
-  if (!body) return bad('B35', '5-8 .tool.txt 进 meta.files', '未找到 writeMeta()')
-  const filterLine = /meta\.files\s*=\s*readdirSync\(dir\)([\s\S]{0,160})/.exec(body)
-  if (!filterLine) return bad('B35', '5-8 .tool.txt 进 meta.files', '未找到 meta.files 赋值')
-  if (/tool\.txt/.test(filterLine[1]))
-    return ok('B35', '5-8 .tool.txt 进 meta.files', 'meta.files 过滤掉了 .tool.txt')
-  bad(
-    'B35',
-    '5-8 .tool.txt 进 meta.files',
-    'meta.files 只 filter 掉 meta.json，其余目录项全收；trimForModel 写的 *.tool.txt 会被列进去',
-  )
+  const NAME = '5-8 .tool.txt 进 meta.files'
+  const body = fnBody(FRAMES, 'mergeLedger')
+  if (!body) return bad('B35', NAME, '未找到 mergeLedger() —— 判据扫描面失效，不许静默放行')
+  // 剥注释再按行取完整条件：只在 continue 语句所在行判定，不查整个函数体的字面。
+  const conds = stripComments(body).split('\n')
+    .map((l) => /^\s*if\s*\((.*)\)\s*continue\s*;?\s*$/.exec(l))
+    .filter(Boolean)
+    .map((m) => m[1])
+  if (!conds.length)
+    return bad('B35', NAME, 'mergeLedger 里没有 if(...) continue 跳过语句 —— 两个过滤条件都不在场')
+  const hasMeta = conds.some((c) => c.includes('meta.json'))
+  const hasTool = conds.some((c) => c.includes('.tool.txt'))
+  // 只要求两个过滤条件各自出现在某条 continue 的完整条件里，不要求同行：
+  //   拆成两条 if(...) continue 是等价实现，钉「必须同一行」会误伤（扰动 D 验过）。
+  if (!hasMeta || !hasTool) {
+    const miss = [!hasMeta && 'meta.json', !hasTool && '.tool.txt'].filter(Boolean).join(' / ')
+    return bad('B35', NAME, `mergeLedger 的 continue 完整条件缺：${miss}（注释里的字面不算）`)
+  }
+  ok('B35', NAME,
+    `mergeLedger 剥注释后 ${conds.length} 条 if(...) continue，两个过滤条件都在 continue 完整条件里`)
 })
 
 // ══════════════════════════════════════════════════════════════════════

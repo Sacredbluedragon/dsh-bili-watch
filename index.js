@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url'
 import { lockState, classifyLock } from './lib/locks.mjs'
 // 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
-import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll } from './lib/cache-own.mjs'
+import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll, cacheBreakdown } from './lib/cache-own.mjs'
 // C236b：三档 deleteMode 的唯一实现；手动 / 自动 / --all 三条路径都从这里取策略。
 import { normalizeDeleteMode, deletePaths, DELETE_MODES } from './lib/recycle.mjs'
 import { modelRow } from './lib/model-integrity.mjs'
@@ -2843,6 +2843,14 @@ function registerPanelRoute(ctx) {
                     // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
                     //   这张表，暴露出去面板才知道该灰哪几行。只列目标名，不含 pid/路径。
                     downloading: Array.from(DOWNLOADING.keys()),
+                    // issue #11 问题 3：跨进程锁要在面板可见。复用 downloadLockBusy()
+                    //   （与 /download 预检、CLI lockState 同一份三态判定），不另写一套。
+                    //   只带三个标量字段，不把锁文件绝对路径带进面板回包。
+                    lock: (() => {
+                      const lk = downloadLockBusy()
+                      if (!lk) return null
+                      return { pid: lk.pid ?? null, target: lk.target ?? '', startedAt: lk.startedAt ?? 0 }
+                    })(),
                     // 只报「哪个 .part、现在多大、算不算数」，
                     //   百分比由面板算 —— 分母是估算字符串，后端算不出真百分比。
                     //   activeDepIds 传 DOWNLOADING：没有进程在写它就判「无法测量」，
@@ -2892,14 +2900,22 @@ function registerPanelRoute(ctx) {
                 }
               }
               // C236b：确认框要算「将删除 N 项 / X MB」，只在点按钮那一下扫，绝不进 /status。
+              // issue #15：同一个入口顺带给「占用 X / 本次可删 Y / 认不出 Z」三个数，
+              //   由 cacheBreakdown 一次算出，X − Y = Z 恒成立，不许前端另拿两个数相减。
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/preview') {
-                return sendJson(res, 200, { ok: true, data: previewAll(cacheDir()) })
+                return sendJson(res, 200, {
+                  ok: true,
+                  data: { ...previewAll(cacheDir()), breakdown: cacheBreakdown(cacheDir()) },
+                })
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
                 const all = body?.all === true || Number(body?.all) === 1
                 const confirmed = body?.confirmed === true || Number(body?.confirmed) === 1
                 const mode = normalizeDeleteMode(body?.mode || cacheCfg().deleteMode)
+                // 第三件（0.4.11）：includeUnknown = 用户在确认框勾选后一次性显式授权删第二类文件。
+                //   只在 removeAllOwned 的 all 分支透传；removeOwned（立即清理）永远只删第一类。
+                const includeUnknown = body?.includeUnknown === true || Number(body?.includeUnknown) === 1
                 // A1：patch 形态，只传这次真要改的字段（漏传 = 不改，不会抹掉 autoClean）
                 const cfgPatch = {}
                 if (Number.isFinite(body?.days)) cfgPatch.days = Math.max(1, body.days)
@@ -2911,7 +2927,10 @@ function registerPanelRoute(ctx) {
                 // 两步确认：--all 第一次只回预览，一个字节都不删；必须带 confirmed=1 才真执行。
                 //   后端也守这道，面板之外直接打 API 同样绕不过去。
                 if (all && !confirmed) {
-                  return sendJson(res, 200, { ok: true, data: { needConfirm: true, ...previewAll(cacheDir()), mode } })
+                  return sendJson(res, 200, {
+                    ok: true,
+                    data: { needConfirm: true, ...previewAll(cacheDir()), breakdown: cacheBreakdown(cacheDir()), mode },
+                  })
                 }
                 // A7（2026-10-27）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
                 //   不再像以前那样「先删完再补一句 warning」（锁外删会跟运行中的抽帧抢目录）。
@@ -2920,6 +2939,12 @@ function registerPanelRoute(ctx) {
                 //   forceUnknown=1 且当前确实 unknown 才放行 —— 面板不给按钮，能力只走 CLI/API。
                 const ls = lockState(cacheDir(), lockTtlMs())
                 const forceUnknown = body?.forceUnknown === true || Number(body?.forceUnknown) === 1
+                // forceUnknown 与 includeUnknown 语义不同，不许合并、不许互相复用：
+                //   · forceUnknown 是「缓存根有目录读不出来（三态里的 unknown）时强制放行」，
+                //     面板不给按钮，能力只走 CLI/API（见上面 C1 三态分支）。
+                //   · includeUnknown 是「用户在确认框勾选后，显式授权删除第二类（明确可疑）文件」，
+                //     只由 /cache/clear 的 all 分支透传给 removeAllOwned。
+                //   一个关乎「读不全要不要硬清」，一个关乎「认不出归属要不要一并删」，互不替代。
                 // 活锁是「有人在用」的确定事实，unknown 只是「有目录读不全」的不确定信息。
                 //   forceUnknown 只能绕过后者，不能绕过有人正在写的事实；两者同时成立时 why 两条都写，
                 //   不许只报一条。
@@ -2948,21 +2973,34 @@ function registerPanelRoute(ctx) {
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
                 const cleared = all
-                  ? removeAllOwned(cacheDir(), { mode })
+                  ? removeAllOwned(cacheDir(), { mode, includeUnknown })
                   : removeOwned(cacheDir(), { mode })
+                // 两个入口的 files 语义不同：removeOwned 是真删文件数，removeAllOwned 是计划数。
+                //   --all 一律改读 removedFiles，让 removed 在这条接口上恒为「真删文件数」。
+                const removedFiles = all ? (cleared.removedFiles ?? 0) : cleared.files
                 if (cleared.overflow?.count) lastSkippedOverflow = { count: cleared.overflow.count, bytes: cleared.overflow.bytes }
                 if (ls.state === 'unknown') {
-                  try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理完成：已忽略 ${ls.reason}，实际清理 ${cleared.files} 个文件`) } catch {}
+                  try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理完成：已忽略 ${ls.reason}，实际清理 ${removedFiles} 个文件`) } catch {}
                 }
                 // #11：清完立刻让占用缓存失效——面板紧接着那次 /status 要看到清完的真实体积
                 invalidateCacheStat()
-                // 9-8：有权限问题删不掉时不报成功，且 removed 只数真删掉的；面板按 ok/why 显示「部分失败：N 项」
-                const partial = cleared.failed.length > 0
+                // 9-8：有权限问题删不掉时不报成功；面板按 ok/why 显示「部分失败：N 项」。
+                //   removed 只数真删掉的文件，plannedFiles 另列计划数，不再共用一个字段。
+                //   容量溢出导致一项都没删时同样不算成功：否则调用方拿到 ok:true + removed:0
+                //   会以为已经清干净。失败项与容量跳过分开报数，各说各的后果。
+                const failedCount = cleared.failed.length
+                const overflowCount = cleared.overflow?.count || 0
+                const partial = failedCount > 0 || overflowCount > 0
+                const reasons = []
+                if (failedCount) reasons.push(`部分失败：${failedCount} 项`)
+                if (overflowCount) reasons.push(`回收站空间不足跳过 ${overflowCount} 项`)
+                const why = partial ? reasons.join('；') : undefined
                 return sendJson(res, 200, {
                   ok: !partial,
-                  why: partial ? `部分失败：${cleared.failed.length} 项` : undefined,
+                  why,
                   // 这里的 skipped 是 removeOwned 的清单**数组**，与 autoCleanCache 的布尔同名不同义，不许统一
-                  data: { removed: cleared.files, bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed,
+                  data: { removed: removedFiles, ...(all ? { plannedFiles: cleared.plannedFiles ?? 0 } : {}),
+                    bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed,
                     mode, items: cleared.items ?? cleared.plan?.length ?? 0,
                     skippedOverflow: cleared.overflow || { count: 0, bytes: 0 }, fallback: cleared.fallback || [] },
                 })
