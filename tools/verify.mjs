@@ -6,6 +6,8 @@
  * 每条坑一条断言，跑完打印 PASS/FAIL，有 FAIL 就 exit 1。
  *
  * 用法：node tools/verify.mjs
+ * 只跑其中几条：node tools/verify.mjs --only C1,C2 —— 多个编号可用逗号或空格分隔，
+ *   `--only C1 C2` 与 `--only C1,C2` 等价，都会真跑两条；遇到 --verbose / --fast 即停止收集。
  * 不进 npm 包（files 里只留 tools/look.mjs，见 package.json）。
  */
 import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readdirSync, renameSync, copyFileSync, openSync, closeSync, statSync, symlinkSync, chmodSync } from 'node:fs'
@@ -66,6 +68,7 @@ import { extractWrittenPath } from '../lib/written-path.mjs'
 import {
   makeChecker, must, parseOnlySpecs, matchOnly, onlyNoticeLine, renderResults,
   checkId, SLOW_CHECKS, SLOW_BY_TIMING, TIMING_PRODUCERS, makeSlowChecker, fastNoticeLine,
+  timingSummaryLines,
 } from './check-run.mjs'
 // C245/C246：删除类命令的干跑契约，判据直接调真参数表（不采信夹具自述）。
 // 用命名空间导入是刻意的：实现还没落地时，具名 import 会让整个主闸当场崩掉，
@@ -200,6 +203,77 @@ const c367Probe = () => {
   return c367Cache
 }
 
+// C378/C379/C381：评论接口真跑取证。夹具起真 look.mjs 进程跑 comments --format json，
+//   只把 HTTP 响应换成本地替身；两种凭证态各一次、顶层评论故意跨页重复 rpid。
+//   顶层 const 包装同 c364Probe：判据块里不出现子进程调用字面（C276），C325 据此判成行为判据。
+let c378Cache
+const c378Probe = () => {
+  if (c378Cache) return c378Cache
+  const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c378-comments-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 2 * 1024 * 1024,
+  })
+  let json = null
+  try { json = JSON.parse((r.stdout || '').trim()) } catch {}
+  c378Cache = { status: r.status, json, raw: `${r.stdout || ''}${r.stderr || ''}` }
+  return c378Cache
+}
+// 这两条只是把记账数组按路径切一刀，放在 preflight 区供三条判据共用。
+//   C325 认的是 c378Probe（定义体含 spawnSync 字面），判据体必须直接调它；
+//   若中间再包一层不含 spawnSync 的 const，C325 会把整条判成纯字面量静态判据。
+const replyHits = (x) => x.hits.filter((h) => h.path.startsWith('/x/v2/reply/'))
+const mainHits = (x) => x.hits.filter((h) => h.path === '/x/v2/reply/main')
+
+// 0.4.12 第二批：C380 四象限、C382 渲染层/E/H、C383 F/G、C385 三档截断。
+//   三份顶层 const 包装都含 spawnSync 字面，C325 据此判成行为判据；判据体直接调它们，
+//   中间不包没有 spawnSync 的 const（上一批踩过，见 20261115-1227 回段 §一.5）。
+let c380Cache
+const c380Probe = () => {
+  if (c380Cache) return c380Cache
+  const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c380-note-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 120000, maxBuffer: 2 * 1024 * 1024,
+  })
+  let json = null
+  try { json = JSON.parse((r.stdout || '').trim()) } catch {}
+  c380Cache = { status: r.status, json, raw: `${r.stdout || ''}${r.stderr || ''}` }
+  return c380Cache
+}
+let c382Cache
+const c382Probe = () => {
+  if (c382Cache) return c382Cache
+  const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c382-comments-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
+  })
+  let json = null
+  try { json = JSON.parse((r.stdout || '').trim()) } catch {}
+  c382Cache = { status: r.status, json, raw: `${r.stdout || ''}${r.stderr || ''}` }
+  return c382Cache
+}
+let c383Cache
+const c383Probe = () => {
+  if (c383Cache) return c383Cache
+  const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c383-tool-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
+  })
+  let json = null
+  try { json = JSON.parse((r.stdout || '').trim()) } catch {}
+  c383Cache = { status: r.status, json, raw: `${r.stdout || ''}${r.stderr || ''}` }
+  return c383Cache
+}
+
+// 0.4.12 第三刀：F3 差额标记 / F6 条数校验共用一份真跑取证。
+//   顶层 const 包装含 spawnSync 字面，C325 据此判成行为判据；判据体直接调它，不包中转 const。
+let c386Cache
+const c386Probe = () => {
+  if (c386Cache) return c386Cache
+  const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c386-f3f6-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
+  })
+  let json = null
+  try { json = JSON.parse((r.stdout || '').trim()) } catch {}
+  c386Cache = { status: r.status, json, raw: `${r.stdout || ''}${r.stderr || ''}` }
+  return c386Cache
+}
+
 // 3c C313/C314/C316：精确 spec 单条真跑取证包装。刻意放在所有 check() 之前 ——
 // C276 按块数子进程调用字面，判据块里若出现会被当成新的账外重判据；判据只调这个包装。
 function onlyProbe(spec) {
@@ -208,6 +282,16 @@ function onlyProbe(spec) {
     cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
   })
   return { ms: Date.now() - t0, status: r.status, out: `${r.stdout || ''}${r.stderr || ''}` }
+}
+
+// C377：真 CLI 的「--only 后带多个裸位置参数」形态。onlyProbe 只传一个 argv，
+//   造不出 `--only C370 C371`；包装放顶层（所有 check 之前），判据块里不出现子进程字面，
+//   免得 C276 的按块扫描把它当成新的账外慢判据。
+const c377ArgvProbe = (...args) => {
+  const r = spawnSync(process.execPath, ['tools/verify.mjs', '--only', ...args], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
+  })
+  return { status: r.status, out: `${r.stdout || ''}${r.stderr || ''}` }
 }
 
 // 1418 派单 ⑦ / C317：独立现抽边界守卫的扫面，判「白名单里有没有 0 命中的空指向」。
@@ -7654,7 +7738,7 @@ check('C126 git 推送段必须局部降级成 Continue（Stop 会把 git 的 st
 //   dataOnly 的 return 之后；② 「提示让模型绕过自家围栏」——展示层加了 source tag + 围栏，
 //   而 2451 行让模型 read 的落盘文件是**纯正文**，那条最短的路把标记绕过去了。
 //
-// 判据为什么不写成「scanInjection 返回什么」：那只能证明正则还在。出问题的地方是「跑没跑」，
+// 判据为什么不写成「scanInjection 返回什么」：那只能证明函数还在。出问题的地方是「跑没跑」，
 //   所以 C127/C128 **真跑命令**看 stdout / stderr / 落盘文件；C129/C130 要喂一批语料看命中率，
 //   用「把定义段原样切出来 + 探针尾巴」的办法（切的是真代码，不是复刻件）。
 const GUARD_BASE = 'e889822' // 加这组护栏之前的基线：逐字节对比要拿它的 look.mjs 跑一遍
@@ -7669,7 +7753,7 @@ function guardProbe(cases, label) {
   must(j > i, `${label}：找不到 WARN_STATE 作为切段终点 —— 切出来会是半截代码`)
   const seg = src.slice(i, j)
   // 切到空处时探针会「零命中」全绿 —— 那正是最坏的假绿，所以先验切出来的段里该有的都在
-  for (const need of ['const SUSPECT_ALL', 'const SUSPECT_HIGH', 'function scanInjection']) {
+  for (const need of ['const INVISIBLE_RES', 'function scanInjection']) {
     must(seg.includes(need), `${label}：切出来的段里没有 ${need}（切到空处了）`)
   }
   const dir = mkdtempSync(join(tmpdir(), 'bw-guard-'))
@@ -7753,12 +7837,21 @@ check('C127 --format json 下护栏真的跑：命中带 _untrusted，未命中�
   // C217/A4 批准 video；评论三数 + replies + note 也是批准的加法（加字段＝兼容）。
   //   旧版逐字节全等禁止任何加法，改成「除批准清单外逐字节全等」；并**加严**：
   //   新输出相对旧输出多出来的键必须恰好等于批准清单，多一个没批准的字段照样红。
-  const APPROVED_ADDITIONS = ['video', 'total', 'shown', 'repliesTotal', 'replies', 'note']
+  // C379（0.4.12）：comments 的 items 每条新增 rcount。批准精确到字段名 ——
+  //   只摘 rcount 再逐字节比，另在下面验「items 相对旧版多出的键恰好只有 rcount」。
+  const APPROVED_ADDITIONS = ['video', 'total', 'shown', 'repliesTotal', 'replies', 'note', 'truncated', 'loggedIn']
+  const APPROVED_ITEM_ADDITIONS = ['rcount']
   const stripApproved = (s) => {
     try {
       const o = JSON.parse(s)
       if (o && typeof o === 'object' && !Array.isArray(o)) {
         for (const k of APPROVED_ADDITIONS) delete o[k]
+        if (Array.isArray(o.items)) {
+          for (const it of o.items) {
+            if (!it || typeof it !== 'object' || Array.isArray(it)) continue
+            for (const k of APPROVED_ITEM_ADDITIONS) delete it[k]
+          }
+        }
         return JSON.stringify(o, null, 2) + '\n'
       }
     } catch {}
@@ -7781,6 +7874,21 @@ check('C127 --format json 下护栏真的跑：命中带 _untrusted，未命中�
     must(typeof pOk.total === 'number' && typeof pOk.shown === 'number'
       && typeof pOk.repliesTotal === 'number' && Array.isArray(pOk.replies) && typeof pOk.note === 'string',
       `1815 段批准的新增字段形状不对：total=${typeof pOk.total} shown=${typeof pOk.shown} repliesTotal=${typeof pOk.repliesTotal} replies=${Array.isArray(pOk.replies)} note=${typeof pOk.note}`)
+    must(typeof pOk.truncated === 'boolean' && typeof pOk.loggedIn === 'boolean',
+      `F3 批准的顶层标记形状不对：truncated=${typeof pOk.truncated} loggedIn=${typeof pOk.loggedIn}`)
+    // C379：items 里新加的键必须恰好只有 rcount；旧版键集合从真跑的旧输出取，不手抄。
+    //   多一个字段 / 少一个字段 / 值不是非负有限数字，都在这条红（strip 只摘 rcount，
+    //   多出来的其它字段会在上面的逐字节比里先红）。
+    let pOld = null
+    try { pOld = JSON.parse(oldOut) } catch {}
+    const oldItemKeys = new Set(Object.keys(pOld?.items?.[0] || {}))
+    must(pOld && Array.isArray(pOld.items) && pOk.items.length === pOld.items.length && oldItemKeys.size > 0,
+      `C379 items 条数与改动前不一致：新 ${pOk.items.length} / 旧 ${pOld?.items?.length ?? -1}`)
+    must(pOk.items.every((x) => {
+      const extra = Object.keys(x).sort().filter((k) => !oldItemKeys.has(k))
+      return extra.join(',') === 'rcount'
+        && typeof x.rcount === 'number' && Number.isFinite(x.rcount) && x.rcount >= 0
+    }), `C379 批准的 items 加法不合规（多字段 / 少字段 / rcount 不是非负数字）：${JSON.stringify(pOk.items.map((x) => Object.keys(x).sort()))}`)
   }
 
   return '命中→_untrusted+hits+stderr 警告；未命中→无扩展字段；除批准清单外与旧版逐字节一致，新增键逐个验形状'
@@ -7813,7 +7921,10 @@ check('C128 落盘：原文件仍纯正文，wrapped 副本带 source tag+围栏
   return 'sub.txt 纯正文 / sub.wrapped.txt 带 tag+围栏 / 提示词指向 wrapped'
 })
 
-check('C129 20 条正常字幕在长文本规则下零命中（三条语义规则不加的依据）', () => {
+// 2026-11-15：语义关键词规则整组删掉后，本条只守「正常语料不被形态判据误伤」，
+//   不再守「长文本池误报」——那种误报已随语义规则一起消失；藏字还能不能被抓到，
+//   由 C130 的 zw / tag / bidi 正例与它自己的反向扰动守，本条不重复验。
+check('C129 20 条正常字幕在不可见字符判据下零命中（形态判据不误伤）', () => {
   const raw = read('tools/fixtures/normal-subtitles.txt')
   const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
   must(lines.length >= 20, `语料只有 ${lines.length} 条（应 ≥20）—— 删条目就等于放宽这条判据`)
@@ -7821,13 +7932,11 @@ check('C129 20 条正常字幕在长文本规则下零命中（三条语义规�
   must(out.length === lines.length, `探针返回 ${out.length} 条，喂了 ${lines.length} 条`)
   const bad = out.filter((r) => r.long.length)
   must(bad.length === 0,
-    `长文本池把 ${bad.length} 条正常字幕当成注入了：${bad.map((b) => `${b.name}→${b.long.join('/')}`).join('；')}` +
-    '（字幕几千字，误报一条就是「每次都报」，下一步必然被人整段注释掉）')
-  // 短文本池（评论）本来就会命中一些——不是断言目标，但必须打出来：
-  //   「短池误报多少」是下一步要不要收紧的唯一依据，藏在报告里迟早被忘。
+    `不可见字符判据把 ${bad.length} 条正常字幕当成注入了：${bad.map((b) => `${b.name}→${b.long.join('/')}`).join('；')}` +
+    '（正常语料零命中是唯一正确结果，命中一条就是判据写宽了）')
+  // 长短两路探针现在跑同一套形态判据；两个字段保留只为不动既有断言形状。
   const sh = out.filter((r) => r.short.length)
-  return `${lines.length} 条正常字幕：长文本池 0 命中；短文本池 ${sh.length} 条命中` +
-    (sh.length ? `（${sh.slice(0, 3).map((x) => x.short.join('/')).join('；')}…）` : '')
+  return `${lines.length} 条正常字幕：不可见字符判据 0 命中（长短两路同源，各 ${sh.length} 条命中）`
 })
 
 check('C130 不可见字符是确定性判据：零宽/tag/双向控制符命中，正常文本与开头 BOM 不命中', () => {
@@ -8581,23 +8690,76 @@ check('C183 C48-P2-1 跨进程锁判据统一：活锁 / 8h 活锁 / 坏 JSON，
 // 为什么不能只判墙钟：缓存是共享的，同步版第一个请求跑完就写满三份缓存，后三个全命中，
 //   于是「4 并发墙钟 ≈ 单发冷态」也会落进 2 倍阈值里 —— 单靠墙钟是纸老虎。
 //   夹具另起 5ms 心跳直接测主线程有没有被堵，两条同时成立才算数（扰动 D1 里会实测墙钟不红、心跳红）。
+// C375（2037 段 §一 A）：心跳/墙钟是共享机器上的一次性读数，别的进程抢 CPU 就能把它顶过阈值。
+//   本机裸跑实测三次 19.04 / 87.14 / 19.96ms —— 87.14 那次首遍会误判成「事件循环被堵」。
+//   命中才复测 2 次、取三次最小值：真同步阻塞是稳定慢的，抖动是偶发的。阈值不写死，
+//   从夹具源码的 TICK_LIMIT 真取值（现在 40），夹具改阈值时判据跟着走。
+const c184TickLimit = () => {
+  const m = /const TICK_LIMIT\s*=\s*(\d+)/.exec(read('tools/fixtures/perf-probe.mjs'))
+  must(m && Number(m[1]) > 0, 'C184 读不到 perf-probe.mjs 的 TICK_LIMIT 真值')
+  return Number(m[1])
+}
+const c184Verdict = (runs, limit) => {
+  const row = (j, mode) => (j?.notes?.rows || []).find((x) => x.mode === mode) || {}
+  const minOf = (pick) => Math.min(...runs.map((j) => {
+    const v = Number(pick(j))
+    return Number.isFinite(v) ? v : Infinity
+  }))
+  return {
+    singleTick: minOf((j) => row(j, 'single').maxTickMs),
+    quadTick: minOf((j) => row(j, 'quad').maxTickMs),
+    singleWall: minOf((j) => row(j, 'single').wallMs),
+    quadWall: minOf((j) => row(j, 'quad').wallMs),
+    limit,
+  }
+}
+const c184Ok = (v) => ({
+  ...v,
+  singleNotCheated: v.singleTick <= v.limit,
+  eventLoopNotBlocked: v.quadTick >= 0 && v.quadTick <= v.limit,
+  quadWallWithinTwiceSingle: v.quadWall > 0 && v.singleWall > 0 && v.quadWall <= v.singleWall * 2,
+})
+
 let perfRun = null
-const perf = () => {
-  if (!perfRun) perfRun = runFixture('perf-probe.mjs', 300000)
-  return perfRun
+const perf = (fresh = false) => {
+  if (!fresh && perfRun) return perfRun
+  const r = runFixture('perf-probe.mjs', 300000)
+  if (!fresh) perfRun = r
+  return r
 }
 
-check('C184 面板首屏 4 并发不堆叠：墙钟 ≤ 单发×2 + 事件循环心跳 ≤40ms；三处 timeout 与判 ok 原样', () => {
+check('C184 面板首屏 4 并发不堆叠：墙钟 ≤ 单发×2 + 事件循环心跳 ≤40ms（命中复测取最小）；三处 timeout 与判 ok 原样', () => {
   const r = perf()
   must(r.status === 0 && r.json, `性能夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
   const j = r.json
   must(!j.fatal, `性能夹具 fatal：${j.fatal}`)
   must(j.capability?.C184_baselineGreen === true, '性能夹具没跑全冷态基线 —— 下面的绿可能是没测到东西')
   must(j.capability?.C184_fourConcurrentReallyServed === true, '4 个并发没有全部真回 200/ok=true')
-  must(j.capability?.C184_singleNotCheated === true, '单发那轮自身就堵了事件循环，对照不成立')
-  const bad = ['C184_quadWallWithinTwiceSingle', 'C184_eventLoopNotBlocked']
-    .filter((k) => j.defect?.[k] !== true)
-  must(bad.length === 0, `${bad.join(' / ')} 没过（rows=${JSON.stringify(j.notes?.rows || []).slice(0, 500)}）`)
+  const limit = c184TickLimit()
+  const runs = [j]
+  let v = c184Ok(c184Verdict(runs, limit))
+  if (!v.singleNotCheated || !v.eventLoopNotBlocked || !v.quadWallWithinTwiceSingle) {
+    // 只在首遍命中时复测 2 次；正常情况一次也不多花，语义仍是「有没有堵住事件循环」。
+    for (let i = 0; i < 2; i++) {
+      const rr = perf(true)
+      must(rr.status === 0 && rr.json && !rr.json.fatal,
+        `C184 复测夹具失效（rc=${rr.status}）：${(rr.raw || '').slice(0, 300)}`)
+      runs.push(rr.json)
+    }
+    v = c184Ok(c184Verdict(runs, limit))
+  }
+  const fastestTick = Math.min(...runs.map((x) => {
+    const raw = (x.notes?.rows || []).find((y) => y.mode === 'single')?.maxTickMs
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : Infinity
+  }))
+  must(v.singleNotCheated,
+    `单发那轮自身就堵了事件循环，对照不成立（${runs.length} 次最小心跳 ${v.singleTick}ms > ${limit}ms）`)
+  const bad = []
+  if (!v.quadWallWithinTwiceSingle) bad.push('C184_quadWallWithinTwiceSingle')
+  if (!v.eventLoopNotBlocked) bad.push('C184_eventLoopNotBlocked')
+  must(bad.length === 0,
+    `${bad.join(' / ')} 没过（${runs.length} 次取最小：quad 心跳 ${v.quadTick}ms / 墙钟 ${v.quadWall}ms；rows=${JSON.stringify(j.notes?.rows || []).slice(0, 400)}）`)
   const src = read('index.js')
   for (const t of [1200, 5000, 15000]) {
     must(new RegExp(`timeout: ${t}\\b`).test(src), `改异步后把 timeout ${t} 弄丢了`)
@@ -8605,7 +8767,7 @@ check('C184 面板首屏 4 并发不堆叠：墙钟 ≤ 单发×2 + 事件循环
   must(/const r = await execFileP\(py,/.test(src) && /ok = r\.ok/.test(src), 'pyProbe 没判 ok 或没走 execFileP')
   must(/r\.ok\) \{ hit = c/.test(src), 'resolveFfmpeg 没判 ok（失败会被当成装好了）')
   const rows = (j.notes?.rows || []).map((x) => `${x.mode}:${x.wallMs}ms/心跳${x.maxTickMs}ms/yt${x.ytdlp}`)
-  return rows.join(' · ')
+  return `${runs.length} 次探针取最小（单发心跳 ${fastestTick}ms / 阈值 ${limit}ms）· ${rows.join(' · ')}`
 })
 
 // ── C185：首屏请求合并 + 子进程调用次数（2026-11-06 面板首屏性能）────────────
@@ -12169,14 +12331,27 @@ slowCheck('C313【主判据】3c 分档上界：主闸未跳过判据逐条 =Cxx
   }
   must(noHit.length === 0,
     `C313：${noHit.length} 条精确 spec 没真跑起来：${noHit.slice(0, 5).join(',')}`)
-  must(violations.length === 0,
-    `C313：${violations.length} 条未跳过判据单跑 >= 10 秒，该归位却没进清单：${violations.join(',')}`)
+  // 瞬时负载抖动不该让闸变红：只对首遍命中的另测 2 次，取三次最小值；仍 >=10s 才算真慢。
+  // 复测只在违例非空时进入，正常情况一次也不多花。
+  const stillSlow = []
+  if (violations.length > 0) {
+    for (const v of violations) {
+      const id = v.split(' ')[0]
+      const first = Number((/(\d+)ms/.exec(v) || [])[1] || 0)
+      const times = [first]
+      for (let i = 0; i < 2; i++) times.push(onlyProbe('=' + id).ms)
+      const fastest = Math.min(...times)
+      if (fastest >= 10000) stillSlow.push(`${id} ${fastest}ms`)
+    }
+  }
+  must(stillSlow.length === 0,
+    `C313：${stillSlow.length} 条判据三次最小值仍 >= 10 秒：${stillSlow.join(',')}`)
   // ② 静态守卫在后：精确 spec 语法本身不能被换回前缀匹配，否则上面全是假的。
   must(matchOnly('C20 某判据', ['=C20']) === true
     && matchOnly('C200 某判据', ['=C20']) === false
     && matchOnly('C200 某判据', ['C20']) === true,
   'C313：=Cxxx 精确 spec 退化了（C200 不该被 =C20 命中，但应被 C20 命中）')
-  return `${targets.length} 条未跳过判据逐条 =Cxxx 真跑，0 条 >= 10 秒；最慢 ${slowest.id} ${slowest.ms}ms；单跑 rc≠0 共 ${nonZero.length} 条（只取墙钟、不当 PASS 证据）`
+  return `${targets.length} 条未跳过判据逐条 =Cxxx 真跑；首遍命中 ${violations.length} 条，复测后仍慢 ${stillSlow.length} 条；最慢 ${slowest.id} ${slowest.ms}ms；单跑 rc≠0 共 ${nonZero.length} 条（只取墙钟、不当 PASS 证据）`
 })
 
 slowCheck('C314【主判据】3c 精确 spec：=C20 命中 1 条 / C20 命中 11 条，三种旧形态行为不变', () => {
@@ -12391,10 +12566,29 @@ slowCheck('C336【主判据】非删除类命令行为不变 + 他处合法参�
   must(!j.error && j.mutated && j.mutated.built === true,
     'C336：夹具或反向对照没建成，不许判绿')
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
-  // ① 行为在前：非删除类命令的输出，主态与摘判定态必须逐字一致。
+  // doctor 输出里有「剩余 X GiB」这一行磁盘实时读数，不是命令行为。
+  //   全量跑到这条时，前面判据写的临时文件会让它跨过 0.1 GiB 边界（受控复现 33.9→33.7），
+  //   主态与摘判定态因此被误判成「行为被改」。只归一化这一个读数，其余仍逐字比。
+  const normEnv = (s) => String(s).replace(/剩余 \d+(?:\.\d+)? GiB/g, '剩余 <N> GiB')
+  must(normEnv('✓ cache：可写，剩余 33.9 GiB') === normEnv('✓ cache：可写，剩余 33.7 GiB'),
+    'C336 磁盘读数归一化没生效')
+  must(normEnv('✓ cache：可写，剩余 33.9 GiB') !== normEnv('✗ cache：可写，剩余 33.9 GiB'),
+    'C336 归一化把非读数的差异也吃掉了（等于关掉了这条判据）')
+  const sameCli = (a, b) => !!a && !!b && a.rc === b.rc
+    && normEnv(a.out) === normEnv(b.out) && normEnv(a.err) === normEnv(b.err)
+  const brief = (a, b) => {
+    for (const key of ['out', 'err']) {
+      const la = normEnv(a?.[key] ?? '').split('\n'), lb = normEnv(b?.[key] ?? '').split('\n')
+      for (let i = 0; i < Math.max(la.length, lb.length); i++) {
+        if (la[i] !== lb[i]) return `rc ${a?.rc}/${b?.rc} ${key}:${i + 1} main=${JSON.stringify(la[i])} mut=${JSON.stringify(lb[i])}`
+      }
+    }
+    return `rc ${a?.rc}/${b?.rc}（文本逐行相同）`
+  }
+  // ① 行为在前：非删除类命令的输出，主态与摘判定态必须逐字一致（磁盘读数除外）。
   for (const k of ['help', 'doctor', 'sheet']) {
-    must(same(j.main[k], j.mutated[k]),
-      `C336：${k} --dryrun 主态与摘判定态输出不一致，非删除类行为被改了`)
+    must(sameCli(j.main[k], j.mutated[k]) || same(j.main[k], j.mutated[k]),
+      `C336：${k} --dryrun 主态与摘判定态输出不一致，非删除类行为被改了（${brief(j.main[k], j.mutated[k])}）`)
   }
   must(j.pure.textNear === null && j.pure.viewNear === null,
     'C336：非删除类命令被近似判定拦了')
@@ -12802,16 +12996,14 @@ check('C346【主判据】发版链元判据闸：DryRun 只跑烟测、真跑�
   must(end > at, 'C346：找不到闸段结束锚点')
   const seg = src.slice(at, end)
   must(seg.length > 200, `C346：闸段被削到 ${seg.length} 字符`)
-  // 2026-11-12 00:20 现场：元判据从 release.ps1 里跑时七条全红（C178 在
-  //   BW_VERIFY_PROBE_CHILD=1 环境下失败），同一条单独跑 PASS —— 环境性缺陷。
-  //   发版被这道闸堵死，改成「默认只烟测、显式设 BILI_WATCH_GATE_STRICT=1 才跑完整九条」。
-  //   判据同步：分叉条件里必须带 DryRun，且严格开关要真的能把完整跑打开。
+  // 2026-11-14 订正：旧注释把「七条全红」归给 C178 的环境缺陷，属错归因；真因是父进程
+  //   spawnSync 旧 400s 超时（已抬到 900s）。分叉只许保留 DryRun：真跑必须走完整九条。
   const branch = /\$selfArgs\s*=\s*if\s*\(([^)]*)\)\s*\{\s*"--smoke"\s*\}\s*else\s*\{\s*""\s*\}/
   const m = branch.exec(seg)
   must(m, 'C346：$selfArgs 没按条件分叉，或真跑分支带了 --smoke')
   must(/\$DryRun/.test(m[1]), 'C346：分叉条件里没有 $DryRun')
-  must(/BILI_WATCH_GATE_STRICT/.test(m[1]),
-    'C346：默认路径必须是烟测（否则发版会被环境性缺陷堵死），严格开关要能打开完整跑')
+  must(!/BILI_WATCH_GATE_STRICT/.test(m[1]),
+    'C346：默认路径必须是完整跑，不许再用严格开关把九条元判据默认关掉')
   must(/Invoke-NodeUtf8\s+\$selfScript\s+\$selfArgs/.test(seg), 'C346：闸没有按分支参数调用入口')
   must(/\$selfRun\.Rc\s*-ne\s*0/.test(seg), 'C346：rc≠0 检查不见了')
   must(/Fail\s+"元判据闸未过/.test(seg), 'C346：rc≠0 后没有 Fail，失败会被静默放过')
@@ -13284,17 +13476,23 @@ check('C365【主判据】楼中楼取到且上限生效：rcount=100 只取 20 
   return `rcount=100 的桩给 100 条，只取 20 条；reply/reply?root=7&ps=20&pn=1&nohot=1`
 })
 
-check('C366【主判据】匿名态明确降级：note 说出 N 条与登录凭证，登录态不误报，差额不静默', () => {
+// 0.4.12 C（20261115-1258-DSH §二 C）：旧裁定「登录态 note 必须空串」已翻面。
+//   note 与 truncated 同由 allCount > shown 驱动，登录态截断也要说差额；
+//   两条断言一起翻，只改措辞不改第二条会红在登录态那条。四象限由 C380 覆盖。
+check('C366【主判据】差额说明与 truncated 同向：两态都报「上游 X 条中的 Y 条」，不承诺登录能拿更多', () => {
   const r = c364Probe()
   must(r.status === 0 && r.json, `C366 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
   const a = r.json.anon
+  const l = r.json.logged
   must(a.loggedIn === false && a.shown === 2 && a.total === 358 && a.truncated === true,
     `C366 匿名态三数或差额标记不对：${JSON.stringify(a)}`)
-  must(/未登录只能拿到 2 条/.test(a.note) && /完整评论需要登录凭证/.test(a.note),
-    `C366 匿名态没明确说出「只能拿到 N 条 + 需要登录凭证」：${a.note}`)
-  must(r.json.logged.note === '',
-    `C366 登录态也报降级，判据是恒定加提示的假绿：${r.json.logged.note}`)
-  return `匿名 shown=2 / total=358 / truncated=true，note="${a.note}"；登录态 note=""`
+  must(/已取到上游 358 条中的 2 条/.test(a.note),
+    `C366 匿名态没说出上游与实拿的差额：${a.note}`)
+  must(/已取到上游 358 条中的 2 条/.test(l.note),
+    `C366 登录态截断时没说差额（旧裁定「登录态 note 必须为空」已翻面）：${l.note}`)
+  must(!/需要登录凭证/.test(a.note) && !/需要登录凭证/.test(l.note),
+    `C366 又承诺了「登录能拿更多」：anon="${a.note}" logged="${l.note}"`)
+  return `匿名/登录 shown=2 / total=358 / truncated=true，两态 note 同说差额；不含「需要登录凭证」`
 })
 
 // 2026-11-14（20261114-0156-DSH §7.2）：日志退出两条删除路径的行为判据。
@@ -13326,6 +13524,396 @@ check('C367【主判据】日志不参与清理：两档 plan 无 _logs、skippe
     `C367 没有正向能力证据（整棵树没跑也会假绿）：qrGone=${x.qrGone} removedFiles=${x.removedFiles}`)
   must(x.userZipSurvived === true, 'C367 用户文件被删了')
   return `两档 plan 无 _logs、skipped 说明「日志不参与清理」；真删后 runs.jsonl ${d.runsLinesBefore}→${x.runsLinesAfter} 行；qrGone=${x.qrGone}；占用 ${d.occupied.files} > 不含日志 ${d.statNoLogs.files}`
+})
+
+
+// —— 0.4.12 §5.4.6 工程收尾（C370–C374）——
+// 五条都是静态形态 + 轻量本地检查，不引入新的进程调用面；慢的真跑取证在交卷里单独做。
+
+const r9ReleaseSrc = () => read('scripts/release.ps1')
+
+check('C370【主判据】跑完不留临时产物：未跟踪的相对 --out 残留必须为零', () => {
+  const out = runExecFileSync('git', ['status', '--porcelain'], { cwd: ROOT, encoding: 'utf8' })
+  const stray = String(out || '').split('\n')
+    .filter((l) => /^\?\?\s+/.test(l)).map((l) => l.slice(3).trim())
+    .filter((f) => /^_tmp\d*\.json$|^x\.json$/.test(f))
+  must(stray.length === 0, `C370 跑完留下临时产物：${stray.join(',')}`)
+  return `未跟踪临时产物 ${stray.length} 个；恢复判据可信`
+})
+
+check('C371【主判据】push 凭据走动态探测：-c 注入在位、无硬编码 GCM、保留名一类清理在位', () => {
+  const src = r9ReleaseSrc()
+  must(/Resolve-GitCredentialHelper/.test(src), 'C371 动态探测函数不见了')
+  must(/credential\.helper=\$helper/.test(src), 'C371 push 命令没带 -c credential.helper')
+  must(!/D:\/Git\/ucrt64|D:\\Git\\ucrt64/.test(src), 'C371 出现硬编码 GCM 路径（会撞 C299）')
+  must(/Remove-PathRobust/.test(src) && /CON\/PRN\/AUX\/NUL/.test(src),
+    'C371 保留名一类清理不见了')
+  return '动态探测 / -c 注入 / 无硬编码路径 / 保留名清理 四项在位'
+})
+
+check('C372【主判据】WBI 迁移评估一页纸：结论、弃用理由、若迁落点、证据边界齐备', () => {
+  const p = join(ROOT, '..', '..', '项目', 'bili-watch', '审查',
+    '20261114-0.4.12-工程收尾', 'WBI-接口迁移评估.md')
+  must(existsSync(p), `C372 评估文档缺失：${p}`)
+  const s = readFileSync(p, 'utf8')
+  must(/暂不迁/.test(s), 'C372 没有明确的迁 / 不迁结论')
+  must(/迁移动力是接口弃用，不是功能需要/.test(s), 'C372 理由没写「接口弃用，不是功能需要」')
+  must(/pagination_str\.offset/.test(s) && /reply\/wbi\/main/.test(s), 'C372 若迁落点不齐')
+  must(/DSH.*自述/.test(s) && /未复跑/.test(s), 'C372 没标注现网实测的来源边界')
+  return '暂不迁 / 弃用理由 / 若迁落点 / 证据边界 四项齐备'
+})
+
+check('C373【主判据】C313 墙钟复测形态：只在违例非空时复测、取三次最小值、真跑探针', () => {
+  const src = read('tools/verify.mjs')
+  const s = src.indexOf("slowCheck('C313")
+  const e = src.indexOf("slowCheck('C314")
+  must(s > 0 && e > s, 'C373 找不到 C313 块边界')
+  const seg = src.slice(s, e)
+  must(/if\s*\(violations\.length\s*>\s*0\)/.test(seg), 'C373 复测没有只在违例非空时进入')
+  must(/Math\.min\(/.test(seg), 'C373 没有取三次最小值')
+  const calls = (seg.match(/onlyProbe\(/g) || []).length
+  must(calls >= 2, `C373 复测没有真跑探针（onlyProbe 仅 ${calls} 处）`)
+  return `复测只在违例时进入 / Math.min 取最小值 / 探针调用 ${calls} 处`
+})
+
+check('C374【主判据】元判据闸默认完整跑：$selfArgs 只许 DryRun 一个分叉，C346 已翻面', () => {
+  const src = r9ReleaseSrc()
+  const m = /\$selfArgs\s*=\s*if\s*\(([^)]*)\)\s*\{\s*"--smoke"\s*\}\s*else\s*\{\s*""\s*\}/.exec(src)
+  must(m, 'C374 $selfArgs 形态变了')
+  must(/^\s*\$DryRun\s*$/.test(m[1]), `C374 真跑路径还带额外分叉：${m[1]}`)
+  const v = read('tools/verify.mjs')
+  const c346 = v.slice(v.indexOf("check('C346"), v.indexOf("check('C347"))
+  must(/must\(!\s*\/BILI_WATCH_GATE_STRICT/.test(c346), 'C374 C346 仍是「默认必须烟测」的反向判据')
+  must(/timeout:\s*900000/.test(readFileSync(join(ROOT, 'tools', 'verify-self.mjs'), 'utf8')),
+    'C374 父进程超时余量不见了')
+  return 'DryRun 唯一分叉 / 默认完整跑 / C346 已翻面 / 900s 超时余量在位'
+})
+
+check('C375【主判据】C184 心跳命中才复测 2 次取最小值；桩双向取证 + 形态守卫', () => {
+  const src = read('tools/verify.mjs')
+  const s = src.indexOf("check('C184")
+  const e = src.indexOf("check('C185")
+  must(s > 0 && e > s, 'C375 找不到 C184 块边界')
+  const seg = src.slice(s, e)
+  must(/Math\.min\(/.test(seg), 'C375 C184 块里没有取三次最小值')
+  must(/for\s*\(\s*let i = 0;\s*i < 2;\s*i\+\+\s*\)/.test(seg),
+    'C375 C184 块里没有「命中才复测 2 次」的循环')
+  must(/if\s*\(!v\.singleNotCheated\s*\|\|/.test(seg), 'C375 复测没有只在违例时进入')
+  const lim = /const TICK_LIMIT\s*=\s*(\d+)/.exec(read('tools/fixtures/perf-probe.mjs'))
+  must(lim && Number(lim[1]) === 40, `C375 TICK_LIMIT 不是 40（${lim && lim[1]}）`)
+
+  // 真求值同一个判定函数：三次都撑到 45ms 必须判红，只有首遍 45ms 必须判绿。
+  // 「红绿」在这里由 c184Ok 的返回布尔取证，不靠改被测对象去迎合断言。
+  const stub = (singleTick, quadTick = 20) => ({
+    notes: { rows: [
+      { mode: 'single', wallMs: 300, maxTickMs: singleTick },
+      { mode: 'quad', wallMs: 300, maxTickMs: quadTick },
+    ] },
+  })
+  const hotV = c184Verdict([stub(45), stub(45), stub(45)], 40)
+  const hot = c184Ok(hotV)
+  must(hot.singleNotCheated === false, 'C375 三次都 45ms 却判绿 —— 复测把真阻塞也放过了')
+  const hotQuad = c184Ok(c184Verdict([stub(20, 45), stub(20, 45), stub(20, 45)], 40))
+  must(hotQuad.eventLoopNotBlocked === false, 'C375 quad 三次都 45ms 却判绿')
+  const jitterV = c184Verdict([stub(45), stub(20), stub(20)], 40)
+  const jitter = c184Ok(jitterV)
+  must(jitter.singleNotCheated === true, 'C375 只首遍抖动却仍判红 —— 取最小值没生效')
+  must(jitterV.singleTick === 20 && hotV.singleTick === 45, 'C375 最小值算错了')
+  return `TICK_LIMIT=40 / 命中才复测 2 次 / 桩双向：45×3→红、45+20+20→绿、quad 45×3→红`
+})
+
+check('C376【主判据】元判据汇总分两行报「总墙钟」与「最慢单次 spawn + 余量」', () => {
+  // ① 真求值格式化函数：两个字段、上下限与余量都按喂进去的真值算。
+  const a = timingSummaryLines(911000, 428123)
+  must(a.length === 2, 'C376 汇总不是两行')
+  must(/^总墙钟 = 911\.0s$/.test(a[0]) && /最慢单次 spawn = /.test(a[1]),
+    'C376 两个字段不全或总墙钟算错')
+  must(a[1].includes('900000ms') && a[1].includes('471877ms'),
+    'C376 单次上限 / 余量没按真值算')
+  const over = timingSummaryLines(950000, 950000)
+  must(over[1].includes('-50000ms'), 'C376 单次超过上限时余量没变负，等于把超时藏了')
+
+  // ② 静态守调用点：报数必须来自真实 spawn 计时，且 900000 不许改小。
+  const s = read('tools/verify-self.mjs')
+  must(/timingSummaryLines\(/.test(s), 'C376 verify-self.mjs 没调用汇总函数')
+  must(/SPAWN_TIMES\.push\(/.test(s) && /Date\.now\(\)\s*-\s*t0/.test(s),
+    'C376 单次 spawn 不是真实计时（或只是写死的文案）')
+  const head = s.indexOf('// —— 汇总')
+  must(head > 0 && s.slice(head).includes('timingSummaryLines('),
+    'C376 两行不是在汇总处真打印')
+  must(/timeout:\s*900000/.test(s), 'C376 900000 单次上限被改小了')
+  return '两行字段齐 / 余量按真值 / 超上限显负 / 真实计时与调用点在位'
+})
+
+check('C377【主判据】--only 多个编号可用逗号或空格，空格形式真跑多条；README 不写这个内部参数', () => {
+  // ① 真求值解析函数：空格 / 逗号 / --only= / flag 截断 / 空值 / 无 --only 六种形态。
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+  must(eq(parseOnlySpecs(['--only', 'C370', 'C371']), ['C370', 'C371']),
+    'C377 空格形式没解析出两个 spec')
+  must(eq(parseOnlySpecs(['--only', 'C370,C371']), ['C370', 'C371']),
+    'C377 逗号形式退化了')
+  must(eq(parseOnlySpecs(['--only=C370', 'C371']), ['C370', 'C371']),
+    'C377 --only= 形式没接着吃后续裸参数')
+  must(eq(parseOnlySpecs(['--only', 'C370', '--verbose']), ['C370']),
+    'C377 把 --verbose 当成编号吃进来了')
+  must(eq(parseOnlySpecs(['--only']), []) && parseOnlySpecs(['a', 'b']) === null,
+    'C377 空值 / 默认路径退化了')
+  must(eq(parseOnlySpecs(['--only', '=C20']), ['=C20']), 'C377 精确 spec 被吃坏了')
+
+  // ② 真跑 CLI：两种形态都必须真跑 2 条（不是只打一行提示）。
+  const spaced = c377ArgvProbe('C370', 'C371')
+  must(spaced.status === 0 && /只跑了 2 \/ /.test(spaced.out),
+    `C377 空格形式没真跑 2 条：${spaced.out.slice(-220)}`)
+  const comma = onlyProbe('C370,C371')
+  must(comma.status === 0 && /只跑了 2 \/ /.test(comma.out),
+    `C377 逗号形式没真跑 2 条：${comma.out.slice(-220)}`)
+  // ③ 老大 20:56 指示：README 不加这个莫名其妙的章节（内部开发参数不进对外文档）。
+  must(!read('README.md').includes('--only'), 'C377 README 又冒出 --only 用法章节')
+  must(/多个编号可用逗号或空格分隔/.test(read('tools/verify.mjs').slice(0, 1200)),
+    'C377 顶部注释没写明多项写法')
+  return '空格 / 逗号 / --only= 三形态等价 / flag 截断 / 两种 CLI 各真跑 2 条 / README 不加章节'
+})
+
+// 0.4.12 评论面第一批：C378 剥 buvid3、C379 带 rcount、C381 按 rpid 去重。
+//   三条共用一份真跑取证（两种凭证态 × 两页顶层），断言都落在 HTTP 记账与 json 出口上。
+//   判据体直接调 c378Probe：C325 的 preflightHelperNames 只认「定义体含 spawnSync 的顶层 const」，
+//   多包一层中转会让它把整条判成静态判据（本批实测踩过，见当日交卷段）。
+check('C378【主判据】评论请求永不自造 buvid3：匿名不带 Cookie、有凭证只带 SESSDATA，全局 headersFor 不受波及', () => {
+  const r = c378Probe()
+  must(r.status === 0 && r.json && !r.json.fatal && r.json.anon?.payload && r.json.cred?.payload,
+    `C378 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const anon = replyHits(j.anon)
+  const cred = replyHits(j.cred)
+  // 先证真发了请求（没请求也能「Cookie 里没有 buvid3」，那是假绿）
+  must(mainHits(j.anon).length === 2 && mainHits(j.cred).length === 2,
+    `C378 评论接口没真翻两页：anon=${mainHits(j.anon).length} cred=${mainHits(j.cred).length}`)
+  must(anon.every((h) => h.cookie === ''),
+    `C378 匿名态评论请求带了 Cookie：${JSON.stringify(anon.map((h) => h.cookie).slice(0, 3))}`)
+  must(cred.every((h) => /SESSDATA=SESSDATA_FIXTURE/.test(h.cookie)),
+    `C378 有凭证态没带 SESSDATA：${JSON.stringify(cred.map((h) => h.cookie).slice(0, 3))}`)
+  must(cred.every((h) => !/buvid3|buvid4/i.test(h.cookie)),
+    `C378 有凭证态仍带了 buvid3/buvid4：${JSON.stringify(cred.map((h) => h.cookie).slice(0, 3))}`)
+  // 注入点只在 comments 包装层；其它命令与 headersFor 全局原样（它们仍会带匿名 buvid3）。
+  const look = read('tools/look.mjs')
+  const api = read('lib/bili-api.mjs')
+  const st = look.indexOf('const topComments = (aid, want = 10, opts = {}) => {')
+  const en = st < 0 ? -1 : look.indexOf('\n}\n', st)
+  const wrap = st >= 0 && en > st ? look.slice(st, en + 2) : ''
+  must(wrap.length > 100 && /commentsHeaders\(/.test(wrap) && !/headersFor\(/.test(wrap),
+    'C378 剥 Cookie 没落在 comments 包装层，或包装层仍在用全局 headersFor')
+  must((look.match(/headersFor\(/g) || []).length >= 4,
+    'C378 把 sub / text / peek / hot 共用的 headersFor 调用也改掉了')
+  must(api.includes('if (cred.buvid3) parts.push(`buvid3=${cred.buvid3}`)'),
+    'C378 动了 headersFor 全局实现（本批只许新增 commentsHeaders）')
+  return `匿名 ${anon.length} 个评论请求 Cookie 全空；有凭证 ${cred.length} 个只带 SESSDATA+bili_jct；view 请求仍走全局匿名头（刻意的边界）`
+})
+
+check('C379【主判据】comments 的 items 带 rcount：上游 5 与 0 原样出现在 json 出口', () => {
+  const r = c378Probe()
+  must(r.status === 0 && r.json && !r.json.fatal && r.json.anon?.payload && r.json.cred?.payload,
+    `C379 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const items = j.cred.payload.items
+  must(Array.isArray(items) && items.length > 0, `C379 json 出口没有 items：${JSON.stringify(j.cred.payload).slice(0, 200)}`)
+  const five = items.find((x) => x.rpid === 101)
+  const zero = items.find((x) => x.rpid === 102)
+  must(five && five.rcount === 5, `C379 rcount=5 没原样带出：${JSON.stringify(five)}`)
+  must(zero && zero.rcount === 0, `C379 rcount=0 没原样带出（键丢失也算）：${JSON.stringify(zero)}`)
+  must(items.every((x) => Object.prototype.hasOwnProperty.call(x, 'rcount')),
+    'C379 有的 item 没带 rcount 键 —— 映射只给部分条目补了字段')
+  return `${items.length} 条 items 全带 rcount；101→5 / 102→0 / 103→0，未新增请求`
+})
+
+check('C381【主判据】翻页按 rpid 去重落在 push() 里且早于 cap：重复项不占名额，shown 是去重后条数', () => {
+  const r = c378Probe()
+  must(r.status === 0 && r.json && !r.json.fatal && r.json.anon?.payload && r.json.cred?.payload,
+    `C381 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const p = j.cred.payload
+  const rpids = p.items.map((x) => x.rpid)
+  must(mainHits(j.cred).length === 2, 'C381 没真翻到第二页，重复 rpid 的用例根本没发生')
+  must(new Set(rpids).size === rpids.length, `C381 items 的 rpid 有重复：${rpids.join(',')}`)
+  must(rpids.join(',') === '101,102,103',
+    `C381 第二页的新评论 103 被重复项挤掉了（或顺序不对）：${rpids.join(',')}`)
+  must(p.shown === 3 && p.count === 3,
+    `C381 shown/count 不是去重后真实条数：shown=${p.shown} count=${p.count}`)
+  must(p.total === 4, `C381 去重不能改上游 all_count：total=${p.total}`)
+  // 去重必须在 push() 内部、out.push 之前；末尾 filter 会被上面 cap=3 的用例抓红。
+  const api = read('lib/bili-api.mjs')
+  const st = api.indexOf('const push = (r, tag) => {')
+  const en = st < 0 ? -1 : api.indexOf('\n  }', st)
+  const body = st >= 0 && en > st ? api.slice(st, en) : ''
+  must(body.length > 100 && /seenRpids\.has\(rpid\)/.test(body) && body.indexOf('seenRpids.has(rpid)') < body.indexOf('out.push('),
+    'C381 去重不在 push() 里或落在 out.push 之后（重复项会先吃掉 cap 名额）')
+  return `两页共 4 条、重复 1 条；去重后 items 3 条 / shown=3 / count=3，total 仍为 4`
+})
+
+// ── 0.4.12 第二批（20261115-1258-DSH）：C / E / F / G / H + 三档截断 ──────
+check('C380【主判据】note 与 truncated 同由 allCount > shown 驱动：四象限同向，不承诺登录能拿更多', () => {
+  const r = c380Probe()
+  must(r.status === 0 && r.json?.cases?.length === 4,
+    `C380 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const by = Object.fromEntries(r.json.cases.map((c) => [c.name, c]))
+  const want = [
+    ['anonTruncated', false, true], ['anonComplete', false, false],
+    ['loggedTruncated', true, true], ['loggedComplete', true, false],
+  ]
+  for (const [name, loggedIn, truncated] of want) {
+    const c = by[name]
+    must(c && c.loggedIn === loggedIn && c.truncated === truncated,
+      `C380 ${name} 象限不对：${JSON.stringify(c)}`)
+    must((c.note.length > 0) === truncated,
+      `C380 ${name} note 与 truncated 不同向：note="${c.note}" truncated=${c.truncated}`)
+  }
+  must(/已取到上游 100 条中的 2 条/.test(by.anonTruncated.note)
+    && /已取到上游 100 条中的 2 条/.test(by.loggedTruncated.note),
+    `C380 截断态没说出上游与实拿的差额：anon="${by.anonTruncated.note}" logged="${by.loggedTruncated.note}"`)
+  must(r.json.cases.every((c) => !/需要登录凭证/.test(c.note)), 'C380 note 又承诺了「登录能拿更多」')
+  const api = read('lib/bili-api.mjs')
+  must(/const truncated = allCount > shown/.test(api) && /const note = truncated/.test(api),
+    'C380 note 没跟 truncated 同源（还绑在 !loggedIn 上）')
+  must(!/需要登录凭证/.test(api), 'C380 源码里还留着「需要登录凭证」')
+  return `四象限同向：截断态 note="…已取到上游 100 条中的 2 条"、完整态 note=""；两态都不承诺登录能多拿`
+})
+
+check('C382【主判据】每根默认 2 条 / --full 展开到 20：text 与 json 同策略、首行提示双向、comments 标题带分P', () => {
+  const r = c382Probe()
+  must(r.status === 0 && r.json && !r.json.fatal,
+    `C382 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const m = r.json.mixed
+  const s = r.json.small
+  must(m.jsonDefault.status === 0 && m.jsonFull.status === 0 && m.textDefault.status === 0 && m.textFull.status === 0,
+    `C382 四种真跑有非 0 退出：${[m.jsonDefault.status, m.jsonFull.status, m.textDefault.status, m.textFull.status].join('/')}`)
+  must(m.jsonDefault.repliesLens.join(',') === '2,2,1',
+    `C382 json 出口默认没折叠到每根 2 条：${m.jsonDefault.repliesLens.join(',')}`)
+  must(m.jsonFull.repliesLens.join(',') === '5,2,1',
+    `C382 --full 没展开到抓取上限：${m.jsonFull.repliesLens.join(',')}`)
+  must(m.textDefault.subLines === 5 && m.textFull.subLines === 8,
+    `C382 text 出口楼中楼行数不对：默认 ${m.textDefault.subLines} / full ${m.textFull.subLines}`)
+  must(/每根默认只显示前 2 条/.test(m.textDefault.stdout), 'C382 有 rcount>2 时没打首行提示')
+  must(!/每根默认只显示前/.test(m.textFull.stdout), 'C382 --full 时不该再打「还有更多」')
+  must(!/每根默认只显示前/.test(s.textDefault.stdout), 'C382 全部 rcount≤2 时打了失真的「还有更多」')
+  // H：多 P 标题。peek/view/sub/text 原本都带，comments 是这次补的。
+  must(/（P1\/3）/.test(m.textDefault.stdout) && /（P1\/3）/.test(s.textDefault.stdout),
+    'C382 comments 标题行没带分P信息（H 项没落地）')
+  const api = read('lib/bili-api.mjs')
+  const look = read('tools/look.mjs')
+  must(/renderSubsPerRoot: 2/.test(api), 'C382 输出策略常量不在 lib 里（两份默认值会漂）')
+  // 定义是 `const renderSubs = (x) => …`（名字后面是等号），调用才是 `renderSubs(x)`：
+  //   两个出口各调一次，别把定义也算进调用数。
+  must(/const renderSubs = \(/.test(look) && (look.match(/renderSubs\(/g) || []).length === 2,
+    'C382 text 与 json 没共用同一个渲染函数（或一个出口绕开它自己切了）')
+  return `json 2,2,1 → 5,2,1；text 5 → 8 行；提示三态（有折叠/--full/全≤2）双向；标题带（P1/3）`
+})
+
+check('C383【主判据】F：schema description 补 comments、CLI 警告点明两层效果、accepts 含 full（F5 翻面）', () => {
+  const r = c383Probe()
+  must(r.status === 0 && r.json, `C383 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.schema.headDesc.includes('comments') && j.schema.fullDesc.includes('comments'),
+    `C383 head/full description 没补 comments：head="${j.schema.headDesc}" full="${j.schema.fullDesc}"`)
+  must(j.params.hasFull === true,
+    `C383 comments.accepts 缺 full（CLI 侧 --full 真会展开楼中楼，不该再判「不接受」）：${j.params.accepts.join(',')}`)
+  must(/两层效果不同/.test(j.warnText) && /工具层可用/.test(j.warnText)
+    && /命令行不截断/.test(j.warnText) && /没有上限可放宽/.test(j.warnText),
+    `C383 警告文案没分清两层效果：${(j.warnText || '').slice(-260)}`)
+  must(j.help?.hasFullLine === true && j.help?.twoLayer === true,
+    `C383 HELP 没补 --full 入口或没写清两层效果：${JSON.stringify(j.help)}`)
+  return `head/full description 含 comments；accepts=${j.params.accepts.join(',')}（含 full）；警告与 HELP 都点明两层效果`
+})
+
+check('C384【主判据】G：num 只加顶层条数，工具层真拼位置参数；带 3 / 不带回默认 10 双向真跑', () => {
+  const r = c383Probe()
+  must(r.status === 0 && r.json, `C384 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  must(j.schema.numInSchema === true, 'C384 schema 里没有 num')
+  const w = j.argv.withNum
+  const wo = j.argv.withoutNum
+  must(w[2] === '3' && !w.includes('--num'),
+    `C384 num 没拼成 comments 的第二个位置参数：${JSON.stringify(w)}`)
+  must(!wo.includes('3'), `C384 不带 num 时多拼了条数：${JSON.stringify(wo)}`)
+  must(j.argv.numRun.status === 0 && j.argv.numRun.items === 3,
+    `C384 带 num=3 真跑没拿到 3 条：${JSON.stringify(j.argv.numRun)}`)
+  must(j.argv.defaultRun.status === 0 && j.argv.defaultRun.items === 10,
+    `C384 不带 num 没回到默认 10 条（参数被静默丢弃或默认值被改）：${JSON.stringify(j.argv.defaultRun)}`)
+  const idx = read('index.js')
+  must((idx.match(/renderSubsPerRoot/g) || []).length === 0,
+    'C384 工具层又写了一份「每根 2 条」默认值（两个维度不许合并）')
+  return `argv=[comments, BV, "3", --quiet, --format, json] → items 3；不带 num → items 10；schema 只加 num`
+})
+
+check('C385【主判据】三档截断分开验：cap 内原样 / 文本截断带首行提示与落盘路径 / JSON 整体落盘不回半截', () => {
+  const r = c383Probe()
+  must(r.status === 0 && r.json, `C385 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const t = r.json.tiers
+  // ① 默认不截断：cap 内原样返回（不是「输出 ≤ cap」这种恒绿条件，是逐字全等）
+  must(t.short === 'A'.repeat(50), `C385 cap 内没原样返回：${JSON.stringify(t.short.slice(0, 80))}`)
+  must(t.fullLong === 'D'.repeat(500), 'C385 full 时 500 字不该被 800/2000 的档切回摘要')
+  // ② 文本截断：前 head 字 + 首行总量提示 + 落盘路径，三样缺一不可
+  must(t.textLong.startsWith('B'.repeat(50)), 'C385 文本截断没回前 50 字')
+  must(/只回了前 50 字/.test(t.textLong), 'C385 文本截断缺首行总量提示（去掉首行提示的扰动该红在这条）')
+  must(/全文已存：/.test(t.textLong), 'C385 文本截断缺落盘路径（去掉落盘路径的扰动该红在这条）')
+  must(t.files.length === 4 && t.files.every((f) => f.endsWith('.tool.txt')),
+    `C385 落盘文件数或后缀不对：${JSON.stringify(t.files)}`)
+  // ③ JSON 整体落盘：不回半截、不走文本截断那句提示
+  must(/JSON 已整体落盘/.test(t.jsonLong) && /已存：/.test(t.jsonLong),
+    `C385 JSON 档没整体落盘并指路：${t.jsonLong.slice(0, 160)}`)
+  must(!/只回了前/.test(t.jsonLong), 'C385 JSON 档走了文本截断（会回半截）')
+  must(!t.jsonLong.trimStart().startsWith('{'), 'C385 JSON 档回了半截 JSON 开头')
+  must(t.capLine === true, 'C385 cap 不再只看 opts.full（有人为 comments 单独调高了 toolTextCap）')
+  return `①50 字原样 / full 500 字原样；②前 50 字 + 提示 + .tool.txt 4 份；③JSON 整体落盘不回半截`
+})
+
+check('C386【主判据】F3：payload 带 truncated / loggedIn 且 truncated 恒等于 total > shown；差额措辞分主动少取与被动截断', () => {
+  const r = c386Probe()
+  must(r.status === 0 && r.json && !r.json.fatal,
+    `C386 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const by = Object.fromEntries((j.apiCases || []).map((c) => [c.name, c]))
+  must(j.apiCases?.length === 4, `C386 四态取证没跑全：${j.apiCases?.length}`)
+  must(j.apiCases.every((c) => c.truncated === (c.total > c.shown)),
+    `C386 truncated 不等于 allCount > shown：${JSON.stringify(j.apiCases)}`)
+  must(by.active.truncated === true && /按请求只取前 2 条/.test(by.active.note)
+    && !/已取到上游/.test(by.active.note),
+    `C386 主动少取没说清是请求限制（或说成被动降级）：${by.active.note}`)
+  must(by.passive.truncated === true && /已取到上游 100 条中的 2 条/.test(by.passive.note)
+    && !/按请求只取/.test(by.passive.note),
+    `C386 被动截断被说成主动少取：${by.passive.note}`)
+  must(by.complete.truncated === false && by.complete.note === '',
+    `C386 无差额时不该给 note：${by.complete.note}`)
+  must(by.defaultFull.truncated === true && /按请求只取前 10 条/.test(by.defaultFull.note)
+    && by.defaultFull.want === 10,
+    `C386 默认上限取满时也该按请求措辞（第二轮块 8 抓到的边界）：${by.defaultFull.note}`)
+  const p = j.payload
+  must(p && p.status === 0, `C386 json 出口没真跑出来：rc=${p?.status} ${(p?.stderr || '').slice(0, 160)}`)
+  must(p.keys.includes('truncated') && p.keys.includes('loggedIn'),
+    `C386 payload 缺 F3 两个字段：${(p.keys || []).join(',')}`)
+  must(p.truncated === (p.total > p.shown) && typeof p.loggedIn === 'boolean',
+    `C386 payload 的 truncated 与 total/shown 不咬合，或 loggedIn 不是布尔：truncated=${p.truncated} total=${p.total} shown=${p.shown} loggedIn=${p.loggedIn}`)
+  must(/按请求只取前 2 条/.test(p.note),
+    `C386 payload.note 没跟着区分主动少取：${p.note}`)
+  return `四态：显式主动「${by.active.note}」/ 被动「${by.passive.note}」/ 无差额空 / 默认取满「${by.defaultFull.note}」；payload truncated=${p.truncated} ≡ ${p.total}>${p.shown}`
+})
+
+check('C387【主判据】F6：四个非法条数各 rc≠0 且 stderr 说清合法范围；合法值与默认行为不变', () => {
+  const r = c386Probe()
+  must(r.status === 0 && r.json && !r.json.fatal,
+    `C387 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
+  const j = r.json
+  const bad = j.numInvalid || []
+  must(bad.length === 4, `C387 非法输入取证没跑全：${bad.length}`)
+  for (const x of bad) {
+    must(x.rc !== 0, `C387 num=${x.num} 静默通过了（rc=0）`)
+    must(/需为/.test(x.stderr) && /1–200/.test(x.stderr),
+      `C387 num=${x.num} 的 stderr 没说清合法范围：${(x.stderr || '').slice(0, 160)}`)
+  }
+  const v = j.numValid || {}
+  must(v.with3?.rc === 0 && v.with3?.shown === 3 && !/需为/.test(v.with3?.stderr || ''),
+    `C387 合法值 3 行为被改坏：rc=${v.with3?.rc} shown=${v.with3?.shown}`)
+  must(v.default?.rc === 0 && !/需为/.test(v.default?.stderr || ''),
+    `C387 不传条数的默认路径被改坏：rc=${v.default?.rc} ${(v.default?.stderr || '').slice(0, 160)}`)
+  return `四个非法输入（-5 / abc / 0 / 201）各 rc≠0 且报 1–200；合法 3 与默认路径 rc=0`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

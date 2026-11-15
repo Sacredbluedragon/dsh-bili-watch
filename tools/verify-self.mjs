@@ -6,7 +6,7 @@
  * 会让主闸每次全量重跑自己，实测把约 141 秒拖到 490 秒。
  *
  * 独立跑：node tools/verify-self.mjs
- * 不进发布五闸、不进 --fast 分档；`--only` 仍可用（扰动取证用）。
+ * 不进发布五闸、不进 --fast 分档；`--only` 仍可用（扰动取证用，多个编号用逗号或空格分隔）。
  * 被测对象**永远是主闸 tools/verify.mjs**，绝不能指向本文件（那会全绿但什么也没验）。
  */
 import { readFileSync } from 'node:fs'
@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   makeChecker, must, parseOnlySpecs, matchOnly, onlyNoticeLine, renderResults,
-  SLOW_CHECKS, fastNoticeLine,
+  SLOW_CHECKS, fastNoticeLine, timingSummaryLines,
 } from './check-run.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -30,6 +30,10 @@ const LIGHT_SKIP_DETAIL = '本次未真跑，真跑只在父进程'
 
 const results = []
 const ARGV = process.argv.slice(2)
+// C376：整趟总墙钟与「最慢单次 spawn」是两个量，不许混成一句。
+//   timeout: 900000 是每次 spawn 一个子进程的上限；下面只记 900000 那两处取证链的耗时。
+const BOOT_MS = Date.now()
+const SPAWN_TIMES = []
 
 // 2026-11-11（22:50 DSH 裁定 1）：发版链 -DryRun 专用烟测。
 // 完整九条会 spawn 主闸默认全量取证（本机 428 秒、DryRun 实测 14m18s），拿它当
@@ -93,10 +97,13 @@ const verifyRuns = new Map()
 function runVerify(args = []) {
   const key = JSON.stringify(args)
   if (!verifyRuns.has(key)) {
-    verifyRuns.set(key, spawnSync(process.execPath, [VERIFY_MAIN, ...args], {
+    const t0 = Date.now()
+    const r = spawnSync(process.execPath, [VERIFY_MAIN, ...args], {
       cwd: ROOT, encoding: 'utf8', timeout: 900000, maxBuffer: 16 * 1024 * 1024,
       env: { ...process.env, BW_VERIFY_PROBE_CHILD: '1', BW_VERIFY_C271_CHILD: '1' },
-    }))
+    })
+    SPAWN_TIMES.push(Date.now() - t0)
+    verifyRuns.set(key, r)
   }
   return verifyRuns.get(key)
 }
@@ -104,7 +111,8 @@ function runVerify(args = []) {
 // DSH 带 PROBE_CHILD 复现实测 346 秒 —— 400 秒余量只有 54 秒，负载一抖就 rc=null。
 // 元判据接进发版链后才第一次暴露；900000 给足一倍余量，C345 静态守着不许改回去。
 function runVerifyEnv(args, on) {
-  return spawnSync(process.execPath, [VERIFY_MAIN, ...args], {
+  const t0 = Date.now()
+  const r = spawnSync(process.execPath, [VERIFY_MAIN, ...args], {
     cwd: ROOT, encoding: 'utf8', timeout: 900000, maxBuffer: 16 * 1024 * 1024,
     env: {
       ...process.env,
@@ -112,6 +120,8 @@ function runVerifyEnv(args, on) {
       BW_VERIFY_C271_CHILD: on ? '1' : '0',
     },
   })
+  SPAWN_TIMES.push(Date.now() - t0)
+  return r
 }
 
 // ── 以下九条判据从 tools/verify.mjs 整条搬来（3a）；断言逻辑一字未改，
@@ -501,4 +511,8 @@ if (skipN > 0) {
     console.log(`    ${r.detail || '（没写原因 —— 这条要补）'}`)
   }
 }
+// C376：两行分开打。总墙钟是整趟，最慢单次 spawn 是单次子进程（上限 900000ms），
+//   两者不是同一个量；余量按单次算，别拿 911s 总墙钟去减 900s 单次上限。
+const slowestSpawnMs = SPAWN_TIMES.length ? Math.max(...SPAWN_TIMES) : 0
+for (const line of timingSummaryLines(Date.now() - BOOT_MS, slowestSpawnMs)) console.log(line)
 process.exit(fail ? 1 : 0)

@@ -2693,11 +2693,11 @@ function registerTool(ctx) {
       },
       head: {
         type: 'number',
-        description: '只取前 N 字（text/sub/asr 用）。超过默认上限时返回摘要与全文路径；需要完整内容时传入该参数',
+        description: '只取前 N 字（text/sub/asr 用）。超过默认上限时返回摘要与全文路径；需要完整内容时传入该参数；command=comments 时由工具层按 head 截断回给模型的文本',
       },
       full: {
         type: 'boolean',
-        description: '直接返回全文（text/sub/asr 用）。长视频文本较长，会占用较多上下文；仅在需要完整内容时使用',
+        description: '直接返回全文（text/sub/asr 用）。长视频文本较长，会占用较多上下文；仅在需要完整内容时使用；command=comments 时工具层放宽回传上限，CLI 直出全文',
       },
       verify: {
         type: 'boolean',
@@ -2710,6 +2710,10 @@ function registerTool(ctx) {
       limit: {
         type: 'number',
         description: 'command=hot/search 的结果条数（hot 默认 10，search 默认 10）。',
+      },
+      num: {
+        type: 'number',
+        description: 'command=comments 时取多少条顶层评论（默认 10）；只管顶层根数，每根楼中楼显示几条由输出策略决定，不合并成一个数。',
       },
     },
     output: {
@@ -2783,7 +2787,12 @@ function registerTool(ctx) {
       const target = args.command === 'search' ? String(args.keyword ?? '').trim() : String(args.bv ?? '').trim()
       if (args.command === 'search' && !target) return { ok: false, text: 'search 需要 keyword 参数（要搜什么词）' }
       if (!target) return { ok: false, text: '缺少 BV 号或分享链接' }
-      const r = await lookup({ command: args.command, bv: target, extra, signal })
+      // 0.4.12 G：num 是 comments 的第二个位置参数（lookup 认 positionals[1]）。
+      //   只加这一个顶层条数维度；每根楼中楼显示几条是输出策略，不另设参数。
+      const positionals = (args.command === 'comments' && typeof args.num === 'number' && Number.isFinite(args.num) && args.num > 0)
+        ? ['', String(Math.floor(args.num))]
+        : []
+      const r = await lookup({ command: args.command, bv: target, positionals, extra, signal })
       return { ok: r.ok, text: trimForModel(r.text, args.command, target, false, { full: args.full, head: args.head }) }
       } catch (e) {
         // T41：别的 defineTool 都包了 try/catch，我们没包——runLook 抛错会让整轮失败

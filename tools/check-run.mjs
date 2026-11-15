@@ -128,14 +128,34 @@ export function must(cond, msg) {
 // 分母口径（C286 统一后）：总数 = 判据单元数 = 所有 check() 调用数 + 顶层独立 skip 数；
 // 分子 = 实际调用过断言体的条数。「其余 = 总数 − 分子」才自洽，且这个总数与默认全量
 // 汇总行「通过 + 失败 + 跳过」同源。本函数不猜单位，由调用方把算好的总数传进来。
+// 2026-11-14 20:56 老大指示（覆盖 2037 段 §三「不改解析语义、只加警告」）：
+//   --only 后面写多个编号时，**空格分隔也要真跑多条**，不许静默忽略后续参数。
+//   原先只取紧邻的一个 argv → `--only C370 C371` 只跑 1 条，写报告的人会拿到假凭证。
+//   现在把 --only 之后连续的不带 '-' 的位置参数全收进来，再按 ',' 展开；
+//   遇到 flag（--verbose / --fast / 任何 - 开头）即停止，不吞别的开关。
+//   逗号形态、--only= 形态、'=Cxxx' 精确 spec、空值返回 [] 四种既有行为逐字节保持。
 export function parseOnlySpecs(argv) {
-  let raw = null
+  let first = null
+  let restFrom = -1
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--only') { raw = argv[i + 1] ?? ''; break }
-    if (argv[i].startsWith('--only=')) { raw = argv[i].slice('--only='.length); break }
+    if (argv[i] === '--only') {
+      first = argv[i + 1] ?? ''
+      restFrom = i + 2
+      break
+    }
+    if (argv[i].startsWith('--only=')) {
+      first = argv[i].slice('--only='.length)
+      restFrom = i + 1
+      break
+    }
   }
-  if (raw === null) return null
-  return raw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+  if (first === null) return null
+  const raw = [first]
+  for (let i = restFrom; i < argv.length; i++) {
+    if (argv[i].startsWith('-')) break
+    raw.push(argv[i])
+  }
+  return raw.join(',').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
 }
 
 /**
@@ -166,6 +186,20 @@ export function matchOnly(name, specs) {
 export function onlyNoticeLine(total, ran, active) {
   if (!active) return null
   return `[--only] 本 run 只跑了 ${ran} / ${total} 条，其余 ${total - ran} 条未执行`
+}
+
+// C376（2037 段 §一 B）：元判据汇总必须把「整趟总墙钟」与「最慢单次 spawn」分开报。
+//   900000ms 是**每次 spawn 一个子进程**的上限，不是整趟的上限；把 911s 总墙钟和
+//   900s 单次上限放一起会得出「差点被超时杀掉」的错误结论。放共享模块是为了让 C376
+//   能 import 真求值（喂桩数据看两行输出），而不是读 verify-self.mjs 源码抠 console.log。
+export function timingSummaryLines(totalMs, slowestSpawnMs, capMs = 900000) {
+  const sec = (ms) => (ms / 1000).toFixed(1)
+  const slow = Math.round(slowestSpawnMs)
+  const rest = capMs - slow
+  return [
+    `总墙钟 = ${sec(totalMs)}s`,
+    `最慢单次 spawn = ${sec(slowestSpawnMs)}s / ${slow}ms（上限 ${sec(capMs)}s / ${capMs}ms，余量 ${sec(rest)}s / ${rest}ms）`,
+  ]
 }
 
 // ── C272 · 输出瘦身（2026-11-10，0750 派单第一层）──
