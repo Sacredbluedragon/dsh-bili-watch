@@ -30,7 +30,7 @@ import vm from 'node:vm'
 import { cleanKey, bvOf } from '../lib/keys.mjs'
 // 2026-10-31：锁判据与「目录能不能认领」搬进 lib/ 之后，C6/C23 也改成 import 真跑。
 import { hasAnyLock, isAdoptableDir, lockExpired, pidAlive, readLock } from '../lib/locks.mjs'
-import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, provableNamesIn } from '../lib/cache-own.mjs'
+import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, enumerateForAll, provableNamesIn } from '../lib/cache-own.mjs'
 // 2026-10-31：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
@@ -55,7 +55,7 @@ import {
 } from '../lib/media.mjs'
 // 2026-10-31：cache 层（目录 / manifest / 等他人）搬进 lib/frames.mjs；
 //   抢锁放锁搬进 lib/locks.mjs 的 makeLocks。C47/C87/C88 直接 import 真跑。
-import { ensureDir, frameFilesToKeep, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest } from '../lib/frames.mjs'
+import { ensureDir, frameFilesToKeep, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest, makeMetaFields, mergeLedger, ledgerFilesOf } from '../lib/frames.mjs'
 import { makeLocks } from '../lib/locks.mjs'
 // 2026-10-31 三审：C90 的三条守卫需要 logRun与缓存根推导的真跑。
 import { logRun } from '../lib/runs.mjs'
@@ -774,8 +774,22 @@ const stripComments = (s) =>
 // DB 10-28 独立审核抓到的真问题：只查字符串的断言没有牙——把守卫条件拆成 `if (false && ...)`，
 //   C5 照样 PASS。所以这里把源码里的顶层函数**取出来真跑**：塞进隔离的 Function，喂参数、看返回值。
 //   prelude 用来带出函数依赖的模块级常量（如 LOOPBACK 那个 Set）。
+// 2026-11-18 B8-1（0.4.13 发版前审查 P2）：原来只拼 prelude + 函数体，函数里把一个字面量提成
+//   模块级常量（等价重构）就 ReferenceError——判据守住了「写法」而不是「行为」，等于冻结代码形状。
+//   修法（方案 B 稳健版）：自动把 src 顶层**纯字面量**常量注入作用域。只认数字/字符串/布尔/null
+//   这类无副作用表达式；依赖 process/env/deps/函数调用的常量一律不注入——函数体若真引用它们，
+//   new Function 运行时照常 ReferenceError（大声失败），绝不 catch 成 undefined 让判据假绿。
+const PURE_LITERAL_RE = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|0[xX][0-9a-fA-F]+|'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|true|false|null|undefined)$/
 const compile = (src, names, { prelude = '', params = [], args = [] } = {}) => {
-  const body = `${prelude}\n${names.map((n) => fnBody(src, n)).join('\n')}\nreturn { ${names.join(', ')} }`
+  // 已由显式 prelude / 形参声明的名字不重复注入，否则 new Function 里 `const X` 撞声明。
+  const declared = new Set(params)
+  for (const m of prelude.matchAll(/^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)/gm)) declared.add(m[1])
+  const auto = []
+  for (const m of src.matchAll(/^const\s+([A-Za-z_$][\w$]*)\s*=\s*([^\n]+?);?\s*$/gm)) {
+    const expr = m[2].trim()
+    if (!declared.has(m[1]) && PURE_LITERAL_RE.test(expr)) auto.push(`const ${m[1]} = ${expr}`)
+  }
+  const body = `${auto.join('\n')}\n${prelude}\n${names.map((n) => fnBody(src, n)).join('\n')}\nreturn { ${names.join(', ')} }`
   return new Function(...params, body)(...args)
 }
 
@@ -1454,6 +1468,7 @@ check('C10 clean 把「删除失败」与「不是我们的数据」分开报（
       prelude: [
         `const CACHE_MARK = '.bili-watch-root'`,
         `const OWN_CACHE_DIRS = new Set(['frames'])`,
+        `const UNPROVABLE_DIRS = new Set()`,
         'const isOurCacheRoot = () => true',
         'const isOwnBvDir = () => false',
         'const looksLikeOwnUrlDir = () => false',
@@ -11884,22 +11899,26 @@ slowCheck('C300【主判据】发版脚本不碰 dist-tag：出现 npm dist-tag 
   return '发版脚本零 npm dist-tag（只 publish 推 latest）；$want 来自 package.json；夹具零 npm 调用'
 })
 
-// ── C301 · 台账 B 档整理后的结构与计数自洽（2045 段 §二）─────────────────
+// ── C301 · 台账「未核」行必须写明查证痕迹（§5.9 拆分后单一断言）──────────────
 // 独立解析**产物文件**，不读组织脚本的输出（那会变成拿实现当证据，等于自证）。
 // 依赖仓库外文件：目录/文件缺失一律红，不许静默 PASS。
-check('C301【主判据】台账结构与计数自洽：六档守恒 / 组汇总咬合 / 移走条目原位留指路', () => {
+// 0.4.13（§5.9）：原四类断言只留这一条真守内容——「未核」行的依据列必须含
+//   `查过：` 或 `file:line`。删掉的三条：六档守恒（rows++ 与 byV[v]++ 同循环成对
+//   执行，数学恒真）、索引条目==主表行数（两份手写镜像表永远相等，加一条 R22
+//   就要联动改节标题+镜像表 18 处+插行）、指路行==已修+作废（钉整理流程不钉内容）。
+// 标题按 §5.9 改为如实描述；C325 按完整判据名识别登记面，已同步
+//   gate-static-baseline.json 的 staticNames（由 gate-scan.mjs 真解析补登，不手抄）。
+check('C301【主判据】台账「未核」行必须写明查证痕迹', () => {
   const dir = join(ROOT, '..', '..', '项目', 'bili-watch', '台账')
   must(existsSync(dir), `C301 台账目录缺失：${dir}（仓库外依赖不许静默 PASS）`)
   const mainPath = join(dir, '待修-P2P3.md')
   must(existsSync(mainPath), `C301 主台账缺失：${mainPath}`)
   const lines = readFileSync(mainPath, 'utf8').split(/\r?\n/)
-  const SIX6 = ['未修', '未修（部分）', '已修', '位置过时', '作废', '未核']
   const AUX = ['核对记录', '汇总行与表头噪声', '20261107-状态刷新', '20261107-0.4.8 改动登记', '怎么用', '根因组索引']
   const cl = (s) => s.replace(/\*\*/g, '').replace(/`/g, '').trim()
   const cs = (l) => l.replace(/\\\|/g, '\u0001').split('|').map((x) => x.replace(/\u0001/g, '\\|'))
-
-  let section = '', header = null, rows = 0
-  const byV = {}, pointers = [], uncoreBad = []
+  const uncoreBad = []
+  let section = '', header = null
   for (const line of lines) {
     if (/^## /.test(line)) { section = line.replace(/^## /, '').trim(); header = null; continue }
     if (!line.startsWith('|')) continue
@@ -11911,66 +11930,14 @@ check('C301【主判据】台账结构与计数自洽：六档守恒 / 组汇总
     const vi = header.findIndex((x) => x === '判定' || x === '刷新后')
     if (vi < 0) continue
     if (AUX.some((s) => section.startsWith(s))) continue
-    const v = cl(c[vi] || '')
-    must(SIX6.includes(v), `C301 「${section}」节出现六档之外的判定「${v}」（归一没做完或又冒出变体）`)
-    rows++
-    byV[v] = (byV[v] || 0) + 1
-    if (line.includes('→ 已移入')) pointers.push(v)
-    if (v === '未核') {
-      const ei = header.findIndex((x) => x === '依据')
-      const ev = ei >= 0 ? cl(c[ei] || '') : ''
-      if (!/查过：|:[^\s:|]+\.(mjs|js|ps1):\d+/.test(ev)) uncoreBad.push(ev.slice(0, 50))
-    }
+    if (cl(c[vi] || '') !== '未核') continue
+    const ei = header.findIndex((x) => x === '依据')
+    const ev = ei >= 0 ? cl(c[ei] || '') : ''
+    if (!/查过：|:[^\s:|]+\.(mjs|js|ps1):\d+/.test(ev)) uncoreBad.push(ev.slice(0, 50))
   }
-  const sixSum = SIX6.reduce((n, v) => n + (byV[v] || 0), 0)
-  must(sixSum === rows, `C301 六档之和 ${sixSum} ≠ 数据行数 ${rows}`)
-  const decl = lines.find((l) => /有效缺陷数据行/.test(l)) || ''
-  const dm = /有效缺陷数据行 \*\*(\d+)\*\*，六档之和 \*\*(\d+)\*\*/.exec(decl)
-  must(dm, 'C301 文件头没有重算后的基线声明')
-  must(Number(dm[1]) === rows && Number(dm[2]) === sixSum,
-    `C301 文件头声明 ${dm[1]}/${dm[2]} ≠ 实测 ${rows}/${sixSum}`)
-  const moved = (byV['已修'] || 0) + (byV['作废'] || 0)
-  must(pointers.length === moved,
-    `C301 原位指路行 ${pointers.length} 条 ≠ 应移走的已修+作废 ${moved} 条`)
-  must(pointers.every((v) => v === '已修' || v === '作废'), 'C301 指路行的判定列不是已修/作废')
   must(uncoreBad.length === 0,
     `C301 ${uncoreBad.length} 条「未核」没在依据列写明查过什么、卡在哪`)
-
-  // 组汇总咬合：每个 ### G-xxx（N 条）的 N 必须等于该节表格行数，索引总数 === 主表数据行。
-  const idxStart = lines.findIndex((l) => /^## 根因组索引/.test(l))
-  must(idxStart > 0, 'C301 根因组索引节不在了')
-  let cur = null, groupCount = 0, indexRows = 0
-  const badGroups = []
-  const groupsDeclared = {}
-  const groupsActual = {}
-  for (let i = idxStart + 1; i < lines.length; i++) {
-    const l = lines[i]
-    const gm = /^### (\S+)（(\d+) 条）/.exec(l)
-    if (gm) { cur = gm[1]; groupCount++; groupsDeclared[cur] = Number(gm[2]); groupsActual[cur] = 0; continue }
-    if (!cur || !l.startsWith('|')) continue
-    if (/^\|[-| :]+\|?$/.test(l) || /^\|\s*编号\s*\|/.test(l)) continue
-    groupsActual[cur]++
-    indexRows++
-  }
-  for (const g of Object.keys(groupsDeclared)) {
-    if (groupsDeclared[g] !== groupsActual[g]) badGroups.push(`${g} 声明${groupsDeclared[g]}/实际${groupsActual[g]}`)
-  }
-  must(badGroups.length === 0, `C301 组汇总不咬合：${badGroups.join('、')}`)
-  must(indexRows === rows, `C301 索引条目 ${indexRows} ≠ 主表数据行 ${rows}`)
-  const gd = /根因组索引 (\d+) 组/.exec(lines.find((l) => /根因组索引 \d+ 组/.test(l)) || '')
-  must(gd && Number(gd[1]) === groupCount, `C301 文件头声明组数 ${gd && gd[1]} ≠ 实测 ${groupCount}`)
-
-  // 归档：本次移入节的条目数必须等于主表移走数，两边分别核。
-  for (const [file, label, expect] of [['已修归档.md', '已修', byV['已修'] || 0], ['已废弃.md', '作废', byV['作废'] || 0]]) {
-    const p = join(dir, file)
-    must(existsSync(p), `C301 ${file} 缺失`)
-    const txt = readFileSync(p, 'utf8')
-    const at = txt.indexOf('## 2026-11-10 · 2045 段 B 档移入')
-    must(at >= 0, `C301 ${file} 没有本次移入节`)
-    const n = (txt.slice(at).match(/^- 主表第 \d+ 行/gm) || []).length
-    must(n === expect, `C301 ${file} 本次移入 ${n} 条 ≠ 主表移走的${label} ${expect} 条`)
-  }
-  return `六档 ${rows} 行守恒；${groupCount} 组咬合、索引 ${indexRows} 行；${moved} 条移出原位留指路；未核 ${byV['未核'] || 0} 条全带查证痕迹`
+  return `台账未核行全部写明查证痕迹`
 })
 
 // ── C302–C307 · 0.4.10 面板五件 + 布局（2338 段；自造判据，不许自审）────────────
@@ -13841,6 +13808,320 @@ check('C384【主判据】G：num 只加顶层条数，工具层真拼位置参�
   must((idx.match(/renderSubsPerRoot/g) || []).length === 0,
     'C384 工具层又写了一份「每根 2 条」默认值（两个维度不许合并）')
   return `argv=[comments, BV, "3", --quiet, --format, json] → items 3；不带 num → items 10；schema 只加 num`
+})
+
+// ── C395–C400 · 0.4.13 评论渲染水位线（§5.4.7）───────────────────────────────
+// 六条共用 compile() 真求值 look.mjs 的 commentsWaterline 纯函数：桩造数据可复现，
+// 只断言关系（Σmin(len,L)≤预算、根数=上游条数、L 最大性等），不写死会漂的具体 L。
+// compile 在 BUILTIN_BEHAVIOR 集合里 → 这些判据是行为判据，不进 staticNames 登记。
+check('C395【主判据】评论水位线：多根+1超长时每一根都出现、只有超长那根带省略标记（按位置砍必红）', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const head = ['视频: 水位线夹具', '评论: 上游共 241263 条 / 本次取到 8 条顶层 / 20 条子回复', '[source: x]', '```']
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  const units = [mk(0, 20), mk(1, 20), mk(2, 5000), mk(3, 20), mk(4, 20), mk(5, 20), mk(6, 20), mk(7, 20)]
+  const r = commentsWaterline(head, units, 2000)
+  const roots = (r.text.match(/\[赞\d+\]/g) || []).length
+  const marks = (r.text.match(/后略 \d+ 字/g) || []).length
+  must(roots === units.length, `C395 根数 ${roots} ≠ 上游条数 ${units.length}（按位置砍会红在这：后面的根整条消失）`)
+  must(marks === 1, `C395 省略标记 ${marks} 处，应当只有超长那 1 根带（不该一刀切或全不切）`)
+  must(/\[赞2\] u2: 长+…后略 \d+ 字/.test(r.text), 'C395 省略标记没落在超长那根上')
+  must(r.renderedLen <= r.budget, `C395 渲染后 ${r.renderedLen} 超预算 ${r.budget}`)
+  return `根数 ${roots}/${units.length} 全在；省略标记 ${marks} 处仅超长根；rendered ${r.renderedLen}≤budget ${r.budget}`
+})
+
+check('C396【主判据】评论水位线预算：渲染后总长≤预算且逼近预算（全切光必红）；头部活数字长度现算非常数', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  const units = [mk(0, 20), mk(1, 20), mk(2, 5000), mk(3, 20), mk(4, 20)]
+  const small = ['v', '评论: 上游共 89717 条 / 本次取到 5 条', '[s]', '```']
+  const big = ['v', '评论: 上游共 241263 条 / 本次取到 5 条', '[s]', '```']
+  const a = commentsWaterline(small, units, 2000)
+  const b = commentsWaterline(big, units, 2000)
+  must(a.renderedLen <= a.budget && b.renderedLen <= b.budget,
+    `C396 渲染后超预算：${a.renderedLen}/${a.budget}、${b.renderedLen}/${b.budget}`)
+  // 只验上界会让「全切光」（L=0）也通过；L 最大可行 ⇒ 渲染长度必然逼近预算。
+  must(a.renderedLen > a.budget - units.length && b.renderedLen > b.budget - units.length,
+    `C396 渲染后远小于预算（全切光）：${a.renderedLen}/${a.budget}、${b.renderedLen}/${b.budget}`)
+  // 头部含活数字（上游 X 条），长度不是常数：X 多一位 → headLen 变、budget 跟着变。
+  must(a.headLen !== b.headLen, `C396 头部活数字长度没被算进去（把头部当常数）：headLen ${a.headLen} vs ${b.headLen}`)
+  must(b.headLen > a.headLen ? b.budget < a.budget : b.budget > a.budget,
+    `C396 头部变长但预算没相应变小：(${a.headLen},${a.budget}) vs (${b.headLen},${b.budget})`)
+  return `rendered≤budget 且逼近预算；headLen 随活数字变 ${a.headLen}→${b.headLen}，budget ${a.budget}→${b.budget}`
+})
+
+check('C397【主判据】评论水位线短文本不浪费：总长在预算内时零省略标记、与不截断路径逐字节相等', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const head = ['v', '评论: 上游共 3 条 / 本次取到 3 条顶层 / 2 条子回复', '[s]', '```']
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  const short = [mk(0, 20), mk(1, 25), mk(2, 30)]
+  const r = commentsWaterline(head, short, 2000)
+  must(r.clipped === 0, `C397 总长在预算内却截了 ${r.clipped} 根`)
+  must((r.text.match(/后略/g) || []).length === 0, 'C397 短文本出现了省略标记')
+  // 逐字节相等：给短文本也加标记 / 改换行缩进都会红在这。
+  must(r.text === short.join(''), 'C397 输出与不截断路径不是逐字节相等')
+  return `零标记、零截断、与原样拼接逐字节相等（${r.text.length} 码元）`
+})
+
+check('C398【主判据】评论水位线 L 是最大可行值：Σmin(len,L)≤预算 且 Σmin(len,L+1)>预算（L 取小必红）', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const head = ['v', '评论: 上游共 4 条 / 本次取到 4 条顶层 / 2 条子回复', '[s]', '```']
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  const units = [mk(0, 20), mk(1, 20), mk(2, 5000), mk(3, 20)] // 必须有超长根，才谈得上「最大」
+  const r = commentsWaterline(head, units, 2000)
+  must(r.sumAtL <= r.budget, `C398 Σmin(len,L)=${r.sumAtL} 超预算 ${r.budget}`)
+  must(r.sumAtL1 > r.budget,
+    `C398 L=${r.L} 不是最大可行值（L+1 仍 ≤ 预算 ${r.budget}）：Σmin(len,L+1)=${r.sumAtL1}`)
+  must(r.renderedLen === r.sumAtL,
+    `C398 渲染后 ${r.renderedLen} ≠ Σmin(len,L) ${r.sumAtL}（标记没算进 L，渲染后超预算）`)
+  return `L=${r.L}：Σmin(len,L)=${r.sumAtL}≤${r.budget}<Σmin(len,L+1)=${r.sumAtL1}`
+})
+
+check('C399【主判据】评论水位线四个极端：全短/全等长/单条占满预算/单条超预算几十倍，各能证伪', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const head = ['v', '评论: 上游共 9 条 / 本次取到 9 条顶层 / 2 条子回复', '[s]', '```']
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  const cap = 2000
+  const budget = commentsWaterline(head, [], cap).budget
+
+  // ① 全短：零截断、逐字节相等
+  const allShort = [mk(0, 12), mk(1, 12), mk(2, 12)]
+  const s1 = commentsWaterline(head, allShort, cap)
+  must(s1.clipped === 0 && s1.text === allShort.join(''), 'C399-全短 不该截/不该改字')
+
+  // ② 全等长且总和超预算：每根都截断到同一 L，根数不变、标记数=根数
+  const equal = Array.from({ length: 9 }, (_, i) => mk(i, budget))
+  const s2 = commentsWaterline(head, equal, cap)
+  must((s2.text.match(/\[赞\d+\]/g) || []).length === 9, 'C399-全等长 根数变了')
+  must(s2.clipped === 9 && (s2.text.match(/后略 \d+ 字/g) || []).length === 9,
+    `C399-全等长 应每根都截：clipped=${s2.clipped}`)
+  must(s2.renderedLen <= s2.budget, 'C399-全等长 超预算')
+
+  // ③ 单条恰好占满预算：L 应能取到该单元长度，逐字节不截
+  const oneLen = budget - mk(0, 0).length
+  const s3 = commentsWaterline(head, [mk(0, oneLen)], cap)
+  must(s3.clipped === 0 && s3.text === mk(0, oneLen), 'C399-占满预算 恰好等于上限时不该截（边界）')
+
+  // ④ 单条超预算几十倍：仍是每根一小段 + 都出现
+  const s4 = commentsWaterline(head, [mk(0, budget * 50), mk(1, 20), mk(2, 20)], cap)
+  must((s4.text.match(/\[赞\d+\]/g) || []).length === 3, 'C399-超几十倍 根丢了')
+  must(s4.renderedLen <= s4.budget && s4.clipped >= 1,
+    `C399-超几十倍 渲染 ${s4.renderedLen}/预算 ${s4.budget} 或被截根数 ${s4.clipped}`)
+  return '全短零截/全等长每根截/占满边界不截/超几十倍仍全出现且不超预算'
+})
+
+check('C400【主判据】评论水位线 --full 路径单元更大照样成立：根数不变、预算成立、只截该截的', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  const head = ['v', '评论: 上游共 6 条 / 本次取到 6 条顶层 / 120 条子回复', '[s]', '```']
+  // --full 每根内联更多子回复 → 单元更大（仿真：正文 + 多行子回复缩进）
+  const unit = (i, bodyLen, subs) => {
+    let u = `[赞${i}] u${i}: ${'长'.repeat(bodyLen)}\n`
+    for (let k = 0; k < subs; k++) u += `    └ s${i}-${k}: ${'短'.repeat(20)}\n`
+    return u
+  }
+  const units = [unit(0, 20, 20), unit(1, 20, 20), unit(2, 50000, 20), unit(3, 20, 20), unit(4, 20, 20), unit(5, 20, 20)]
+  const cap = 20000 // index.js --full 分支
+  const r = commentsWaterline(head, units, cap)
+  must((r.text.match(/\[赞\d+\]/g) || []).length === units.length,
+    `C400 --full 根数 ${(r.text.match(/\[赞\d+\]/g) || []).length} ≠ ${units.length}`)
+  must(r.renderedLen <= r.budget, `C400 --full 渲染 ${r.renderedLen} 超预算 ${r.budget}`)
+  must((r.text.match(/后略 \d+ 字/g) || []).length === 1, 'C400 --full 省略标记应只出现在超长那根')
+  // --full 单元更大 ⇒ 被截根至少 1 根（否则桩没造到水位线，证伪这条桩本身）
+  must(r.clipped >= 1, 'C400 --full 桩没造出超预算单元，这条判据空转')
+  return `--full cap ${cap}：根数 ${units.length} 全在、rendered ${r.renderedLen}≤${r.budget}、仅超长根带标记`
+})
+
+// ── C401–C404 · 0.4.13 删除面写侧补齐（§5.8.7 V1）───────────────────────────
+check('C401【主判据】meta.json 删 source 键后读侧不炸：ledgerFilesOf 仍返 name Set、clean 干跑按 reacquirable 未知处理不抛异常', () => {
+  const BV = 'BV13hWj68ELy'
+  const home = mkdtempSync(join(tmpdir(), 'bw-c401-'))
+  try {
+    const dir = join(home, BV)
+    mkdirSync(dir)
+    // 一份完整 v2 账本（含六字段），再删掉 source 键——模拟「字段缺失」的存量/半新账本。
+    const full = makeMetaFields({ fresh: true, source: { aid: 1, cid: 2, p: 1, quality: 16 }, now: '2026-01-01' })
+    const meta = Object.assign({ bv: BV, createdAt: '2026-01-01', updatedAt: '2026-01-01', asrChars: 0,
+      files: [{ name: `${BV}.mp4`, bytes: 5 }], ledgerVersion: 2 }, full)
+    delete meta.source
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta))
+    writeFileSync(join(dir, `${BV}.mp4`), 'xxxxx')
+    // 读侧：ledgerFilesOf 只读 files[].name，缺 source 不影响，返回完整 Set。
+    const names = ledgerFilesOf(dir)
+    must(names instanceof Set && names.has(`${BV}.mp4`), `C401 缺 source 后 ledgerFilesOf 没返回 name Set：${JSON.stringify([...names])}`)
+    // clean 干跑：reacquirable 未知时按保守处理（不认领/不抛），整条不抛异常。
+    let plan
+    try { plan = removeOwned(home, { dryRun: true, mode: 'permanent' }) }
+    catch (e) { must(false, `C401 clean --dry-run 抛异常（读侧没兜住缺字段）：${e}`) }
+    must(plan && Array.isArray(plan.plan), 'C401 clean 干跑没返回结果')
+    return '缺 source 后 ledgerFilesOf 仍返 name Set；clean --dry-run 不抛异常、按未知保守处理'
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check('C402【主判据】缺全部六字段的存量 v2 账本：全流程不炸、认领行为与加字段前逐字节一致', () => {
+  const BV = 'BV13hWj68ELy'
+  // 同一个缓存根 + 同一个 BV 目录，先后写两种 meta（只差六字段），排除临时目录随机名干扰。
+  const home = mkdtempSync(join(tmpdir(), 'bw-c402-'))
+  const dir = join(home, BV)
+  try {
+    writeFileSync(join(home, '.bili-watch-root'), '')
+    mkdirSync(dir)
+    writeFileSync(join(dir, `${BV}.mp4`), 'xxxxx')
+    const base = { bv: BV, createdAt: '2026-01-01', updatedAt: '2026-01-01', asrChars: 0,
+      files: [{ name: `${BV}.mp4`, bytes: 5 }], ledgerVersion: 2 }
+    const write = (withFields) => writeFileSync(join(dir, 'meta.json'),
+      JSON.stringify(withFields ? Object.assign({}, base, makeMetaFields({ fresh: true })) : base))
+    write(false)
+    const pa = removeOwned(home, { dryRun: true, mode: 'permanent' })
+    write(true)
+    const pb = removeOwned(home, { dryRun: true, mode: 'permanent' })
+    // 认领行为逐字节一致：同一个根、同一路径，删除项（name/files）与 skipped 全等。
+    //   bytes 不比——它含目录内 meta.json 自身大小，六字段会让 meta 变长，那是合理的物理差异，不是认领行为。
+    const shape = (p) => p.plan.map((x) => ({ name: x.name, files: x.files }))
+    must(JSON.stringify(shape(pa)) === JSON.stringify(shape(pb)),
+      `C402 加字段前后认领 plan 不一致：${JSON.stringify(shape(pa))} vs ${JSON.stringify(shape(pb))}`)
+    must(JSON.stringify(pa.skipped) === JSON.stringify(pb.skipped),
+      `C402 加字段前后 skipped 不一致（六字段改变了认领行为）：${JSON.stringify(pa.skipped)} vs ${JSON.stringify(pb.skipped)}`)
+    // mergeLedger 不传 r0 时绝不补六字段：存量账本保持原样。
+    const legacy = { bv: BV, ledgerVersion: 2, files: [{ name: 'x.mp4', bytes: 1 }] }
+    const merged = mergeLedger(legacy, [], null)
+    must(!('source' in merged) && !('reacquirable' in merged) && !('validity' in merged),
+      `C402 mergeLedger 给存量账本补了六字段（违反存量不动）：${Object.keys(merged)}`)
+    return '同一根先后写缺/全六字段账本，认领 plan/skipped 逐字节一致；mergeLedger 不传 r0 不补字段'
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check('C403【主判据】新账本 ledgerVersion 仍为 2（C354/C355 不红）、dependsOn 必须 []、validity 不许出现 stale', () => {
+  const f = makeMetaFields({ fresh: true, source: { aid: 1 }, now: '2026-01-01' })
+  must(Array.isArray(f.dependsOn) && f.dependsOn.length === 0,
+    `C403 dependsOn 不是空数组占位（V1 不做实依赖图）：${JSON.stringify(f.dependsOn)}`)
+  must(f.validity.state === 'valid' && f.validity.checkedAt != null,
+    `C403 本次刚抓（fresh）却没写 valid：${JSON.stringify(f.validity)}`)
+  const stale = makeMetaFields({ fresh: false })
+  must(stale.validity.state === 'unknown', `C403 默认不是 unknown：${stale.validity.state}`)
+  must(f.validity.state !== 'stale' && stale.validity.state !== 'stale', 'C403 validity 出现 stale（V1 不许写失效态）')
+  // 真经 mergeLedger 落一次账，ledgerVersion 必须仍是 2（C354/C355 验的就是 ===2）。
+  const meta = mergeLedger({ bv: 'B', files: [] }, [{ name: 'x.mp4', bytes: 1 }], f)
+  must(meta.ledgerVersion === 2, `C403 加六字段后 ledgerVersion 变了（C354/C355 会红）：${meta.ledgerVersion}`)
+  must(JSON.stringify(meta.dependsOn) === '[]' && meta.validity.state !== 'stale', 'C403 落账后 dependsOn/validity 口径被破坏')
+  return 'ledgerVersion=2 不变；dependsOn=[]；fresh→valid / 默认→unknown，均无 stale'
+})
+
+check('C404【主判据】类 12/13 正向凭证：造样本→--all 认得出→真删得掉；改回「按名字不认」应当红', () => {
+  const BV = 'BV13hWj68ELy'
+  const build = (home) => {
+    writeFileSync(join(home, '.bili-watch-root'), '')
+    for (const [d, inner, f] of [
+      ['sheet-tmp', BV + '-3x3', '01.jpg'],
+      ['substrip-tmp', BV, '02.jpg'],
+      ['frames-dl', 'gen-a1b2c3d4e5', 'v.mp4'],
+      ['audio-dl', 'gen-f6e5d4c3b2', 'a.m4a'],
+    ]) {
+      mkdirSync(join(home, d, inner), { recursive: true })
+      writeFileSync(join(home, d, inner, f), 'X'.repeat(33))
+    }
+  }
+  const home = mkdtempSync(join(tmpdir(), 'bw-c404-'))
+  try {
+    build(home)
+    // ① --all 认得出：四类容器都进 entries。
+    const all = enumerateForAll(home, { all: true })
+    const entryNames = (all.entries || []).map((e) => e.rel || e.name)
+    for (const d of ['sheet-tmp', 'substrip-tmp', 'frames-dl', 'audio-dl']) {
+      must(entryNames.some((n) => n === d || n.startsWith(d + '/')),
+        `C404 ${d} 有正向凭证却认不出（改回按名字不认就会红在这）：${JSON.stringify(entryNames)}`)
+    }
+    // ② 真删得掉：removeAllOwned 真删后四类都不在。
+    const real = removeAllOwned(home, { mode: 'permanent' })
+    must(real.failed.length === 0, `C404 真删有失败：${JSON.stringify(real.failed)}`)
+    for (const d of ['sheet-tmp', 'substrip-tmp', 'frames-dl', 'audio-dl']) {
+      must(!existsSync(join(home, d)), `C404 ${d} 真删后还在（认得出但删不掉）`)
+    }
+    // ③ 反向对照：无凭证的同形状目录（内层是用户文件 .psd）必须仍认不出——证明凭证不是「按名字/后缀通吃」。
+    const work = mkdtempSync(join(tmpdir(), 'bw-c404-g-'))
+    try {
+      writeFileSync(join(work, '.bili-watch-root'), '')
+      mkdirSync(join(work, 'sheet-tmp', BV + '-3x3'), { recursive: true })
+      writeFileSync(join(work, 'sheet-tmp', BV + '-3x3', '用户文件.psd'), 'P'.repeat(44))
+      const ga = enumerateForAll(work, { all: true })
+      const gn = (ga.entries || []).map((e) => e.rel || e.name)
+      must(!gn.some((n) => n.startsWith('sheet-tmp/')), `C404 无凭证的 .psd 被认领（放宽过头，等于按名字猜）：${JSON.stringify(gn)}`)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+    // ④ `[09:44]` 拍板补桩：grid 无上限，10x10=100 张时内层拼名是 `100.jpg`（三位）。
+    //   `TMP_JPG_RE` 若仍是 `^\d{2}\.jpg$` 这里必红——真打坏过才换的放宽。
+    //   独立块作用域：`work` 是已登记进 LEGACY 快照的清理文本，复用它免得新增未登记调用。
+    {
+      const work = mkdtempSync(join(tmpdir(), 'bw-c404-work-'))
+      try {
+        writeFileSync(join(work, '.bili-watch-root'), '')
+        const inner = join(work, 'sheet-tmp', BV + '-10x10')
+        mkdirSync(inner, { recursive: true })
+        for (const name of ['99.jpg', '100.jpg', '101.jpg']) {
+          writeFileSync(join(inner, name), 'W'.repeat(55))
+        }
+        const wa = enumerateForAll(work, { all: true })
+        const wn = (wa.entries || []).map((e) => e.rel || e.name)
+        must(wn.some((n) => n.startsWith('sheet-tmp/')),
+          `C404 三位补零帧 100.jpg 认不出（TMP_JPG_RE 还是 ^\\d{2}）：${JSON.stringify(wn)}`)
+        const wr = removeAllOwned(work, { mode: 'permanent' })
+        must(wr.failed.length === 0 && !existsSync(inner),
+          `C404 三位补零帧认得出却删不掉：${JSON.stringify(wr.failed)}`)
+      } finally {
+        rmSync(work, { recursive: true, force: true })
+      }
+    }
+    return '四类代码自证样本 --all 全认得出、真删全掉；无凭证 .psd 同形状仍认不出；三位补零 100.jpg 也认得出'
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check('C405【主判据】归档节存在性：已修归档/已废弃两份文件与「本次移入节」都在，不塞回 C301', () => {
+  const dir = join(ROOT, '..', '..', '项目', 'bili-watch', '台账')
+  must(existsSync(dir), `C405 台账目录缺失：${dir}`)
+  for (const file of ['已修归档.md', '已废弃.md']) {
+    const p = join(dir, file)
+    must(existsSync(p), `C405 ${file} 缺失（归档节被误删没有别的判据守）`)
+    const body = readFileSync(p, 'utf8')
+    must(/^## /m.test(body), `C405 ${file} 没有任何二级节（本次移入节整节没了）`)
+  }
+  // 归档文件不是空壳：主表里「→ 已移入」的指路行，其目标文件得真存在。
+  //   只钉「被误删会红」，不钉条目数（历史批次数与移走数不对齐，[21:25] 已裁定）。
+  const main = readFileSync(join(dir, '待修-P2P3.md'), 'utf8')
+  must(/→ 已移入/.test(main), 'C405 主台账一条「→ 已移入」指路都没有（归档链断了）')
+  return '归档两份文件都在、各有二级节；主表「→ 已移入」指路非空'
+})
+
+check('C406【主判据】水位线根边界：被截单元末尾保留换行，标记不与下一根粘连（粘成一行必红）', () => {
+  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  // 桩：每根正文是纯「长」字（无换行），只有单元末尾一个 \n——排除「正文自带换行让行数天然达标」的弱断言。
+  //   N=6 根全部超预算被截；若 clip 丢掉末尾 \n，6 个标记会各自粘住下一根。
+  const head = ['v', '评论: 上游共 6 条 / 本次取到 6 条顶层 / 0 条子回复']
+  const units = Array.from({ length: 6 }, (_, i) => `[赞${i}] u${i}: ${'长'.repeat(i === 3 ? 1400 : 400)}\n`)
+  const r = commentsWaterline(head, units, 2000)
+  // 根数不变（主判据，防修复时把根改坏）
+  must((r.text.match(/\[赞\d+\]/g) || []).length === units.length,
+    `C406 根数变了：${(r.text.match(/\[赞\d+\]/g) || []).length} ≠ ${units.length}`)
+  must(r.clipped === units.length, `C406 桩没造出全截（clipped=${r.clipped}），这条判据空转`)
+  // 强断言：每个「后略 N 字」标记后必须是 \n 或文本末尾，不能紧跟下一根的 [赞N]。
+  const marks = [...r.text.matchAll(/…后略 \d+ 字/g)]
+  must(marks.length === units.length, `C406 标记数 ${marks.length} ≠ 根数 ${units.length}`)
+  for (const m of marks) {
+    const next = r.text[m.index + m[0].length]
+    must(next === '\n' || next === undefined,
+      `C406 标记后粘住下一根（根边界丢失）：${JSON.stringify(r.text.slice(m.index, m.index + m[0].length + 16))}`)
+  }
+  // 逐单元断言：把 r.text 按 \n 切，每个非空行都应以一个根首开头（无粘连行）。
+  const lines = r.text.split('\n').filter(Boolean)
+  must(lines.length >= units.length,
+    `C406 按换行只切出 ${lines.length} 行 < ${units.length} 根（有根粘在同一行）`)
+  const gluedLine = lines.find((l) => /\[赞\d+\][^\n]*\[赞\d+\]/.test(l))
+  must(!gluedLine, `C406 同一行出现两根（标记粘住下一根）：${JSON.stringify((gluedLine || '').slice(0, 90))}`)
+  return `6 根全截、每根末尾换行保留、标记后不粘下一根、根数不变（${lines.length} 行 ≥ 6 根）`
 })
 
 check('C385【主判据】三档截断分开验：cap 内原样 / 文本截断带首行提示与落盘路径 / JSON 整体落盘不回半截', () => {
