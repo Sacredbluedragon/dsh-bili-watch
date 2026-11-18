@@ -13910,7 +13910,10 @@ check('C399【主判据】评论水位线四个极端：全短/全等长/单条�
 })
 
 check('C400【主判据】评论水位线 --full 路径单元更大照样成立：根数不变、预算成立、只截该截的', () => {
-  const { commentsWaterline } = compile(read('tools/look.mjs'), ['commentsWaterline'])
+  // 0.4.14 件1：FENCE 是 look.mjs 顶层纯字面量常量，compile() 自动注入作用域；追加临时
+  //   函数带出取值，尾围栏行的 \n 与 headLen 同口径现算，判据里不写死 4。
+  const probe = '\nfunction __fenceOfLook() {\n  return FENCE\n}\n'
+  const { commentsWaterline, __fenceOfLook } = compile(read('tools/look.mjs') + probe, ['commentsWaterline', '__fenceOfLook'])
   const head = ['v', '评论: 上游共 6 条 / 本次取到 6 条顶层 / 120 条子回复', '[s]', '```']
   // --full 每根内联更多子回复 → 单元更大（仿真：正文 + 多行子回复缩进）
   const unit = (i, bodyLen, subs) => {
@@ -13920,10 +13923,13 @@ check('C400【主判据】评论水位线 --full 路径单元更大照样成立�
   }
   const units = [unit(0, 20, 20), unit(1, 20, 20), unit(2, 50000, 20), unit(3, 20, 20), unit(4, 20, 20), unit(5, 20, 20)]
   const cap = 20000 // index.js --full 分支
-  const r = commentsWaterline(head, units, cap)
+  const r = commentsWaterline(head, units, cap, [__fenceOfLook()])
   must((r.text.match(/\[赞\d+\]/g) || []).length === units.length,
     `C400 --full 根数 ${(r.text.match(/\[赞\d+\]/g) || []).length} ≠ ${units.length}`)
   must(r.renderedLen <= r.budget, `C400 --full 渲染 ${r.renderedLen} 超预算 ${r.budget}`)
+  // 0.4.14 件1：--full 同样漏算收尾围栏（headLen=94 + 两根各 9953 → 含围栏 20004 > 20000）。
+  must(r.totalLen <= cap,
+    `C400 --full 含收尾围栏真实总量 ${r.totalLen} 超 cap ${cap}（尾围栏没进预算）`)
   must((r.text.match(/后略 \d+ 字/g) || []).length === 1, 'C400 --full 省略标记应只出现在超长那根')
   // --full 单元更大 ⇒ 被截根至少 1 根（否则桩没造到水位线，证伪这条桩本身）
   must(r.clipped >= 1, 'C400 --full 桩没造出超预算单元，这条判据空转')
@@ -14122,6 +14128,34 @@ check('C406【主判据】水位线根边界：被截单元末尾保留换行，
   const gluedLine = lines.find((l) => /\[赞\d+\][^\n]*\[赞\d+\]/.test(l))
   must(!gluedLine, `C406 同一行出现两根（标记粘住下一根）：${JSON.stringify((gluedLine || '').slice(0, 90))}`)
   return `6 根全截、每根末尾换行保留、标记后不粘下一根、根数不变（${lines.length} 行 ≥ 6 根）`
+})
+
+// ── C407 · 0.4.14 件1：收尾围栏进预算（真实总量 ≤ cap 且逼近）──────────────────
+// 0.4.13 根因：console.log(FENCE) 在 commentsWaterline 算完之后才输出，尾围栏从未进预算，
+//   comments 输出 2003 > cap 2000 被 trimForModel 截到前 800，只看到 4/10 根。
+// 这条守「真实总量」：FENCE 现取长度当 tailLines 传进去，断 totalLen ≤ cap 且逼近 cap。
+//   尾围栏长度从 FENCE 现取，不写死 4；预算被砍到一半会红在逼近断言上。
+check('C407【主判据】收尾围栏进预算：真实总量≤cap 且逼近 cap（漏算尾围栏/预算砍半必红）', () => {
+  // FENCE 是 look.mjs 顶层纯字面量常量，compile() 自动注入作用域；追加临时函数带出取值。
+  const probe = '\nfunction __fenceOfLook() {\n  return FENCE\n}\n'
+  const { commentsWaterline, __fenceOfLook } = compile(read('tools/look.mjs') + probe, ['commentsWaterline', '__fenceOfLook'])
+  const fence = __fenceOfLook()
+  const tailLen = fence.length + 1 // 尾围栏行 +1 个 \n，与 headLen 同口径现算
+  const head = ['视频: 收尾围栏夹具', '评论: 上游共 1234 条 / 本次取到 5 条顶层 / 0 条子回复', '[source: x]', '```']
+  const mk = (i, len) => `[赞${i}] u${i}: ${'长'.repeat(len)}\n`
+  // 4 根短 + 1 根超长：超长根可连续取值，渲染总量正好填满预算（totalLen 应恰为 cap）。
+  const units = [mk(0, 20), mk(1, 20), mk(2, 100000), mk(3, 20), mk(4, 20)]
+  const cap = 2000
+  const w = commentsWaterline(head, units, cap, [fence])
+  must(typeof w.totalLen === 'number' && typeof w.tailLen === 'number',
+    'C407 返回值没有 totalLen/tailLen（收尾围栏还没进预算的函数形状）')
+  must(w.tailLen === tailLen,
+    `C407 tailLen=${w.tailLen} ≠ FENCE 现取 ${tailLen}（尾围栏没按 FENCE 现取算）`)
+  must(w.totalLen <= cap, `C407 真实总量 ${w.totalLen} 超 cap ${cap}（收尾围栏漏算）`)
+  const margin = tailLen + units.length // 小余量：尾围栏 4 + 每根 1
+  must(w.totalLen > cap - margin,
+    `C407 真实总量 ${w.totalLen} 远小于 cap ${cap}（预算被砍狠了，逼近断言守的是这个）`)
+  return `FENCE 现取尾行 ${tailLen} 码元；真实总量 ${w.totalLen}≤cap ${cap} 且 >${cap - margin}`
 })
 
 check('C385【主判据】三档截断分开验：cap 内原样 / 文本截断带首行提示与落盘路径 / JSON 整体落盘不回半截', () => {

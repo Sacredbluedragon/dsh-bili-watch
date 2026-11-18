@@ -1642,9 +1642,14 @@ function fencedDisplay(full, kind, bv) {
  *   用码点会在 emoji 场景让渲染后码元数重新超 cap、把已做进预算的文本又截断一次。
  * - L 不设下限兜底：即使单条十万字，也只是每根给一小段 + 都出现。
  */
-function commentsWaterline(headLines, units, cap) {
+function commentsWaterline(headLines, units, cap, tailLines = []) {
   const headLen = headLines.reduce((n, l) => n + String(l ?? '').length + 1, 0) // +1: 每行一个 \n（console.log）
-  const budget = Math.max(0, cap - headLen)
+  // 0.4.14 件1：收尾围栏（console.log(FENCE)）在正文之后单独输出，历史上没进预算，
+  //   超 cap 后被 trimForModel 截掉，模型看不到最后几根。tailLines 与 headLines 同口径现算
+  //   （各 +1 个 \n），和 headLen 一起从 cap 里扣；不并进 headLines —— headLines 全打在正文
+  //   之前，尾围栏必须在正文之后，塞进去会破坏围栏语义。预算概念留在函数内，调用方不减 4。
+  const tailLen = tailLines.reduce((n, l) => n + String(l ?? '').length + 1, 0)
+  const budget = Math.max(0, cap - headLen - tailLen)
   const lens = units.map((u) => String(u ?? '').length)
   const sumAt = (L) => lens.reduce((a, n) => a + Math.min(n, L), 0)
   let lo = 0, hi = Math.max(0, ...lens), L = 0
@@ -1687,8 +1692,9 @@ function commentsWaterline(headLines, units, cap) {
   const pieces = units.map((u) => clip(u, L))
   const text = pieces.join('')
   return {
-    text, L, budget, headLen, lens,
+    text, L, budget, headLen, tailLen, lens,
     renderedLen: text.length,
+    totalLen: headLen + text.length + tailLen, // 真实总量 = 头部行 + 正文 + 收尾围栏行
     sumAtL: sumAt(L), sumAtL1: sumAt(L + 1),
     clipped: lens.filter((n) => n > L).length,
   }
@@ -1784,7 +1790,7 @@ async function cmdComments(bv, ps = 10, opts = {}) {
   })
   // cap 与 trimForModel 同口径：默认 toolTextCap()，--full 走 20000（index.js:92/95）。
   const textCap = renderAll ? 20000 : tuning().toolTextCap
-  const w = commentsWaterline(headLines, units, textCap)
+  const w = commentsWaterline(headLines, units, textCap, [FENCE])
   // 警告已在上面统一发过（cHits），这里不再 warnForeign 一次。
   for (const line of headLines) console.log(line)
   process.stdout.write(w.text)

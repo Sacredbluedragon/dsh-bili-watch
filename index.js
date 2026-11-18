@@ -356,6 +356,13 @@ function readDepsLock() {
  * ttlMs，pid 活着就仍是 live；这是原来 `!Number.isFinite(startedAt) || ...` 的保守语义，
  * 统一判据不能把这一侧削掉。锁体没有合法 pid（写了一半 / 损坏）归 corrupt，不拦用户。
  */
+// 0.4.14 件2-C（不修，理由留痕）：issue #18 说「锁要 6 小时才判过期」是错的——
+//   classifyLock()（lib/locks.mjs:78）第一句就是 pidAlive(owner.pid) && !lockExpired(...)，
+//   pidAlive 用 process.kill(pid,0) 探活，6h 只是 TTL 上限（pid 活着却干不完时的兜底）。
+//   另担心过 detached 子进程收不到 exit 让 DOWNLOADING 滞留——该前提也不成立：
+//   index.js:2072 的 detached = !isWin() 在 Windows 恒 false；实测 detached:true 父进程照样收
+//   exit/close，清理走 closeOut()（:2112-2119）被 error/exit 全覆盖。所以不修的理由是
+//   「路径不存在」，不是「场景太窄」。窄洞只剩 pid 无身份校验（PID 复用），留后续版本单独评估。
 function depsLockVerdict(cur) {
   if (!cur || !Number.isInteger(cur.pid) || cur.pid <= 0) return { state: 'corrupt', why: 'corrupt' }
   const hasAt = Number.isFinite(cur.startedAt) && cur.startedAt > 0
@@ -1625,6 +1632,31 @@ const OCR_IMPORT_CODE =
   '        __import__(m)\n' +
   '        sys.exit(0)\n' +
   'sys.exit(1)\n'
+// 0.4.14 件2-D：半成品 venv 的 detail 要直说「只装了 pip（依赖包未装完）」，
+//   别只甩 ModuleNotFoundError —— 用户会以为环境装完了却不能用。只看 site-packages 里
+//   有没有 pip 以外的包，不动探针、不新增状态源。
+function venvOnlyPip(py) {
+  if (!py) return false
+  const root = dirname(dirname(py)) // Windows <venv>\Scripts\python.exe / POSIX <venv>/bin/python
+  let sps = []
+  if (isWin()) sps = [join(root, 'Lib', 'site-packages')]
+  else {
+    const lib = join(root, 'lib')
+    try {
+      sps = readdirSync(lib, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && /^python\d/.test(e.name))
+        .map((e) => join(lib, e.name, 'site-packages'))
+    } catch {}
+  }
+  for (const sp of sps) {
+    let names = []
+    try { names = readdirSync(sp) } catch { continue }
+    const pkgs = names.filter((n) => /\.dist-info$|\.egg-info$/.test(n) || existsSync(join(sp, n, '__init__.py')))
+    if (pkgs.length === 0) return false // 连 pip 都没有：不是「只装了 pip」
+    return pkgs.every((n) => /^pip[-.]/i.test(n))
+  }
+  return false
+}
 async function pyProbe(py, code, opts = {}) {
   if (!py) return { ok: false, why: '没有 python 环境' }
   let stamp = 0
@@ -1758,7 +1790,10 @@ async function depRows(gpuVal, opts = {}) {
       ok: Boolean(asrPython) && asrProbe.ok,
       detail: !asrPython
         ? '未找到 Python 环境，无字幕视频无法转写；可执行 node scripts/fetch-deps.mjs asr 安装'
-        : (asrProbe.ok ? maskAbs(asrPython) : `Python 环境存在，但无法导入 \`faster_whisper\`：${asrProbe.why || '未知原因'}`),
+        : (asrProbe.ok ? maskAbs(asrPython)
+          : venvOnlyPip(asrPython)
+            ? 'venv 存在但只装了 pip（依赖包未装完），跑 node scripts/fetch-deps.mjs asr --force 重装即可'
+            : `Python 环境存在，但无法导入 \`faster_whisper\`：${asrProbe.why || '未知原因'}`),
       path: maskAbs(asrPython),
       removable: false,
       // P1-2（2026-10-28 全量检查）：文案原来写「在插件目录外」——错的，默认就装在 deps/.venv-asr。

@@ -62,7 +62,7 @@
  */
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -295,22 +295,50 @@ function dirSize(p) {
   } catch {}
   return total
 }
-/** 跑一条命令，返回 { code, out, err }。**不用 shell**：参数数组直接给，没有引号/转义/管道。 */
+/** 跑一条命令，返回 { code, out, err }。**不用 shell**：参数数组直接给，没有引号/转义/管道。
+ *  0.4.14 件2-B：opts.fd 给定时 stdout/stderr 直接由 OS 写进该文件描述符（download.out.log），
+ *  不再攒进内存；不传 fd 的其余调用一律走原读流路径，行为逐字不变。 */
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, {
-    encoding: 'utf8',
+    encoding: opts.fd == null ? 'utf8' : undefined,
     windowsHide: true,
     env: opts.env || process.env,
     cwd: opts.cwd,
     timeout: opts.timeout ?? 0,
     maxBuffer: 64 * 1024 * 1024,
+    ...(opts.fd == null ? {} : { stdio: ['ignore', opts.fd, opts.fd] }),
   })
   return {
     code: r.status === null ? -1 : r.status,
-    out: (r.stdout || '').trim(),
-    err: (r.stderr || '').trim(),
+    out: r.stdout ? String(r.stdout).trim() : '',
+    err: r.stderr ? String(r.stderr).trim() : '',
     error: r.error,
   }
+}
+
+// ── 0.4.14 件2-B：pip 阶段日志实时可见 ────────────────────────────
+// 原 run() 用 spawnSync 把 pip 输出攒在内存，装包几十秒里 download.out.log 一动不动。
+//   给 pip 四处传 fd，让每一行由 OS 直接追加进 download.out.log；不引入 async 传染。
+// 坑：pipInstall 镜像失败会 fallback 再跑一次，两次写同一个文件。每次调用前记下文件大小
+//   当偏移量，失败末 N 行只读本次增量，否则会把上一次的历史当成本次报错。
+const OUT_LOG_FILE = join(DEPS, 'download.out.log')
+function outLogSize() {
+  try { return statSync(OUT_LOG_FILE).size } catch { return 0 }
+}
+function readOutLogFrom(offset) {
+  try {
+    const buf = readFileSync(OUT_LOG_FILE) // 按字节偏移切，避免切在半个 UTF-8 汉字上
+    return buf.subarray(Math.min(Math.max(0, offset), buf.length)).toString('utf8')
+  } catch { return '' }
+}
+function runLogged(cmd, args, opts = {}) {
+  if (DRY) return run(cmd, args, opts)
+  const offset = outLogSize()
+  let fd
+  try { fd = openSync(OUT_LOG_FILE, 'a') } catch { return run(cmd, args, opts) }
+  let r
+  try { r = run(cmd, args, { ...opts, fd }) } finally { closeSync(fd) }
+  return { ...r, outLog: readOutLogFrom(offset) }
 }
 /** 外部命令的全部命中路径。Windows 的 where 会返回多行（PATH 里每个命中一行），POSIX 的 which 一般一行。 */
 function whichAll(cmd) {
@@ -518,7 +546,14 @@ function download(url, out, label, depId = '') {
     } catch {}
     let hint = `curl 退出码 ${r.code}`
     if (r.error) hint += `（${r.error.message}）`
-    if (!PROXY) hint += '；如果这台机器要走代理，试 --proxy 或检查 --no-proxy'
+    // 0.4.14 件2-A：退出码 35 / Schannel 是「本机 curl 这一路不可用」，不是「网络断」。
+    //   作者那台 Win10 的 Schannel 故障本机复现不了，加降级通道＝写一条无法验证的路径，
+    //   所以只把诊断和可操作替代写进这一句（hint 同时进 download.log 与抛出的 detail，不两处各写一遍）。
+    if (r.code === 35 || /SEC_E_NO_CREDENTIALS|schannel/i.test(r.err || '')) {
+      hint += '；本机 curl 这一路不可用（TLS/Schannel 握手失败，不是网络断）：换一个 curl（如 Git for Windows 自带的 curl.exe）、设 --proxy 走代理，或改用 Python 侧下载（pip / huggingface_hub 走 HTTP(S)_PROXY）'
+    } else if (!PROXY) {
+      hint += '；如果这台机器要走代理，试 --proxy 或检查 --no-proxy'
+    }
     log(`下载失败 ${label}（${hint}）：${url}`)
     // 失败时清掉状态：.part 已被删，留着这条只会让面板显示一个永远不动的进度。
     writePartState(null)
@@ -878,20 +913,20 @@ function pipInstall(py, args) {
     //   （uv pip install install rapidocr-onnxruntime → No solution found）。
     const rest = args.slice(1)
     log(`uv pip install ${rest.join(' ')}（--python ${py}）`)
-    let r = run(plan.uv, ['pip', 'install', '--python', py, ...rest, '--index-url', PY_INDEX])
+    let r = runLogged(plan.uv, ['pip', 'install', '--python', py, ...rest, '--index-url', PY_INDEX])
     if (r.code === 0) return r
     if (PY_INDEX === 'https://pypi.org/simple') return r
     console.log(`    ! 镜像装不上（${PY_INDEX}），改走官方 PyPI 重试`)
     log(`uv pip 镜像失败（${PY_INDEX}），改走官方 PyPI`)
-    return run(plan.uv, ['pip', 'install', '--python', py, ...rest, '--index-url', 'https://pypi.org/simple'])
+    return runLogged(plan.uv, ['pip', 'install', '--python', py, ...rest, '--index-url', 'https://pypi.org/simple'])
   }
   log(`pip install ${args.join(' ')}（${py}）`)
-  let r = run(py, ['-m', 'pip', ...args, ...proxyArgs, '-i', PY_INDEX], { timeout: 0 })
+  let r = runLogged(py, ['-m', 'pip', ...args, ...proxyArgs, '-i', PY_INDEX], { timeout: 0 })
   if (r.code === 0) return r
   if (PY_INDEX === 'https://pypi.org/simple') return r
   console.log(`    ! 镜像装不上（${PY_INDEX}），改走官方 PyPI 重试`)
   log(`pip 镜像失败（${PY_INDEX}），改走官方 PyPI`)
-  return run(py, ['-m', 'pip', ...args, ...proxyArgs, '-i', 'https://pypi.org/simple'], { timeout: 0 })
+  return runLogged(py, ['-m', 'pip', ...args, ...proxyArgs, '-i', 'https://pypi.org/simple'], { timeout: 0 })
 }
 
 /**
@@ -1019,7 +1054,10 @@ function ensureVenv(venv, mod, pkgs) {
     // 2026-11-02（发版前审查）：原来只报「安装 X 失败」，pip 的真实报错被丢掉。
     //   这条路径上最常见的三种原因（连不上索引站 / 系统代理没进环境变量 / Python 版本
     //   不满足 requires-python）全都要读 stderr 才能分辨，不给就等于让用户干猜。
-    const tail = (r.err || r.out || '')
+    // 0.4.14 件2-B：流式落盘后 r.out/r.err 为空，末 N 行改从 download.out.log 的本次增量取。
+    //   pipInstall 镜像失败会 fallback 再跑一次，两次写同一文件 —— runLogged 记的偏移量保证
+    //   这里读到的只是最后一次调用的增量，不会把上一次的历史输出当成这次的报错。
+    const tail = (r.err || r.out || r.outLog || '')
       .split(/\r?\n/)
       .map((s) => s.trimEnd())
       .filter((s) => s.trim())
