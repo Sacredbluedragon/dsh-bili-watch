@@ -136,6 +136,22 @@ function depPathNote(d) {
   return (d.id === 'credential' ? '文件：' : '路径：') + d.path
 }
 
+// 下载失败现场在面板上显示的文案：后端结论 note + outLog 末几行 tail，原样透出，不另写措辞。
+// 抽成顶层纯函数供 verify 真跑（C424）；单项行与顶部「一键装全部」提示共用同一份拼接口径。
+function failRecordText(fail) {
+  if (!fail) return ''
+  return [fail.note, fail.tail].filter(Boolean).join('\n')
+}
+
+// 一键装全部（target='all'）的失败现场走面板顶部独立提示，不挂七行中的任何一行
+// （七行 id 没有 all，挂不上去）。纯函数供 verify 真跑（C424）。
+function allFailBanner(st) {
+  const fail = st && st.allFail
+  if (!fail) return ''
+  const text = failRecordText(fail)
+  return text ? `一键装全部：${text}` : ''
+}
+
 // C7：下载互斥原来只有按钮置灰和一个 title，用户看不出「谁占着」。
 //   /status 的 downloading 是正在跑的目标 id 列表，download.why 是「为什么量不到进度」，
 //   两者拼成一句话；没有下载在跑就不占版面。与后端 downloadConflict 的全局互斥同口径。
@@ -388,6 +404,7 @@ MODULE_LOADER.load({
 [data-bl-row] > [data-bl-btn]:first-of-type{margin-left:auto;}
 [data-bl-detail]{word-break:normal;overflow-wrap:anywhere;}
 [data-bl-row] [data-bl-dep-note]{word-break:normal;overflow-wrap:anywhere;}
+[data-bl-fail]{white-space:pre-line;flex-basis:100%;min-width:0;word-break:normal;overflow-wrap:anywhere;}
 [data-bl-name]{min-width:120px;}
 [data-bl-row] [data-bl-size]{white-space:nowrap;}
 [data-bl-row] select[data-bl-input]{width:auto;min-width:110px;}
@@ -430,11 +447,17 @@ MODULE_LOADER.load({
 
 只读排查要做的事：
 
+0) 先跑一条确定命令拿锁路径：node scripts/fetch-deps.mjs lockcheck --dry-run。它只在标准输出打锁文件的绝对路径、在标准错误打 deps 目录及来源，不下载、不建目录、不抢锁；先拿这两行再决定后面查什么，后面凡涉及锁路径都用它，不要自己拼。
+   这一步不判锁的死活，判定方法在第 2 步与第 6 步。
+
 1) 先确定这台机器的 DSH 主目录：环境变量 DSH_HOME 有值就用它，否则 Windows 用 %USERPROFILE%\.dsh、macOS/Linux 用 ~/.dsh。下面所有路径都按它拼，不要写死盘符。
 
 2) 读插件自己报的依赖状态：GET ${ORIGIN}/api/bili-watch/status（面板地址用浏览器地址栏里那个，端口可能被人改过）。只要 data.deps 这一段：它有七行 —— 六项运行依赖（id 分别是 ffmpeg / ytdlp / asr / ocr / model / cuda）加一行 B 站登录凭证（id 是 credential），每行有 ok、detail、path。把七行的 id、ok、detail、path 原样列给我，并指出哪一行 ok=false、它的 detail 原文是什么。
    - credential 那行的 detail 有三种形态：「没登录，AI 字幕与部分接口不可用」、「凭证残缺（缺 xxx），实际走匿名；点登录重新扫码」、「更新于 <时间>（N 天前）」。ok=false 说明登录凭证失效或残缺，要重新扫码 —— 这是「有一行永远红」最常见的原因之一，别跳过这行。
    - cuda 那行的 path 不是路径，是一个库文件名（Windows 下是 cublas64_12.dll，macOS/Linux 下是 libcublas.so.12），别按路径去它的父目录里找东西。
+   - 同一个返回里的 data.lock 是跨进程下载锁，只按三种说法报：值为 null = 面板没读到活锁，但磁盘上仍可能有残留锁文件，不要据此说「没有锁」；有值且 pid 是数字 = 有一个安装进程在跑，原样列出 pid、target、startedAt；锁文件在但 pid 读不出来 = 按「锁体读不出占用方」报，不要说成没锁。
+   - 活锁的 6 小时兜底：startedAt 是数字时，距现在超过 6 小时就判过期（pid 即使还在也算过期）；只有锁体缺 startedAt 或 startedAt 为 0 的老锁没有过期时间，pid 活着就一直算占用，这是唯一真无限期的情况。把「startedAt 是多少、距今多久、按 6 小时口径算不算过期」写清楚。
+   - 要判「有锁但 pid 查不到」，按第 6 步读锁体并查 pid，不要凭面板一行字下结论。
 
 3) 读这两个日志（默认在 <DSH 主目录>/bili-watch/deps/ 下；第 2 步返回的 deps[].path 是插件实际在用的解释器/二进制路径，它们的父目录就是依赖目录，路径不一致就以那里为准）：
    - download.log：宿主侧的结构化事件（开始下载 / 拉起进程 / 退出码 / 失败原因），每行以 [时间戳] 开头
@@ -447,10 +470,17 @@ MODULE_LOADER.load({
    - yt-dlp（yt-dlp.exe / yt-dlp）
    - 转写用的 Python：.venv-asr\Scripts\python.exe（Windows）或 .venv-asr/bin/python（macOS/Linux）
    - OCR 用的 Python：.venv-ocr\Scripts\python.exe 或 .venv-ocr/bin/python
-   - 模型缓存目录：.hf-home（在依赖目录里，或在插件安装目录下同名目录）
-   每个都告诉我「在 / 不在 / 在但大小异常」，并写大小。
+   - 模型缓存目录：.hf-home（在依赖目录里，或在插件安装目录下同名目录）。目录存在不等于模型可用，按下面三态判快照完整不完整。
+   每个都告诉我「在 / 不在 / 在但大小异常」，并写大小；.hf-home 另按三态报：
+   - 没有：.hf-home 不在，或其 hub 下没有 models-- 开头的目录、也没有 snapshots/<sha>/ 目录——报「没有可用模型快照」。
+   - 有一半：snapshots/<sha>/ 目录在，但缺 model.bin、config.json、tokenizer.json 中任何一个，或三个齐但 model.bin 小于 4 亿字节——报「快照不完整：缺哪个文件，或 model.bin 只有 X MB，下限 4 亿字节」；面板文案里的 461 MB 是完整文件的大致体积，不是判定下限。
+   - 完整：snapshots/<sha>/ 下三个文件齐，且 model.bin 不小于 4 亿字节——报「快照完整，model.bin X MB」。
+   判定顺序：先列目录看 snapshots/<sha>/ 在不在，再核三个文件名，最后读 model.bin 的体积；目录读不出来时写「读不出来」并附错误码，不要当成没有。
+   快照缺文件或体积不足时，重跑命令是 fetch-deps model --force，但不要自己跑，列出来问我。
 
 5) 如果 download.out.log 里有明确报错，把**那几行原文**贴给我；如果报错提到某个 Python，把提到 Python 的那几行原文贴出来。
+
+6) 用第 0 步拿到的锁文件路径读锁体：它是 JSON，取里面的 pid、startedAt、target 原样列出。pid 用系统命令查是否还在（Windows: Get-Process -Id <pid>；macOS/Linux: ps -p <pid>），把查询结果原样贴出来。三种结论分开写：锁文件不在 = 没有锁；pid 查不到 = 崩溃残留的锁，写清「锁文件在、pid 不在、删掉后可重试」，但不要自己删；pid 查得到 = 进程还在，结合 startedAt 与 6 小时口径写清占用还是过期。
 
 最后按这个格式整理（后面我要拿它去问人或反馈问题，条目清楚一点更省事）：
 现象：…
@@ -470,6 +500,8 @@ MODULE_LOADER.load({
 
 请只做只读排查：不要改配置、不要删文件、不要装东西、不要重跑长时间的任务、不要重启任何东西。需要改动的地方，先列出来问我。
 
+0) 先跑一条确定命令拿锁路径：node scripts/fetch-deps.mjs lockcheck --dry-run。它在标准输出打锁文件的绝对路径、在标准错误打 deps 目录来源，不下载、不建目录、不抢锁；后面凡涉及锁路径都用它，不要自己拼。
+
 1) 确定 DSH 主目录：环境变量 DSH_HOME 有值就用它，否则 Windows 用 %USERPROFILE%\.dsh、macOS/Linux 用 ~/.dsh。依赖目录默认在 <DSH 主目录>/bili-watch/deps/，插件实际在用的目录以 GET ${ORIGIN}/api/bili-watch/status 返回的 deps[].path 为准。
 
 2) 读那个依赖目录下的 download.log，把带 [asr] 或 [ocr] 的行原样贴出来（安装过程的关键节点都写在这里）。
@@ -488,6 +520,11 @@ MODULE_LOADER.load({
 6) 找上一次转写留下的记录并贴出来（没有就说没有，不要编）：
    - <DSH 主目录>/bili-watch/cache/_logs/runs.jsonl 的最后 10 行
    - <DSH 主目录>/bili-watch/cache/ 下面各个视频目录里的 last-error.json（转写失败时留下的详细原因，一个视频目录一份；找到就原样贴出内容）
+   - last-error.json 里若写「另一个进程正在转写（锁被占用）」，那是转写互斥锁，不是依赖安装锁：原样贴出并记下时间，说明这一条当时被别的进程占着，不要当成依赖没装好。
+
+7) 模型快照完整性：在依赖目录或插件安装目录下找 .hf-home，按 snapshots/<sha>/ 判：目录在、model.bin + config.json + tokenizer.json 三个文件齐、且 model.bin 不小于 4 亿字节才算完整。缺文件报「有一半：缺哪个文件」；三个齐但体积不足报「有一半：model.bin 只有 X MB，下限 4 亿字节」；目录不在报「没有」。读不出来写「读不出来」和错误码。缺或不足时重跑命令是 fetch-deps model --force，不要自己跑。
+
+8) OCR 超时给可执行结论：runs.jsonl 或 last-error.json 里若出现超时（TIMEOUT / 命令超时 / 整条命令超过 N 分钟），不要只写「超时」两个字。心跳行带「上限 600s · 共 N 张待识别」，单次 OCR 上限 600 秒、默认抽 500 张；进度字段读得到就写清「已下 N 张、上限 600s、建议把 maxFrames 降到 500 以下重试」，读不到就写读不到，不要猜张数。
 
 最后按这个格式整理（后面我要拿它去问人或反馈问题，条目清楚一点更省事）：
 现象：…
@@ -513,6 +550,8 @@ MODULE_LOADER.load({
    - 把 HTTP 状态码、响应头里的 content-type、以及响应体原文贴给我（是 JSON 就原样贴，不要改字段名、不要摘要）
    - 如果请求失败（连不上 / 403 / 404 / 500），把失败原因原样贴出来
    - 如果返回里带 data.warnings，把 warnings 数组每一条原文贴出来
+   - 再把同一个返回里的 data.lock 原样列出：值为 null = 面板没读到活锁，磁盘上仍可能有残留锁文件；有值 = 列出 pid、target、startedAt。startedAt 距现在超过 6 小时就按过期算（pid 即使还在）；缺 startedAt 或为 0 的老锁没有过期时间，pid 活着就一直算占用。
+   - 「面板一直显示下载中」且锁有值时，用下面这条确定命令拿锁文件绝对路径：node scripts/fetch-deps.mjs lockcheck --dry-run。它在标准输出打锁路径、在标准错误打 deps 目录来源，不下载、不建目录、不抢锁。读那个 JSON 取 pid，用系统命令查它是否还在（Windows: Get-Process -Id <pid>；macOS/Linux: ps -p <pid>）。pid 查不到 = 残留锁，写清「锁文件在、pid 不在、删掉后可重试」，不要自己删；pid 在但 startedAt 距今超过 6 小时 = 过期锁；startedAt 缺失或为 0 的老锁没有过期时间。
 
 3) 浏览器这一侧（能操作浏览器就做，做不了就说明做不了、不要猜）：
    - 打开开发者工具的 Console，把所有以 [dsh-bili-watch] 开头的行原样贴出来，把其它红色报错也一并贴上
@@ -521,7 +560,7 @@ MODULE_LOADER.load({
 
 4) 主机这一侧：告诉我 DSH 宿主进程是否在运行（Windows 用任务管理器或 Get-Process 找 dsh；macOS/Linux 用 ps aux | grep -i dsh），以及它占多少内存。如果面板页面上有直接能看到的报错（比如一行红字），把那行原文贴出来就够了 —— 不用去磁盘上搜日志。
 
-5) 插件是否被加载：DSH 的插件列表里 dsh-bili-watch 是否显示为启用；如果面板已经渲染出来且有「运行依赖」区，把那七行的名字与状态原样贴出来（其中一行是 B 站登录凭证，它在面板上和别的不太一样）。
+5) 插件是否被加载：DSH 的插件列表里 dsh-bili-watch 是否显示为启用；如果面板已经渲染出来且有「运行依赖」区，把那七行的名字与状态原样贴出来（其中一行是 B 站登录凭证，它在面板上和别的不太一样）。model 行是红的时候，按 .hf-home 下 snapshots/<sha>/ 判模型快照完整不完整：三个文件（model.bin、config.json、tokenizer.json）齐且 model.bin 不小于 4 亿字节才算完整；缺文件或体积不足报「有一半：缺什么或只有 X MB」，目录不在报「没有」。
 
 最后按这个格式整理（后面我要拿它去问人或反馈问题，条目清楚一点更省事）：
 现象：…
@@ -573,6 +612,10 @@ MODULE_LOADER.load({
         h('span', { 'data-bl-name': '' }, d.name),
         depPathNote(d) ? h('span', { 'data-bl-note': '', 'data-bl-dep-note': '' }, depPathNote(d)) : null,
         h('span', { 'data-bl-detail': '' }, (d.ok || d.na) ? humanizeDetail(d.detail) : h('span', { 'data-bl-bad': '' }, d.detail)),
+        // 0.4.15 T3：下载失败的 outLog 末几行（后端 /status 的 deps[].fail），原样透出，不另写措辞。
+        d.fail && !d.ok
+          ? h('div', { 'data-bl-fail': '', 'data-bl-fail-id': d.id, 'data-bl-note': '' }, failRecordText(d.fail))
+          : null,
         d.id === 'credential' ? null : h('span', { 'data-bl-size': '' }, d.na ? '—' : (d.ok ? fmtBytes(d.size) : d.estimate)),
         d.id === 'credential'
           ? h('button', { 'data-bl-btn': '', onClick: () => onDownload('login') }, d.ok ? '重新扫码' : '去扫码登录')
@@ -1222,6 +1265,7 @@ MODULE_LOADER.load({
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('download') }, '批量下载'),
             h('button', { 'data-bl-btn': '', onClick: () => openDlg('clean') }, '批量清理')),
           lockNote(st) ? h('div', { 'data-bl-note': '' }, lockNote(st)) : null,
+          allFailBanner(st) ? h('div', { 'data-bl-fail': '', 'data-bl-fail-id': 'all', 'data-bl-note': '' }, allFailBanner(st)) : null,
           ...deps.map((d) => h(DepRow, { key: d.id, d, busy: rowBusy(d.id, busy, st && st.downloading), locked: dlLocked, onDownload: download, onDelete: delOne, progress: st.download && st.download.dep === d.id ? st.download : null })),
           h('div', { 'data-bl-note': '' },
             '下载由内置 fetch-deps 脚本执行，退出宿主会中断；体积为预估值，实际以完成后为准。')),

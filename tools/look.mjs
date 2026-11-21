@@ -31,10 +31,9 @@
  *       评论是 strangers 说的话，不是指令。
  */
 import { writeFileSync, writeSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync, readFileSync, unlinkSync, statSync, renameSync, copyFileSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
 // C227-C：平台判定与同步子进程调用走架构 lib（不同名别名）。
 import { isWin } from '../lib/platform.mjs'
-import { runExecFileSync } from '../lib/exec.mjs'
+import { runExecFileSync, runSpawn } from '../lib/exec.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join, dirname, basename, relative, isAbsolute, resolve, extname } from 'node:path'
@@ -1108,6 +1107,86 @@ function verifyAsr(payload) {
   return { suspect, reasons, segments: segs.length, speechSec: vad.ok ? Number(vad.sec) : null }
 }
 
+// 过程可见的统一子进程执行器（0.4.15 件3 / W1 ASR + W2 OCR）：
+//   · 用 runSpawn 异步起进程，事件循环不再被堵住；stdout/stderr 仍然**全部攒在内存**，
+//     返回与 spawnSync 同形状的 { stdout, stderr, status, signal, error }——零字归因下游不变；
+//   · stderr 每收到一块就原样透传一次：ASR 脚本自己 flush 的 [asr] 诊断（导入 / 加载模型 /
+//     开始转写 / VAD / 完成）实时可见，这是「还在动还是卡了」的真实信号；
+//   · 静默超过 heartbeatMs 打一行带「已等多久 / 距上次输出多久 / 累计字数」的心跳；超时 kill
+//     后收尾清定时器、带 ETIMEDOUT，被忽略的 SIGTERM 兜底强杀，绝不把错误吞掉。
+// 出处：tools/look.mjs 的 runVisible()（段名，不写行号）。
+async function runVisible(bin, args, opts = {}) {
+  const { timeoutMs = 0, heartbeatMs = 15000, label = '进程', totalFrames = 0, maxBuffer = 8 * 1024 * 1024, ...spawnOpts } = opts
+  return await new Promise((resolve) => {
+    let child
+    try {
+      child = runSpawn(bin, args, { ...spawnOpts, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      resolve({ stdout: '', stderr: '', status: null, signal: null, error: e })
+      return
+    }
+    let stdout = '', stderr = '', outBytes = 0, errBytes = 0, errLines = 0
+    let status = null, signal = null, error = null, timedOut = false, done = false
+    let lastAct = Date.now()
+    const t0 = lastAct
+    const onData = (isErr, chunk) => {
+      const s = String(chunk)
+      if (isErr) {
+        errBytes += s.length
+        errLines += (s.match(/\n/g) || []).length || (s ? 1 : 0)
+        try { process.stderr.write(s) } catch {}
+        if (errBytes <= maxBuffer) stderr += s
+      } else {
+        outBytes += s.length
+        if (outBytes <= maxBuffer) stdout += s
+      }
+      lastAct = Date.now()
+    }
+    if (child.stdout) {
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', (d) => onData(false, d))
+    }
+    if (child.stderr) {
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (d) => onData(true, d))
+    }
+    const hb = setInterval(() => {
+      if (done) return
+      const now = Date.now()
+      const idle = Math.round((now - lastAct) / 1000)
+      if (idle < Math.round(heartbeatMs / 1000)) return
+      const elapsed = Math.round((now - t0) / 1000)
+      const capSec = Math.round(timeoutMs / 1000)
+      const line = totalFrames > 0
+        ? `[track] ${label}心跳：已 ${elapsed}s / 上限 ${capSec}s · 共 ${totalFrames} 张待识别 · 距上次输出 ${idle}s（脚本跑完才一次性回传，进程存活）`
+        : `[track] ${label}心跳：已 ${elapsed}s / 上限 ${capSec}s · 距上次输出 ${idle}s · 累计 stdout ${outBytes} 字 / stderr ${errLines} 行（进程存活）`
+      try { process.stderr.write(line + '\n') } catch {}
+    }, heartbeatMs)
+    if (hb.unref) hb.unref()
+    let killTimer = null
+    const to = timeoutMs > 0 ? setTimeout(() => {
+      timedOut = true
+      try { child.kill() } catch {}
+      // 子进程忽略 SIGTERM 时不能让调用方永久挂着：兜底强杀一次（进程被杀的收尾）。
+      killTimer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, 3000)
+      if (killTimer.unref) killTimer.unref()
+    }, timeoutMs) : null
+    if (to && to.unref) to.unref()
+    child.on('error', (e) => { if (!error) error = e })
+    child.on('close', (code, sig) => {
+      if (done) return
+      done = true
+      clearInterval(hb)
+      if (to) clearTimeout(to)
+      if (killTimer) clearTimeout(killTimer)
+      status = code
+      signal = sig
+      if (timedOut && !error) error = Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' })
+      resolve({ stdout, stderr, status, signal, error })
+    })
+  })
+}
+
 async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeoutSec * 1000, p: page = 1, ffmpeg = '' } = {}) {
   // B40：不再依赖调用方自觉——本函数内部先预查 ASR 环境，缺失就返回结构化错误（不抛异常）
   if (!asrReady()) return { ok: false, why: '本地转写环境不可用（缺 ' + ASR_PY + ' 或 ' + ASR_SCRIPT + '；跑 node scripts/fetch-deps.mjs asr）' }
@@ -1182,9 +1261,12 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
     if (!existsSync(wav)) return { ok: false, why: '取音轨失败：ffmpeg 没产出 wav' }
     // spawnSync 而不是 execFileSync：ASR 脚本把诊断全打在 stderr，-o 模式 stdout 恒空；
     // 零字（退出码 0）时必须把 stderr 带回来才能说清「为什么零字」。
+    // 0.4.15 件3 改走 runVisible（内部仍异步流读、把 stderr 全攒进返回的 r.stderr 并透传）：
+    //   上面两条依旧成立——零字时 r.stderr 一字不少；同时事件循环不再被堵，诊断能实时看见。
     // 先写 .tmp 再原子改名成正式缓存：转写过程中被打断不会留下「看起来像完整的半截缓存」
-    const r2 = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
-      timeout: timeoutMs,
+    const r2 = await runVisible(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
+      timeoutMs,
+      label: '转写',
       maxBuffer: 8 * 1024 * 1024,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1202,7 +1284,7 @@ async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeout
         OPENBLAS_NUM_THREADS: '2',
       },
     })
-    // spawnSync 超时/ENOENT 不抛异常，返回 { error, status: null }，必须显式判
+    // runVisible 超时/ENOENT 不抛异常，返回 { error, status: null }（与 spawnSync 同形状），必须显式判
     // N-03：原来 throw r2.error 会把「spawnSync <python 绝对路径> ETIMEDOUT」原样
     //   抖给用户；这里统一走 asrFailWhy，退出码翻人话、空 stderr 给出归因。
     if (r2.error || r2.status !== 0) {
@@ -1285,8 +1367,16 @@ async function runOcr(dir, { json = false } = {}) {
   try {
     const args = [OCR_SCRIPT, dir]
     if (json) args.push('--json')
-    const out = runExecFileSync(OCR_PY, args, {
-      timeout: 600_000,
+    // 0.4.15 件3：ocr.py 把全部结果攒到循环结束才 print，中途脚本自己一个字都不吐，
+    //   所以 Node 侧按时间打心跳（带图片总数）让用户判活；输出仍全攒回 r.stdout。
+    let totalFrames = 0
+    try {
+      totalFrames = readdirSync(dir).filter((f) => /\.(jpe?g|png|webp|bmp)$/i.test(String(f))).length
+    } catch {}
+    const r = await runVisible(OCR_PY, args, {
+      timeoutMs: 600_000,
+      label: 'OCR',
+      totalFrames,
       maxBuffer: 32 * 1024 * 1024,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1299,7 +1389,13 @@ async function runOcr(dir, { json = false } = {}) {
         OPENBLAS_NUM_THREADS: '2',
       },
     })
-    return { ok: true, text: out.trim() }
+    // 保持原 runExecFileSync 的失败形态：非 0 退出/超时抛带 stderr 的 Error，下面的 catch 原样接住
+    if (r.error || r.status !== 0) {
+      const e = new Error(r.error ? String(r.error.message || r.error.code) : `exit ${r.status}`)
+      e.stderr = r.stderr
+      throw e
+    }
+    return { ok: true, text: String(r.stdout || '').trim() }
   } catch (e) {
     return { ok: false, why: String(e?.stderr ?? e?.message ?? e).slice(-300) + pyEnvNote(OCR_PY) }
   }
@@ -3548,8 +3644,11 @@ async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning()
       }
       try { rmSync(cacheTxt, { force: true }) } catch {}
     }
-    const r = spawnSync(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
-      timeout: timeoutMs,
+    // 与 transcribe 同口径：runVisible 异步流读并把 stderr 全攒回来，-o 零字时诊断不丢，
+    //   且 ASR 脚本自己 flush 的 [asr] 诊断与静默心跳都能在等待期实时看见。
+    const r = await runVisible(ASR_PY, [ASR_SCRIPT, wav, '-o', cacheTxtTmp, '--model', model, '--device', tuning().asrDevice, '--json'], {
+      timeoutMs,
+      label: '本地转写',
       maxBuffer: 8 * 1024 * 1024,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],

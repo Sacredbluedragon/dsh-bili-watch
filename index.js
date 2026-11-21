@@ -28,13 +28,13 @@ import { fileURLToPath } from 'node:url'
 // isAdoptableDir 只被 lib/cache-path.mjs 的 resolveCacheDir 用，本文件不再直接调用。
 // 0.4.8 C1：清缓存的三个入口改走 lockState 三态（读不出来 = unknown，不再压成「没锁」）；
 //   hasAnyLock 那个布尔薄壳只留给老调用方与 C6 真跑判据。
-import { lockState, classifyLock } from './lib/locks.mjs'
+import { lockState } from './lib/locks.mjs'
 // 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
 import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll, cacheBreakdown } from './lib/cache-own.mjs'
 // C236b：三档 deleteMode 的唯一实现；手动 / 自动 / --all 三条路径都从这里取策略。
 import { normalizeDeleteMode, deletePaths, DELETE_MODES } from './lib/recycle.mjs'
-import { modelRow } from './lib/model-integrity.mjs'
+import { modelRow, MODEL_EXPECTED_MB } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
 //   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
@@ -47,7 +47,9 @@ import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults,
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
-import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile, DEPS_LOCK_STALE_MS } from './lib/plugin-paths.mjs'
+import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile } from './lib/plugin-paths.mjs'
+// 2026-11-21（0.4.15 件一）：deps 锁三态判据收进 lib/deps-lock.mjs，本文件与 doctor.mjs 共用一份。
+import { depsLockVerdict } from './lib/deps-lock.mjs'
 // 2026-10-31：坏配置留档 + 回默认值的行为搬进 lib/config.mjs，返回结构化 problem，
 //   文案由本文件组织（CLI 侧是英文，见 tools/look.mjs 的 readDepsCfg）。
 import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/config.mjs'
@@ -93,26 +95,51 @@ function trimForModel(text, tag = 'out', bv = '', jsonMode = false, opts = {}) {
   const head = (Number.isFinite(opts.head) && opts.head > 0)
     ? Math.floor(opts.head)
     : (full ? 20000 : toolTextHead())
+  // noPersist：错误 / 用法输出不落缓存（0.4.15 修单件一 A）。主动不落盘时仍按 cap 截断，
+  //   不许把超长错误文本原样塞回模型；与「真写盘失败」分开：失败是 best-effort 原样返回，
+  //   noPersist 是明确选择，返回文案里不许再出现「全文已存：<路径>」，也不假装存过。
+  const noPersist = opts.noPersist === true
   let f = ''
-  try {
-    const base = String(tag || 'out').replace(/[^\w.-]/g, '') || 'out'
-    // A-2（2026-10-28 阶段A）：同一 BV 下不同模式（--fast/--verify/--full/--head）或不同命令会写同一个
-    //   `<tag>.tool.txt`，后写覆盖先写，工具层按旧路径 read 会读到别人的内容。落盘名加「时间戳36进制 + 进程内自增」
-    //   绝不覆盖；返回文本里带着绝对路径，调用方照读即可。`${name}.tool.txt` 模板字面量必须保留（verify.mjs:69 断言依赖）。
-    const name = `${base}.${Date.now().toString(36)}${(++TOOL_FILE_SEQ).toString(36)}`
-    f = join(videoDir(bv), `${name}.tool.txt`) // .tool 后缀：别覆盖 CLI 落的同名全文
-    writeFileSync(f, s, 'utf8')
-  } catch { f = '' }
-  if (!f) return s // 落盘失败：原样返回，不截断（保护是 best-effort，正确性优先）
+  let persistFailed = false
+  if (!noPersist) {
+    try {
+      const base = String(tag || 'out').replace(/[^\w.-]/g, '') || 'out'
+      // A-2（2026-10-28 阶段A）：同一 BV 下不同模式（--fast/--verify/--full/--head）或不同命令会写同一个
+      //   `<tag>.tool.txt`，后写覆盖先写，工具层按旧路径 read 会读到别人的内容。落盘名加「时间戳36进制 + 进程内自增」
+      //   绝不覆盖；返回文本里带着绝对路径，调用方照读即可。`${name}.tool.txt` 模板字面量必须保留（verify.mjs:69 断言依赖）。
+      const name = `${base}.${Date.now().toString(36)}${(++TOOL_FILE_SEQ).toString(36)}`
+      f = join(videoDir(bv), `${name}.tool.txt`) // .tool 后缀：别覆盖 CLI 落的同名全文
+      writeFileSync(f, s, 'utf8')
+    } catch { f = ''; persistFailed = true }
+  }
+  if (persistFailed) return s // 落盘失败：原样返回，不截断（保护是 best-effort，正确性优先）
   if (s.length <= cap) return s
   // 先剥掉 look.mjs 加的 [source: …] 标签再判：它本身以 [ 开头，会被误判成 JSON 数组（2026-10-26 回归）
   const bare = s.replace(/^\[source:[^\]]*\]\s*/, '')
   const looksJson = jsonMode || /^\s*[{[]/.test(bare)
   if (looksJson) {
+    if (noPersist) {
+      // 不落盘的 JSON 类超长错误：不承诺存在可读文件，只给缩小输出的下一步。
+      return `（全文 ${s.length} 字，超限，本次错误/用法输出未落盘；下面只是截断后的片段，不能按完整 JSON 解析。可换更细的分段命令缩小输出范围，或加 --head 限制行数。）`
+    }
     // B11：JSON 类输出超长整体落盘、不回半截（半截 JSON 不能 JSON.parse）
     return `（全文 ${s.length} 字，超限，JSON 已整体落盘；不要按下面内容尝试 JSON.parse，用 read 打开文件看完整结果。已存：${f}）`
   }
-  return `${cutCp(s, head)}\n\n…（全文 ${s.length} 字，只回了前 ${head} 字${f ? '；全文已存：' + f : ''}）\n要看完整版：用 read 工具打开上面的文件（别再跑一遍命令）；或换更细的 command 分段取。`
+  // S1（0.4.15 件2）：head 必须夹紧进 cap。按 0.4.14 件1「尾行必须进预算」口径——
+  //   尾段算在 head 之外（是追加的尾行），但计入 cap 总预算：正文上限 = cap - 尾段实际码点长度。
+  //   不写死模块级常量：尾段含动态的全文位数 / head 位数 / 落盘绝对路径，写死 155 会低估仍超 cap，
+  //   也违背件1「不许在调用点手写 cap-N」；不改签名：尾段依赖本函数内生成的 f 与夹紧后的 head，
+  //   调用方无从提供，改签名只会把内聚逻辑外泄。
+  const tailOf = noPersist
+    ? (n) => `\n\n…（全文 ${s.length} 字，只回了前 ${n} 字；本次错误/用法输出未落盘）\n可换更细的分段命令缩小输出范围，或加 --head 限制行数。`
+    : (n) => `\n\n…（全文 ${s.length} 字，只回了前 ${n} 字${f ? '；全文已存：' + f : ''}）\n要看完整版：用 read 工具打开上面的文件（别再跑一遍命令）；或换更细的 command 分段取。`
+  // 先用请求 head 量尾段（偏保守）得正文预算；因 digits(effHead) ≤ digits(head)，
+  //   尾段只会更短，故一次夹紧后「正文 + 尾段」必 ≤ cap。
+  const headBudget = cap - [...tailOf(head)].length
+  // 做不到的边界：cap 连尾段都装不下时（如 C385 桩的 cap=100、尾段约 200 字），
+  //   夹紧只会把正文砍成 0 且仍超 cap，无意义；此时退回原行为，不制造空正文。
+  const effHead = headBudget > 0 ? Math.min(head, headBudget) : head
+  return `${cutCp(s, effHead)}${tailOf(effHead)}`
 }
 
 let defineTool = null
@@ -343,35 +370,15 @@ const DEPS_LOCK_FILE = depsLockFile()
 function readDepsLock() {
   try { return JSON.parse(readFileSync(DEPS_LOCK_FILE, 'utf8')) } catch { return null }
 }
-/**
- * deps 跨进程锁的唯一判据（C48-P2-1）。
- *
- * 原来宿主侧只判 pid 存活（进程在就占用），CLI 侧 fetch-deps.mjs 还判 6 小时 TTL，
- * 于是「8 小时前的长下载、进程还活着」CLI 判 stale 能接管、面板判占用点不动，两边都不说为什么。
- * 现在后台迁移 acquireDepsLock 与面板 downloadLockBusy 都走 lib 的 classifyLock 三态，
- * 与 CLI 侧 lockState 的 held/stale/free 用同一个 pid 探活 + 同一个过期窗口。
- *
- * 字段映射：deps 锁体是 { pid, startedAt, target }，classifyLock 认 { pid, at, ttlMs }。
- * 没有 startedAt 的老锁不能判成过期（等于「不知道」，宁可误拒不可误放）——给它一个极大
- * ttlMs，pid 活着就仍是 live；这是原来 `!Number.isFinite(startedAt) || ...` 的保守语义，
- * 统一判据不能把这一侧削掉。锁体没有合法 pid（写了一半 / 损坏）归 corrupt，不拦用户。
- */
+// 0.4.15 件一：三态判据搬到 lib/deps-lock.mjs（本文件与 doctor.mjs 共用一份），
+//   这里只保留调用点 acquireDepsLock / downloadLockBusy。
 // 0.4.14 件2-C（不修，理由留痕）：issue #18 说「锁要 6 小时才判过期」是错的——
-//   classifyLock()（lib/locks.mjs:78）第一句就是 pidAlive(owner.pid) && !lockExpired(...)，
+//   classifyLock() 第一句就是 pidAlive(owner.pid) && !lockExpired(...)，
 //   pidAlive 用 process.kill(pid,0) 探活，6h 只是 TTL 上限（pid 活着却干不完时的兜底）。
 //   另担心过 detached 子进程收不到 exit 让 DOWNLOADING 滞留——该前提也不成立：
-//   index.js:2072 的 detached = !isWin() 在 Windows 恒 false；实测 detached:true 父进程照样收
-//   exit/close，清理走 closeOut()（:2112-2119）被 error/exit 全覆盖。所以不修的理由是
+//   本文件 runDownload 的 detached = !isWin() 在 Windows 恒 false；实测 detached:true
+//   父进程照样收 exit/close，清理走 closeOut() 被 error/exit 全覆盖。所以不修的理由是
 //   「路径不存在」，不是「场景太窄」。窄洞只剩 pid 无身份校验（PID 复用），留后续版本单独评估。
-function depsLockVerdict(cur) {
-  if (!cur || !Number.isInteger(cur.pid) || cur.pid <= 0) return { state: 'corrupt', why: 'corrupt' }
-  const hasAt = Number.isFinite(cur.startedAt) && cur.startedAt > 0
-  return classifyLock({
-    pid: cur.pid,
-    at: hasAt ? cur.startedAt : 0,
-    ttlMs: hasAt ? DEPS_LOCK_STALE_MS : Number.MAX_SAFE_INTEGER,
-  }, DEPS_LOCK_STALE_MS)
-}
 /**
  * 真抢锁：wx 独占写，拿不到返回 null（由调用方延后重试）。锁体与 scripts/fetch-deps.mjs
  * 的 acquireLock 同形（pid / startedAt / target），所以它那侧读到的就是「有人正在跑」。
@@ -806,13 +813,36 @@ function writeUiCfg(patch) {
 const DEFAULT_CACHE_DAYS = 7
 const DEFAULT_CACHE_MAX_MB = 2048
 let DOWNLOAD_LOG = join(DEPS, 'download.log')
+// 0.4.15 T3：失败原因透面板。fetch-deps 失败时只在 download.log 留一句
+//   「失败：model —— 模型下载失败」，真因（Python traceback / curl 错误）在 download.out.log。
+//   这里把本次增量末 N 行落成一个小 JSON，由 /status 的 deps 行带给面板；client.js 负责渲染。
+// 写成函数而非模块级 const：DEPS 迁移后必须现算，不能把旧目录固化在闭包里（C153）。
+function failTailFile() { return join(DEPS, '.download-fail.json') }
+const FAIL_TAIL_LINES = 8
+/** 只取末 N 个非空行：traceback 的真因在最后，前导噪声不占面板版面。 */
+function failTailOf(raw, max = FAIL_TAIL_LINES) {
+  return String(raw || '').split(/\r?\n/).map((s) => s.trimEnd()).filter((s) => s.trim()).slice(-max).join('\n')
+}
+function readDownloadFails() {
+  try {
+    const j = JSON.parse(readFileSync(failTailFile(), 'utf8'))
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : {}
+  } catch { return {} }
+}
+/** ok=true 时清掉该目标的上次失败，免得面板在成功后仍挂着旧 traceback。 */
+function setDownloadFail(target, raw, note, ok = false) {
+  const all = readDownloadFails()
+  if (ok) delete all[target]
+  else all[target] = { tail: failTailOf(raw), note: String(note || ''), at: Date.now() }
+  try { writeFileSync(failTailFile(), JSON.stringify(all), 'utf8') } catch {}
+}
 // 一键下载的预估体积，只给面板显示，不参与逻辑
 const ESTIMATES = {
   ffmpeg: '约 94 MB',
   ytdlp: '约 17 MB',
   asr: '约 294 MB（venv）',
   ocr: '约 263 MB（venv）',
-  model: '约 464 MB',
+  model: `约 ${MODEL_EXPECTED_MB} MB`,
   // issue #7 · Windows：下载约 1.4 GB（cublas 553 MB + cudnn 743 MB + nvrtc 76 MB），
   //   装完 site-packages/nvidia 约 2.0 GB。原来写「约 500 MB」是估的，用户按它算流量会差三倍。
   // issue #5：Linux 那三个 wheel 更大（cublas 817 MB + cudnn 1.2 GB + nvrtc 217 MB，展开约 2.2 GB）。
@@ -1730,7 +1760,23 @@ function cudaRowNa(gpu) {
   return Boolean(g.noCard || (g.unknown && !g.dllReady))
 }
 
+/** 把落盘的失败现场按目标 id 挂到依赖行上。纯函数，便于 verify 真跑断言（C423）。 */
+function attachRowFails(rows, fails) {
+  for (const row of rows) row.fail = fails[row.id] || null
+  return rows
+}
+
+/**
+ * 一键装全部（target='all'）的失败现场不挂任何单项行：七行 id 里没有 all，
+ * 挂不上去；由 /status 顶层字段带给面板顶部独立提示（C423）。纯函数，便于真跑断言。
+ */
+function pickAllFail(fails) {
+  return fails && fails.all ? fails.all : null
+}
+
 async function depRows(gpuVal, opts = {}) {
+  // 0.4.15 T3：带上最近一次下载失败的 outLog 末几行，按目标 id 挂到下面的依赖行上。
+  const fails = readDownloadFails()
   // W-57：用 resolveFfmpeg()（同 CLI 口径，含 PATH 试跑）而不是 existsSync 硬查文件
   // 2026-11-06：三处探测都改异步，调用方必须 await；漏一个 await 会把 Promise 当值拼进 detail。
   const ffmpeg = await resolveFfmpeg()
@@ -1888,6 +1934,7 @@ async function depRows(gpuVal, opts = {}) {
     size: 0,
     estimate: '扫码登录',
   })
+  attachRowFails(rows, fails)
   return rows
 }
 
@@ -2171,27 +2218,35 @@ function runDownload(target) {
     if (outFd !== null) {
       try { emptyOutput = statSync(outLog).size <= outSizeBefore } catch {}
     }
+    // 0.4.15 T3：本次 outLog 增量只读一次 —— 锁占用文案与失败原因透面板共用同一份现场。
+    let outText = ''
+    if (outFd !== null) {
+      try { outText = readFileSync(outLog).subarray(outSizeBefore).toString('utf8') } catch {}
+    }
     // 子进程因锁被占退 3 时，它已经把拒绝原因写进 outLog。只取本次增量
     // （outSizeBefore 是 spawn 前的字节数），免得翻出上一次下载留下的旧文案。
     // 同步回包拿不到这段，但它会进 download.log 的「结束」行，面板看日志时不再是光秃秃的退出码 3。
     let lockBusy = ''
     if ((code ?? 0) === 3 && outFd !== null) {
       try {
-        const added = readFileSync(outLog).subarray(outSizeBefore).toString('utf8')
-        const line = added.split(/\r?\n/).find((l) => l.includes('已经有一个安装进程在跑'))
+        const line = outText.split(/\r?\n/).find((l) => l.includes('已经有一个安装进程在跑'))
         if (line) lockBusy = `${line.trim()}；锁文件：${DEPS_LOCK_FILE}`
       } catch {}
     }
     const verdictCtx = { emptyOutput, shell: cmd, lockBusy }
     const finish = (rows) => {
+      let v = { ok: false, note: '' }
       try {
-        const v = downloadVerdict(target, code, signal, rows, verdictCtx)
+        v = downloadVerdict(target, code, signal, rows, verdictCtx)
         appendFileSync(
           DOWNLOAD_LOG,
           `[${new Date().toISOString()}] ${target} 结束，${v.note}${v.ok ? '（成功）' : '（失败）'}（详细输出见 deps\\download.out.log）\n`,
           'utf8',
         )
       } catch {}
+      // 0.4.15 T3：失败原因透面板 —— 本次 outLog 末几行落盘，下一次 /status 的 deps 行带上它；
+      //   成功则清掉上一次的失败现场，免得面板成功后仍挂着旧 traceback。
+      setDownloadFail(target, outText, v.note, v.ok)
       closeOut()
     }
     if ((code ?? 0) !== 0 || signal) { finish(null); return }
@@ -2580,7 +2635,7 @@ function registerSlashCommand(ctx) {
       const fullOn = (extra || []).includes('--full')
       const hi = (extra || []).indexOf('--head')
       const headOn = hi >= 0 && Number(extra[hi + 1]) ? Number(extra[hi + 1]) : null
-      return { kind: r.ok ? 'success' : 'error', text: trimForModel(r.text, command, bv, false, { full: fullOn, head: headOn }) }
+      return { kind: r.ok ? 'success' : 'error', text: trimForModel(r.text, command, bv, false, { full: fullOn, head: headOn, noPersist: r.ok !== true }) }
     },
   })
 }
@@ -2828,7 +2883,7 @@ function registerTool(ctx) {
         ? ['', String(Math.floor(args.num))]
         : []
       const r = await lookup({ command: args.command, bv: target, positionals, extra, signal })
-      return { ok: r.ok, text: trimForModel(r.text, args.command, target, false, { full: args.full, head: args.head }) }
+      return { ok: r.ok, text: trimForModel(r.text, args.command, target, false, { full: args.full, head: args.head, noPersist: r.ok !== true }) }
       } catch (e) {
         // T41：别的 defineTool 都包了 try/catch，我们没包——runLook 抛错会让整轮失败
         // 9-10：除 text 外带 code/retryable/after，让调度层能区分可重试错误
@@ -2884,6 +2939,8 @@ function registerPanelRoute(ctx) {
                     skippedOverflow: lastSkippedOverflow || { count: 0, bytes: 0 },
                     credential: credState(),
                     deps: await depRows(gpuNow, { fresh }),
+                    // T1（C423）：一键装全部的失败现场不挂单项行，顶层单独带给面板顶部提示。
+                    allFail: pickAllFail(readDownloadFails()),
                     // issue #10 问题 3 建议 1 的后半句（「面板把按钮置灰」）：宿主内存里本来就有
                     //   这张表，暴露出去面板才知道该灰哪几行。只列目标名，不含 pid/路径。
                     downloading: Array.from(DOWNLOADING.keys()),

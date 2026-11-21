@@ -26,8 +26,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { depsLockFile, DEPS_LOCK_STALE_MS } from '../../lib/plugin-paths.mjs'
-import { classifyLock } from '../../lib/locks.mjs'
+import { depsLockFile } from '../../lib/plugin-paths.mjs'
+import { depsLockVerdict } from '../../lib/deps-lock.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..', '..')
@@ -200,7 +200,6 @@ try {
     writeFileSync(lf, JSON.stringify({ pid: process.pid, startedAt: Date.now(), target: 'ffmpeg' }), 'utf8')
     const c = runVM(`
       const DEPS_LOCK_FILE = ${JSON.stringify(lf)}
-      ${sliceFn(idx, 'function depsLockVerdict(cur) {')}
       ${sliceFn(idx, 'function downloadLockBusy() {')}
       ${sliceFn(idx, 'function lockBusyText(cur, lockPath) {')}
       const DOWNLOADING = new Map()
@@ -215,7 +214,7 @@ try {
       const spawn = () => ({ pid: 4242, on() {}, once() {}, unref() {} })
       ${sliceFn(idx, 'function runDownload(target) {')}
       globalThis.__r = runDownload('ytdlp')
-    `, { classifyLock, DEPS_LOCK_STALE_MS })
+    `, { depsLockVerdict })
     const r = c.__r || {}
     const why = String(r.why || '')
     defect.C177_crossProcessWhyHasPidAndPath = r.started === false

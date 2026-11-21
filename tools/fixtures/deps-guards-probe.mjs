@@ -19,6 +19,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
+import { depsLockVerdict } from '../../lib/deps-lock.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..', '..')
@@ -240,6 +241,7 @@ if (section === 'C') {
   const conflict = sliceFn(src, 'function downloadConflict(target, running) {')
   const runDownload = sliceFn(src, 'function runDownload(target) {')
   const lockFn = sliceFn(fd, 'function lockState(cur, opts = {}) {')
+  const mapFn = sliceFn(fd, 'function verdictToLockState(verdict) {')
   const lockConst = (fd.match(/const LOCK_STALE_MS = [^\n]+/) || [''])[0]
   if (!lockConst) broken('找不到 LOCK_STALE_MS 常量')
   // C48-P2-1：6 小时常量抽到 lib/plugin-paths.mjs 单点，沙箱② 里要先把那行定义贴上，
@@ -294,28 +296,31 @@ if (section === 'C') {
   must(r1.c && r1.c.started === false, '不同目标（ocr）也必须被 asr 挡住（全局互斥），实际 ' + JSON.stringify(r1.c))
   must(r1.d && r1.d.started === false, 'asr 在跑时 all 必须被拒，实际 ' + JSON.stringify(r1.d))
 
-  // ② 跨进程锁的判定（纯函数，注入 now / alive）
+  // ② 跨进程锁的判定（纯函数，走唯一判据 depsLockVerdict；VM 里注入真函数）。
+  //    判据内部用真 process.kill 探活，所以活锁用本探针进程自己的 pid，
+  //    死锁用一个确定不在的 pid；不再靠注入假的 alive 复刻第二份判据。
   const stub2 = `
     ${staleDecl}
     ${lockConst}
+    ${mapFn}
     ${lockFn}
     globalThis.__r = (() => {
-      const now = 1700000000000
-      const aliveTrue = () => true
-      const aliveFalse = () => false
+      const now = Date.now()
+      const livePid = process.pid
+      const deadPid = 999999999
       return {
-        none: lockState(null, { now }),
-        held: lockState({ pid: 111, startedAt: now - 1000 }, { now, alive: aliveTrue }),
-        dead: lockState({ pid: 111, startedAt: now - 1000 }, { now, alive: aliveFalse }),
-        old: lockState({ pid: 111, startedAt: now - LOCK_STALE_MS - 1 }, { now, alive: aliveTrue }),
+        none: lockState(null),
+        held: lockState({ pid: livePid, startedAt: now - 1000 }),
+        dead: lockState({ pid: deadPid, startedAt: now - 1000 }),
+        old: lockState({ pid: livePid, startedAt: now - LOCK_STALE_MS - 1 }),
         // 2026-11-03 自审：跑了 61 分钟的下载，pid 还活着，必须仍是 held。
         //   原来的判定是「先看时间再看 pid」，这种长下载会被判成残留锁、被后来者接管。
-        longRun: lockState({ pid: 111, startedAt: now - 61 * 60 * 1000 }, { now, alive: aliveTrue }),
-        garbage: lockState({ startedAt: now }, { now, alive: aliveTrue }),
+        longRun: lockState({ pid: livePid, startedAt: now - 61 * 60 * 1000 }),
+        garbage: lockState({ startedAt: now }),
       }
     })()
   `
-  const ctx2 = newCtx({})
+  const ctx2 = newCtx({ depsLockVerdict })
   try {
     vm.runInNewContext(stub2, ctx2, { timeout: 5000 })
   } catch (e) {

@@ -69,6 +69,7 @@ import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 import { createInterface } from 'node:readline'
 import { resolveDepsDir, depsLockFile, DEPS_LOCK_STALE_MS } from '../lib/plugin-paths.mjs'
+import { depsLockVerdict } from '../lib/deps-lock.mjs'
 import { inspectModelHomes } from '../lib/model-integrity.mjs'
 // C227-B：平台判定收敛到 lib/platform.mjs。
 import { isMac, isWin } from '../lib/platform.mjs'
@@ -164,31 +165,39 @@ const LOCK_FILE = depsLockFile()
 //   时间只兜「pid 被复用」这一个极端：6 小时够任何一次 all 跑完。
 const LOCK_STALE_MS = DEPS_LOCK_STALE_MS // 单点在 lib/plugin-paths.mjs（C48-P2-1），别再写第二份字面量
 /**
- * 纯函数：现有锁算不算「有人正在跑」。抽出来是为了能真跑断言（C145），不靠读源码猜。
- * 判定顺序：没有 pid -> free；pid 活着 -> held（超过 6 小时才翻成 stale，兜 pid 复用）；
- *   pid 不在了 -> stale（崩溃残留，立刻可接管）。
+ * 纯函数：现有锁算不算「有人正在跑」。抽出来是为了能真跑断言，不靠读源码猜。
+ *
+ * 判据只有一份：lib/deps-lock.mjs 的 depsLockVerdict 给 {state:'live'|'stale'|'corrupt'}；
+ *   这里只做两件事——「无锁先短路」与「三态映射到调用方认的 free/stale/held」。
+ *   原内联的 Number.isFinite + process.kill 是第二份判据：0 是 finite，kill(0,0) 又返回成功，
+ *   于是把一个不存在的进程报成 held。那份内联逻辑已删，不再有第二个住处。
+ *
+ *   无锁（含坏 JSON 被读成 null）是正常 free，不是损坏锁：短路必须在转调之前，
+ *   否则判据对 null 给 corrupt，会把「根本没有锁」也报成损坏。
+ *
  * @param {{pid?:number, startedAt?:number}|null} cur 读到的锁内容（没有锁传 null）
- * @param {{now?:number, staleMs?:number, alive?:(pid:number)=>boolean}} opts 测试可注入
+ * @param {{now?:number}} opts now 可注入，只透传给唯一判据，不另写一套 TTL 算式
  * @returns {'free'|'stale'|'held'}
  */
 function lockState(cur, opts = {}) {
-  if (!cur || !Number.isFinite(cur.pid)) return 'free'
-  const now = opts.now ?? Date.now()
-  const staleMs = opts.staleMs ?? LOCK_STALE_MS
-  const startedAt = Number.isFinite(cur.startedAt) ? cur.startedAt : 0
-  const alive = opts.alive ?? ((pid) => {
-    try {
-      process.kill(pid, 0)
-      return true
-    } catch (e) {
-      // EPERM = 进程在、只是没权限问；其它（ESRCH）才算不在了
-      return e && e.code === 'EPERM'
-    }
-  })
-  if (!alive(cur.pid)) return 'stale'
-  // 活着 + 超时 = 只可能是 pid 被别的进程复用了（下载再慢也不该跑 6 小时）
-  if (startedAt && now - startedAt > staleMs) return 'stale'
-  return 'held'
+  if (!cur) return 'free'
+  return verdictToLockState(depsLockVerdict(cur, { now: opts.now }))
+}
+
+/**
+ * 唯一判据的三态 → 本脚本调用方认的三值。单独成函数，让映射本身能被判据真跑守住：
+ *   任一侧改了而这里没跟上，全量闸必红。
+ *   live→held：真有进程在跑，照旧拒绝启动；
+ *   stale→stale：崩溃残留 / pid 被复用超时，照旧清锁接管；
+ *   corrupt→free：锁体没有合法 pid，不是有效占用，按「不占用」放行。
+ *   与 stale 分开是刻意的：残留锁与损坏锁的清除理由、给用户看的措辞都不同。
+ * @param {{state:'live'|'stale'|'corrupt'}} verdict 唯一判据的结果
+ * @returns {'free'|'stale'|'held'}
+ */
+function verdictToLockState(verdict) {
+  if (verdict.state === 'live') return 'held'
+  if (verdict.state === 'stale') return 'stale'
+  return 'free'
 }
 function readLock() {
   try {
@@ -219,15 +228,20 @@ function printLockBusy(cur) {
 function acquireLock() {
   const cur = readLock()
   const st = lockState(cur)
+  const corrupt = Boolean(cur) && depsLockVerdict(cur).state === 'corrupt'
   if (st === 'held') {
     printLockBusy(cur)
     process.exit(3)
   }
-  if (st === 'stale') {
+  // 锁体在、pid 却不是合法正整数（0 / 负数 / 小数 / 字符串 / 没有 pid）不是有效占用。
+  // lockState 把它映射成 free 是对的（不占用），但下面 wx 原子写会撞 EEXIST 再走一次
+  // printLockBusy → 又拒绝启动，等于没修。所以损坏锁与残留锁共用一个清理出口，
+  // 只是给用户看的措辞分开。
+  if (st === 'stale' || corrupt) {
     try {
       rmSync(LOCK_FILE, { force: true })
     } catch {}
-    console.log('    清掉了上次残留的锁')
+    console.log(corrupt ? '    清掉了损坏的锁（没有合法 pid），继续' : '    清掉了上次残留的锁')
   }
   try {
     // wx = 原子独占创建。原来无条件覆盖写：两个进程同时读到「没锁」或都判 stale 时，
@@ -308,10 +322,21 @@ function run(cmd, args, opts = {}) {
     maxBuffer: 64 * 1024 * 1024,
     ...(opts.fd == null ? {} : { stdio: ['ignore', opts.fd, opts.fd] }),
   })
+  // 0.4.15 件一：spawnSync 超时返回 status=null / signal=SIGTERM / error.code=ETIMEDOUT，
+  //   而 stdout/stderr 全空 —— 若不在这一层把超时写进 err，调用方只会看到「下载失败」三个字。
+  //   在 run() 统一补：runLogged 走同一函数，fd 模式下 r.stderr 为空但 r.error 仍在，照样带上。
+  let err = r.stderr ? String(r.stderr).trim() : ''
+  if (r.error && r.error.code === 'ETIMEDOUT') {
+    const msg = `命令超时（${opts.timeout ?? 0} ms，进程已被终止）`
+    err = err ? `${err}\n${msg}` : msg
+  } else if (r.error) {
+    const msg = `命令启动/执行失败（${r.error.code || r.error.message}）`
+    err = err ? `${err}\n${msg}` : msg
+  }
   return {
     code: r.status === null ? -1 : r.status,
     out: r.stdout ? String(r.stdout).trim() : '',
-    err: r.stderr ? String(r.stderr).trim() : '',
+    err,
     error: r.error,
   }
 }
@@ -340,6 +365,10 @@ function runLogged(cmd, args, opts = {}) {
   try { r = run(cmd, args, { ...opts, fd }) } finally { closeSync(fd) }
   return { ...r, outLog: readOutLogFrom(offset) }
 }
+// 0.4.15 件一：老夹具（deps-guards-probe.mjs / c176-probe.mjs）抠出本文件函数真跑时只桩了 run、
+//   没桩 runLogged。把真执行器挂到 globalThis，供新Venv/ensureModel 在沙箱里取回；
+//   真机与沙箱拿到的是同一个 runLogged 实现，不是另一份替身。
+globalThis.__dshRunLogged = runLogged
 /** 外部命令的全部命中路径。Windows 的 where 会返回多行（PATH 里每个命中一行），POSIX 的 which 一般一行。 */
 function whichAll(cmd) {
   const probe = IS_WIN ? 'where' : 'which'
@@ -377,6 +406,14 @@ function formatProxy(raw) {
   }
   if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) s = `http://${s}`
   return s.replace(/\/+$/, '')
+}
+// 诊断显示与写盘文本不保留代理 URL 的 userinfo（user:password@），只留 scheme 与主机端口；
+// 真实下载请求仍使用未剥的代理值，两者互不影响。
+function redactProxyUserinfo(raw) {
+  const s = String(raw || '')
+  const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/?#]*@)?([^/?#]*)([/?#].*)?$/)
+  if (!m || !m[2]) return s
+  return `${m[1]}***@${m[3]}${m[4] || ''}`
 }
 function wininetProxy() {
   if (!IS_WIN) return ''
@@ -416,6 +453,9 @@ try {
   console.error(`✗ ${e.message}`)
   process.exit(2)
 }
+// PROXY 是真实请求用的原值；PROXY_SAFE 只给诊断显示与写盘文本用。两路分离：
+//   env / curl --proxy / pip --proxy 一律继续用 PROXY，脱敏绝不改到请求本身。
+const PROXY_SAFE = PROXY ? redactProxyUserinfo(PROXY) : ''
 // pip / huggingface_hub / uv 只认这些环境变量；curl 认 http_proxy，但我们另外显式传 --proxy，双保险
 if (PROXY) {
   for (const n of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) process.env[n] = PROXY
@@ -424,13 +464,13 @@ if (PROXY) {
     process.env.no_proxy = 'localhost,127.0.0.1,::1'
   }
 }
-if (PROXY) console.log(`    代理：${PROXY}（curl/pip 显式 --proxy；huggingface_hub 走 HTTP(S)_PROXY）`)
+if (PROXY) console.log(`    代理：${PROXY_SAFE}（curl/pip 显式 --proxy；huggingface_hub 走 HTTP(S)_PROXY）`)
 else if (NO_PROXY) console.log('    代理：--no-proxy，强制直连')
 else console.log('    代理：未探测到（直连）')
 
 log(`==== fetch-deps 开始：Target=${TARGET} Mirror=${MIRROR} DryRun=${DRY}`)
 log(`依赖目录：${DEPS}`)
-log(`代理：${PROXY || '未配置（直连）'}`)
+log(`代理：${PROXY_SAFE || '未配置（直连）'}`)
 
 // ── 镜像（C-01 / C-02，2026-10-29）──────────────────────────────
 let USE_CN = MIRROR === 'cn' || (MIRROR === 'auto' && process.env.BILI_WATCH_MIRROR === 'cn')
@@ -514,11 +554,11 @@ function writePartState(v) {
 function download(url, out, label, depId = '') {
   const tmp = `${out}.part`
   if (DRY) {
-    const px = PROXY ? ` --proxy "${PROXY}"` : ''
+    const px = PROXY ? ` --proxy "${PROXY_SAFE}"` : ''
     console.log(`    [dry-run] curl -L --fail --proto =https --proto-redir =https${px} -C - -o "${tmp}" "${url}"`)
     return
   }
-  const via = PROXY ? `代理 ${PROXY}` : '直连'
+  const via = PROXY ? `代理 ${PROXY_SAFE}` : '直连'
   log(`下载 ${label}（${via}）：${url}`)
   // 状态文件在 curl 起来之前写：面板 8 秒一轮，写晚了第一轮就看不到这一项。
   //   dep 为空串表示「这一项没有可挂的行」，面板不会去猜。
@@ -527,18 +567,18 @@ function download(url, out, label, depId = '') {
   let r
   if (existsSync(tmp)) {
     console.log(`    发现上次没下完的 .part（${mb(statSync(tmp).size)}），续传 ${label} ...`)
-    r = run(curl, [...curlBase(), '-C', '-', '-o', tmp, url], { timeout: 0 })
+    r = runLogged(curl, [...curlBase(), '-C', '-', '-o', tmp, url], { timeout: 0 })
     if (r.code !== 0) {
       console.log('    续传失败（服务器可能不支持 Range），删掉从头重下')
       log(`续传失败（curl 退出码 ${r.code}），删掉 .part 从头重下 ${label}`)
       try {
         rmSync(tmp, { force: true })
       } catch {}
-      r = run(curl, [...curlBase(), '-o', tmp, url], { timeout: 0 })
+      r = runLogged(curl, [...curlBase(), '-o', tmp, url], { timeout: 0 })
     }
   } else {
     console.log(`    下载 ${label} ...`)
-    r = run(curl, [...curlBase(), '-o', tmp, url], { timeout: 0 })
+    r = runLogged(curl, [...curlBase(), '-o', tmp, url], { timeout: 0 })
   }
   if (r.code !== 0 || !existsSync(tmp)) {
     try {
@@ -609,7 +649,7 @@ function ensureFfmpeg() {
   } catch {}
   mkdirSync(tmpDir, { recursive: true })
   // Windows 10 1803+ 自带 bsdtar，能解 zip；不额外引第三方解压库（这个包只该有 qrcode 一个依赖）
-  const t = run(tarBin(), ['-xf', zip, '-C', tmpDir])
+  const t = runLogged(tarBin(), ['-xf', zip, '-C', tmpDir])
   if (t.code !== 0) throw new Error(`解压 ffmpeg.zip 失败：${t.err || t.code}（需要系统自带 tar，Win10 1803+ 有）`)
   const found = findFirst(tmpDir, 'ffmpeg.exe')
   if (!found) throw new Error('解压后没找到 ffmpeg.exe')
@@ -723,7 +763,7 @@ function ensureFfmpegLinux(exe, probe) {
     } catch {}
     throw new Error('ffmpeg 未安装（归档结构不对）')
   }
-  const x = run(tarBin(), ['-xJf', tgz, '-C', tmp])
+  const x = runLogged(tarBin(), ['-xJf', tgz, '-C', tmp])
   if (x.code !== 0) {
     try {
       rmSync(tmp, { recursive: true, force: true })
@@ -964,11 +1004,14 @@ function bootstrapPip(py) {
 
 /** 建 venv 并返回里面的 python；uv 失败自动回退系统 Python。 */
 function newVenv(venv) {
+  // 夹具沙箱只桩 run、没桩 runLogged；从 globalThis 取回真执行器（真机）或退化到 run（沙箱），
+  //   这样调用点字面仍是 runLogged，判据仍验「真用 plan.exe」。
+  const runLogged = globalThis.__dshRunLogged || run
   const plan = pyPlan()
   if (plan.mode === 'uv') {
     console.log(`    建 venv：uv venv --python ${plan.version} "${venv}"`)
     log(`uv venv --python ${plan.version} ${venv}`)
-    const r = run(plan.uv, ['venv', '--python', plan.version, venv], { timeout: 0 })
+    const r = runLogged(plan.uv, ['venv', '--python', plan.version, venv], { timeout: 0 })
     const py = venvPy(venv)
     if (r.code === 0 && existsSync(py)) return py
     console.log(`    ! uv 建 venv 失败（退出码 ${r.code}），回退系统 Python`)
@@ -983,7 +1026,7 @@ function newVenv(venv) {
   const sys = plan.exe || systemPython()
   console.log(`    建 venv："${sys}" -m venv "${venv}"`)
   log(`python -m venv ${venv}（${sys}）`)
-  let r = run(sys, ['-m', 'venv', venv], { timeout: 0 })
+  let r = runLogged(sys, ['-m', 'venv', venv], { timeout: 0 })
   if (r.code !== 0) {
     // issue #6 坑 3：没有 ensurepip 的发行版走 --without-pip + get-pip 引导
     try {
@@ -991,7 +1034,7 @@ function newVenv(venv) {
     } catch {}
     console.log('    python -m venv 失败，改用 --without-pip + get-pip 引导')
     if (r.err) console.log(r.err.split(/\r?\n/).slice(-3).map((l) => `    ${l}`).join('\n'))
-    r = run(sys, ['-m', 'venv', '--without-pip', venv], { timeout: 0 })
+    r = runLogged(sys, ['-m', 'venv', '--without-pip', venv], { timeout: 0 })
     if (r.code !== 0) {
       try {
         rmSync(venv, { recursive: true, force: true })
@@ -1198,9 +1241,14 @@ function ensureOcr() {
 
 // ── 模型 ───────────────────────────────────────────────────────
 function ensureModel() {
+  // 夹具沙箱只桩 run、没桩 runLogged；从 globalThis 取回真执行器（真机）或退化到 run（沙箱），
+  //   C176 仍能靠 RUN 日志验 --force 与干跑。
+  const runLogged = globalThis.__dshRunLogged || run
   const asrPy = venvPy(join(DEPS, '.venv-asr'))
   const hfHome = join(DEPS, '.hf-home')
-  if (existsSync(join(hfHome, 'hub')) && !FORCE) return skip(IS_WIN ? 'deps\\.hf-home' : 'deps/.hf-home')
+  // 0.4.15 T3：目录在 ≠ 快照完整。inspectModelHomes 的五态里只有 complete 才算装好，
+  //   partial / unreadable / empty / missing 都必须继续下载（缺件交给 snapshot_download 补齐）。
+  if (!FORCE && inspectModelHomes([hfHome]).state === 'complete') return skip(IS_WIN ? 'deps\\.hf-home' : 'deps/.hf-home')
   if (!DRY && !existsSync(asrPy)) throw new Error('模型要用 ASR 环境里的 huggingface_hub。先跑 asr。')
   // --force 时若留着体积不足的 model.bin，snapshot_download 见到已有文件可能直接跳过，
   // 于是「强制重下」什么也没修。先删掉那一份快照目录；下载逻辑本身不动。
@@ -1224,11 +1272,19 @@ function ensureModel() {
   }
   const env = { ...process.env, HF_HOME: hfHome, HF_HUB_DISABLE_XET: '1' }
   if (!env.HF_ENDPOINT) env.HF_ENDPOINT = HF_ENDPOINT
-  log(`下载模型 Systran/faster-whisper-small（${PROXY ? `代理 ${PROXY}` : '直连'}，HF_ENDPOINT=${env.HF_ENDPOINT}，HF_HOME=${hfHome}）`)
-  const r = run(asrPy, ['-c', "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"], { env, timeout: 0 })
+  log(`下载模型 Systran/faster-whisper-small（${PROXY ? `代理 ${PROXY_SAFE}` : '直连'}，HF_ENDPOINT=${env.HF_ENDPOINT}，HF_HOME=${hfHome}）`)
+  // 0.4.15 件一：模型下载是全过程最长的一步（真值 483,546,902 B，见 lib/model-integrity.mjs），
+  //   原来 timeout:0 = 无上限，镜像挂起时进程无限期卡住、面板永远「下载中」。给 20 分钟上限：
+  //   最慢可用链路按 512 KB/s 算，483,546,902 B / 524288 ≈ 922 s ≈ 15.4 min，再留约 1.3 倍余量。
+  const r = runLogged(asrPy, ['-c', "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"], { env, timeout: 1_200_000 })
   if (r.code !== 0) {
-    log(`模型下载失败（退出码 ${r.code}）：${env.HF_ENDPOINT}`)
-    throw new Error(`模型下载失败${r.err ? `：${r.err.split(/\r?\n/).slice(-3).join(' / ')}` : ''}`)
+    // 0.4.15 件一：runLogged 之后 huggingface_hub 的 stderr 直接进 fd、r.err 为空；
+    //   真因（HfHubHTTPError: 500 … / run() 补的超时行）在本次 outLog 增量里。
+    //   末 12 行与 pip 失败路径同口径 —— Python traceback 的真因在最后几行，原来只取 3 行太窄。
+    const raw = [r.outLog || '', r.err || ''].filter(Boolean).join('\n')
+    const tail = raw.split(/\r?\n/).map((s) => s.trimEnd()).filter((s) => s.trim()).slice(-12)
+    log(`模型下载失败（退出码 ${r.code}，HF_ENDPOINT=${env.HF_ENDPOINT}）：${tail.slice(-3).join(' / ')}`)
+    throw new Error(`模型下载失败（rc=${r.code}，输出末 ${tail.length} 行）：${tail.length ? tail.join(' / ') : '命令没打出任何输出（进程可能被系统杀掉）'}`)
   }
   console.log(`    ✓ ${hfHome}`)
 }

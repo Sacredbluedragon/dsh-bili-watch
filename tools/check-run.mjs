@@ -55,7 +55,7 @@ function safeMsg(e) {
   return '<抛出物无法转成字符串>'
 }
 
-export function makeChecker(results, select = null) {
+export function makeChecker(results, select = null, dryRun = false) {
   if (!Array.isArray(results)) throw new TypeError('makeChecker 需要一个结果数组')
   if (select !== null && typeof select !== 'function') throw new TypeError('makeChecker 的 select 必须是函数或 null')
 
@@ -64,6 +64,10 @@ export function makeChecker(results, select = null) {
     // 那既没省上下文也没省时间，还让「只跑了 N 条」变成一句谎话。
     if (select && !select(name)) return
     const before = results.length
+    // 轻量探针模式（C416 用）：select 照常判定跳过、累计数与提示行走真逻辑，
+    //   但不执行判据体 —— 秒级返回，专供"从输出反推跳过决策"的判据取证。
+    //   默认 false，C77 等喂桩调用不传第三参，行为一字不变。
+    if (dryRun) { results.push({ name, ok: true, detail: '(dry probe)' }); return }
     try {
       const detail = fn()
       // 本验证器是同步的：async 回调返回的 Promise 不会被 await，也就不会抛到下面的 catch 里——
@@ -306,4 +310,26 @@ export function makeSlowChecker(check, register) {
 export function fastNoticeLine(skipped, ran, active) {
   if (!active) return null
   return `[--fast] 本次跳过 ${skipped} 条含子进程判据，其余 ${ran} 条已跑`
+}
+
+/**
+ * 元判据自检（TIMING_PRODUCERS）跳过提示。只要默认路径跳过数 > 0 就出这行，
+ * 让「这次没跑 C313/C314/C316」对读输出的人可见，不留沉默的雷。
+ * 与 fastNoticeLine 是两条独立提示：同时带 --fast 时两行都出、互不吞。
+ * 前缀特意不用 [--fast]/[--only]，免得撞 C277「默认路径无分档提示」的判据。
+ */
+export function selfNoticeLine(skipped, ids = TIMING_PRODUCERS) {
+  if (!skipped) return null
+  return `[元判据] 本次跳过 ${skipped} 条验证器自检（${ids.join('/')}，默认全量闸不跑；发版前由 release.ps1 单独跑）`
+}
+
+/**
+ * --only 里是否点名了元判据（TIMING_PRODUCERS）。判法与 matchOnly 同源：
+ *   spec 以 '=' 开头则精确相等，否则 id === spec 或 id.startsWith(spec)（前缀命中）。
+ * 点中任何一条 → 三条都不跳（人点名要跑就得跑）。默认路径 specs=null → 不点名 → 跳。
+ * 抽成纯函数是为了让判据真求值喂桩数据，不读 verify.mjs 源码文本猜。
+ */
+export function hasTimingProducerSpec(specs, timingProducers = TIMING_PRODUCERS) {
+  if (specs === null) return false
+  return specs.some((s) => timingProducers.some((id) => matchOnly(id, [s])))
 }

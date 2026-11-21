@@ -3,8 +3,8 @@
  *
  * 只吐一行 JSON、永远 exit 0，判定全在 tools/verify.mjs 的 C183 里做。
  * 两侧都抠**原样函数体**在 VM 里跑，不是复刻实现：
- *   · 宿主侧：index.js 的 depsLockVerdict + downloadLockBusy（注入真 classifyLock / 真常量）
- *   · CLI 侧：scripts/fetch-deps.mjs 的 lockState（不注入 alive，用真 process.kill）
+ *   · 宿主侧：lib/deps-lock.mjs 的真 depsLockVerdict 注入 VM + index.js 的 downloadLockBusy 原样函数体
+ *   · CLI 侧：scripts/fetch-deps.mjs 的 lockState（注入真 depsLockVerdict，探活仍走真 process.kill）
  * 五种锁：活锁 / 8 小时前的活锁 / 坏 JSON / 没锁 / 死 pid。
  * 改坏方式：downloadLockBusy 改回只判 pid 存活 → 8h 那条两边不一致；
  *   depsLockVerdict 恒 stale → 活锁被统一放行（D2「该活时活」红）。
@@ -13,8 +13,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { classifyLock } from '../../lib/locks.mjs'
-import { DEPS_LOCK_STALE_MS } from '../../lib/plugin-paths.mjs'
+import { depsLockVerdict } from '../../lib/deps-lock.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..', '..')
@@ -49,10 +48,10 @@ const runVM = (code, extra = {}) => {
 }
 
 try {
-  const verdictFn = sliceFn(idx, 'function depsLockVerdict(cur) {')
   const busyFn = sliceFn(idx, 'function downloadLockBusy() {')
   const acquireBody = sliceFn(idx, 'function acquireDepsLock(dir) {')
   const lockStateFn = sliceFn(fd, 'function lockState(cur, opts = {}) {')
+  const mapFn = sliceFn(fd, 'function verdictToLockState(verdict) {')
   const lockConst = (fd.match(/const LOCK_STALE_MS = [^\n]+/) || [''])[0]
   const staleDecl = (pp.match(/export const DEPS_LOCK_STALE_MS = [^\n]+/) || [''])[0].replace(/^export /, '')
   if (!lockConst || !staleDecl) throw new Error('常量行抽不出来（单点被删了？）')
@@ -75,20 +74,20 @@ try {
       const DOWNLOAD_LOG = '/stub/download.log'
       const readFileSync = () => { if (RAW === null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e } return RAW }
       const appendFileSync = (p, s) => { LOG.push(String(s)) }
-      ${verdictFn}
       ${busyFn}
       globalThis.__busy = downloadLockBusy()
     `
-    const pc = runVM(panelCode, { classifyLock, DEPS_LOCK_STALE_MS, RAW: cse.raw, LOG: logLines })
+    const pc = runVM(panelCode, { depsLockVerdict, RAW: cse.raw, LOG: logLines })
     let cur = null
     try { cur = cse.raw === null ? null : JSON.parse(cse.raw) } catch {}
     const cliCode = `
       ${staleDecl}
       ${lockConst}
+      ${mapFn}
       ${lockStateFn}
       globalThis.__cli = lockState(CUR)
     `
-    const cc = runVM(cliCode, { CUR: cur })
+    const cc = runVM(cliCode, { CUR: cur, depsLockVerdict })
     rows.push({
       tag: cse.tag,
       panelBusy: Boolean(pc.__busy),
@@ -113,10 +112,9 @@ try {
   capability.C183_noLockStillPasses = byTag.none.panelBusy === false && byTag.none.corruptLogged === false
   capability.C183_noAtStaysLive = (() => {
     const code = `
-      ${verdictFn}
       globalThis.__v = depsLockVerdict({ pid: PID, target: 'x' })
     `
-    return runVM(code, { classifyLock, DEPS_LOCK_STALE_MS, PID: pid }).__v.state === 'live'
+    return runVM(code, { depsLockVerdict, PID: pid }).__v.state === 'live'
   })()
   capability.C183_bothCallSitesWired = /depsLockVerdict\(cur\)/.test(busyFn)
     && /depsLockVerdict\(cur\)/.test(acquireBody)

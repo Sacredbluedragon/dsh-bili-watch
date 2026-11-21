@@ -1,8 +1,8 @@
 {
-  "_comment": "C237 修前基线。由 _临时/20261109-C237/make-baseline.mjs 调 tools/fixtures/c237-scan.mjs::collectRows 现抽，口径与 check-release-leak.mjs::listTargets 一致；每行保留 相对路径 / 行号 / 原文。清理包内文案后本表是唯一原始凭证，不许改行数与文本。",
+  "_comment": "C237 修前基线。由 _临时/20261109-C237/make-baseline.mjs 调 tools/fixtures/c237-scan.mjs::collectRows 现抽，口径与 check-release-leak.mjs::listTargets 一致；每行保留 相对路径 / 行号 / 原文。清理包内文案后本表是唯一原始凭证，不许改行数与文本。2026-11-21 新增 lib/deps-lock.mjs（0.4.15 件一），本表扫描面 46→47；rows 与既有原文一字未动。",
   "generatedBy": "node _临时/20261109-C237/make-baseline.mjs",
   "sourceRoot": "dev 仓库（package.json.files 展开）",
-  "textCount": 46,
+  "textCount": 47,
   "skipped": [],
   "rows": [
     {

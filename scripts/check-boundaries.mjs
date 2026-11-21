@@ -144,7 +144,9 @@ const LEGACY_KEYS = [
   "tools/verify.mjs|} finally { rmSync(t2, { recursive: true, force: true }) }",
   "tools/verify.mjs|} finally { rmSync(tmp, { recursive: true, force: true }) }",
   "tools/verify.mjs|} finally { rmSync(tmp2, { recursive: true, force: true }) }",
-  "tools/verify.mjs|} finally { rmSync(tmpPath, { force: true }) }"
+  "tools/verify.mjs|} finally { rmSync(tmpPath, { force: true }) }",
+  "tools/verify.mjs|} finally { rmSync(dirA, { recursive: true, force: true }) }",
+  "tools/verify.mjs|} finally { rmSync(dirB, { recursive: true, force: true }) }"
 ]
 const LEGACY = EMIT ? new Set() : new Set(LEGACY_KEYS)
 
