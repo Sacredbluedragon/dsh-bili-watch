@@ -1,0 +1,8 @@
+[migrate] 已下沉 0 项到 cache/，跳过 1 项（凭证与根级文件不动）
+[ocr] BV17x411c7mD-01.jpg 识别失败：cannot identify image file D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s\BV17x411c7mD-01.jpg
+[ocr] BV17x411c7mD-02.jpg 识别失败：cannot identify image file D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s\BV17x411c7mD-02.jpg
+[ocr] BV17x411c7mD-03.jpg 识别失败：cannot identify image file D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s\BV17x411c7mD-03.jpg
+[ocr] 另有 31 张同因失败（首因：cannot identify image file D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s\BV17x411c7mD-04.jpg）
+[ocr] summary chars=0 loadFail=34 empty=0 total=34
+▶ 下一步：node tools/look.mjs frames BV17x411c7mD --p 1 --step 5 --fresh
+[bili-watch] 指引：这批图片 OCR 识别未拿到文字。帧目录 D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s 下的 34 张图片试遍都解不开（解码验证未通过），不要去读。原抽帧参数：step=5，等间隔。

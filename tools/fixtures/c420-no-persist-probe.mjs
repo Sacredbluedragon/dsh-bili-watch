@@ -92,9 +92,11 @@ try {
     extractWrittenPath: () => null,
     COMMANDS,
     TOOL_FILE_SEQ: 0,
+    NEXT_STEP_PREFIX: '▶ 下一步：',
   }
+  const stepNames = /function splitNextStep\(/.test(src) ? ['splitNextStep'] : []
   const { lookup, trimForModel, suggestFlag } = runOriginal(
-    ['lookup', 'trimForModel', 'suggestFlag'],
+    ['lookup', ...stepNames, 'trimForModel', 'suggestFlag'],
     baseOverrides,
   )
 

@@ -120,6 +120,8 @@ const server = createServer((req, res) => {
     // 2026-11-02：字幕轨（护栏判据要真跑 sub 的落盘与 wrapped 副本）。
     //   subtitle_url 直接指回本机 mock：preload 只改写四个 B 站域名，127.0.0.1 原样放行 → 正中这里。
     case 'api.bilibili.com/x/player/wbi/v2':
+      // 0.4.16 判据接缝：subtitleOff=true 时返回空字幕轨，让 text 降级链能走到 OCR / 兜底分支。
+      if (workerData.subtitleOff) return send({ code: 0, data: { subtitle: { subtitles: [] } } })
       return send({
         code: 0,
         data: { subtitle: { subtitles: [{ lan: 'zh', subtitle_url: `http://127.0.0.1:${PORT}/subtitle.json` }] } },

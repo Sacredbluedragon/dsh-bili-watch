@@ -39,7 +39,7 @@ import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
 //   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
 //   本文件里只用于扫码登录那三处（QR_GEN / QR_POLL / fillBuvids）。
-import { UA } from './lib/consts.mjs'
+import { UA, NEXT_STEP_PREFIX } from './lib/consts.mjs'
 // 2026-10-31：调优表与钳制/换算搬进 lib/tuning.mjs。
 //   原来本文件与 tools/look.mjs 各写一份 TUNING_DEFS，靠 C17 逐键比对绑在一起；
 //   现在物理上只有一份，两个入口只负责「把配置读出来」（depsCfg / readDepsCfg）。
@@ -2530,6 +2530,20 @@ function suggestFlag(unknown) {
   return bestDist <= 2 ? `未知参数 ${unknown}，你是想用 ${best} 吗` : `未知参数 ${unknown}`
 }
 
+// 0.4.16 施工二：text 失败回退时，CLI 把可原样执行的下一步单独打一行（前缀同源 consts）。
+//   宿主把这一行从诊断里摘出来、提到拼接结果最前面，保证它进模型可见的 head 窗口；
+//   只对 text 生效，其他命令的诊断顺序一字不动。其余 stderr 诊断保留原顺序。
+function splitNextStep(command, err) {
+  if (command !== 'text') return { nextStep: [], restErr: String(err || '') }
+  const nextStep = []
+  const rest = []
+  for (const line of String(err || '').split(/\r?\n/)) {
+    if (line.trim().startsWith(NEXT_STEP_PREFIX)) nextStep.push(line.trim())
+    else rest.push(line)
+  }
+  return { nextStep, restErr: rest.join('\n').trim() }
+}
+
 async function lookup({ command, bv, positionals = [], extra = [], badOut = false, unknownFlags = [], signal = null }) {
   if (badOut) return { ok: false, text: '--out 只接受工作区内的相对路径（不能用绝对路径、盘符、~ 或 ..）' }
   if (unknownFlags.length) return { ok: false, text: unknownFlags.map(suggestFlag).join('；') }
@@ -2573,8 +2587,11 @@ async function lookup({ command, bv, positionals = [], extra = [], badOut = fals
   }
   const parts = []
   if (failed) parts.push(`（${command} 失败，退出码 ${r.code ?? '?'}）`)
+  // text 失败回退：可执行下一步单独前置；其余 stderr 诊断保留原顺序，成功分支顺序不变。
+  const { nextStep, restErr } = splitNextStep(command, err)
+  if (nextStep.length) parts.push(...nextStep)
   // 失败时先给 stderr（诊断），再给 stdout（可能是半截数据）；成功时反过来（T31-3）
-  if (failed ? err : out) parts.push(failed ? err : out)
+  if (failed ? restErr : out) parts.push(failed ? restErr : out)
   if (failed && out) parts.push(out)
   if (!parts.length) {
     if (!failed && outWrittenPath) {

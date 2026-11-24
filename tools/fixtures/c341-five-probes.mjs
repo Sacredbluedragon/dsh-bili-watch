@@ -82,13 +82,15 @@ try {
       const r = spawnSync(process.execPath, ['-e', "console.log('child-failed-output'); process.exit(7)"], { encoding: 'utf8' })
       return { code: r.status, out: r.stdout || '', err: r.stderr || '', ms: 1 }
     }
-    const { lookup } = runOriginal(src, ['lookup'], {
-      runLook,
-      COMMANDS: ['text', 'clean', 'hot', 'login', 'search', 'comments'],
-      writeLastRun: () => {},
-      extractWrittenPath: () => null,
-      suggestFlag: (x) => String(x),
-    })
+  const stepNames = /function splitNextStep\(/.test(src) ? ['splitNextStep'] : []
+  const { lookup } = runOriginal(src, ['lookup', ...stepNames], {
+    runLook,
+    COMMANDS: ['text', 'clean', 'hot', 'login', 'search', 'comments'],
+    writeLastRun: () => {},
+    extractWrittenPath: () => null,
+    suggestFlag: (x) => String(x),
+    NEXT_STEP_PREFIX: '▶ 下一步：',
+  })
     const r = await lookup({ command: 'text', bv: 'BV1xx411c7mD', positionals: [], extra: [], badOut: false, unknownFlags: [], signal: null })
     out.text = String(r && r.text || '')
     out.ok = !!(r && r.ok)

@@ -109,14 +109,18 @@ function positional(list) {
   return out
 }
 const pos = positional(argv)
-const opt = (name, dflt) => {
+// 2026-11-24：取值纯函数从 opt 里抽出来，和 flagFromArgv 同款「可注入 argv」——判据要验
+//   恢复命令实收的 --step/--p，不能只在模块顶层 argv 上取值，也不许在判据里重写一份。
+//   opt 变薄包装，行为与原来逐字一致；C290 注释保持原样（布尔开关同源在 flagFromArgv）。
+function optFromArgv(list, name, dflt) {
   // 兼容 `--name value` 与 `--name=value`（后者以前会被静默忽略，退回默认值）
   //   C290：布尔开关的同源实现见下面的 flagFromArgv —— 两处都认 `=` 形态，别只修一处。
-  const eq = argv.find((a) => a.startsWith(`--${name}=`))
+  const eq = list.find((a) => a.startsWith(`--${name}=`))
   if (eq) return eq.slice(name.length + 3)
-  const i = argv.indexOf(`--${name}`)
-  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : dflt
+  const i = list.indexOf(`--${name}`)
+  return i >= 0 && list[i + 1] && !list[i + 1].startsWith('--') ? list[i + 1] : dflt
 }
+const opt = (name, dflt) => optFromArgv(argv, name, dflt)
 // C290：--dry-run=1 被静默忽略后真删，根因是 flag() 只认独立 token 而 opt() 认 `=` 形态。
 //   纯函数 flagFromArgv 可注入 argv（C292 单元判据真求值用），flag() 只是它的默认实参版本。
 //   FALSY 表与 opt 的「值形态」注释同源：--dry-run=0 应真删，--permanent=0 不应永久删。
@@ -179,4 +183,4 @@ function emitFailureJson(why) {
 
 // 统一在这里导出，而不是给上面每一行加 export：搬运的块保持与 look.mjs 原样逐字相同，
 //   diff 才能证明「一行没改」（判据：真搬运 = 新增只来自函数声明头 + 调用行 + import）。
-export { DIAG, TRACK_BUF, argv, cmd, pos, opt, flag, flagFromArgv, positional, say, warn, track, recordDiag, checkOutDir, emitFailureJson }
+export { DIAG, TRACK_BUF, argv, cmd, pos, opt, optFromArgv, flag, flagFromArgv, positional, say, warn, track, recordDiag, checkOutDir, emitFailureJson }

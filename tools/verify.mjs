@@ -55,7 +55,7 @@ import {
 } from '../lib/media.mjs'
 // 2026-10-31：cache 层（目录 / manifest / 等他人）搬进 lib/frames.mjs；
 //   抢锁放锁搬进 lib/locks.mjs 的 makeLocks。C47/C87/C88 直接 import 真跑。
-import { ensureDir, frameFilesToKeep, framesDirName, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest, makeMetaFields, mergeLedger, ledgerFilesOf } from '../lib/frames.mjs'
+import { ensureDir, frameFilesToKeep, framesDir, framesDirName, framesRoot, listJpgs, readManifest, shotsDirName, waitManifest, writeManifest, makeMetaFields, mergeLedger, ledgerFilesOf } from '../lib/frames.mjs'
 import { makeLocks } from '../lib/locks.mjs'
 // C413（0.4.15 T3）：体积下限单点取 lib，不在判据里再抄一份 400 MB 字面量（C176 守）。
 import { MODEL_MIN_BYTES } from '../lib/model-integrity.mjs'
@@ -68,7 +68,10 @@ import { defaultCacheRoot } from '../lib/cache-path.mjs'
 import { cacheNotice } from '../lib/text-notice.mjs'
 import { extractWrittenPath } from '../lib/written-path.mjs'
 // 0.4.15 外审修单件一：.tool.txt 正凭证正则单点在 lib/consts.mjs，C421 直接 import 真跑正反例。
-import { PROVEN_TOOL_TXT_RE } from '../lib/consts.mjs'
+import { PROVEN_TOOL_TXT_RE, NEXT_STEP_PREFIX } from '../lib/consts.mjs'
+// 2026-11-24 B-1/B-2：失败出口指令行从「查子串」升级为「真解析」——直接引 CLI 的同源 flagFromArgv，
+//   判据里不重写一份，否则验的就不是产品实收的 argv。
+import { flagFromArgv, optFromArgv } from './cli-io.mjs'
 // 2026-11-01（P0-3）：must 也跟着 makeChecker 搬进 check-run.mjs。
 //   它是 700 多处断言的失败信号，却原来只是本文件的局部常量——外面碰不到，也就没有一条断言验过它。
 //   C77 现在 import 同一个绑定，直接喂 false 验「必须抛」。**别在这里再写一份**（那就又成了「验的不是用的」）。
@@ -6665,6 +6668,13 @@ let mockInjectWhy = ''
 try {
   mockInject = await startMockBili({ commentText: INJECT_COMMENT, subtitleText: INJECT_SUBTITLE })
 } catch (e) { mockInjectWhy = String(e?.message ?? e) }
+// 第三个 mock：空字幕轨（0.4.16 判据接缝）。text 降级链要走到 OCR / 兜底分支，
+//   夹具必须返回无字幕轨；与上面两个实例同口径，生产侧不加任何开关。
+let mockOff = null
+let mockOffWhy = ''
+try {
+  mockOff = await startMockBili({ subtitleOff: true })
+} catch (e) { mockOffWhy = String(e?.message ?? e) }
 // 本机 ffmpeg 的判据与 look.mjs 同一套：BILI_WATCH_FFMPEG（用户配置）→ PATH 里的 ffmpeg
 const FF_BIN = (() => { try { return findFfmpeg(process.env.BILI_WATCH_FFMPEG || '') } catch { return null } })()
 // 合法缓存根 = 空目录 + 标记文件（否则 pickCacheDir 会退到子目录，见上面那段注释）
@@ -6683,6 +6693,33 @@ const mockEnvOn = (m, over = {}) => {
 const mockEnv = (over = {}) => mockEnvOn(mockBili, over)
 const runLookMock = (args, env) =>
   spawnSync(process.execPath, ['--import', MOCK_PRELOAD, LOOK_MJS, ...args], { env, encoding: 'utf8', timeout: 180000 })
+// 0.4.16 判据夹具：全坏现场缓存（3 张 0 字节 jpg + 完整 manifest，grabFrames 缓存命中不重下视频）。
+const c425BadCache = () => {
+  const cache = mockCache('c425')
+  const dir = framesDir(cache, framesDirName(MOCK_BV, 1, '5s'))
+  mkdirSync(dir, { recursive: true })
+  const files = [`${MOCK_BV}-01.jpg`, `${MOCK_BV}-02.jpg`, `${MOCK_BV}-03.jpg`]
+  for (const f of files) writeFileSync(join(dir, f), '')
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ok: true, bv: MOCK_BV, p: 1, step: 5, scene: false, sceneTh: null,
+    frames: files.length, files, times: null, at: new Date().toISOString(),
+  }))
+  return { cache, dir }
+}
+// 本机 OCR venv / ffmpeg 探测：找不到 OCR venv 返回 null（判据按 skip 处理，机器无关；
+//   不在判据里硬绑生产 deps 路径）。ffmpeg 单独找，缺了不 skip（走「缺 ffmpeg」陈述分支即可）。
+const c425OcrDeps = () => {
+  const win = hostPlatform() === 'win32'
+  const cands = [process.env.BILI_WATCH_DEPS, join(ROOT, 'deps'), 'D:\\DeepSeek-Harness\\.dsh\\bili-watch\\deps'].filter(Boolean)
+  for (const d of cands) {
+    const py = join(d, '.venv-ocr', win ? 'Scripts' : 'bin', win ? 'python.exe' : 'python3')
+    if (existsSync(py)) {
+      const ff = join(d, win ? 'ffmpeg.exe' : 'ffmpeg')
+      return { deps: d, ffmpeg: existsSync(ff) ? ff : '' }
+    }
+  }
+  return null
+}
 // 影子插件目录（2026-11-01）：让 look.mjs 在一个「deps 是空的」的插件根下跑。
 //
 // 为什么需要它：C111 要验「没凭证时 login --check 必须 rc≠0」。但凭证的**旧位置**
@@ -15218,6 +15255,472 @@ check('C424【主判据】面板顶部一键失败提示与单项行失败文案
   must(failRecordText(null) === '' && failRecordText({}) === '', 'C424 空失败记录应返回空串')
   must(allFailBanner(null) === '' && allFailBanner({}) === '', 'C424 没有 allFail 时顶部提示应为空串')
   return `顶部提示：${JSON.stringify(banner)}；单项行文案：${JSON.stringify(failRecordText(ffRec))}`
+})
+
+// ── 0.4.16 四条缺陷回归判据（C425–C429）─────────────────────────────────────
+// 全坏现场夹具：3 张 0 字节 jpg + 完整 manifest，grabFrames 缓存命中、不重下视频；
+//   OCR 在 PIL 解码阶段就失败，不触 ONNX 推理，结果在退化环境里也确定。
+// C425：全坏 text --fast --format json —— rc=1、source≠ocr、不把空分节当正文。
+check('C425【主判据】全坏现场 text --fast --format json：rc=1、source≠ocr、空分节不当正文', () => {
+  const NAME = 'C425 全坏 JSON 出口'
+  if (!needMock(NAME)) return
+  const deps = c425OcrDeps()
+  if (!deps) { skip(NAME, '本机无 OCR venv，全坏 OCR 现场真跑做不了') ; return }
+  const { cache } = c425BadCache()
+  const home = mkdtempSync(join(tmpdir(), 'bw-c425-home-'))
+  try {
+    mockOff && mockOff.clearHits()
+    const over = { BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: deps.deps }
+    if (deps.ffmpeg) over.BILI_WATCH_FFMPEG = deps.ffmpeg
+    const r = runLookMock(['text', MOCK_BV, '--fast', '--step', '5', '--format', 'json'], mockEnvOn(mockOff, over))
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    must(r.status === 1, `全坏现场退出码应是 1（旧版假成功 rc=0）：rc=${r.status}；err=${tail(err)}`)
+    let j = null
+    try { j = JSON.parse(out) } catch {}
+    must(j, `stdout 不是 JSON：${tail(out)}`)
+    must(j.source !== 'ocr', `全坏却报 source=ocr：${JSON.stringify(j.source)}`)
+    must(j.ok === false && j.reason === 'no-subtitle-no-asr-no-ocr', `失败态字段不对：${JSON.stringify(j)}`)
+    must(!j.text, '全坏正文不应带 OCR 空分节正文')
+    must(j.note && /没有一张能解码|尚未解码验证|解码验证未通过|试遍都解不开/.test(j.note), `note 没按实陈述全坏：${tail(out)}`)
+    // P2-4（门型区分度）：静态守卫——全坏门的文本出口必须按真实识别行 hasRealLines，
+    //   不能退回 rOcr.ok&&rOcr.chars>0（那种写法下正数汇总空分节会被当成功，本判据失去区分度）。
+    const lookSrc = read('tools/look.mjs')
+    const sg = lookSrc.slice(lookSrc.indexOf('async function cmdText('), lookSrc.indexOf('// ④ 兜底')).replace(/\s+/g, '')
+    must(sg.includes('rOcr.ok&&hasRealLines'), 'C425 全坏门静态守卫：cmdText 未按 rOcr.ok&&hasRealLines 判成功（门型无区分度）')
+    must(!sg.includes('rOcr.ok&&rOcr.chars>0'), 'C425 全坏门静态守卫：cmdText 退回 rOcr.ok&&rOcr.chars>0（空分节当成功）')
+    return `rc=1；source=${j.source}；reason=${j.reason}；note 按实陈述全坏`
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// C426：全坏恢复命令带齐 BV / 分 P / step / --fresh，原抽帧参数不丢（照抄才不会复用坏图）。
+check('C426【主判据】全坏恢复命令带齐 BV/分P/step/--fresh，不丢原抽帧参数', () => {
+  const NAME = 'C426 恢复命令带参'
+  if (!needMock(NAME)) return
+  const deps = c425OcrDeps()
+  if (!deps) { skip(NAME, '本机无 OCR venv，恢复命令现场真跑做不了') ; return }
+  const { cache } = c425BadCache()
+  const home = mkdtempSync(join(tmpdir(), 'bw-c426-home-'))
+  try {
+    mockOff && mockOff.clearHits()
+    const over = { BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: deps.deps }
+    if (deps.ffmpeg) over.BILI_WATCH_FFMPEG = deps.ffmpeg
+    const r = runLookMock(['text', MOCK_BV, '--fast', '--step', '5', '--format', 'json'], mockEnvOn(mockOff, over))
+    const out = String(r.stdout || '')
+    let j = null
+    try { j = JSON.parse(out) } catch {}
+    must(j && (j.note || j.nextStep), `没拿到兜底 note/nextStep：${tail(out)}`)
+    const note = j.note || ''
+    const step = j.nextStep || ''
+    must(step.includes(MOCK_BV), '恢复命令没带目标 BV')
+    must(/--p\s+1/.test(step), '恢复命令没带分 P')
+    must(/--step\s+5/.test(step), '恢复命令没带原 step')
+    must(step.includes('--fresh'), '恢复命令丢了 --fresh（照抄会复用坏图）')
+    must(new RegExp(`frames\\s+${MOCK_BV}\\s+--p\\s+1\\s+--step\\s+5\\s+--fresh`).test(step),
+      `恢复命令串不完整：${step}`)
+    return `恢复命令：${(step.match(/node tools\/look\.mjs frames[^\n]*/) || [''])[0]}`
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// C427：纯文本出口盲区——emitText 对 text 返回 false 时，note 必须直写 stderr，且排在「转入抽帧」之前。
+check('C427【主判据】纯文本出口 note 可见：指引直写 stderr 且在「转入抽帧」之前', () => {
+  const NAME = 'C427 纯文本出口指引'
+  if (!needMock(NAME)) return
+  const deps = c425OcrDeps()
+  if (!deps) { skip(NAME, '本机无 OCR venv，纯文本出口现场真跑做不了') ; return }
+  const { cache } = c425BadCache()
+  const home = mkdtempSync(join(tmpdir(), 'bw-c427-home-'))
+  try {
+    mockOff && mockOff.clearHits()
+    const over = { BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: deps.deps }
+    if (deps.ffmpeg) over.BILI_WATCH_FFMPEG = deps.ffmpeg
+    const r = runLookMock(['text', MOCK_BV, '--fast', '--step', '5', '--quiet'], mockEnvOn(mockOff, over))
+    const err = String(r.stderr || '')
+    must(r.status === 1, `纯文本全坏退出码应是 1：rc=${r.status}；err=${tail(err)}`)
+    must(/\[bili-watch\] 指引：/.test(err), `纯文本出口 note 没直写 stderr（被 emitText 盲区丢掉）：${tail(err)}`)
+    const iNote = err.indexOf('[bili-watch] 指引：')
+    const iTrack = err.indexOf('转入抽帧')
+    must(iNote >= 0 && (iTrack < 0 || iNote < iTrack), `指引没排在转入抽帧之前：${tail(err)}`)
+    return '指引直写 stderr，且在「转入抽帧」track 行之前'
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// C428：无 OCR 有缓存按实陈述——existingFramesOnDisk 优先一致性批次，一致性判据纳入 step/scene，
+//   找不到可解码帧不谎称已验证。编译链真跑（函数体抠进隔离 Function，桩目录/清单/验帧原语）。
+check('C428【主判据】existingFramesOnDisk 优先 step/scene 一致批次，按实给张数与解码状态', () => {
+  const src = read('tools/look.mjs')
+  const root = '/probe-c428'
+  const dirNames = ['BV1mock00001-p1-5s', 'BV1mock00001-p1-10s']
+  const jpgs = {
+    'BV1mock00001-p1-5s': ['BV1mock00001-01.jpg', 'BV1mock00001-02.jpg'],
+    'BV1mock00001-p1-10s': ['BV1mock00001-01.jpg', 'BV1mock00001-02.jpg', 'BV1mock00001-03.jpg', 'BV1mock00001-04.jpg', 'BV1mock00001-05.jpg'],
+  }
+  const manifest = {
+    'BV1mock00001-p1-5s': { step: 5, scene: false },
+    'BV1mock00001-p1-10s': { step: 10, scene: false },
+  }
+  const prelude = `
+    const root = ${JSON.stringify(root)}
+    const dirNames = ${JSON.stringify(dirNames)}
+    const jpgs = ${JSON.stringify(jpgs)}
+    const manifest = ${JSON.stringify(manifest)}
+    const join = (a, b) => a + '/' + b
+    const base = (p) => String(p).split('/').pop()
+    const existsSync = () => true
+    const readdirSync = () => dirNames
+    const listJpgs = (d) => jpgs[base(d)] || []
+    const readManifest = (d) => manifest[base(d)] || null
+    const findReadableFrame = (d, ff) => ({ total: (jpgs[base(d)] || []).length, verified: ff ? (jpgs[base(d)] || [])[0] || null : null, ffmpegMissing: !ff })
+    const framesRoot = (c) => c
+    const cacheDir = () => root
+  `
+  const { existingFramesOnDisk } = compile(src, ['existingFramesOnDisk'], { prelude })
+  // ① 一致批次（5s，2 张）排在张数更多的不一致批次（10s，5 张）前面，且验出第一张可读。
+  const hit = existingFramesOnDisk(MOCK_BV, 1, { step: 5, scene: false }, 'ffmpeg')
+  must(hit.dir.endsWith('BV1mock00001-p1-5s'), `没选一致批次：${hit.dir}`)
+  must(hit.consistent === true, '一致批次未标 consistent=true')
+  must(hit.count === 2, `张数取自清单而非张数排序：${hit.count}`)
+  must(hit.verified === 'BV1mock00001-01.jpg', `已验证帧路径不对：${hit.verified}`)
+  // ② 只有不一致批次时：consistent=false，不谎称一致；缺 ffmpeg 时 verified=null。
+  const prelude2 = prelude.replace(JSON.stringify(dirNames), JSON.stringify(dirNames.slice(1)))
+  const compile2 = compile(src, ['existingFramesOnDisk'], { prelude: prelude2 })
+  const miss = compile2.existingFramesOnDisk(MOCK_BV, 1, { step: 5, scene: false }, '')
+  must(miss.dir.endsWith('BV1mock00001-p1-10s'), `不一致批次目录不对：${miss.dir}`)
+  must(miss.consistent === false, '不一致批次被标成 consistent=true')
+  must(miss.verified === null && miss.ffmpegMissing === true, `缺 ffmpeg 时未按实陈述：${JSON.stringify(miss)}`)
+  return '一致批次优先；张数/已验证帧取自清单与真解帧；缺 ffmpeg 不谎称已验证'
+})
+
+// C429：runOcr 汇总权威门源码哨兵——字数唯一权威源是 ocr.py stderr 汇总行；反推只作交叉校验；
+//   汇总取不到时显式 null（既不当 0 也不当成功）；不一致必须报出来。CLI 半边由 C425 真跑覆盖。
+check('C429【主判据】runOcr 以 stderr 汇总为字数权威源，取不到显式 null，反推不一致须报错', () => {
+  const src = read('tools/look.mjs')
+  const body = fnBody(src, 'runOcr')
+  must(body.includes('summary chars=') && body.includes('loadFail=') && body.includes('empty=') && body.includes('total='),
+    'runOcr 没从 stderr 汇总行解析 chars/loadFail/empty/total（权威源丢了）')
+  must(/summaryMismatch/.test(body), '反推与汇总不一致时没有 summaryMismatch 报错分支')
+  must(/chars = null/.test(body), '汇总取不到时 chars 未置 null（会被当成 0 或成功）')
+  const textSrc = read('tools/look.mjs')
+  const gate = textSrc.slice(textSrc.indexOf('async function cmdText('), textSrc.indexOf('// ④ 兜底'))
+  // P1-2 抗空格扰动：剥掉所有空白后比 token 序列，不能靠改空格/别名绕过。
+  const sg = gate.replace(/\s+/g, '')
+  must(sg.includes('rOcr.ok&&hasRealLines'), 'text 主门未按 rOcr.ok&&hasRealLines 判成功（结构判，非空格正则）')
+  must(sg.includes('hasRealLines=rOcr.text.trim()!==\'\'&&(rOcr.inferred??0)>0') ||
+       /hasRealLines=[^;]*rOcr\.inferred/.test(sg), 'hasRealLines 未用 rOcr.inferred 真实识别行定义')
+  must(!sg.includes('rOcr.ok&&rOcr.chars>0'), 'text 主门仍按汇总 rOcr.ok&&rOcr.chars>0 判成功（剥空白后仍命中，正数汇总无识别行会被当成功）')
+  must(sg.includes('rOcr.chars===null'), 'chars=null（无法确认）没有单独的 unknown 分支')
+  return '汇总行为权威源；null 既不当 0 也不当成功；交叉校验不一致必须报错；主门按真实识别行判'
+})
+
+// C430：text 失败纯文本出口把可执行下一步单独成行（前缀与宿主同源 consts），与叙述性指引分开；
+//   指令行排在指引行之前，命令带齐 BV/分P/step/--fresh。
+check('C430【主判据】纯文本失败出口：可执行下一步单独成行并排在叙述指引之前', () => {
+  const NAME = 'C430 指令行单独成行'
+  if (!needMock(NAME)) return
+  const deps = c425OcrDeps()
+  if (!deps) { skip(NAME, '本机无 OCR venv，纯文本失败现场真跑做不了') ; return }
+  const { cache } = c425BadCache()
+  const home = mkdtempSync(join(tmpdir(), 'bw-c430-home-'))
+  try {
+    mockOff && mockOff.clearHits()
+    const over = { BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: deps.deps }
+    if (deps.ffmpeg) over.BILI_WATCH_FFMPEG = deps.ffmpeg
+    const r = runLookMock(['text', MOCK_BV, '--fast', '--step', '5', '--quiet'], mockEnvOn(mockOff, over))
+    const err = String(r.stderr || '')
+    must(r.status === 1, `纯文本失败退出码应是 1：rc=${r.status}；err=${tail(err)}`)
+    const stepLine = err.split(/\r?\n/).find((l) => l.trim().startsWith(NEXT_STEP_PREFIX))
+    must(stepLine, `stderr 没有同源前缀的指令行：${tail(err)}`)
+    const step = stepLine.trim().slice(NEXT_STEP_PREFIX.length)
+    must(step.includes('frames') && step.includes(MOCK_BV) && /--p\s+1/.test(step) && /--step\s+5/.test(step) && step.includes('--fresh'),
+      `指令行参数不齐：${step}`)
+    // P1-3：单独成行——剥离前缀后这条行必须只有一条可执行命令，不能把中文指引词挤进同一行。
+    const cmdCount = step.split('node tools/look.mjs').length - 1
+    must(cmdCount === 1, `指令行不是单独一条命令（出现 ${cmdCount} 次 node tools/look.mjs）：${step}`)
+    // 2026-11-24 B-1（按 16:26 更正 §三）：整行不许含中文（不再剥任何括注豁免），并按空白分词
+    //   与期望整条实参全等——逐项抽查会漏「--fresh 后带中文尾巴被当位置参数丢掉」这种照抄仍错的情形。
+    must(!/[\u4e00-\u9fa5]/.test(step), `指令行混入中文（合并行守不住）：${step}`)
+    const toks = step.trim().split(/\s+/)
+    const expect = ['node', 'tools/look.mjs', 'frames', MOCK_BV, '--p', '1', '--step', '5', '--fresh']
+    must(toks.length === expect.length && toks.every((t, i) => t === expect[i]),
+      `整条实参与期望不全等：第 ${toks.findIndex((t, i) => t !== expect[i]) + 1 || (toks.length > expect.length ? expect.length + 1 : 0)} 个实参是 ${JSON.stringify(toks[toks.findIndex((t, i) => t !== expect[i])])}，期望 ${JSON.stringify(expect[toks.findIndex((t, i) => t !== expect[i])])}；完整=${JSON.stringify(toks)}`)
+    // 逐项单独断一次，只为红时看清红在哪；主断言是上面的整条全等。
+    must(flagFromArgv(toks, 'fresh') === true, `指令行 --fresh 解析不为 true：${step}`)
+    must(optFromArgv(toks, 'step', '') === '5', `指令行 --step 实收不是 5：${step}`)
+    must(optFromArgv(toks, 'p', '') === '1', `指令行 --p 实收不是 1：${step}`)
+    // 反例仅作补充对照（16:26 §二末）：旧版带中文括注那行交同一解析器，--fresh 必须 false。
+    const OLD_BAD = 'node tools/look.mjs frames BV1mock00001 --p 1 --step 5 --fresh（原抽帧参数：step=5，等间隔）'
+    must(flagFromArgv(OLD_BAD.trim().split(/\s+/), 'fresh') === false,
+      `旧版坏样本的 --fresh 竟被判 true，解析器失去区分度：${OLD_BAD}`)
+    const iStep = err.indexOf(NEXT_STEP_PREFIX)
+    const iGuide = err.indexOf('[bili-watch] 指引：')
+    must(iGuide < 0 || iStep < iGuide, `指令行没排在叙述指引之前：${tail(err)}`)
+    return `指令行：${step}`
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// C431：宿主失败回退把指令行前置。编译链抠 splitNextStep + trimForModel，喂 34 帧全坏规模
+//   合成 stderr，断言指令行从诊断摘出、排在其余诊断之前；长样本下命令与 --fresh 进 head 800 开头，
+//   失败标记行（退出码）保留。
+check('C431【主判据】宿主失败回退前置指令行：长样本命令与 --fresh 进 800 开头，失败标记保留', () => {
+  const src = read('index.js')
+  const keys = read('lib/keys.mjs')
+  const prelude = `
+    const NEXT_STEP_PREFIX = '▶ 下一步：'
+    let TOOL_FILE_SEQ = 0
+    const join = (a, b) => a + '/' + b
+    const writeFileSync = () => {}
+    const videoDir = () => '/tmp/c431-probe'
+    const toolTextCap = () => 2000
+    ${fnBody(keys, 'cutCp')}
+  `
+  const { splitNextStep, trimForModel } = compile(src, ['splitNextStep', 'trimForModel'], { prelude })
+  const failLines = Array.from({ length: 3 }, (_, i) => `[ocr] BV17x411c7mD-0${i + 1}.jpg 识别失败：decode error ${'x'.repeat(120)}`)
+  const err = [
+    '[migrate] 旧缓存目录已迁移',
+    ...failLines,
+    '[ocr] 另有 31 张同因失败（首因：decode error）',
+    '[ocr] summary chars=0 loadFail=34 empty=0 total=34',
+    NEXT_STEP_PREFIX + 'node tools/look.mjs frames BV17x411c7mD --p 1 --step 5 --fresh',
+    '[bili-watch] 指引：这批 34 张图片试遍都解不开（解码验证未通过），不要去读。',
+  ].join('\n')
+  const { nextStep, restErr } = splitNextStep('text', err)
+  must(nextStep.length === 1, `指令行未被摘出：${JSON.stringify(nextStep)}`)
+  must(!restErr.includes(NEXT_STEP_PREFIX), '其余诊断里残留指令行前缀')
+  const parts = ['（text 失败，退出码 1）', ...nextStep, restErr]
+  const combined = parts.join('\n')
+  const trimmed = trimForModel(combined, 'text', 'BV17x411c7mD', false, { head: 800, noPersist: true })
+  const head800 = [...trimmed].slice(0, 800).join('')
+  must(head800.includes('frames BV17x411c7mD'), '命令没进 800 开头')
+  must(head800.includes('--fresh'), '--fresh 没进 800 开头')
+  must(head800.includes('退出码 1'), '失败标记行没保留')
+  return `长样本 ${[...combined].length} 码点；命令前置，head 800 内命令与 --fresh 存活`
+})
+
+// C432：chars=null 直说不与全坏共用措辞；四出口按实况分开（已验证图 / 解不开 / 缺 ffmpeg / 无帧）。
+check('C432【主判据】chars=null 直说不与全坏共用措辞；四出口按实况分开', () => {
+  const src = read('tools/look.mjs')
+  const seg = src.slice(src.indexOf('async function cmdText('), src.indexOf('// ── 本地文件转写'))
+  must(seg.includes('OCR 汇总缺失，无法确认识别结果'), 'unknown 分支没有直说汇总缺失措辞')
+  // P2-1：四个出口绑定到各自的 nextStep 赋值行就近查，不做全文存在性（避免字符串挪到别的出口仍绿）。
+  const nextSteps = seg.split(/\r?\n/).filter((l) => l.trim().startsWith('nextStep = '))
+  const ns1 = nextSteps.find((l) => l.includes('read_image '))
+  must(ns1, '出口①（已验证图片 → read_image）的 nextStep 赋值缺失')
+  const ns2 = nextSteps.find((l) => l.includes('recoverCmd'))
+  must(ns2 && /--fresh|原抽帧参数/.test(seg), '出口②（恢复命令 --fresh）缺失')
+  const ns3 = nextSteps.find((l) => l.includes('fetch-deps.mjs ffmpeg'))
+  must(ns3, '出口③（缺 ffmpeg 装依赖）的 nextStep 赋值缺失')
+  const ns4 = nextSteps.find((l) => l.includes('未生成可读帧') || l.includes('frames '))
+  const note4 = seg.split(/\r?\n/).find((l) => l.includes('本次未生成可读帧'))
+  must(note4 && /本次未生成可读帧/.test(seg), '出口④（真没生成帧 → 生成命令）缺失')
+  const unknownLine = seg.split(/\r?\n/).find((l) => l.includes('汇总缺失'))
+  must(unknownLine && !/没有一张解码成功|图片损坏|图片坏了/.test(unknownLine), 'unknown 句把无法确认讲成了图片损坏')
+  return '四出口在位；unknown 直说且不并入全坏措辞'
+})
+
+// C433：frames --ocr / ocr / local 三站点还原生产原对外行为（0.4.16 施工二按 Astra 裁定三还原）。
+check('C433【主判据】frames --ocr / ocr / local 三站点还原生产原对外行为', () => {
+  const src = read('tools/look.mjs')
+  must(/opts\.result\.ocr = rOcr\.text \|\| ''/.test(src), 'frames --ocr 未还原 rOcr.text || ""')
+  must(/text: rOcr\.text \|\| '', chars: \(rOcr\.text \|\| ''\)\.length/.test(src), 'ocr 站点未还原反推 chars')
+  must(/if \(rOcr\.ok && rOcr\.text\)/.test(src), 'local 站点未还原 ok && text 判定')
+  // P2-3：零残留用剥空白结构判，堵住 rOcr.chars>0 无空格窄缝。
+  const ss = src.replace(/\s+/g, '')
+  must(!ss.includes('rOcr.chars>0'), '三站点仍残留 rOcr.chars>0 成功判定（剥空白后仍命中）')
+  return '三站点逐字回到生产原行为；chars>0 判定零残留'
+})
+
+// C434：正数汇总但出口无实际识别行，不能交空分节当成功正文；text 主门按真实识别行字数判。
+check('C434【主判据】正数汇总无识别行不当成功：text 主门按真实识别行字数判', () => {
+  const src = read('tools/look.mjs')
+  const gate = src.slice(src.indexOf('async function cmdText('), src.indexOf('// ④ 兜底'))
+  // P1-2 抗空格扰动：剥空白后比 token 序列。
+  const sg = gate.replace(/\s+/g, '')
+  must(sg.includes('hasRealLines=rOcr.text.trim()!==\'\'&&(rOcr.inferred??0)>0') ||
+       /hasRealLines=[^;]*rOcr\.inferred/.test(sg), '真实行字数判据未落地（结构判）')
+  must(sg.includes('rOcr.ok&&hasRealLines'), '主门未按 rOcr.ok&&hasRealLines 判成功')
+  must(!sg.includes('rOcr.ok&&rOcr.chars>0'), '主门仍只看汇总 rOcr.ok&&rOcr.chars>0（剥空白后仍命中）')
+  return '汇总正数但出口无识别行 → 走 miss 兜底，不交空分节正文'
+})
+
+// C435：Markdown 成功对照（对照守卫，不是修复项——旧版本来就该绿）。好缓存带字现场
+//   text --format md：rc=0、正文标 source=ocr、含识别文字；成功出口不带失败回退指令行前缀
+//   （指令行只进失败回退，成功路径逐字节不变）。影子目录放桩 ocr.py 固定返回一行文字，
+//   不依赖真实 OCR 引擎的识别结果。
+check('C435【对照判据】Markdown 成功对照：带字现场 md 出口 rc=0、source=ocr、正文含识别文字、不含指令行前缀', () => {
+  const NAME = 'C435 md 成功对照'
+  if (!needMock(NAME)) return
+  const deps = c425OcrDeps()
+  if (!deps) { skip(NAME, '本机无 OCR venv，md 成功现场真跑做不了'); return }
+  const work = mkdtempSync(join(tmpdir(), 'bw-c435-shadow-'))
+  mkdirSync(join(work, 'tools'), { recursive: true })
+  copyFileSync(join(HERE, 'look.mjs'), join(work, 'tools', 'look.mjs'))
+  copyFileSync(join(HERE, 'cli-io.mjs'), join(work, 'tools', 'cli-io.mjs'))
+  try { symlinkSync(join(HERE, '..', 'lib'), join(work, 'lib'), 'junction') } catch {}
+  const stubOcr = [
+    '#!/usr/bin/env python',
+    'import json, os, sys',
+    'src = sys.argv[1]',
+    'files = sorted(os.path.join(src, f) for f in os.listdir(src) if f.lower().endswith((".jpg",".jpeg",".png",".webp",".bmp"))) if os.path.isdir(src) else [src]',
+    'result = [{"file": os.path.basename(f), "lines": ["HELLO 123"], "chars": 9, "loadFail": 0} for f in files]',
+    'print("[ocr] summary chars=%d loadFail=0 empty=0 total=%d" % (9*len(files), len(files)), file=sys.stderr)',
+    'if "--json" in sys.argv:',
+    '    print(json.dumps(result, ensure_ascii=False))',
+    'else:',
+    '    for it in result:',
+    '        print("=== %s ===" % it["file"])',
+    '        print("HELLO 123")',
+    '        print("")',
+    'sys.exit(0)',
+    '',
+  ].join('\n')
+  writeFileSync(join(work, 'tools', 'ocr.py'), stubOcr, 'utf8')
+  const cache = mockCache('c435')
+  const dir = framesDir(cache, framesDirName(MOCK_BV, 1, '5s'))
+  mkdirSync(dir, { recursive: true })
+  const files = [`${MOCK_BV}-01.jpg`, `${MOCK_BV}-02.jpg`, `${MOCK_BV}-03.jpg`]
+  for (const f of files) writeFileSync(join(dir, f), '')
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ok: true, bv: MOCK_BV, p: 1, step: 5, scene: false, sceneTh: null,
+    frames: files.length, files, times: null, at: new Date().toISOString(),
+  }))
+  const home = mkdtempSync(join(tmpdir(), 'bw-c435-home-'))
+  try {
+    mockOff && mockOff.clearHits()
+    const over = { BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: deps.deps }
+    if (deps.ffmpeg) over.BILI_WATCH_FFMPEG = deps.ffmpeg
+    const envFor = mockEnvOn(mockOff, over)
+    const r = runLookShadow(work, ['text', MOCK_BV, '--fast', '--step', '5', '--format', 'md'], envFor)
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    must(r.status === 0, `md 成功现场退出码应是 0：rc=${r.status}；err=${tail(err, 400)}`)
+    must(/来源：ocr/.test(out), `md 正文未标 source=ocr：${tail(out)}`)
+    must(out.includes('HELLO 123'), `md 正文不含识别文字：${tail(out)}`)
+    must(!out.includes(NEXT_STEP_PREFIX), '成功 md 出口不应带失败回退指令行前缀')
+    return 'md 出口 rc=0；来源=ocr；正文含 HELLO 123；无指令行前缀'
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+    rmSync(work, { recursive: true, force: true })
+  }
+})
+
+// C436：出口③缺 ffmpeg 真跑（空 DEPS 无 OCR + 盘上预置帧 + BILI_WATCH_FFMPEG 指向不存在路径）。
+//   断言：rc=1；note 说清缺 ffmpeg 与装法；nextStep 给 fetch-deps 命令；全出口不出现 read_image
+//   （缓存帧未解码验证，不叫模型读未验证的图）。
+//   夹具隔离：子进程 PATH 收缩到空目录（见判据体内 noBin），裸名 ffmpeg 不被本机 PATH 兜住；
+//   否则换一台 PATH 上有 ffmpeg 的机器，本判据会走进出口②，结论随环境漂移。
+check('C436【主判据】缺 ffmpeg 出口③：说明缺工具与装法，给 fetch-deps 命令，不出现 read_image', () => {
+  const NAME = 'C436 缺 ffmpeg 出口'
+  if (!needMock(NAME)) return
+  const cache = mockCache('c436')
+  const dir = framesDir(cache, framesDirName(MOCK_BV, 1, '5s'))
+  mkdirSync(dir, { recursive: true })
+  const files = [`${MOCK_BV}-01.jpg`, `${MOCK_BV}-02.jpg`, `${MOCK_BV}-03.jpg`]
+  for (const f of files) writeFileSync(join(dir, f), '')
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ok: true, bv: MOCK_BV, p: 1, step: 5, scene: false, sceneTh: null,
+    frames: files.length, files, times: null, at: new Date().toISOString(),
+  }))
+  const home = mkdtempSync(join(tmpdir(), 'bw-c436-home-'))
+  const homeEmpty = mkdtempSync(join(tmpdir(), 'bw-c436-empty-deps-'))
+  const fakeFf = join(tmpdir(), 'bw-c436-no-such-ffmpeg.exe')
+  // C436 隔离（Astra 2059 第 3 条）：除显式变量（BILI_WATCH_FFMPEG 指向不存在路径）与空 deps 外，
+  //   再把该判据子进程的 PATH 收缩到一个空目录——裸名 ffmpeg / yt-dlp 不再从本机 PATH 兜住，
+  //   「缺 ffmpeg」现场不依赖跑闸机器的 PATH 内容。夹具所需工具不经过 PATH：node 走
+  //   process.execPath 绝对路径；ASR/OCR 由 venv 路径存在性闸门（asrReady/ocrReady）挡在外面；
+  //   本现场帧已预置磁盘，不触发下载。
+  const noBin = join(home, 'nobin')
+  mkdirSync(noBin, { recursive: true })
+  try {
+    mockOff && mockOff.clearHits()
+    const over = {
+      BILI_WATCH_CACHE: cache, DSH_HOME: home, BILI_WATCH_DEPS: homeEmpty,
+      BILI_WATCH_FFMPEG: fakeFf,
+    }
+    const envFor = mockEnvOn(mockOff, over)
+    envFor.PATH = noBin
+    envFor.Path = noBin
+    delete envFor.BILI_WATCH_YTDLP
+    const r = runLookMock(['text', MOCK_BV, '--fast', '--step', '5', '--format', 'json'], envFor)
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    let j = null
+    try { j = JSON.parse(out) } catch {}
+    must(r.status === 1, `缺 ffmpeg 现场退出码应是 1：rc=${r.status}；err=${tail(err)}`)
+    must(j, `stdout 不是 JSON：${tail(out)}`)
+    const note = j.note || ''
+    const step = j.nextStep || ''
+    must(/缺 ffmpeg/.test(note), `note 没说清缺 ffmpeg：${note}`)
+    must(/fetch-deps\.mjs ffmpeg/.test(step), `nextStep 没给 ffmpeg 安装命令：${step}`)
+    must(!note.includes('read_image') && !step.includes('read_image'), '缺 ffmpeg 出口不应叫人读未验证的图')
+    return `nextStep=${step}`
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+    rmSync(homeEmpty, { recursive: true, force: true })
+  }
+})
+
+// C437（2026-11-24，Astra 放行硬前提 / S-01 P1-1）：默认纯文本长样本真回归。
+//   旧 C431 自拼 parts、合成 stderr 仅 800 码点 <= cap，trimForModel 在 :116 直接 return，
+//   夹紧分支从未执行 —— 判据空转。本条改走产品真实失败拼装：fixture 是 0.4.16 look.mjs 真跑
+//   产出的 stderr/stdout（34 帧全坏），判据不自拼 parts、不手写指令行与失败标记；
+//   真编译 index.js 的 lookup + splitNextStep + trimForModel，桩 runLook 回放 fixture，
+//   断言超 cap 真截断、失败标记保留、完整独立指令进 head 窗口、可原样取用；
+//   另用 head=1950 证明夹紧分支（:138-142）真把 effHead 压到 head 以下。
+check('C437【主判据】默认纯文本长样本：真走 lookup 拼装+截断，指令/失败标记进 head，夹紧生效', () => {
+  const probe = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c437-probe.mjs')], {
+    cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 4 * 1024 * 1024,
+  })
+  must(probe.status === 0, `C437 取证夹具跑失败：rc=${probe.status}；${tail(String(probe.stderr || ''))}`)
+  const g = JSON.parse(String(probe.stdout || '').trim())
+  // 夹具形状自检：真跑 fixture 必须带产品产出的指令行与全坏汇总（读原始 stderr，撤产品前置行也仍在）。
+  must(g.hasNextPrefixInFixture, 'fixture stderr 缺 ' + NEXT_STEP_PREFIX + ' 指令行（不是全坏现场）')
+  must(g.hasSummaryInFixture, 'fixture stderr 缺全坏汇总（不是 34 帧全坏现场）')
+  // 断言③（最前，直接守指令前置行为）：完整独立指令必须被 splitNextStep 摘出并前置进 head 窗口。
+  //   放最前是为了撤掉产品 if(nextStep.length) parts.push(...nextStep) 那行时，判据直接红在
+  //   「可见命令丢失」，而不是先被「拼合未超 cap」这条前提断言挡住（那样是间接红，守不住目标）。
+  must(g.stepLine.startsWith(NEXT_STEP_PREFIX), '指令行没被 splitNextStep 摘出并前置（可见命令丢失）')
+  const step = g.stepLine.slice(NEXT_STEP_PREFIX.length).trim()
+  must(/node tools\/look\.mjs frames BV17x411c7mD/.test(step), `指令不是 frames <BV>：${step}`)
+  // 2026-11-24 B-2（按 16:26 更正 §三）：整条实参全等为主断言——逐项抽查抓不住「--fresh 后带
+  //   中文尾巴被当位置参数丢掉」。红时给第 N 个实参的期望/实收。
+  const c437Toks = step.split(/\s+/)
+  const c437Expect = ['node', 'tools/look.mjs', 'frames', 'BV17x411c7mD', '--p', '1', '--step', '5', '--fresh']
+  const c437Bad = c437Toks.findIndex((t, i) => t !== c437Expect[i])
+  must(c437Toks.length === c437Expect.length && c437Bad < 0,
+    `整条实参与期望不全等：第 ${c437Bad + 1 || (c437Toks.length > c437Expect.length ? c437Expect.length + 1 : 0)} 个实参是 ${JSON.stringify(c437Toks[c437Bad])}，期望 ${JSON.stringify(c437Expect[c437Bad])}；完整=${JSON.stringify(c437Toks)}`)
+  // 逐项副断言，只为红时看清红在哪。
+  must(optFromArgv(c437Toks, 'p', '') === '1', `指令 --p 实收不是 1：${step}`)
+  must(optFromArgv(c437Toks, 'step', '') === '5', `指令 --step 实收不是 5：${step}`)
+  must(flagFromArgv(c437Toks, 'fresh') === true, `指令 --fresh 解析不为 true：${step}`)
+  const cmdCount = step.split('node tools/look.mjs').length - 1
+  must(cmdCount === 1, `剥离前缀后不是「只剩一条可执行命令」（出现 ${cmdCount} 次 node tools/look.mjs）：${step}`)
+  // 断言④：head800 实窗口内命令与 --fresh 都在（用实际生效值 effHead，不是请求值 head）。
+  must(g.head800HasCmd && g.head800HasFresh, 'head 800 窗口内命令或 --fresh 丢失（指令没前置进可视窗口）')
+  // 断言①：拼合码点超生效上限，且真发生截断（不是 :116 的 s.length <= cap 直接返回）。
+  must(g.combinedCp > g.cap, `拼合未超生效上限：combined=${g.combinedCp} cap=${g.cap}`)
+  must(g.truncated, '超长文本未发生截断（trimForModel 空转）')
+  must(g.trimmedCp < g.combinedCp, `截断后没变短：${g.combinedCp} -> ${g.trimmedCp}`)
+  // 断言②：截断后的可见正文仍保留失败标记，且位置在 effHead 之前（head 窗口内）。
+  must(g.exitPos >= 0 && g.hasTextFailBeforeExit, '失败标记不是 lookup 产出的（（text 失败，退出码 1））')
+  must(g.head800HasExit, '失败标记没留在可见正文（800 开头）')
+  // 夹紧分支实证：head=1950 时 headBudget=1929 < head，effHead 必须被压小，总长不超 cap。
+  must(g.effHead > 0 && g.effHead < 1950, `夹紧未生效：effHead=${g.effHead} 不小于请求 head=1950`)
+  must(g.t2WithinCap, '夹紧后仍超 cap')
+  return `拼合 ${g.combinedCp} 码点截断到 ${g.trimmedCp}；指令/失败标记进 head800；夹紧 effHead=${g.effHead}<1950`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

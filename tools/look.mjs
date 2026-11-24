@@ -61,7 +61,7 @@ import { readPluginVersion, resolveDepsDir } from '../lib/plugin-paths.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA / Referer 搬进 lib/consts.mjs。lib/bili-api.mjs 的 jget
 //   默认请求头要用同一份，而 lib 不能反向 import 入口。原来本文件与 index.js 各写一份、
 //   逐字相同；REF_VIDEO 与 REF 的值也一直完全一样（都是站点根），合并成一个 REF。
-import { REF, UA } from '../lib/consts.mjs'
+import { REF, UA, NEXT_STEP_PREFIX } from '../lib/consts.mjs'
 // 2026-10-31：调优表 / 钳制 / TTL 换算搬进 lib/tuning.mjs。
 //   与 index.js 共用同一份 TUNING_DEFS，「面板改了 CLI 没生效」这一类的分叉从物理上消失。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
@@ -1395,9 +1395,39 @@ async function runOcr(dir, { json = false } = {}) {
       e.stderr = r.stderr
       throw e
     }
-    return { ok: true, text: String(r.stdout || '').trim() }
+    const raw = String(r.stdout || '')
+    // 0.4.16 要求一：识别字数 / 失败张数的唯一权威源是 ocr.py stderr 汇总行
+    //   （json/text 两模式同源同格式）。Node 侧从出口反推只作交叉校验，
+    //   两者不一致必须报出来，不许静默采用反推值覆盖汇总值。
+    const sm = String(r.stderr || '').match(/\[ocr\] summary chars=(\d+) loadFail=(\d+) empty=(\d+) total=(\d+)/)
+    let chars = null, loadFail = null, empty = null, total = null
+    let summaryMismatch = null
+    if (sm) {
+      chars = Number(sm[1]); loadFail = Number(sm[2]); empty = Number(sm[3]); total = Number(sm[4])
+    }
+    // 交叉校验（非权威）：JSON 出口按各 item.lines 求和；文本出口剥分节头与空行后计长。
+    let inferred = null
+    try {
+      if (json) {
+        inferred = JSON.parse(raw).reduce((n, it) => n + (it.lines || []).join('').length, 0)
+      } else {
+        inferred = raw.split(/\r?\n/)
+          .filter((l) => l.trim() && !/^=== .+ ===$/.test(l.trim()))
+          .join('').length
+      }
+    } catch {}
+    if (chars !== null && inferred !== null && inferred !== chars) {
+      summaryMismatch = `summary chars=${chars} 与出口反推 chars=${inferred} 不一致（以汇总为准）`
+      console.error(`[ocr] ${summaryMismatch}`)
+    }
+    // 汇总取不到时 chars=null＝无法确认：既不当 0（不全坏），也不当成功。
+    return { ok: true, text: raw.trim(), chars, loadFail, empty, total, inferred, summaryMismatch }
   } catch (e) {
-    return { ok: false, why: String(e?.stderr ?? e?.message ?? e).slice(-300) + pyEnvNote(OCR_PY) }
+    return {
+      ok: false,
+      why: String(e?.stderr ?? e?.message ?? e).slice(-300) + pyEnvNote(OCR_PY),
+      chars: null, loadFail: null, empty: null, total: null, inferred: null, summaryMismatch: null,
+    }
   }
 }
 
@@ -1573,6 +1603,10 @@ function emitTextMd(opts, payload) {
     if (meta.estimated) info.push('时间轴：估算（不是官方字幕）')
     if (info.length) head.push(info.join(' · '), '')
     head.push(String(payload?.text ?? '').trim(), '')
+    // 0.4.16：失败态（四级链全 miss）把 note 一并交付。原来只取 payload.text（兜底时为 null），
+    //   md 调用者只看到标题和元信息，连「没拿到文字」都不知道。成功路径 payload 无 ok:false，逐字节不变。
+    if (payload?.ok === false && payload?.note) head.push(String(payload.note).trim(), '')
+    if (payload?.ok === false && payload?.nextStep) head.push(NEXT_STEP_PREFIX + String(payload.nextStep).trim(), '')
     text = head.join('\n')
   }
   if (opts.out) {
@@ -2968,6 +3002,67 @@ function printText(text, opts, bv, kind = 'text') {
   if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）')
 }
 
+// 0.4.16 增量：在帧目录里定位「一张真能打开的图片」。
+// 光看文件数或只解 JPEG 头都不够——SOF 完整但无扫描数据的文件解不出像素，
+//   Astra 复核第 7 行就是首帧这种残缺却被告知「已验证可解码」。
+// 判据与复核脚本同型：ffmpeg 解一帧到 rawvideo，rc=0 且 stdout 有像素字节才算真能打开。
+// 按顺序找，找到第一张就停（Astra：无需为报总数逐张解码）；全坏返回 verified=null；
+// 没有 ffmpeg 时返回 ffmpegMissing=true，让调用方给恢复步骤，不能瞎报「已验证」。
+// count 只报目录里的文件总数，verified 才是「已证明可解码」的那一张——两者绝不混说。
+function findReadableFrame(dir, ffmpegBin) {
+  let files = []
+  try { files = readdirSync(dir).filter((f) => /\.(jpe?g|png|webp|bmp)$/i.test(f)).sort() } catch {}
+  const total = files.length
+  if (!ffmpegBin || !total) return { total, verified: null, ffmpegMissing: !ffmpegBin }
+  for (const name of files) {
+    try {
+      const pixels = runExecFileSync(ffmpegBin, [
+        '-v', 'error', '-xerror', '-i', join(dir, name),
+        '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-',
+      ], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024, timeout: ffTimeoutMs() })
+      if (pixels && pixels.length > 0) return { total, verified: name, ffmpegMissing: false, pixelBytes: pixels.length }
+    } catch {}
+  }
+  return { total, verified: null, ffmpegMissing: false }
+}
+
+// 0.4.16 缺陷 C：在 frames 根下按 BV/分P 找已有帧目录（OCR 环境不可用、本次没抽帧时用）。
+// 要求二：同目标（BV+分P）下用 findReadableFrame 找一张真能打开的文件给确切路径；
+//   目录选择把 manifest 的 step/scene 与本次请求的一致性纳入判据，参数不一致的批次排在后面。
+//   找不到可解码或缺 ffmpeg 时不谎称「已验证」，由调用方按实陈述。
+function existingFramesOnDisk(bv, page, opts = {}, ffmpegBin = '') {
+  const empty = { dir: '', count: 0, verified: null, ffmpegMissing: false, consistent: false, manifest: null }
+  try {
+    const root = framesRoot(cacheDir())
+    if (!existsSync(root)) return empty
+    const prefix = `${bv}-p${page}-`
+    const wantStep = Number.isFinite(opts.step) && opts.step > 0 ? opts.step : 0
+    const wantScene = !!opts.scene
+    const cands = []
+    for (const d of readdirSync(root)) {
+      if (!d.startsWith(prefix)) continue
+      const dp = join(root, d)
+      const count = listJpgs(dp).length
+      if (!count) continue
+      const mf = readManifest(dp)
+      let consistent = false
+      if (mf) {
+        const stepOk = !wantStep || Number(mf.step) === wantStep
+        const sceneOk = !!mf.scene === wantScene
+        consistent = stepOk && sceneOk
+      }
+      cands.push({ dir: dp, count, mf, consistent })
+    }
+    // 一致性批次优先；同档按张数多的在前。
+    cands.sort((a, b) => (b.consistent - a.consistent) || (b.count - a.count))
+    for (const c of cands) {
+      const rf = findReadableFrame(c.dir, ffmpegBin)
+      return { dir: c.dir, count: c.count, verified: rf.verified, ffmpegMissing: rf.ffmpegMissing, consistent: c.consistent, manifest: c.mf }
+    }
+    return empty
+  } catch { return empty }
+}
+
 async function cmdText(bv, credPath, opts = {}) {
   // T37a-C：--format JSON/MD 大小写不敏感（原先 'JSON' 不命中，过程行混入 stdout）
   const _fmt = String(opts.format || '').toLowerCase()
@@ -3143,12 +3238,20 @@ async function cmdText(bv, credPath, opts = {}) {
   }
 
   // ③ 抽帧 OCR（画面文字转文本）
+  // 0.4.16 增量：grabFrames 的目录要留到 ④ —— OCR miss 时帧已经在磁盘上，
+  //   兜底 note 必须按这次的真实产物说话（有可读帧就给目录与张数，不能还说「未生成」）。
+  let ocrFrameDir = null
+  let ocrMiss = null // { kind: 'crash'|'unknown'|'empty'|'allfail' }
   if (ocrReady()) {
     track(`[track] 画面 OCR: 抽帧…`)
     const r = await grabFrames(bv, { step: opts.step ?? 0, p: v.p, ffmpeg: opts.ffmpeg })
+    ocrFrameDir = r?.dir ?? null
     const rOcr = await runOcr(r.dir)
     // 6-14：OCR 崩溃返回 ok:false，不把错误串当识别结果打印落盘
-    if (rOcr.ok && rOcr.text) {
+    // 施工二：成功门按「实际识别行」判——汇总正数但出口只有空分节头/空行时，
+    //   inferred（剥分节头与空行后的真实字数）为 0，不能把空分节当成功正文交出去。
+    const hasRealLines = rOcr.text.trim() !== '' && (rOcr.inferred ?? 0) > 0
+    if (rOcr.ok && hasRealLines) {
       if (emitText(opts, {
         video: videoMeta(bv, v),
         source: 'ocr',
@@ -3163,21 +3266,92 @@ async function cmdText(bv, credPath, opts = {}) {
       done()
       return
     }
-    track(`[track] 画面 OCR: miss（${rOcr.ok ? '（空）' : String(rOcr.why).slice(0, 160)}）`)
+    if (!rOcr.ok) ocrMiss = { kind: 'crash', detail: String(rOcr.why).slice(0, 160) }
+    else if (rOcr.chars === null) ocrMiss = { kind: 'unknown', detail: 'OCR 汇总缺失，无法确认识别结果' }
+    else if (rOcr.total > 0 && rOcr.loadFail === rOcr.total) ocrMiss = { kind: 'allfail' }
+    else ocrMiss = { kind: 'empty', detail: `loadFail=${rOcr.loadFail} empty=${rOcr.empty} total=${rOcr.total}` }
+    track(`[track] 画面 OCR: miss（${ocrMiss.kind}${ocrMiss.detail ? `：${ocrMiss.detail}` : ''}）`)
   } else {
     track(`[track] 画面 OCR: skip（环境不可用）`)
   }
 
   // ④ 兜底：抽帧读图
-  // V2（定为改文案）：note 必须给帧目录绝对路径 + 明确指令模型用 read_image 逐张读 .jpg；
-  //   目录模板与 grabFrames 实际生成的一致（cmdFrames 用 {step, p} 调 grabFrames，无 scene）。
-  const fbStep = (opts.step ?? 0) > 0 ? Number(opts.step) : autoStep(v.dur)
-  const fbSafeStep = v.dur > 0 ? fbStep : Math.max(fbStep, 10)
-  const fbDir = framesDir(cacheDir(), framesDirName(bv, v.p, `${fbSafeStep}s`))
-  const note = `没有可直接导出的文本。帧目录绝对路径：${fbDir} —— 请用 read_image 工具逐张读取该目录下的 .jpg 文件（命名 ${bv}-NN.jpg，按时间等间隔分布），据此描述画面内容。`
+  // 0.4.16：note 必须按本次实际产物说话，且「已验证可解码」只能说被真正证明的那一张——
+  //   ③ 的 grabFrames 可能已经抽帧（OCR 进程失败但帧在磁盘上）。按顺序用 ffmpeg 解像素找第一张
+  //   真能打开的（findReadableFrame），找到就给那张的具体路径；只验了一张就只报一张，不谎称「N 张可读」。
+  //   全坏给恢复步骤；OCR 未就绪 / grabFrames 失败 / 无帧目录则说未生成并给生成方法。
+  const rf = ocrFrameDir
+    ? findReadableFrame(ocrFrameDir, findFfmpeg(opts.ffmpeg))
+    : { total: 0, verified: null, ffmpegMissing: false }
+
+  // 恢复命令参数：manifest 优先（现成凭据），缺字段回落本次请求值。
+  const mf = ocrFrameDir ? readManifest(ocrFrameDir) || {} : {}
+  const recBv = mf.bv || bv
+  const recP = Number.isFinite(mf.p) ? mf.p : (v.p ?? 1)
+  const recStep = Number.isFinite(mf.step) ? mf.step : (opts.step ?? 0)
+  const recScene = !!mf.scene
+  const recFlags = `--p ${recP}${recStep > 0 ? ` --step ${recStep}` : ''}${recScene ? ' --scene' : ''}`
+  const recoverCmd = `node tools/look.mjs frames ${recBv} ${recFlags} --fresh`
+
+  // 原因句拆开：「这次为什么没拿到文字」（OCR 侧）与「这些图片能不能打开」（解码侧）是两件事。
+  //   汇总缺失既不能证明图片坏，也不能推翻一次真实的解码失败；能否打开以 findReadableFrame 实际解码为准。
+  const ocrWhy = !ocrMiss
+    ? '本机 OCR 环境不可用，未能识别画面文字'
+    : ocrMiss.kind === 'unknown'
+      ? 'OCR 汇总缺失，无法确认识别结果（这不代表图片一定损坏，也不能推翻一次真实的解码失败）'
+      : ocrMiss.kind === 'crash'
+        ? `OCR 进程失败：${ocrMiss.detail}`
+        : ocrMiss.kind === 'allfail'
+          ? '这批图片 OCR 识别未拿到文字'
+          : 'OCR 未识别出画面文字'
+
+  let note, nextStep = null
+  if (rf.verified) {
+    // 出口①：有已验证图片 → 给那张具体文件路径 + read_image
+    note = `${ocrWhy}。帧目录 ${ocrFrameDir} 下的 ${rf.verified} 已用 ffmpeg 解出像素、确认可打开；本次只验证了这一张（其余未逐张验证）。`
+    nextStep = `read_image ${join(ocrFrameDir, rf.verified)}`
+  } else if (ocrFrameDir && rf.total > 0) {
+    if (rf.ffmpegMissing) {
+      // 出口③：缺 ffmpeg → 说清缺什么工具 + 怎么装，不叫人读未验证的图
+      note = `${ocrWhy}。本机缺 ffmpeg，这批 ${rf.total} 张图片尚未解码验证，无法判断能不能打开；不要去读未验证的图。装好 ffmpeg 后重跑 text；或设 BILI_WATCH_FFMPEG 指向 ffmpeg。`
+      nextStep = 'node scripts/fetch-deps.mjs ffmpeg'
+    } else {
+      // 出口②：试遍都解不开 → 给恢复命令（BV/分P/step/scene/--fresh 齐全）
+      note = `${ocrWhy}。帧目录 ${ocrFrameDir} 下的 ${rf.total} 张图片试遍都解不开（解码验证未通过），不要去读。原抽帧参数：step=${recStep}${recScene ? '，scene 吸附' : '，等间隔'}。`
+      nextStep = recoverCmd
+    }
+  } else {
+    // 0.4.16 缺陷 C：OCR 环境不可用时 ocrFrameDir 为 null，但磁盘上可能已有上一轮抽好的帧；
+    //   不能一概说「未生成」。按 BV/分P 在 frames 根下找已有帧目录，有数就按实说目录与张数；
+    //   目录选择纳入 manifest step/scene 与本次请求的一致性判据。
+    const existing = existingFramesOnDisk(bv, v.p, opts, findFfmpeg(opts.ffmpeg))
+    if (existing.count > 0) {
+      const mismatch = existing.manifest && !existing.consistent ? '；该批帧的 step/scene 与本次请求不一致' : ''
+      if (existing.verified) {
+        // 出口①：磁盘缓存里有已验证图片
+        note = `${ocrWhy}。磁盘上已有 ${existing.count} 张缓存帧（目录 ${existing.dir}），其中 ${existing.verified} 已用 ffmpeg 解出像素、确认可打开${mismatch}。`
+        nextStep = `read_image ${join(existing.dir, existing.verified)}`
+      } else if (existing.ffmpegMissing) {
+        // 出口③：缺 ffmpeg，缓存帧未解码验证
+        note = `${ocrWhy}。磁盘上已有 ${existing.count} 张缓存帧（目录 ${existing.dir}），但本机缺 ffmpeg，这批帧尚未解码验证，无法判断能不能打开；不要去读未验证的图${mismatch}。装好 ffmpeg 后重跑 text；或设 BILI_WATCH_FFMPEG 指向 ffmpeg。`
+        nextStep = 'node scripts/fetch-deps.mjs ffmpeg'
+      } else {
+        // 出口②：缓存帧试遍解不开 → 给重抽命令
+        const emf = existing.manifest || {}
+        const eStep = Number.isFinite(emf.step) ? emf.step : recStep
+        const eScene = !!emf.scene
+        const eFlags = `--p ${recP}${eStep > 0 ? ` --step ${eStep}` : ''}${eScene ? ' --scene' : ''}`
+        note = `${ocrWhy}。磁盘上已有 ${existing.count} 张缓存帧（目录 ${existing.dir}），但试遍都解不开（解码验证未通过），不要去读${mismatch}。`
+        nextStep = `node tools/look.mjs frames ${recBv} ${eFlags} --fresh`
+      }
+    } else {
+      // 出口④：真没生成帧 → 给生成命令
+      note = `${ocrWhy}。本次未生成可读帧。生成帧后再用 read_image 读取。`
+      nextStep = `node tools/look.mjs frames ${bv} --p ${v.p ?? 1}${recStep > 0 ? ` --step ${recStep}` : ''}`
+    }
+  }
   // 3-14：--format json 兜底时 text 从空字符串改 null 并带 reason，模型不误判「成功但空」
-  // T37f-D：四级链全 miss 是失败不是「空成功」——ok:false + 退出码 1；
-  //   note 仍带帧目录绝对路径，让模型知道可以 read_image 读图（text 模式下接着抽帧，json 模式下路径已在 payload 里）
+  // T37f-D：四级链全 miss 是失败不是「空成功」——ok:false + 退出码 1；保留 ok/reason，note 只讲可执行下一步。
   if (emitText(opts, {
     ok: false,
     video: videoMeta(bv, v),
@@ -3187,12 +3361,22 @@ async function cmdText(bv, credPath, opts = {}) {
     empty: true,
     reason: 'no-subtitle-no-asr-no-ocr',
     note,
+    nextStep,
   })) { process.exitCode = 1; return }
   // N05-B3（2026-10-27 改）：全 miss 在 text 模式同样是失败。原来只有 json/md（emitText 命中上面那个 if）
   //   才置退出码，text 模式一路 rc=0，工具层据此判 ok=true，把「没有文本」当成成功返回。
   //   帧目录照样抽出来交给模型读图，但退出码必须说清楚这次没拿到文字。
   process.exitCode = 1
-  track(`[track] 兜底：抽帧交给模型读图（帧目录 ${fbDir}，用 read_image 逐张读 .jpg；已耗时 ${Math.round((Date.now() - t0) / 1000)}s）`)
+  // 纯文本出口盲区：emitText 对 text/txt/srt 返回 false，note 不进 stdout；这里绕过 say 直写
+  //   stderr 固定段（工具层恒带 --quiet，say 在 --quiet 下虽走 stderr，但直写 console.error 不经过
+  //   任何静默判断）。指引必须在「转入抽帧」之前打出，避免被后续帧目录输出挤掉。
+  const fmt = String(opts?.format || '').toLowerCase()
+  if (fmt !== 'json' && fmt !== 'md') {
+    // 可执行下一步单独成行（前缀与宿主同源 consts），排在叙述性指引之前；宿主把这一行提到拼接最前。
+    if (nextStep) console.error(NEXT_STEP_PREFIX + nextStep)
+    console.error(`[bili-watch] 指引：${note}`)
+  }
+  track(`[track] 兜底：这次没拿到文字，转入抽帧；帧目录由抽帧步骤输出（已耗时 ${Math.round((Date.now() - t0) / 1000)}s）`)
   await cmdFrames(bv, { step: opts.step ?? 0, p: v.p, ffmpeg: opts.ffmpeg })
 }
 

@@ -1,0 +1,14 @@
+视频: 客厅的窗户推不开，因为其实这是电视机！  UP: 支付8000点发动  时长 2m48s
+[track] 预算：约 30–90 秒
+[track] 字幕: miss（试了 2 次都没拿到（第 1 次：无字幕轨））
+[track] 转写: skip（--fast）
+[track] 画面 OCR: 抽帧…
+[track] 画面 OCR: miss（allfail）
+成本：4.2s · 帧 0 · 0 B · 缓存命中 未知（估算）
+[track] 兜底：这次没拿到文字，转入抽帧；帧目录由抽帧步骤输出（已耗时 4s）
+抽帧 BV17x411c7mD
+目录: D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s
+  复用上次抽好的 34 帧（要重抽加 --fresh；清全部加 clean）
+视频: D:\007 Dsh工作区\_临时\c431实测\repro\frames\BV17x411c7mD-p1-5s\BV17x411c7mD.mp4
+帧: 34 张 → BV17x411c7mD-01.jpg, BV17x411c7mD-02.jpg, BV17x411c7mD-03.jpg, BV17x411c7mD-04.jpg, BV17x411c7mD-05.jpg, BV17x411c7mD-06.jpg, BV17x411c7mD-07.jpg, BV17x411c7mD-08.jpg, BV17x411c7mD-09.jpg, BV17x411c7mD-10.jpg, BV17x411c7mD-11.jpg, BV17x411c7mD-12.jpg, BV17x411c7mD-13.jpg, BV17x411c7mD-14.jpg, BV17x411c7mD-15.jpg, BV17x411c7mD-16.jpg, BV17x411c7mD-17.jpg, BV17x411c7mD-18.jpg, BV17x411c7mD-19.jpg, BV17x411c7mD-20.jpg, BV17x411c7mD-21.jpg, BV17x411c7mD-22.jpg, BV17x411c7mD-23.jpg, BV17x411c7mD-24.jpg, BV17x411c7mD-25.jpg, BV17x411c7mD-26.jpg, BV17x411c7mD-27.jpg, BV17x411c7mD-28.jpg, BV17x411c7mD-29.jpg, BV17x411c7mD-30.jpg, BV17x411c7mD-31.jpg, BV17x411c7mD-32.jpg, BV17x411c7mD-33.jpg, BV17x411c7mD-34.jpg
+成本：0.0s · 帧 34 · 0 B · 缓存命中 是（估算）
