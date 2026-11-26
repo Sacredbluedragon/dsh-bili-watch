@@ -93,7 +93,7 @@ C89 把 `client.js` 里 `const COPY_XXX = String.raw`...`` 求值出来，与下
 5) 内存：报出这台机器的物理内存总量与当前可用量（Windows: Get-CimInstance Win32_OperatingSystem 的 TotalVisibleMemorySize 与 FreePhysicalMemory；macOS/Linux: free -h 或 vm_stat）。
 
 6) 找上一次转写留下的记录并贴出来（没有就说没有，不要编）：
-   - <DSH 主目录>/bili-watch/cache/_logs/runs.jsonl 的最后 10 行
+   - <DSH 主目录>/bili-watch/logs/runs.jsonl 的最后 10 行（0.4.18 起日志从 cache/_logs 搬到 bili-watch/logs/；旧 cache/_logs 目录会在自动升级后保留原字节作历史副本，不是没迁完，等确认不再需要可手动删）
    - <DSH 主目录>/bili-watch/cache/ 下面各个视频目录里的 last-error.json（转写失败时留下的详细原因，一个视频目录一份；找到就原样贴出内容）
    - last-error.json 里若写「另一个进程正在转写（锁被占用）」，那是转写互斥锁，不是依赖安装锁：原样贴出并记下时间，说明这一条当时被别的进程占着，不要当成依赖没装好。
 

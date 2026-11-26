@@ -11,6 +11,7 @@ import os from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 
+const { join } = path
 const ROOT = path.resolve(process.argv[2] || '.')
 const BASE_REF = process.argv[3] || '50792ac36e7c3d0774c2b704283a207516505910'
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'c509-base-'))
@@ -38,7 +39,7 @@ function pickPreview(p) {
   return { count: p.count, files: p.files, bytes: p.bytes, tokens: p.tokens, unknownFiles: p.unknownFiles }
 }
 function pickBreakdown(b) {
-  return { occupied: b.occupied, removable: b.removable, unrecognized: b.unrecognized, unrecognizedCount: b.unrecognizedCount, unknownFiles: b.unknownFiles }
+  return { occupied: b.occupied, removable: b.removable, unrecognized: b.unrecognized, unrecognizedCount: b.unrecognizedCount, unknownFiles: b.unknownFiles, logs: b.logs }
 }
 
 try {
@@ -55,7 +56,7 @@ try {
   const newMod = await import(pathToFileURL(path.join(ROOT, 'lib', 'cache-own.mjs')).href)
   const oldPreview = pickPreview(oldMod.previewAll(root, {}))
   const oldBreakdown = pickBreakdown(oldMod.cacheBreakdown(root, {}))
-  const combined = newMod.cachePreview(root, {})
+  const combined = newMod.cachePreview(root, { logsDir: join(root, '_logs') })
   const newPreview = pickPreview(combined)
   const newBreakdown = pickBreakdown(combined.breakdown)
   out.old = { preview: oldPreview, breakdown: oldBreakdown }
@@ -65,6 +66,12 @@ try {
   out.sameTokensOrder = JSON.stringify(oldPreview.tokens) === JSON.stringify(newPreview.tokens)
   out.sameUnknownFiles = JSON.stringify(oldPreview.unknownFiles) === JSON.stringify(newPreview.unknownFiles) &&
     JSON.stringify(oldBreakdown.unknownFiles) === JSON.stringify(newBreakdown.unknownFiles)
+  // 0.4.18：occupied 由「含 _logs」改为「去日志」，差值应恰好等于第四栏日志字节
+  out.logsInfo = newBreakdown.logs || null
+  out.occupiedDelta = {
+    bytes: oldBreakdown.occupied.bytes - newBreakdown.occupied.bytes,
+    files: oldBreakdown.occupied.files - newBreakdown.occupied.files,
+  }
 } catch (e) { out.fatal = String(e?.stack || e).slice(0, 1200) }
 finally {
   try { fs.rmSync(base, { recursive: true, force: true }) } catch {}

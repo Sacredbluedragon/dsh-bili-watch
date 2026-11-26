@@ -26,7 +26,9 @@ const cut = (startMark, endMark) => {
   return a >= 0 && b > a ? src.slice(a, b) : ''
 }
 const ffmpegFn = cut('async function resolveFfmpeg() {', 'function hfHomes()')
-const ytdlpFn = cut('async function ytdlpVersion() {', '// 第十条')
+// 结束锚用下游常量声明而不是注释：注释会被文本闸清理删掉，而这条常量行稳定，
+//   且正好在 GPU 状态注释块之后、ytdlp 函数体之外，切进来不会重复声明 GPU_CACHE_MS。
+const ytdlpFn = cut('async function ytdlpVersion() {', 'const GPU_CACHE_MS')
 const gpuFn = cut('function gpuStatus(fresh) {', '/** execFile 的 Promise 版')
 
 // 每个 case 独立 VM，变量互不干扰。stub 用数组 join 拼，

@@ -55,10 +55,10 @@ import { lockState, makeLocks } from '../lib/locks.mjs'
 import { provableNamesIn, removeOwned, removeAllOwned } from '../lib/cache-own.mjs'
 import { normalizeDeleteMode, invalidDeleteModeOf } from '../lib/recycle.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from '../lib/keys.mjs'
-// 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
+// deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
 //   （与 index.js 同一份；原来这里那份判据差一截，见下面 DEPS 处的注释）。
 import { readPluginVersion, resolveDepsDir } from '../lib/plugin-paths.mjs'
-// 2026-11-01（0.4.1 第 1 条）：UA / Referer 搬进 lib/consts.mjs。lib/bili-api.mjs 的 jget
+// UA / Referer 搬进 lib/consts.mjs。lib/bili-api.mjs 的 jget
 //   默认请求头要用同一份，而 lib 不能反向 import 入口。原来本文件与 index.js 各写一份、
 //   逐字相同；REF_VIDEO 与 REF 的值也一直完全一样（都是站点根），合并成一个 REF。
 import { REF, UA, NEXT_STEP_PREFIX } from '../lib/consts.mjs'
@@ -71,7 +71,7 @@ import { logRun } from '../lib/runs.mjs'
 import { readJsonOrBackup, writeJsonAtomic } from '../lib/config.mjs'
 // 2026-10-31：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
 //   这一片搬的不是函数是状态，compile 抽函数验不出来，所以判据换成真起进程（见 tools/verify.mjs C64/C65）。
-import { cacheAdoptNotice, cacheDir, initCachePath, previewCacheDir, videoDir } from '../lib/cache-path.mjs'
+import { cacheAdoptNotice, cacheDir, defaultLogsRoot, initCachePath, previewCacheDir, videoDir } from '../lib/cache-path.mjs'
 // 2026-10-31：凭证位置 / 四字段判据 / 旧路径迁移搬进 lib/cred.mjs（与 index.js 同一份）。
 //   lib 只返回结构化结果，stderr 那几行提示留在这里——PS 5.1 管道按当前代码页解码，中文会变问号。
 import { adoptLegacyCred, credPaths, fillBuvids, pickLoginCookies, readCred } from '../lib/cred.mjs'
@@ -150,7 +150,7 @@ installSourceCleanup()
 const HERE = dirname(fileURLToPath(import.meta.url))
 // 依赖自包含：优先用插件目录 deps\ 下的环境，缺失时回退 BILI_WATCH_PROJ / deps\deps-config.json
 // X-30（2026-10-29）：deps 默认在包外（$DSH_HOME\bili-watch\deps），重装包不会把 venv / 模型一起删掉。
-// 2026-11-01（0.4.1 第 8 条）：判据搬进 lib/plugin-paths.mjs —— 这里原来那份只判「包内 deps 目录
+// 判据搬进 lib/plugin-paths.mjs —— 这里原来那份只判「包内 deps 目录
 //   存在」，index.js 判的是「包内 deps **有内容**」。干净安装（包内是空目录）时两边分叉：
 //   面板用包外、CLI 用包内空目录。现在与运行时同一份判据（以 index.js 为准），CLI 不再单独判。
 const DEPS = resolveDepsDir({ pluginRoot: join(HERE, '..') })
@@ -173,7 +173,7 @@ function readDepsCfg() {
   }
   return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {}
 }
-// 2026-11-01（0.4.1 第 9 条）：原来这里叫 `depsCfg`，而 index.js 里 `depsCfg` 是个**函数**
+// 原来这里叫 `depsCfg`，而 index.js 里 `depsCfg` 是个**函数**
 //   （`function depsCfg() { return readDepsCfgFile(...) }`，每次调用都读盘）。
 //   同名不同物让外部审查脚本直接绕过：看到 `depsCfg.cache` 会以为拿到的是「当前配置」，
 //   其实这里是**模块加载时读一次的快照**（CLI 进程活一次，别处改配置它不会跟着变）。
@@ -804,7 +804,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
   const dirTag = atDirTag(atTimes) || (scene ? `scene-${safeStep}s` : `${safeStep}s`)
   const dir = outDir || framesDir(cacheDir(), framesDirName(bv, v.p, dirTag))
   // --out 指向用户目录时绝不整目录递归删：只覆盖本工具产物（下面会重下 mp4、清 jpg）
-  // --fresh 的清理**必须等拿到锁之后**：锁外删会把别人刚写的 .lock 一起删掉，两个进程都以为持锁（2026-10-26 审查 T24）
+  // --fresh 的清理**必须等拿到锁之后**：锁外删会把别人刚写的 .lock 一起删掉，两个进程都以为持锁
   ensureDir(dir)
   const mp4 = join(dir, `${bv}.mp4`)
   const jpgs = () => listJpgs(dir)
@@ -920,7 +920,7 @@ async function grabFrames(bv, { step = 0, outDir, ffmpeg, fresh = false, p: page
     // V1：本次产物的文件名写进 manifest.files，下一轮 --fresh 只按这份清单删
     // P1（2026-10-30）：at 模式的产物是 f_7m40s.jpg，原来只认 `<bv>-NN.jpg`，于是 files 恒为空数组，
     //   下次 --fresh 走「manifest 没有 files 清单 → 一律不碰」，同一个 --out 目录里的旧时刻帧永远删不掉。
-    // 2026-11-01（0.4.1 第 12 条）：判定抽进 lib/frames.mjs 的 frameFilesToKeep —— 抽出来才能在
+    // 判定抽进 lib/frames.mjs 的 frameFilesToKeep —— 抽出来才能在
     //   verify 里真跑（喂真文件名看真输出），原来那里只能 grep 这一行含不含 `f_`。
     const produced = frameFilesToKeep(bv, jpgs())
     // 源视频 `${bv}.mp4` 也是本批写进该目录的产物：写进 manifest.files 才算这份
@@ -962,11 +962,12 @@ function asrScriptTag() {
 }
 
 // ── 失败现场落盘（T25-P0-1：一次调用失败后，能只靠磁盘复现）────────────
-// 2026-11-01（0.4.1 第 8 条）：与 index.js 同一份读取（lib/plugin-paths.mjs 的 readPluginVersion）。
+// 与 index.js 同一份读取（lib/plugin-paths.mjs 的 readPluginVersion）。
 const PLUGIN_VERSION = readPluginVersion(join(HERE, '..'))
 // D98：缓存根改成懒初始化（ensureCache），这里必须现算。写成顶层常量会把「未初始化时的纯路径」固化下来：
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个已经用不上的旧路径。
-const runsFile = () => join(cacheDir(), '_logs', 'runs.jsonl')
+// 活跃 runs.jsonl 改到新日志根，与面板侧同口径。
+  const runsFile = () => join(defaultLogsRoot(), 'runs.jsonl')
 // 轮转、追加、失败现场三件都在 lib/runs.mjs（2026-10-31 搬追加，随后补齐 logRun）。
 //   CLI 侧与面板侧的差异只有两处，都用参数表达：
 //     ① 失败 entry 额外挂 diag / trackTail（面板进程里没有这两个概念）；
@@ -2365,7 +2366,7 @@ async function cmdSheet(bv, opts = {}) {
   const [cols, rows] = grid.split('x').map(Number)
   if (!cols || !rows) { process.exitCode = 1; console.error('✗ 格子格式应是 3x3 / 4x4'); return }
   const n = cols * rows
-  // 2026-11-01（0.4.1 第 5 条）：--at 与 frames 走同一套 parseAtTimes（在 grabFrames 里），
+  // --at 与 frames 走同一套 parseAtTimes（在 grabFrames 里），
   //   这里只负责把 at 传下去 + 后续按「时刻命名的帧」读文件。
   const at = String(opts.at ?? '').trim()
   // C233：预算由分派链按 tuning 注入（本函数不引入第二个常量）；估算与 dry-run 第四行同一口径。
@@ -3004,9 +3005,9 @@ function printText(text, opts, bv, kind = 'text') {
 
 // 0.4.16 增量：在帧目录里定位「一张真能打开的图片」。
 // 光看文件数或只解 JPEG 头都不够——SOF 完整但无扫描数据的文件解不出像素，
-//   Astra 复核第 7 行就是首帧这种残缺却被告知「已验证可解码」。
+//   首帧这种残缺却被告知「已验证可解码」。
 // 判据与复核脚本同型：ffmpeg 解一帧到 rawvideo，rc=0 且 stdout 有像素字节才算真能打开。
-// 按顺序找，找到第一张就停（Astra：无需为报总数逐张解码）；全坏返回 verified=null；
+// 按顺序找，找到第一张就停（无需为报总数逐张解码）；全坏返回 verified=null；
 // 没有 ffmpeg 时返回 ffmpegMissing=true，让调用方给恢复步骤，不能瞎报「已验证」。
 // count 只报目录里的文件总数，verified 才是「已证明可解码」的那一张——两者绝不混说。
 function findReadableFrame(dir, ffmpegBin) {
@@ -4130,7 +4131,9 @@ function crashDump(err, kind) {
       trackTail: TRACK_BUF.slice(-15),
       version: PLUGIN_VERSION,
     }
-    const dir = join(cacheDir(), '_logs')
+    // 崩溃现场写新日志根；视频目录里 lib/runs.mjs:89 那份
+    //   last-error.json 不在 _logs、不在此项范围，保持原样。
+    const dir = defaultLogsRoot()
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'last-error.json'), JSON.stringify(d, null, 2) + '\n', 'utf8')
   } catch {}
@@ -4240,7 +4243,7 @@ try {
     frames: '需要 BV 号或视频链接：node look.mjs frames <BV|链接> [--step 2] [--p N]',
     sheet: '需要 BV 号或视频链接：node look.mjs sheet <BV|链接> [--grid 3x3]',
     substrip: '需要 BV 号或视频链接：node look.mjs substrip <BV|链接> [--step 7]',
-    // 回归复核（2026-10-28）：这里原来写成「需要图片路径：ocr <图片文件> [--format json]」——错的。
+    // 这里原来写成「需要图片路径：ocr <图片文件> [--format json]」——错的。
     //   ocr 接的是 BV（cmdOcr(bv, opts)，HELP 也写 `ocr <BV或链接>`），不是图片路径。
     //   C220 之后 ocr 自己也认 `--format json`（见 COMMANDS 表），但缺参提示仍按 HELP 原样写。
     ocr: '需要 BV 号或视频链接：node look.mjs ocr <BV|链接> [--step 2]',
@@ -4337,7 +4340,7 @@ try {
     const fo = { step: STEP, p: P, outDir: opt('out'), ffmpeg: opt('ffmpeg'), fresh: flag('fresh'), ocr: flag('ocr'), scene: flag('scene'), at: opt('at'), costT0: Date.now(), format: opt('format') || 'text' }
     await runCommandJson({ opts: fo, source: 'frames', bv: BV, getVideo: () => viewOf(BV, P), fn: () => cmdFrames(BV, fo) })
   } else if (cmd === 'sheet') {
-    // 2026-11-01（0.4.1 第 5 条）：sheet 原来不认 --at，而 frames 认。同一个「要这几秒的画面」需求，
+    // sheet 原来不认 --at，而 frames 认。同一个「要这几秒的画面」需求，
     //   用户在两处得到两种结果（sheet 静默按 --step 抽），补上，走同一套 parseAtTimes。
     // 2026-11-02：加 --cues（宫格挂台词）与 --cred（拉字幕要凭证）。
     //   --cred 以前只在 sub/text 显式传，sheet 走的是 credFor(null) 自动找本地凭证；

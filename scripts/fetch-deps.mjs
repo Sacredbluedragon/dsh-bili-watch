@@ -380,7 +380,7 @@ function whichAll(cmd) {
     .filter(Boolean)
 }
 function which(cmd) {
-  // 2026-11-02（发版前审查）：原来只取首行。Windows 上 `where python` 经常是
+  // 原来只取首行。Windows 上 `where python` 经常是
   //   「应用商店存根在前、真解释器在后」，只取首行等于把真的漏掉——systemPython 的存根
   //   跳过逻辑只看到一个存根，最后报「只找到存根」，用户明明装了 Python 也用不了。
   //   需要多命中的调用方改用 whichAll。
@@ -665,7 +665,7 @@ function ensureFfmpeg() {
     rmSync(tmpDir, { recursive: true, force: true })
     rmSync(zip, { force: true })
   } catch {}
-  // 2026-11-02（发版前审查，E1-01 同族）：cp 成功 ≠ 跑得起来。Windows 侧原来直接打 ✓，
+  // cp 成功 ≠ 跑得起来。Windows 侧原来直接打 ✓，
   //   而 look.mjs 的 resolveFfmpeg 会真试跑 -version 判定「没装」——脚本说装好了、运行时说没装，
   //   用户看到的就是「装完还是用不了」。与 Linux 分支（下方 ffmpeg 段）对齐，只认 ffmpeg 自己的退出码。
   const v = run(exe, ['-version'])
@@ -1058,7 +1058,7 @@ function newVenv(venv) {
 /**
  * 装一个 venv：建环境 → 引导 pip → 装包 → **装完复验 import**。
  *
- * 出口验证（2026-11-01，0.4.1 第 3 条，守卫 C98）：pip 返回 0 **不等于**装成了。
+ * 出口验证：pip 返回 0 **不等于**装成了。
  *   入口那里已经验过一次 `import <mod>`（半成品陷阱），但装完之后必须再验一次：
  *   requires-python 不满足、wheel 落到别的解释器、空壳 venv 上装成「看起来装了」，
  *   这三种都是 install 成功、import 失败。不在这里拦，等到跑 ASR 才炸，
@@ -1094,7 +1094,7 @@ function ensureVenv(venv, mod, pkgs) {
   const r = pipInstall(real, ['install', ...pkgs])
   if (r.code !== 0) {
     moveSemiVenv(venv)
-    // 2026-11-02（发版前审查）：原来只报「安装 X 失败」，pip 的真实报错被丢掉。
+    // 原来只报「安装 X 失败」，pip 的真实报错被丢掉。
     //   这条路径上最常见的三种原因（连不上索引站 / 系统代理没进环境变量 / Python 版本
     //   不满足 requires-python）全都要读 stderr 才能分辨，不给就等于让用户干猜。
     // 0.4.14 件2-B：流式落盘后 r.out/r.err 为空，末 N 行改从 download.out.log 的本次增量取。

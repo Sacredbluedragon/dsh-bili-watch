@@ -13,7 +13,7 @@
 // 以前这里补一个**空实现**让本文件加载完、只留一行 console.warn —— 结果是宿主照样报
 //   `loaded without registering`：那句话指向**结果**（面板没注册），不指向**原因**（宿主太老），
 //   普通用户只看到「插件坏了」，而警告躺在控制台里没人看。
-// 2026-11-01（0.4.1 第 2 条）：改成直接抛。报错本身带原因与版本要求，宿主把它原样抛给用户。
+// 改成直接抛。报错本身带原因与版本要求，宿主把它原样抛给用户。
 //   守卫见 C97：在假 window 里求值本文件，必须抛这句话。
 const MODULE_LOADER =
   typeof window !== 'undefined' && window.__ModuleLoader__ && typeof window.__ModuleLoader__.load === 'function'
@@ -56,7 +56,7 @@ function fmtSkippedNote(d) {
   return `保留 ${skipped.length} 项不是本插件的文件（${list}${more}）`
 }
 
-// issue #5 同族（2026-10-31，深入审查）：哪些行该显示「一键下载」。
+// 哪些行该显示「一键下载」。
 //   原来写死在 DepRow 里 `!d.ok && d.id !== 'credential'`，于是「GPU 运行库」这行
 //   在**没有 NVIDIA 卡**的机器上也有按钮 —— 点下去会装 2.2 GB 运行库，装完照样走 CPU。
 //   后端给行带 installable:false 时不显示按钮（没这个字段的行照旧显示，向后兼容）。
@@ -191,11 +191,17 @@ function clearAllConfirmWording(deleteMode) {
 function cacheFactsNode(h, o) {
   const b = o && o.breakdown
   if (!b) return null
+  const ar = o && o.archive
   const fmt = o.fmt || ((n) => String(n))
   const X = Number(b.occupied?.bytes || 0)
   const Y = Number(b.removable?.bytes || 0)
   const Z = Number(b.unrecognized?.bytes || 0)
   const count = Number(b.unrecognizedCount || 0)
+  // 可勾选清单的项数只认 unknownFiles（foreign 顶层普通文件），不是 unrecognizedCount（=skipped 跳过项数）。
+  // 两个数字不是同一计量：前者能勾选删除，后者含保留目录/子目录/非普通文件、勾选不到。
+  const listCount = Array.isArray(b.unknownFiles) ? b.unknownFiles.length : 0
+  const L = Number(b.logs?.bytes || 0)
+  const LF = Number(b.logs?.files || 0)
   const rows = [
     h('div', { 'data-bl-row': '' },
       h('span', { 'data-bl-name': '' }, '当前占用'),
@@ -205,11 +211,41 @@ function cacheFactsNode(h, o) {
       h('span', { 'data-bl-detail': '', 'data-bl-fact-y': '' }, `${fmt(Y)} / ${Number(b.removable?.count || 0)} 项`)),
     h('div', { 'data-bl-row': '' },
       h('span', { 'data-bl-name': '' }, '认不出归属'),
-      h('span', { 'data-bl-detail': '', 'data-bl-fact-z': '' }, `${fmt(Z)} / ${count} 项`)),
+      h('span', { 'data-bl-detail': '', 'data-bl-fact-z': '' }, `${fmt(Z)} / ${listCount} 项`)),
+    h('div', { 'data-bl-row': '' },
+      h('span', { 'data-bl-name': '' }, '运行日志'),
+      h('span', { 'data-bl-detail': '', 'data-bl-fact-logs': '' }, `${fmt(L)} / ${LF} 个文件`)),
   ]
+  // 归档结果按真实状态分档：没跑过/全完成/有跳过或冲突/有错误，四档文案不同，
+  //   绝不无条件说「已归档」——那会把没跑或失败说成成功。
+  let archiveNote = '运行日志单独统计，不参与「本次可删」；旧 cache/_logs 里的历史日志保留原字节，没有被删除'
+  if (ar && ar.ran) {
+    if (Number(ar.errorCount) > 0) {
+      archiveNote = `运行日志单独统计；历史日志归档时有 ${ar.errorCount} 处没能完成，相关文件保留在原处，可重试；本次没有删除任何日志`
+    } else if (Number(ar.conflictCount) > 0 || Number(ar.skippedCount) > 0) {
+      // 冲突（成功另存 .N）和跳过（没提交、留原处）是两件事，分开说；复用单独点明「已有副本」。
+      const parts = []
+      if (Number(ar.archived) > 0) parts.push(`新归档 ${ar.archived} 个`)
+      if (Number(ar.reused) > 0) parts.push(`复用已有副本 ${ar.reused} 个（没有重复写盘）`)
+      if (Number(ar.conflictCount) > 0) parts.push(`${ar.conflictCount} 个同名不同内容，已各自另存为 .2/.3 等副本、字节完整保留`)
+      if (Number(ar.skippedCount) > 0) parts.push(`${ar.skippedCount} 个因目录重叠或非普通文件没归档、留在原处`)
+      archiveNote = `运行日志单独统计；${parts.join('，')}；本次没有删除任何日志`
+    } else {
+      // 全完成档也要让「复用」可见——不能只在别的分支提一句。
+      const reusedPart = Number(ar.reused) > 0 ? `、复用已有副本 ${ar.reused} 个（没有重复写盘）` : ''
+      archiveNote = `运行日志单独统计；历史日志已归档到新日志目录的 archive 下（${ar.archived} 个${reusedPart}），旧 cache/_logs 里的原文件保留未删`
+    }
+  }
+  rows.push(h('div', { 'data-bl-note': '', 'data-bl-fact-logs-note': '' }, archiveNote))
   if (Z !== 0 || count > 0) {
+    // 不写「另有 N 项没列出」：count 来自 skipped.length（读失败会让同一路径记两次），
+    //   listCount 来自 unknownFiles.length，两者相减给不出「未列出的唯一文件数」。
+    //   可勾选清单的项数上面那一行已经显示，这里不再重复。
+    const tail = listCount > 0
+      ? '清单中的文件默认保留，可在「彻底清空」时勾选删除。'
+      : '当前没有可勾选的文件。'
     rows.push(h('div', { 'data-bl-note': '', 'data-bl-fact-note': '' },
-      `这 ${count} 项认不出归属，可能是你放进来的文件，也可能是本插件产物；默认一律保留不删，只有在「彻底清空」确认框里勾选「连同这些文件一起删除」才会一并清理`))
+      `此处大小按「当前占用 − 本次可删」计算。${tail}`))
   }
   return h('div', { 'data-bl-facts': '' }, ...rows)
 }
@@ -518,7 +554,7 @@ MODULE_LOADER.load({
 5) 内存：报出这台机器的物理内存总量与当前可用量（Windows: Get-CimInstance Win32_OperatingSystem 的 TotalVisibleMemorySize 与 FreePhysicalMemory；macOS/Linux: free -h 或 vm_stat）。
 
 6) 找上一次转写留下的记录并贴出来（没有就说没有，不要编）：
-   - <DSH 主目录>/bili-watch/cache/_logs/runs.jsonl 的最后 10 行
+   - <DSH 主目录>/bili-watch/logs/runs.jsonl 的最后 10 行（0.4.18 起日志从 cache/_logs 搬到 bili-watch/logs/；旧 cache/_logs 目录会在自动升级后保留原字节作历史副本，不是没迁完，等确认不再需要可手动删）
    - <DSH 主目录>/bili-watch/cache/ 下面各个视频目录里的 last-error.json（转写失败时留下的详细原因，一个视频目录一份；找到就原样贴出内容）
    - last-error.json 里若写「另一个进程正在转写（锁被占用）」，那是转写互斥锁，不是依赖安装锁：原样贴出并记下时间，说明这一条当时被别的进程占着，不要当成依赖没装好。
 
@@ -684,7 +720,7 @@ MODULE_LOADER.load({
       const [defaultOut, setDefaultOut] = React.useState('')
       // 参数分层：转写闸门在面板按分钟编辑，deps-config 里存的是秒（asrMaxSec）
       const [asrMin, setAsrMin] = React.useState('30')
-      // 第十条（2026-10-29）：ASR 推理设备。面板上是「转写时用 GPU」一个开关（开=auto / 关=cpu），
+      // ASR 推理设备。面板上是「转写时用 GPU」一个开关（开=auto / 关=cpu），
       //   后端存的是枚举字符串，不是布尔——所以这里单独一个 state，不走 TuneRow 的数值通道。
       const [asrDev, setAsrDev] = React.useState('auto')
       const [frames, setFrames] = React.useState('500')
@@ -950,7 +986,7 @@ MODULE_LOADER.load({
             // 两值归属后没有第三类「灰区」：没有正向凭证的一律按 foreign 默认保留，
             //   不进「将删除」；只有在确认框勾选「连同这些文件一起删除」才会一并清理。
             //   旧句「认不出形状的中间产物已计入将删除」是三值时代的假话，本批撤回。
-            `另有 ${unknown} 项没有归属凭证，默认一律保留不删；勾选上方「连同这些文件一起删除」后才会一并清理；回收站容量有限时可能跳过部分条目`),
+            `另有 ${unknown} 项没有归属凭证，默认一律保留不删；勾选上方「连同这些文件一起删除」只清理下面清单里实际列出的这些文件，不涉及「认不出归属」差值里清单之外的项；回收站容量有限时可能跳过部分条目`),
         ]
         if (foreign.length) {
           const names = foreign.slice(0, 5).map((f) => String(f.name || '')).join('、')
@@ -1378,7 +1414,7 @@ MODULE_LOADER.load({
             h('button', { 'data-bl-btn': '', 'data-bl-clean-now': '', onClick: doCleanNow }, '立即清理'),
             h('button', { 'data-bl-btn': '', 'data-bl-clear-all': '', onClick: openClearAll }, clearAllLabel(deleteMode))),
           // 三个数常驻：占用 X / 本次可删 Y / 认不出 Z（Z = X − Y），只由 cacheFactsNode 渲染。
-          cacheFactsNode(h, { breakdown: cacheFacts, fmt: fmtBytes }),
+          cacheFactsNode(h, { breakdown: cacheFacts, fmt: fmtBytes, archive: st && st.cache && st.cache.archive }),
           dlg === 'clearAll' ? clearAllConfirmNode(h, {
             preview: allPreview, breakdown: cacheFacts, deleteMode,
             fmt: fmtBytes, confirm: confirmDlg, cancel: () => setDlg(null),
@@ -1510,7 +1546,7 @@ MODULE_LOADER.load({
         // 参数分层（阶段B）常规组：不折叠。转写闸门按分钟显示，存的是秒。
         h('div', { 'data-bl-sec': '' },
           h('span', { 'data-bl-sec-title': '' }, '转写与抽帧'),
-          // 第十条（2026-10-29）：转写设备开关。开=auto（有卡走 GPU，显存不足自动回落 CPU）/ 关=cpu。
+          // 转写设备开关。开=auto（有卡走 GPU，显存不足自动回落 CPU）/ 关=cpu。
           //   没有 NVIDIA 卡时也能切，但切到 auto 实际还是走 CPU——所以下面按 gpu 三态补一句说明。
           h('div', { 'data-bl-row': '' },
             h('label', { 'data-bl-dlgrow': '' },

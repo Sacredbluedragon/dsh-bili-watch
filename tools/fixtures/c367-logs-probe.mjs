@@ -30,7 +30,8 @@ try {
   const runsBefore = linesOf(runsPath)
   const dryOwned = removeOwned(root, { dryRun: true, mode: 'permanent' })
   const dryAll = removeAllOwned(root, { dryRun: true, mode: 'permanent' })
-  const bd = cacheBreakdown(root)
+  // 0.4.18：日志搬出三栏。第四栏用 logsDir 单独统计；缓存根里的旧 _logs 不再计入 occupied。
+  const bd = cacheBreakdown(root, { logsDir: join(root, '_logs') })
 
   out.dry = {
     ownedPlan: names(dryOwned.plan),
@@ -38,8 +39,9 @@ try {
     allPlan: names(dryAll.plan),
     allSkipped: withWhy(dryAll.skipped),
     autoClaimsLogs: isOwnedEntry(root, join(root, '_logs')) === true,
-    occupied: bd.occupied,               // 走 cacheBreakdown:398 的 dirStat(includeLogs:true)
-    statNoLogs: dirStat(root),           // 默认口径不含日志，作为 :398 的对照
+    occupied: bd.occupied,               // 0.4.18：已不含 _logs
+    logs: bd.logs,                       // 第四栏：日志字节单独统计
+    statNoLogs: dirStat(root),           // 默认口径（本就等于去日志后的 occupied）
     runsLinesBefore: runsBefore,
   }
 

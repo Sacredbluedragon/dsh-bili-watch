@@ -40,7 +40,7 @@ import { readJsonOrBackup } from '../lib/config.mjs'
 // 2026-10-31：缓存根的状态搬进 lib/cache-path.mjs。这里只 import 两个**无状态**的动作
 //   （路径推导 / 落盘探测）真跑；有状态的那半（initCachePath / cacheDir）必须另起进程验——
 //   本进程一旦 init 过，C65 的「未初始化必抛」就永远绿不起来了。
-import { pickCacheDir, resolveCacheDir } from '../lib/cache-path.mjs'
+import { pickCacheDir, resolveCacheDir, defaultLogsRoot, checkLogsRootOverlap } from '../lib/cache-path.mjs'
 // 2026-10-31：凭证的位置 / 四字段判据 / 旧路径迁移只剩 lib/cred.mjs 一份，C16 直接 import 真跑。
 import { adoptLegacyCred, credPaths, missingCredFields, readCred } from '../lib/cred.mjs'
 import { claimRoute, releaseRoute, claimedPaths } from '../lib/route-claim.mjs'
@@ -501,6 +501,47 @@ const resumeProbe = () => {
   }
   return resumeProbeRun
 }
+// 2017 第一档规则行为取证：子进程 import 真 _rules.mjs 求值，放所有 check 之前避 C276 按块扫描。
+//   7 正例必须「旧规则不命中、新规则命中」，3 反例两边都不命中；旧规则不命中由隔离扰动证明。
+let rulesProbeRun = null
+const rulesProbe = () => {
+  if (!rulesProbeRun) {
+    const modUrl = pathToFileURL(join(ROOT, 'scripts/_rules.mjs')).href
+    const P = [
+      '// 修补（2026-11-26 复核）：这条改过',
+      '// 复核 2026-11-26 之后补的',
+      '// 第6条（2026-11-26）说明',
+      '// 0.4.18 第3条',
+      '// 台账 L1449 那行',
+      '// 2033 A-3 的口径',
+      '// 20261126-1354'
+    ]
+    const N = [
+      '// 缓存目录默认值见配置项',
+      '// C206（清理回显）：修好了',
+      '// 计算向量 L1 距离'
+    ]
+    const probe = [
+      `import { scanCollab, COLLAB_RULES } from ${JSON.stringify(modUrl)}`,
+      'const P = ' + JSON.stringify(P),
+      'const N = ' + JSON.stringify(N),
+      'process.stdout.write(JSON.stringify({',
+      '  names: COLLAB_RULES.map(r => r[0]),',
+      '  p: P.map(s => scanCollab(s)),',
+      '  n: N.map(s => scanCollab(s))',
+      '}))'
+    ].join('\n')
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe],
+      { encoding: 'utf8', timeout: 60000, cwd: ROOT })
+    const out = `${r.stdout || ''}`.trim()
+    const err = `${r.stderr || ''}`.trim()
+    let json = null
+    try { json = JSON.parse(out) } catch {}
+    rulesProbeRun = { status: r.status, raw: `${out}\n${err}`.trim(), json, positives: P, negatives: N }
+  }
+  return rulesProbeRun
+}
+
 
 // B 块（N-F2 确认边界）：三现场共用一次子进程取证（真起 index.js 路由，走两次真实请求 + 中间插文件）。
 //   夹具 c477-confirm-boundary-probe.mjs 自己 import index.js、起 route handler、造临时缓存根。
@@ -621,6 +662,87 @@ const autoCleanProbe = () => {
 //   独立复核带出的推翻项：PS5.1 把中文按 ISO-8859-1 编成问号静默入库。
 //   放所有 check 之前（C276 按块扫描会把夹在判据间的 spawnSync 算到相邻判据头上）。
 let ghApiUtf8Cache = null
+// 1354 第一批：新日志根改道 + migrate.log 止写取证（独立子进程设隔离 DSH_HOME，
+//   避开本进程已 init 的 cache-path 单例）。放所有 check 之前避 C276 按块扫描。
+let logRedirectCache = null
+let archiveProbeCache = null
+let panelFourProbeCache = null
+let concProbeCache = null
+let writebackProbeCache = null
+const logRedirectProbe = () => {
+  if (!logRedirectCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c515-log-redirect-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 4 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C515_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C515/C516 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    logRedirectCache = JSON.parse(line)
+  }
+  return logRedirectCache
+}
+
+// 1354 第二批：旧日志归档八现场 / 面板四栏取证（runner 放所有 check 之前，避 C276 按块扫描）。
+const archiveProbe = () => {
+  if (!archiveProbeCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c518-archive-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C518_JSON_ALL=(.*)/.exec(out) || [])[1]
+    must(line, `C518 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    archiveProbeCache = JSON.parse(line)
+  }
+  return archiveProbeCache
+}
+const panelFourProbe = () => {
+  if (!panelFourProbeCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c519-panel-four-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C519_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C519 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    panelFourProbeCache = JSON.parse(line)
+  }
+  return panelFourProbeCache
+}
+
+// 1603 续修：同内容并发复用 / 不同内容无损分流 / 冲突副本幂等 / 归档状态三档。
+// runner 放所有 check 之前，避 C276 按块扫描把 spawnSync 算到相邻判据。
+const concProbe = () => {
+  if (!concProbeCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c520-concurrency-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C520_JSON_ALL=(.*)/.exec(out) || [])[1]
+    must(line, `C520 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    concProbeCache = JSON.parse(line)
+  }
+  return concProbeCache
+}
+
+// 1717 A件：走真实 archiveOldLogs 出口，注入硬链接 ENOTSUP + 回退短写/抛错，验半份档清除。
+// runner 放所有 check 之前，避 C276 按块扫描把 spawnSync 算到相邻判据。
+const writebackProbe = () => {
+  if (!writebackProbeCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c524-writeback-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C524_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C524 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    writebackProbeCache = JSON.parse(line)
+  }
+  return writebackProbeCache
+}
+
 const ghApiUtf8Probe = () => {
   if (!ghApiUtf8Cache) {
     const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c491-ghapi-utf8-probe.mjs')], {
@@ -4963,6 +5085,10 @@ const RUNLOG_PROBE = [
   "const res = { writeHead() { return this }, setHeader() { return this }, end(b) { try { payload = JSON.parse(String(b)) } catch {} }, write() { return this } }",
   'await route.handler(req, res)',
   "console.log('CACHE_DIR=' + (payload?.data?.cache?.dir ?? 'MISSING'))",
+  // 0.4.18 起日志改道独立日志根，不再挂缓存根；让子进程自己算一次，主进程不复算，
+  // 否则「主进程算对了、子进程写歪了」会被掩盖。
+  "const cp = await import(new URL('./lib/cache-path.mjs', process.argv[2]).href)",
+  "console.log('LOG_DIR=' + cp.defaultLogsRoot())",
   'process.exit(0)',
 ].join('\n')
 
@@ -4990,14 +5116,18 @@ check('C67 面板侧 logRun 真写盘：跑一条必失败的命令，runs.jsonl
     must(kind === 'error', `必失败的命令没被判成 error：KIND=${kind ?? '(空)'}  stderr=${err.slice(0, 300)}`)
     const cacheDir = (/CACHE_DIR=(.*)/.exec(out) || [])[1]?.trim()
     must(cacheDir && cacheDir !== 'MISSING', `面板侧拿不到缓存根：${out.slice(0, 300)}`)
+    const logDir = (/LOG_DIR=(.*)/.exec(out) || [])[1]?.trim()
+    must(logDir && logDir !== 'MISSING', `面板侧拿不到独立日志根：${out.slice(0, 300)}`)
+    // 0.4.18：日志根必须已经移出缓存树，不能还挂在 cache/_logs 下（Astra 第4条四栏口径前提）
+    must(!logDir.startsWith(cacheDir + sep), `日志根还在缓存根下：log=${logDir} cache=${cacheDir}`)
 
     // ① runs.jsonl：子进程（look.mjs）**自己也会写一行**（它的 exit handler），所以「文件里有行」
     //   根本证明不了面板侧 logRun 跑过——第一版这里就是这么假绿的（R2 把面板侧的 last-error 写入
     //   整段注释掉，断言照样全绿）。真判据必须是「能认出哪一行是面板写的」：
     //   两边 entry 的字段差是稳定的——CLI 那份无条件带 diag/trackTail，index 的 logRun 没有这两个键。
     //   面板在子进程 close 之后才写，所以它那行一定是最后一行。
-    const runs = join(cacheDir, '_logs', 'runs.jsonl')
-    must(existsSync(runs), `面板侧跑完一条命令，runs.jsonl 没落地：${runs}（logRun → runsFile() 这条链断了）`)
+    const runs = join(logDir, 'runs.jsonl')
+    must(existsSync(runs), `面板侧跑完一条命令，runs.jsonl 没落地：${runs}（logRun → defaultLogsRoot() 这条链断了）`)
     const lines = readFileSync(runs, 'utf8').trim().split('\n').filter(Boolean)
     must(lines.length >= 2, `runs.jsonl 只有 ${lines.length} 行：子进程自己会写一行，面板 logRun 必须再写一行（少了就是面板侧那条链没执行）`)
     const panel = JSON.parse(lines[lines.length - 1])
@@ -6927,36 +7057,31 @@ check('C103 两个入口没有同名异类的顶层定义（depsCfg 那种撞名
   return `index ${a.size} 个顶层定义 / look ${b.size} 个，无同名异类`
 })
 
-// ── C104：缓存根的「谁负责初始化」必须与代码一致（2026-11-01 0.4.1 第 11 条）──────────
-// cache-path.mjs 原来写「现在两侧统一走 cacheDir()」，而 index.js 的 runsFile 实际走 ensureCache()。
-// 注释错还是代码错？核下来是**注释错**：
-//   · CLI 一条命令一进程，没初始化就是真没初始化 → cacheDir() 必抛，最省事；
-//   · 面板是常驻进程，runLogRecord 可能在 apply() 之前被调到 → ensureCache() 幂等就地初始化，
-//     否则整条日志丢掉。它拿的不是「未初始化的纯路径」，所以不属于「伪装成初始化好了」那种错。
-// 两边算出来的根是同一个（C64 真起两个进程比过），差异只在「谁负责初始化」。
-// 这条钉住这个分工：谁把它改成「统一」了，就直接红——那种「统一」会把日志或初始化时机弄坏。
-check('C104 缓存根初始化责任分明：CLI 的 runsFile 走 cacheDir()（必抛），面板走 ensureCache()（幂等）', () => {
+// ── C104：runs.jsonl 的写入根必须与缓存根解耦（2026-11-26 0.4.18 日志迁移改口径）──────────
+// 旧口径（0.4.1 第 11 条）：CLI 的 runsFile 走 cacheDir()（必抛）、面板走 ensureCache()（幂等）。
+// 0.4.18 起日志整体搬出缓存树：CLI 与面板两侧 runsFile 都改走 defaultLogsRoot()——一个纯路径函数，
+//   既不依赖缓存初始化、也不再挂 cache/_logs。这样日志根随安装（DSH_HOME）走，不随用户自定义缓存根走。
+// 这条钉住新分工：谁把 runsFile 改回 cacheDir()/ensureCache()（重新挂回缓存树），或直接红。
+check('C104 日志写入根与缓存根解耦：CLI/面板 runsFile 都走 defaultLogsRoot()（不依赖缓存初始化）', () => {
   const iSrc = read('index.js')
   const lSrc = read('tools/look.mjs')
-  must(/const runsFile = \(\) => join\(ensureCache\(\), '_logs', 'runs\.jsonl'\)/.test(iSrc),
-    'index.js 的 runsFile 不再走 ensureCache() —— 换成 cacheDir() 会在 apply() 之前抛，整条日志丢掉')
-  must(/const runsFile = \(\) => join\(cacheDir\(\), '_logs', 'runs\.jsonl'\)/.test(lSrc),
-    'tools/look.mjs 的 runsFile 不再是 cacheDir() —— CLI 侧应保留「未初始化必抛」')
-  // 面板侧「幂等」的落点就在这个定义上：ensureCache 必须只是 initCachePath(cacheWant) 的薄壳。
-  //   哪天它被改成「先读一个已有 CACHE、没有再初始化」，这里的幂等就变成了「读到空就抛」，注释又对不上了。
-  must(/function ensureCache\(\) \{\s*\n\s*const r = initCachePath\(cacheWant\)/.test(iSrc),
-    'index.js 的 ensureCache 不再是 initCachePath(cacheWant) 的薄壳 —— 面板侧的「幂等就地初始化」前提没了')
-  // 注释靶子：这两句都已经被实证为「与代码不符」，写回去就红（它们正是第 11 条要修的东西）
-  const badNotes = [
-    /一律走 lib 的 cacheDir\(\)/,
-    /缓存根没初始化时 runsFile\(\) 会抛/,
-  ].filter((re) => re.test(iSrc))
-  must(badNotes.length === 0, `index.js 又写回了与代码不符的注释：${badNotes.map(String).join(' / ')}`)
+  must(/const runsFile = \(\) => join\(defaultLogsRoot\(\), 'runs\.jsonl'\)/.test(iSrc),
+    'index.js 的 runsFile 不再走 defaultLogsRoot() —— 挂回缓存树会让日志随自定义缓存根漂移')
+  must(/const runsFile = \(\) => join\(defaultLogsRoot\(\), 'runs\.jsonl'\)/.test(lSrc),
+    'tools/look.mjs 的 runsFile 不再走 defaultLogsRoot() —— CLI 侧应同样与缓存根解耦')
+  // 两个入口都从 cache-path.mjs import defaultLogsRoot（路径只算一次，不在各入口复算）
+  must(/defaultLogsRoot/.test((/^import \{[^}]*\} from '\.\/lib\/cache-path\.mjs'/m.exec(iSrc) || [''])[0]),
+    'index.js 没从 lib/cache-path.mjs import defaultLogsRoot')
+  must(/defaultLogsRoot/.test((/^import \{[^}]*\} from '\.\.\/lib\/cache-path\.mjs'/m.exec(lSrc) || [''])[0]),
+    'tools/look.mjs 没从 lib/cache-path.mjs import defaultLogsRoot')
   const libSrc = read('lib/cache-path.mjs')
-  // 只认「整行就是那句断言」的写法（新注释里引用这句时带引号、不是行首，不该误判）
-  must(!/^\/\/\s*现在两侧统一走 cacheDir\(\)/m.test(libSrc), 'cache-path.mjs 又写回了「两侧统一走 cacheDir()」，与代码不符')
-  must(/ensureCache\(\)/.test(libSrc), 'cache-path.mjs 的说明没提面板侧的 ensureCache()，读者会以为两边一样')
-  return 'CLI=cacheDir（必抛）/ 面板=ensureCache（幂等自初始化）；文档与代码一致'
+  // defaultLogsRoot 必须是纯路径函数：基于 defaultHome()、不读缓存根、不做任何初始化
+  const m = (/export function defaultLogsRoot\(\) \{([^}]*)\}/.exec(libSrc) || [])[1]
+  must(m && /defaultHome\(\)/.test(m), 'defaultLogsRoot() 不是基于 defaultHome() 的纯路径函数')
+  must(m && !/cacheDir\(|ensureCache\(|initCachePath\(/.test(m), 'defaultLogsRoot() 依赖了缓存初始化/缓存根')
+  // crashDump 也要改道到新日志根（look.mjs 的 last-error.json 落点）
+  must(/const dir = defaultLogsRoot\(\)/.test(lSrc), 'tools/look.mjs 的 crashDump 目录没改道 defaultLogsRoot()')
+  return 'CLI/面板 runsFile + crashDump 都走 defaultLogsRoot()（随 DSH_HOME，不依赖缓存初始化）'
 })
 
 // ── C105–C111：七条命令的命令级端到端（2026-11-01 E5 补观测）────────────────────────
@@ -13982,7 +14107,7 @@ check('C366【主判据】差额说明与 truncated 同向：两态都报「上�
 
 // 2026-11-14（20261114-0156-DSH §7.2）：日志退出两条删除路径的行为判据。
 //   一条主判据里分四组，每组都落在真跑输出上；不读源码找字面，不用 || 兜底。
-check('C367【主判据】日志不参与清理：两档 plan 无 _logs、skipped 点名说明、真删后 runs.jsonl 行数不变、面板占用仍含日志', () => {
+check('C367【主判据】日志不参与清理：两档 plan 无 _logs、skipped 点名说明、真删后 runs.jsonl 行数不变、占用与日志解耦且第四栏单独统计', () => {
   const r = c367Probe()
   must(r.status === 0 && r.json && !r.json.fatal,
     `C367 夹具失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
@@ -13998,9 +14123,10 @@ check('C367【主判据】日志不参与清理：两档 plan 无 _logs、skippe
   must(/日志不参与清理/.test(whyOf(d.allSkipped)),
     `C367 彻底清空没说明日志为什么留：${JSON.stringify(d.allSkipped)}`)
   must(d.autoClaimsLogs === false, 'C367 自动清理认领了 _logs')
-  // ③ :398 保留 —— cacheBreakdown 的占用仍要把日志算进去，拿默认 dirStat 作对照
-  must(Number(d.occupied.files) > Number(d.statNoLogs.files),
-    `C367 面板占用没算日志（includeLogs 被删了？）：occupied=${JSON.stringify(d.occupied)} noLogs=${JSON.stringify(d.statNoLogs)}`)
+  // ③ 0.4.18：日志搬出三栏——占用不再含 _logs（occupied == 默认 dirStat），第四栏 logs 单独统计且有字节
+  must(JSON.stringify(d.occupied) === JSON.stringify(d.statNoLogs) &&
+    Number(d.logs?.files) >= 2 && Number(d.logs?.bytes) > 0,
+    `C367 三栏没与日志解耦或第四栏没统计到日志：occupied=${JSON.stringify(d.occupied)} statNoLogs=${JSON.stringify(d.statNoLogs)} logs=${JSON.stringify(d.logs)}`)
   // ④ 真删一次：日志行数不变、文件仍在；配正向能力证明真删跑过，防「整棵树没跑」假绿
   const x = j.real
   must(x.runsStillThere === true && x.runsLinesAfter === d.runsLinesBefore && d.runsLinesBefore === 2,
@@ -14008,7 +14134,7 @@ check('C367【主判据】日志不参与清理：两档 plan 无 _logs、skippe
   must(x.qrGone === true && Number(x.removedFiles) > 0,
     `C367 没有正向能力证据（整棵树没跑也会假绿）：qrGone=${x.qrGone} removedFiles=${x.removedFiles}`)
   must(x.userZipSurvived === true, 'C367 用户文件被删了')
-  return `两档 plan 无 _logs、skipped 说明「日志不参与清理」；真删后 runs.jsonl ${d.runsLinesBefore}→${x.runsLinesAfter} 行；qrGone=${x.qrGone}；占用 ${d.occupied.files} > 不含日志 ${d.statNoLogs.files}`
+  return `两档 plan 无 _logs、skipped 说明「日志不参与清理」；真删后 runs.jsonl ${d.runsLinesBefore}→${x.runsLinesAfter} 行；qrGone=${x.qrGone}；三栏占用不含日志 ${JSON.stringify(d.occupied)}，第四栏 logs=${JSON.stringify(d.logs)}`
 })
 
 
@@ -17289,12 +17415,18 @@ slowCheck('C508【主判据】2128 两个预览入口各只枚举一次：previe
 slowCheck('C509【主判据】2128 新旧逐字段契约一致：清单/foreign/removable/occupied/unrecognized 同源对照', () => {
   const c = contractProbe()
   must(!c.fatal, `C509 夹具内部抛错：${c.fatal}`)
-  must(c.samePreview === true && c.sameBreakdown === true && c.sameTokensOrder === true && c.sameUnknownFiles === true,
-    `C509 50792ac 旧实现与新 cachePreview 必须逐字段一致：${JSON.stringify(c)}`)
+  // 0.4.18：occupied 口径主动变更（日志搬出三栏），清单/removable/tokens/foreign 仍须逐字段一致；
+  //   occupied/unrecognized 的差值必须恰好等于搬出的日志字节，防「口径没变」或「多减/少减」。
+  must(c.samePreview === true && c.sameTokensOrder === true && c.sameUnknownFiles === true &&
+    JSON.stringify(c.old.breakdown.removable) === JSON.stringify(c.now.breakdown.removable),
+    `C509 50792ac 与新版清单/removable/tokens/foreign 必须逐字段一致：${JSON.stringify(c)}`)
+  must(c.occupiedDelta.bytes === c.logsInfo.bytes && c.occupiedDelta.files === c.logsInfo.files &&
+    c.occupiedDelta.bytes > 0,
+    `C509 occupied 口径差异须恰好等于搬出的日志字节：${JSON.stringify(c)}`)
   must(c.now.preview.count === 1 && c.now.breakdown.removable.count === 1 &&
     c.now.breakdown.unrecognizedCount === 2 && c.now.preview.unknownFiles.length === 1,
     `C509 对照现场须同时含可删/foreign/日志：${JSON.stringify(c.now)}`)
-  return '50792ac previewAll+cacheBreakdown 与 cachePreview 同盘逐字段一致；tokens 顺序与 unknownFiles 也一致'
+  return '50792ac 与新版清单/removable/tokens/foreign 逐字段一致；occupied 差值恰等于第四栏日志字节（口径变更）'
 })
 
 slowCheck('C510【主判据】2128 未标记根零结构：两个预览入口不枚举、不报可删项、三数全零', () => {
@@ -17304,7 +17436,8 @@ slowCheck('C510【主判据】2128 未标记根零结构：两个预览入口不
   must(u && u.rc === 0 && u.counts?.preview === 0 && u.counts?.clear === 0,
     `C510 未标记根两入口都不得打开目标文件：${JSON.stringify(u)}`)
   const zeroBreakdown = { occupied: { bytes: 0, files: 0 }, removable: { count: 0, files: 0, bytes: 0 },
-    unrecognized: { bytes: 0, files: 0 }, unrecognizedCount: 0, unknownFiles: [] }
+    unrecognized: { bytes: 0, files: 0 }, unrecognizedCount: 0, unknownFiles: [],
+    logs: { bytes: 0, files: 0 } } // 0.4.18 第四栏：未标记根日志也零结构
   for (const [name, data] of [['preview', u.preview?.data], ['clear', u.clear?.data]]) {
     must(data && data.count === 0 && data.files === 0 && data.bytes === 0 && Array.isArray(data.tokens) && data.tokens.length === 0,
       `C510 ${name} 清单须零结构：${JSON.stringify(data)}`)
@@ -17376,6 +17509,242 @@ slowCheck('C513【主判据】1120 慢档口径同源：slowCheck 声明与 --fa
   const targets = [...all].filter((id) => !slowSet.has(id))
   must(targets.length >= 150, `C513：同源慢集合把扫描面掏空，targets=${targets.length}`)
   return `慢集合单一来源=SLOW_SET(${slowSet.size})；slowCheck 声明 ${declared.size} 条全被认；targets=${targets.length}；两入口共用同一实例`
+})
+
+
+// 1354 第一批：新日志根 defaultLogsRoot + 实际路径重叠三态校验（相等/嵌套/junction/分离）。
+//   直接 import 真函数跑，不读源码文本猜；mkdtempSync 造现场，finally 形态照 LEGACY 登记的字面量。
+check('C514【主判据】1354 新日志根复用 defaultHome，实际路径重叠三态（相等/嵌套/junction/分离）判准', () => {
+  const base = mkdtempSync(join(tmpdir(), 'c514-'))
+  try {
+    const cache = join(base, 'cache')
+    const logs = join(base, 'logs')
+    mkdirSync(cache, { recursive: true })
+    mkdirSync(logs, { recursive: true })
+    let r = checkLogsRootOverlap(cache, logs)
+    must(r.overlap === false, `C514：分离的两个目录被判重叠 ${JSON.stringify(r)}`)
+    r = checkLogsRootOverlap(logs, logs)
+    must(r.overlap === true && /同一个实际路径/.test(r.reason), `C514：相等没被识别 ${JSON.stringify(r)}`)
+    const innerLogs = join(cache, 'logs')
+    mkdirSync(innerLogs, { recursive: true })
+    r = checkLogsRootOverlap(cache, innerLogs)
+    must(r.overlap === true && /内部/.test(r.reason), `C514：日志在缓存内没被识别 ${JSON.stringify(r)}`)
+    const junc = join(base, 'junction-logs')
+    symlinkSync(cache, junc, 'junction')
+    r = checkLogsRootOverlap(cache, junc)
+    must(r.overlap === true, `C514：junction 指向缓存没被识别 ${JSON.stringify(r)}`)
+    const logsOuter = join(base, 'logs-outer')
+    const cacheInner = join(logsOuter, 'cache')
+    mkdirSync(cacheInner, { recursive: true })
+    r = checkLogsRootOverlap(cacheInner, logsOuter)
+    must(r.overlap === true, `C514：缓存在日志内没被识别 ${JSON.stringify(r)}`)
+    const expect = join(dirname(defaultCacheRoot()), 'logs')
+    must(defaultLogsRoot() === expect, `C514：defaultLogsRoot 没复用 defaultHome：${defaultLogsRoot()} != ${expect}`)
+    return `分离/相等/嵌套/junction/反嵌套五态判定正确；defaultLogsRoot=${defaultLogsRoot()}`
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+
+// 1354 第一批：四写手改道 + migrate.log 止写（真跑独立子进程，非读源码猜）。
+check('C515【主判据】1354 四写手改道新日志根：index/look 的 runsFile 与 crashDump 都用 defaultLogsRoot', () => {
+  const p = logRedirectProbe()
+  const w = p.writers
+  must(w.indexRuns && w.lookRuns && w.lookCrash && w.bothImport,
+    `C515：写手没全改道 ${JSON.stringify(w)}`)
+  must(p.stop.rc === 0 && p.withBv.rc === 0,
+    `C515：取证子进程非 0（stop=${p.stop.rc} withBv=${p.withBv.rc}）`)
+  return `index.runs / look.runs / look.crash / import 四处全走 defaultLogsRoot`
+})
+
+check('C516【主判据】1354 migrate.log 止写：例行跳过连跑三次零行零文件，真迁移才写一行', () => {
+  const p = logRedirectProbe()
+  const s = p.stop.json
+  must(s && s.before === 0 && s.second === 0 && s.third === 0,
+    `C516：例行跳过却写了日志 ${JSON.stringify(s)}`)
+  must(s.logExists === false, `C516：没迁移却建了 migrate.log`)
+  const b = p.withBv.json
+  must(b && b.exists === true && b.lines === 1,
+    `C516：真迁移没写恰好一行 ${JSON.stringify(b)}`)
+  return `例行连跑三次 0/0/0 且无 migrate.log；真迁移写 1 行`
+})
+
+
+// 1354 第一批 A-5：用户可见的排障路径指引改到新日志根 + 旧副本说明（纯字面量结构判据）。
+check('C517【主判据】1354 排障指引指向新日志根并说明旧 cache/_logs 保留原字节', () => {
+  const c = read('client.js')
+  must(/<DSH 主目录>\/bili-watch\/logs\/runs\.jsonl/.test(c),
+    'C517：排障指引还指旧路径，没指向 bili-watch/logs/runs.jsonl')
+  must(/0\.4\.18 起日志从 cache\/_logs 搬到 bili-watch\/logs/.test(c),
+    'C517：没交代日志搬迁的来源与目标')
+  must(/保留原字节/.test(c) && /历史副本/.test(c),
+    'C517：没说清旧 cache/_logs 会保留原字节作历史副本')
+  return 'client.js 排障指引=新根 + 搬迁说明 + 旧副本保留原字节'
+})
+
+// 1354 第二批：旧日志归档八现场（真调 archiveOldLogs，源一律保留、同名复用、冲突另存、重叠跳过）。
+check('C518【主判据】1354 旧日志归档八现场：源保留、同名复用、冲突另存、非文件跳过、同实际路径去重', () => {
+  const o = archiveProbe()
+  for (const s of ['old-root-only', 'coexist', 'custom-root', 'reuse', 'conflict', 'nonfile', 'dedup-same-realpath', 'midchange']) {
+    must(o[s] && o[s].rc === 0 && !o[s].error && !o[s].parseFail,
+      `C518 现场 ${s} 夹具失效：${JSON.stringify(o[s]).slice(0, 200)}`)
+    must(o[s].statusSame === true, `C518 现场 ${s}：archiveStatus 与返回值不一致`)
+  }
+  const a = o['old-root-only']
+  must(a.R.archived === 1 && a.srcKept === 'OLD-A' && a.archivedAt === 'OLD-A',
+    `C518 只有旧根：应归档 OLD-A 且源保留 ${JSON.stringify(a)}`)
+  const co = o.coexist
+  must(co.R.archived === 2 && co.atOld === 'OLD-B-TOP' && co.atDef === 'NEW-B'
+    && co.topKept === 'OLD-B-TOP' && co.defKept === 'NEW-B',
+    `C518 两来源共存：应各归档不覆盖且源都保留 ${JSON.stringify(co)}`)
+  const cu = o['custom-root']
+  must(cu.R.sources.includes('custom-cache') && cu.atCustom === 'CUSTOM-Y' && cu.customKept === 'CUSTOM-Y',
+    `C518 自定义缓存根：应归档 CUSTOM-Y 且源保留 ${JSON.stringify(cu)}`)
+  const re = o.reuse
+  must(re.R.archived === 0 && re.R.reused === 1 && re.before === 'SAME' && re.after === 'SAME',
+    `C518 同名复用：第二次应 reused=1 且内容不变 ${JSON.stringify(re)}`)
+  const cf = o.conflict
+  must(cf.R.conflicts.length === 1 && cf.atMain === 'V1' && cf.atTwo === 'V2-DIFF',
+    `C518 源变化冲突：主档保 V1、另存 V2 ${JSON.stringify(cf)}`)
+  const nf = o.nonfile
+  must(nf.R.skipped.length >= 1 && nf.atMain === 'PLAIN' && nf.subdirExists === false,
+    `C518 非普通文件：目录应跳过不归档、普通文件照归 ${JSON.stringify(nf)}`)
+  const dd = o['dedup-same-realpath']
+  must(dd.R.archived === 1 && dd.srcKept === 'ONCE',
+    `C518 同实际路径去重：junction 两份只处理一次 ${JSON.stringify(dd)}`)
+  return '八现场全绿：源保留、两来源不覆盖、自定义根、同名复用、冲突另存 .2、非文件跳过、junction 去重、常规归档'
+})
+
+// 1354 第二批：面板四栏——occupied 去日志、X=Y+Z 恢复、第四栏 logs 独立统计含历史副本。
+check('C519【主判据】1354 面板四栏：占用不含日志且 X=Y+Z 恢复，第四栏统计新日志根含历史副本', () => {
+  const p = panelFourProbe()
+  must(p && !p.fatal, `C519 夹具失效：${JSON.stringify(p).slice(0, 200)}`)
+  must(p.xEqYZ === true, `C519：X=Y+Z 没恢复 ${JSON.stringify(p)}`)
+  must(p.noOldLogsInX === true, `C519：缓存根内旧 _logs 混进了占用 X ${JSON.stringify(p.occupied)}`)
+  must(p.logsBytesOk === true && p.logsFileOk === true,
+    `C519：第四栏日志字节/文件数不对（应 100B/2 文件，含 archive 副本）${JSON.stringify(p.logs)}`)
+  must(p.previewLogsOk === true && p.samePreviewBreakdown === true,
+    `C519：预览与明细的日志口径不一致 ${JSON.stringify(p)}`)
+  return `三栏占用不含旧日志且 X=Y+Z；第四栏 logs=${p.logs.bytes}B/${p.logs.files} 文件（含 archive 副本）`
+})
+
+// 1603 续修四条：并发覆盖 / 重复后缀幂等 / 归档状态三档。真调 archiveOldLogs。
+check('C520【主判据】1603 同内容并发到达后复用：主档已存在同字节不覆盖、不堆副本、状态为复用', () => {
+  const o = concProbe()
+  const s = o['same-content']
+  must(s && s.rc === 0 && !s.parseFail, `C520 夹具失效：${JSON.stringify(s).slice(0, 200)}`)
+  must(s.R.reused === 1 && s.R.archived === 0 && s.R.conflicts === 0 && s.R.errors === 0,
+    `C520 同内容应复用不覆盖：${JSON.stringify(s.R)}`)
+  must(s.main === 'V1-SAME' && s.files.join(',') === 'runs.jsonl',
+    `C520 主档内容/副本数不对：${JSON.stringify({ main: s.main, files: s.files })}`)
+  must(s.notRunSum.ran === false && s.runSum.ran === true && s.runSum.reused === 1,
+    `C520 状态摘要没反映复用：${JSON.stringify({ notRun: s.notRunSum, run: s.runSum })}`)
+  return '同内容并发：主档 V1-SAME 保住、reused=1、无副本、状态摘要 ran=true/reused=1'
+})
+
+check('C521【主判据】1603 不同内容并发到达后无损分流：先到者字节完整、后到者另存 .2、源保留、无 tmp 残骸', () => {
+  const o = concProbe()
+  const s = o['diff-content']
+  must(s && s.rc === 0 && !s.parseFail, `C521 夹具失效：${JSON.stringify(s).slice(0, 200)}`)
+  must(s.hookHits === 1, `C521 并发注入点没命中：${JSON.stringify({ hookHits: s.hookHits })}`)
+  must(s.main === 'V1-OTHER-PROCESS' && s.two === 'V1-MINE',
+    `C521 两版本没有都保住：${JSON.stringify({ main: s.main, two: s.two })}`)
+  must(s.srcKept === 'V1-MINE' && s.R.conflicts === 1 && s.R.errors === 0,
+    `C521 源未保留或冲突未记：${JSON.stringify({ srcKept: s.srcKept, R: s.R })}`)
+  must(Array.isArray(s.tmpLeft) && s.tmpLeft.length === 0,
+    `C521 留有 .tmp 残骸：${JSON.stringify(s.tmpLeft)}`)
+  return '不同内容并发：主档=先到者、.2=后到者、源保留、conflicts=1、零 tmp 残骸'
+})
+
+check('C522【主判据】1603 已有冲突副本后重复调用幂等：命中已有 .2 同哈希即复用，不生成 .3/.4', () => {
+  const o = concProbe()
+  const s = o['conflict-reuse']
+  must(s && s.rc === 0 && !s.parseFail, `C522 夹具失效：${JSON.stringify(s).slice(0, 200)}`)
+  must(s.files.join(',') === 'runs.jsonl,runs.jsonl.2',
+    `C522 堆了新后缀：${JSON.stringify(s.files)}`)
+  must(s.main === 'V1-ORIGINAL' && s.two === 'V2-SAME',
+    `C522 主档/副本字节被改：${JSON.stringify({ main: s.main, two: s.two })}`)
+  must(s.R1.archived === 0 && s.R1.reused >= 1 && s.R2.archived === 0 && s.R2.reused >= 1,
+    `C522 两次调用未都复用：${JSON.stringify({ R1: s.R1, R2: s.R2 })}`)
+  return '冲突副本幂等：两次调用都 reused=1、仍只有 runs.jsonl + .2、主档与副本字节不变'
+})
+
+check('C523【主判据】1603 归档状态三档可见：未执行 ran=false、完成 archived>0、跳过 skippedCount>0 且计数一致', () => {
+  const o = concProbe()
+  const done = o['status-done']
+  const partial = o['status-partial']
+  must(done && done.rc === 0 && partial && partial.rc === 0, `C523 夹具失效：${JSON.stringify({ done, partial }).slice(0, 200)}`)
+  must(partial.notRunSum.ran === false && partial.notRunSum.errorCount === 0,
+    `C523 未执行档不对：${JSON.stringify(partial.notRunSum)}`)
+  must(done.runSum.ran === true && done.runSum.archived === done.R.archived && done.runSum.archived > 0,
+    `C523 完成档计数不一致：${JSON.stringify({ sum: done.runSum, R: done.R })}`)
+  must(partial.runSum.ran === true && partial.runSum.skippedCount === partial.skipCount && partial.skipCount > 0,
+    `C523 跳过档计数不一致：${JSON.stringify({ sum: partial.runSum, skipCount: partial.skipCount })}`)
+  return '状态三档：未执行 ran=false、完成 archived>0 计数一致、跳过 skippedCount>0 计数一致'
+})
+
+check('C524【主判据】1717 回退分支中途抛错：走真实 archiveOldLogs 出口报可重试失败、清半份、源完整', () => {
+  const eno = writebackProbe().enospc
+  must(eno && eno.rc === 0, `C524 夹具失效：${JSON.stringify(eno)}`)
+  must(eno.summary.errorCount === 1 && eno.summary.archived === 0,
+    `C524 抛错现场没报失败：${JSON.stringify(eno.summary)}`)
+  must(eno.main === null && eno.extraFiles.length === 0 && eno.src === 'ABCDEFGH',
+    `C524 抛错现场留了半份或动了源：${JSON.stringify({ main: eno.main, extra: eno.extraFiles, src: eno.src })}`)
+  return 'ENOSPC 现场：errorCount=1、archived=0、归档目录无该文件、源 ABCDEFGH 完整'
+})
+
+check('C525【主判据】1717 回退分支短写：writeSync 返回值被复核，短写报失败、无半份档（Astra 挖出的半份正式档缺陷）', () => {
+  const sh = writebackProbe().short
+  must(sh && sh.rc === 0, `C525 夹具失效：${JSON.stringify(sh)}`)
+  must(sh.summary.errorCount === 1 && sh.summary.archived === 0,
+    `C525 短写现场没报失败（旧 bug 会 archived=1/errorCount=0）：${JSON.stringify(sh.summary)}`)
+  must(/短写/.test((sh.errors[0]?.why) || ''), `C525 短写失败文案没点明短写：${JSON.stringify(sh.errors)}`)
+  must(sh.main === null && sh.extraFiles.length === 0 && sh.src === 'ABCDEFGH',
+    `C525 短写现场留了半份档或动了源：${JSON.stringify({ main: sh.main, extra: sh.extraFiles, src: sh.src })}`)
+  return '短写现场：写 3/8 被判失败、errorCount=1、无半份档、源完整'
+})
+
+check('C526【主判据】1717 写入逐字节核对：写满长度但内容被篡改也必须判失败清档，成功路径逐字节相等', () => {
+  const o = writebackProbe()
+  const tam = o.tamper, ok = o.ok
+  must(tam && tam.rc === 0 && ok && ok.rc === 0, `C526 夹具失效：${JSON.stringify({ tamper: tam?.rc, ok: ok?.rc })}`)
+  must(tam.summary.errorCount === 1 && tam.summary.archived === 0,
+    `C526 篡改现场没被逐字节核对抓住（旧 bug 会报成功）：${JSON.stringify(tam.summary)}`)
+  must(tam.main === null && tam.extraFiles.length === 0 && tam.src === 'ABCDEFGH',
+    `C526 篡改现场留了坏档或动了源：${JSON.stringify({ main: tam.main, extra: tam.extraFiles, src: tam.src })}`)
+  must(ok.summary.archived === 1 && ok.summary.errorCount === 0 && ok.main === 'ABCDEFGH' && ok.src === 'ABCDEFGH',
+    `C526 成功路径字节不等或没归档：${JSON.stringify({ sum: ok.summary, main: ok.main, src: ok.src })}`)
+  return '篡改现场被回读核对抓住并清档；成功路径主档与源逐字节相等'
+})
+
+check('C527【主判据】1717 失败后可重试：短写失败清干净，恢复条件（不再注入）重跑能真归档成功', () => {
+  const rt = writebackProbe().retry
+  must(rt && rt.fail?.rc === 0 && rt.ok?.rc === 0, `C527 夹具失效：${JSON.stringify(rt)}`)
+  must(rt.fail.summary.errorCount === 1 && rt.afterFail.main === null,
+    `C527 失败现场没干净失败：${JSON.stringify({ fail: rt.fail.summary, afterFail: rt.afterFail })}`)
+  must(rt.ok.summary.archived === 1 && rt.final.main === 'ABCDEFGH',
+    `C527 恢复条件后没能重试成功：${JSON.stringify({ ok: rt.ok.summary, final: rt.final })}`)
+  return '先短写失败清档，恢复后重跑 archived=1、主档 ABCDEFGH'
+})
+
+slowCheck('C528【主判据】第一档六条规则真求值：7 正例全命中且规则名对、3 反例零命中（不是断规则名还在）', () => {
+  const r = rulesProbe()
+  must(r.status === 0 && r.json, `C528：_rules.mjs 真求值失败 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  const j = r.json
+  const expectName = ['会话坐标 / 内部批次', '会话坐标 / 内部批次', '会话坐标 / 内部批次',
+    '会话坐标 / 内部批次', '会话坐标 / 内部批次', '内部协作标记', '派单编号 / 内部时刻']
+  must(Array.isArray(j.names) && j.names.length === 3,
+    `C528：COLLAB_RULES 三类规则不在了：${JSON.stringify(j.names)}`)
+  r.positives.forEach((s, i) => {
+    const hits = j.p?.[i] || []
+    must(hits.length > 0, `C528：正例${i + 1}「${s}」新规则没命中（旧规则本就不命中，这是回归）`)
+    must(hits.includes(expectName[i]),
+      `C528：正例${i + 1} 命中的规则名不对，期望含「${expectName[i]}」，实得 ${JSON.stringify(hits)}`)
+  })
+  r.negatives.forEach((s, i) => {
+    must((j.n?.[i] || []).length === 0,
+      `C528：反例${i + 1}「${s}」被误伤：${JSON.stringify(j.n?.[i])}`)
+  })
+  return `${r.positives.length} 正例全命中（规则名对）/${r.negatives.length} 反例零命中，_rules.mjs 真求值`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

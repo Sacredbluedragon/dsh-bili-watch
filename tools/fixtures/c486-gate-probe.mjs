@@ -56,6 +56,16 @@ const npmA = fakeNpm('fakeA', '["0.4.16"]')            // 目标 0.4.17 未发�
 const npmB = fakeNpm('fakeB', '["0.4.16","0.4.17"]')   // 目标已发布（版本未递增闸）
 const npmC = fakeNpm('fakeC', '[]')                     // 空列表（md5 闸绕开闸1）
 
+// C486 写版本正对照要求「源版本 < 目标版本」。真实 dev 树 version 会随发布推进（现 0.4.17），
+// 若源已是 0.4.17，release 写 0.4.17 就是 no-op，判据 before/after 假红。把专用 srcB 的源版本
+// 钉到 0.4.16，让 before=0.4.16 → after=0.4.17 与真实 version 解耦（只改隔离副本，不碰真实包）。
+{
+  const pj = join(srcB, 'package.json')
+  const j = JSON.parse(readFileSync(pj, 'utf8'))
+  j.version = '0.4.16'
+  writeFileSync(pj, JSON.stringify(j, null, 2) + '\n')
+}
+
 // srcB 元判据桩：元判据闸与三条元判据秒过（省 428s+846s；真品保留在 srcA/srcC）。
 const STUB = "console.log('[stub] ok');process.exit(0)\n"
 writeFileSync(join(srcB, 'tools', 'verify-self.mjs'), STUB, 'ascii')

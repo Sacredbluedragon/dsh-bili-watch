@@ -36,7 +36,7 @@ import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, cac
 import { normalizeDeleteMode, deletePaths, DELETE_MODES, invalidDeleteModeOf } from './lib/recycle.mjs'
 import { modelRow, MODEL_EXPECTED_MB } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
-// 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
+// UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
 //   逐字相同，而 lib/bili-api.mjs 的 jget 默认头也要它，lib 不能反向 import 入口。
 //   本文件里只用于扫码登录那三处（QR_GEN / QR_POLL / fillBuvids）。
 import { UA, NEXT_STEP_PREFIX } from './lib/consts.mjs'
@@ -46,7 +46,7 @@ import { UA, NEXT_STEP_PREFIX } from './lib/consts.mjs'
 import { TUNING_DEFS, TUNING_KEYS, lockTtlMsOf, normalizeTuning, tuningDefaults, tuningRanges } from './lib/tuning.mjs'
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs（收路径参数，不碰状态）。
 import { logRun } from './lib/runs.mjs'
-// 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
+// deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs（与 tools/look.mjs 同一份）。
 import { depsPaths, readPluginVersion, resolveDepsDir, DEPS_LOCK_NAME, depsLockFile } from './lib/plugin-paths.mjs'
 // 2026-11-21（0.4.15 件一）：deps 锁三态判据收进 lib/deps-lock.mjs，本文件与 doctor.mjs 共用一份。
 import { depsLockVerdict } from './lib/deps-lock.mjs'
@@ -56,7 +56,7 @@ import { readJsonOrBackup as readJsonOrBackupRaw, writeJsonAtomic } from './lib/
 // 2026-10-31：缓存根的**状态与初始化时序**搬进 lib/cache-path.mjs。
 //   前三次搬的是纯函数，compile 抽出来跑等于真跑；这一次搬的是可变模块状态 + 「谁先调」，
 //   所以判据也换了（C64 真起两个进程比对实际路径 / C65 未初始化必抛，见 tools/verify.mjs）。
-import { cacheAdoptNotice, cacheDir, initCachePath, previewCacheDir, videoDir } from './lib/cache-path.mjs'
+import { archiveStatusSummary, cacheAdoptNotice, cacheDir, defaultLogsRoot, initCachePath, previewCacheDir, videoDir } from './lib/cache-path.mjs'
 // 2026-10-31：凭证的位置 / 完整性判据 / 旧路径迁移搬进 lib/cred.mjs。
 //   本文件与 tools/look.mjs 原来各有一份迁移逻辑，四字段清单更是散在三处；
 //   现在只有一份，两个入口各自把结构化结果翻译成自己的文案（面板静默 → /status，CLI 打 stderr）。
@@ -304,7 +304,7 @@ function copyAndVerifyDstToTmp(dst, tmp) {
   const verdict = compareDepsEntries(dstEntries, tmp)
   if (!verdict.ok) throw new DepsCopyIncompleteError(verdict.issues, verdict.extra)
 }
-// 2026-11-01（0.4.1 第 8 条）：deps 的三个候选路径与「用哪份」的判据搬进 lib/plugin-paths.mjs。
+// deps 的三个候选路径与「用哪份」的判据搬进 lib/plugin-paths.mjs。
 //   tools/look.mjs 原来有一份「长得像但差一截」的：它只判包内目录**存在**，不判有内容，
 //   于是干净安装（包内 deps 是空目录）时面板用包外、CLI 用包内。判据现在只有一份，以本文件为准。
 const { pref: DEPS_PREF, local: DEPS_LOCAL, movedMark: DEPS_MOVED_MARK } = depsPaths({ pluginRoot: HERE })
@@ -638,7 +638,7 @@ function writeTuning(body) {
     const v = body[k]
     if (v === null) { delete cur[k]; touched = true; continue }
     const d = TUNING_DEFS[k]
-    // 第十条（2026-10-29）：枚举项（asrDevice）按字符串白名单存，不走数值判据
+    // 枚举项（asrDevice）按字符串白名单存，不走数值判据
     if (d.kind === 'enum') {
       const s = String(v ?? '').trim().toLowerCase()
       if (d.values.includes(s)) { cur[k] = s; touched = true } else { bad.push(`${k}=${v} 只能是 ${d.values.join(' / ')}`) }
@@ -763,7 +763,7 @@ let _ffmpegProbeSeq = 0
 /** W-57（2026-10-28 全量检查）：面板侧的 ffmpeg 探测必须与 CLI（tools/look.mjs:750 findFfmpeg）同口径——
  *  文件候选查存在性，裸 'ffmpeg' 要试跑 -version（PATH 里装了也算有）。
  *  原来只 existsSync，于是「CLI 能抽帧、面板却说没装 ffmpeg」的谎报完全成立（用户最容易当场发现）。
- *  回归复核（2026-10-28）：这个函数在 GET /status 里被调用，而 /status 每 8 秒轮询一次——
+ * 这个函数在 GET /status 里被调用，而 /status 每 8 秒轮询一次——
  *  timeout 从 5000 收到 1200（ffmpeg -version 正常 <100ms），缓存从 60s 提到 300s。
  *  2026-11-06 面板首屏：execFileSync 会堵住事件循环，首屏 4 个并发 /status 只能排队；
  *  改走 execFileP（不 reject，统一回 {ok,...}），并加在飞 Promise 复用——
@@ -866,7 +866,10 @@ const inject = ['commands', 'webServer', 'agents']
 const PLUGIN_VERSION = readPluginVersion(HERE)
 // D98：缓存根是懒初始化的（ensureCache），这里必须现算——顶层常量会把「未初始化时算出的纯路径」固化下来，
 //   万一 pickCacheDir 因不可写回退到默认根，日志就会一直写进那个用不上的旧路径。
-const runsFile = () => join(ensureCache(), '_logs', 'runs.jsonl')
+// 活跃 runs.jsonl 改到新日志根 $DSH_HOME/bili-watch/logs/，
+  //   不再挂缓存根——换缓存根时日志留在安装目录，排障找的是插件日志不是某个缓存目录的日志。
+  //   保留惰性函数形态（求值点在 logRun 的 try 里）以维持原有异常边界。
+  const runsFile = () => join(defaultLogsRoot(), 'runs.jsonl')
 // 轮转、追加、失败现场三件一起搬进 lib/runs.mjs（2026-10-31 搬了追加，随后补齐 logRun）。
 //   两处原来逐字相同（18 行 × 2）；真正的差异用参数表达：面板侧没有 diag/trackTail（不传 extra），
 //   缓存根由本文件的 ensureCache 决定（传 videoDirOf）。
@@ -1426,7 +1429,7 @@ async function ytdlpVersion() {
   return p
 }
 
-// 第十条（2026-10-29）：GPU 状态。三个问题分开答，别混成一个布尔：
+// GPU 状态。三个问题分开答，别混成一个布尔：
 //   deviceCount——有没有 NVIDIA 卡（nvidia-smi -L 的行数）
 //   dllReady——cuBLAS 运行库能不能真加载（不看 pip 包名，真跑一次加载）。
 //     Windows 是 ctypes.WinDLL("cublas64_12.dll")，Linux 是先 RTLD_GLOBAL 预载
@@ -1887,7 +1890,7 @@ async function depRows(gpuVal, opts = {}) {
       estimate: ESTIMATES.model,
     },
   ]
-  // 第十条（2026-10-29）：第 7 项 GPU 运行库。ok 判据是「DLL 真能加载」，不是「pip 包在不在」
+  // 第 7 项 GPU 运行库。ok 判据是「DLL 真能加载」，不是「pip 包在不在」
   //   ——包可能在 site-packages 里而 DLL 在别处（或反之）。removable 只认 pip 装的那份
   //   （系统装的 CUDA Toolkit 不归我们管，面板不给删）。
   const gpu = gpuVal || (await gpuStatus())
@@ -2316,7 +2319,7 @@ function deleteDeps(targets) {
       continue
     }
     if (t === 'cuda') {
-      // 第十条（2026-10-29）：必须走 pip uninstall——只删目录会留下 *.dist-info，
+      // 必须走 pip uninstall——只删目录会留下 *.dist-info，
       //   重装时 pip 报「已安装」但文件没了。失败把 stderr 放进 skipped。
       const py = venvAsr().find((p) => existsSync(p)) || ''
       if (!py) { skipped.push({ id: t, why: 'ASR 环境还没装，没有 GPU 运行库可删' }); continue }
@@ -2989,10 +2992,10 @@ function registerPanelRoute(ctx) {
                     //   activeDepIds 传 DOWNLOADING：没有进程在写它就判「无法测量」，
                     //   避免上次中断留下的状态变成一条永远不动的进度条。
                     download: downloadProgress(DEPS, { activeDepIds: DOWNLOADING.keys() }),
-                    // 第十条（2026-10-29）：GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
+                    // GPU 三态给面板用（有卡有库 / 有卡无库 / 无卡）。
                     //   探测结果 5 分钟缓存，不随 8 秒轮询跑子进程。
                     gpu: gpuNow,
-                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(cacheDir()), lastAutoClean: cleaned, defaultOut: String(depsCfg()?.defaultOut || '') },
+                    cache: { ...cacheStat(), ...cacheCfg(), dir: maskAbs(cacheDir()), lastAutoClean: cleaned, defaultOut: String(depsCfg()?.defaultOut || ''), archive: archiveStatusSummary() },
                     tuning: readTuning(),
                     tuningDefaults: tuningDefaults(),
                     tuningRanges: tuningRanges(),
@@ -3037,7 +3040,7 @@ function registerPanelRoute(ctx) {
               // 2128 续派：面板挂载会显式请求一次；/status 的 8 秒轮询不走这里。
               //   一次请求只做一次带内容摘要的枚举，清单/foreign/三数同源；占用仍独立 dirStat。
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/preview') {
-                return sendJson(res, 200, { ok: true, data: cachePreview(cacheDir()) })
+                return sendJson(res, 200, { ok: true, data: cachePreview(cacheDir(), { logsDir: defaultLogsRoot() }) })
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
@@ -3078,7 +3081,7 @@ function registerPanelRoute(ctx) {
                   // 与 /cache/preview 共用单次快照实现；confirmed 真删分支仍从磁盘重新枚举。
                   return sendJson(res, 200, {
                     ok: true,
-                    data: { needConfirm: true, ...cachePreview(cacheDir()), mode },
+                    data: { needConfirm: true, ...cachePreview(cacheDir(), { logsDir: defaultLogsRoot() }), mode },
                   })
                 }
                 // B-4（1805）：面板的确认请求（all && confirmed，即两步确认的第二步）必须携带
@@ -3162,7 +3165,7 @@ function registerPanelRoute(ctx) {
                 const overflowCount = cleared.overflow?.count || 0
                 let clearState = 'ok'
                 if (all && confirmed && Array.isArray(confirmedTokens)) {
-                  // 2033 C-1（Astra 2028 第3条）：真正空必须「没有 changed 新增项」也成立。
+                  // 真正空必须「没有 changed 新增项」也成立。
                   //   空预览之后有新增时，emptyList=true 但 changedCount>0，不能被抢先判成 empty，
                   //   否则「实际清理 0 项 + 新增项保留 + 提示重新预览」这条回执拿不到。
                   if (emptyList && removedFiles === 0 && changedCount === 0) clearState = 'empty'
