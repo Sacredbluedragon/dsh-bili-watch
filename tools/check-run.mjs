@@ -308,6 +308,36 @@ export function makeSlowChecker(check, register) {
   }
 }
 
+/**
+ * 1120 发版阻断：慢判据口径必须单一来源。
+ * 从源码文本抽出所有 slowCheck() 声明的编号——**不读运行时 declaredSlow**：
+ * C313 定义在前（12787），绝大多数慢判据在它之后才注册，运行时集合那时还是空的。
+ * 行首锚点（可空白）+ 紧跟引号，注释里的 `slowCheck(` 不会误命中。
+ */
+export function declaredSlowIdsFromSource(src) {
+  const out = new Set()
+  const re = /^\s*slowCheck\(\s*'([^']+)'/
+  for (const l of String(src).split('\n')) {
+    const m = re.exec(l)
+    if (!m) continue
+    const id = checkId(m[1])
+    if (id) out.add(id)
+  }
+  return out
+}
+
+/**
+ * 「算不算慢」的唯一构造入口。extraGroups 是若干编号数组（三份常量清单）。
+ * 返回冻结的编号集合 = 所有 extraGroups ∪ 源码 slowCheck 声明。
+ * --fast 的 isSlow 与 C313 的慢集合都从这里取，杜绝「检查面与被检查面各算一份」。
+ */
+export function makeSlowSet(src, extraGroups = []) {
+  const set = new Set()
+  for (const group of extraGroups) for (const id of group) set.add(id)
+  for (const id of declaredSlowIdsFromSource(src)) set.add(id)
+  return Object.freeze(set)
+}
+
 /** --fast 的跳过提示。默认路径（active=false）返回 null，不许冒出这行噪音。 */
 export function fastNoticeLine(skipped, ran, active) {
   if (!active) return null

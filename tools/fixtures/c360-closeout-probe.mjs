@@ -54,6 +54,7 @@ const runPanel = (body, reply, includeUnknown = false) => {
   const fn = new Function(
     'ctx',
     `const { includeUnknown, jpost, setMsg, dirtyRef, load, refreshFacts } = ctx
+     const confirmedTokens = ctx.confirmedTokens || []
      return (async () => { ${body} })()`,
   )
   return fn(ctx).then(() => ({ msgs })).catch((e) => ({ msgs, error: String(e?.message || e) }))
@@ -61,16 +62,20 @@ const runPanel = (body, reply, includeUnknown = false) => {
 
 // ---------- C：抠回包判定原样片段，喂四类 cleared 桩 ----------
 const replyFragment = () => {
-  const a = indexSrc.indexOf('const failedCount = cleared.failed.length')
-  if (a < 0) return ''
-  const b = indexSrc.indexOf("const why = partial ? reasons.join('；') : undefined", a)
-  return b > a ? indexSrc.slice(a, b + "const why = partial ? reasons.join('；') : undefined".length) : ''
+  // 1939 A 件：前导多了 skippedList/changedCount/clearState 计算，起锚前移到 skippedList。
+  const a = indexSrc.indexOf('const skippedList = Array.isArray(cleared.skipped)')
+  const anchor = a >= 0 ? a : indexSrc.indexOf('const failedCount = cleared.failed.length')
+  if (anchor < 0) return ''
+  const b = indexSrc.indexOf("const why = partial ? reasons.join('；') : undefined", anchor)
+  return b > anchor ? indexSrc.slice(anchor, b + "const why = partial ? reasons.join('；') : undefined".length) : ''
 }
-const runReply = (fragment, cleared) => {
+const runReply = (fragment, cleared, opts = {}) => {
   if (!fragment) return { error: '回包判定片段抠不出来' }
   try {
-    const fn = new Function('cleared', `${fragment}\nreturn { ok: !partial, why }`)
-    return fn(cleared)
+    // 前导用到 all/confirmed/confirmedTokens/removedFiles，给恒等桩（非面板确认路径，clearState 落 ok）。
+    const fn = new Function('cleared', 'all', 'confirmed', 'confirmedTokens', 'removedFiles',
+      `${fragment}\nreturn { ok: !partial, why, clearState }`)
+    return fn(cleared, opts.all ?? false, opts.confirmed ?? false, opts.confirmedTokens ?? null, opts.removedFiles ?? 0)
   } catch (e) {
     return { error: String(e?.message || e) }
   }

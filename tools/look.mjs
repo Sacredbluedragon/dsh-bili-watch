@@ -53,7 +53,7 @@ import { lockState, makeLocks } from '../lib/locks.mjs'
 //   只留 removeOwned；同理上面的 consts 两项也不再需要 import（CACHE_MARK 只被 pickCacheDir 用，
 //   OWN_CACHE_DIRS 只被 migrateLegacyCache 用，两者都搬进了 lib/cache-path.mjs）。
 import { provableNamesIn, removeOwned, removeAllOwned } from '../lib/cache-own.mjs'
-import { normalizeDeleteMode } from '../lib/recycle.mjs'
+import { normalizeDeleteMode, invalidDeleteModeOf } from '../lib/recycle.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from '../lib/keys.mjs'
 // 2026-11-01（0.4.1 第 8 条）：deps 路径判据与版本号读取搬进 lib/plugin-paths.mjs
 //   （与 index.js 同一份；原来这里那份判据差一截，见下面 DEPS 处的注释）。
@@ -4386,8 +4386,27 @@ try {
       // 三条路径（常规 clean / clean --all / 面板自动清理）都经 normalizeDeleteMode 归一，
       // 坏配置一律回 permanent，不会把用户配置里的错字变成「全走回收站」。
       const override = flag('permanent') ? 'permanent' : flag('recycle') ? 'recycle' : flag('smart') ? 'smart' : ''
-      let cfgMode
-      try { cfgMode = readJsonOrBackup(join(DEPS, 'cache-config.json'), {}).value?.deleteMode } catch {}
+      // N-F1：原来 `.value || {}` 会把 null / [] / 标量吞成 {}，坏 JSON 的 problem 也丢，
+      //   于是放行后按 permanent 直删。改成把原始 value 与 problem 分开拿，顶层形状错、坏 JSON、
+      //   读失败一律喂 invalidDeleteModeOf 拦下，原文件保留不动。
+      let cfgObj = {}
+      let cfgProblem = null
+      try {
+        const got = readJsonOrBackup(join(DEPS, 'cache-config.json'), {})
+        cfgObj = got.value
+        cfgProblem = got.problem || null
+      } catch (e) { cfgProblem = { kind: 'read', error: String(e?.message || e) } }
+      const cfgMode = (cfgObj && typeof cfgObj === 'object' && !Array.isArray(cfgObj)) ? cfgObj.deleteMode : undefined
+      // X13-F2 / N-F1：显式非法值、顶层形状错、坏 JSON、读失败，删除前一律停下，绝不静默降级成 permanent。
+      //   缺省（键不存在 / 整个文件不存在）与三个合法值不拦；命令行显式合法值也不掩盖配置里的错字。
+      const badCfgMode = invalidDeleteModeOf(cfgObj, cfgProblem)
+      if (badCfgMode !== null) {
+        const hint = badCfgMode.problem
+          ? `配置文件读取/解析失败（${badCfgMode.problem}${badCfgMode.detail ? '：' + badCfgMode.detail : ''}），原文件保留未动，请修改其中的 deleteMode`
+          : (badCfgMode.shape ? `配置顶层必须是对象` : `缓存配置里的删除方式 ${JSON.stringify(badCfgMode.value)} 无法识别`)
+        console.error(`✗ ${hint}，已停止清理（没有删除任何文件）。合法值只有 permanent / recycle / smart，请修改 ${join(DEPS, 'cache-config.json')} 中的 deleteMode 后重试`)
+        process.exit(1)
+      }
       const mode = normalizeDeleteMode(override || cfgMode)
       const cleared = all
         ? removeAllOwned(cacheDir(), { dryRun, mode })

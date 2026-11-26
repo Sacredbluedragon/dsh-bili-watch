@@ -709,6 +709,9 @@ MODULE_LOADER.load({
       //   勾选后一次性显式授权——不是按扩展名判定归属，是用户自己点头的那一下。
       const [includeUnknown, setIncludeUnknown] = React.useState(false)
       const [unknownFiles, setUnknownFiles] = React.useState([])
+      // N-F2（2026-11-25）：确认时记下预览返回的稳定标识清单，二次 clear 带上它——
+      //   服务端执行前逐个核对，确认之后新增/被换掉的文件不删（同数量同字节替换也认得出）。
+      const [confirmedTokens, setConfirmedTokens] = React.useState([])
       // BLK-03（2026-10-28）：8 秒轮询原来无条件把输入框重置成服务端值，用户改完天数还没点保存
       //   就被改回 7。用 ref 记「用户动过输入框」，轮询见到就跳过覆盖，保存成功后复位。
       const dirtyRef = React.useRef(false)
@@ -752,7 +755,8 @@ MODULE_LOADER.load({
         }
       }, [])
 
-      // 三数单独取一次，不并进 load() 的 8 秒轮询（previewAll 会全量 walk 缓存根）。
+      // 三数随面板挂载显式取一次，不并进 load() 的 8 秒轮询。
+      // 2128 续派：/cache/preview 一次请求只枚举一遍（带内容摘要），清单与三数同源。
       const refreshFacts = React.useCallback(async () => {
         try {
           const p = await jpost('/cache/preview', {})
@@ -958,6 +962,16 @@ MODULE_LOADER.load({
             h('div', { 'data-bl-row': '', 'data-bl-unknown-check': '' },
               h('input', { type: 'checkbox', checked: !!o.includeUnknown, onChange: o.onToggleUnknown }),
               h('span', { 'data-bl-name': '' }, '连同这些文件一起删除')))
+          // 4-F1：勾选后明确告诉用户「总共」将删多少——主体 preview（不含 foreign）加上这批外来文件，
+          //   只加一次（外来文件就在 o.unknownFiles 里，不再叠加 breakdown 的同源汇总），
+          //   数据全用 previewAll 已经给出的 count/bytes 与 unknownFiles，不在前端自己重扫重算。
+          if (o.includeUnknown) {
+            const allCount = Number(allPreview?.count || 0) + foreign.length
+            const allBytes = Number(allPreview?.bytes || 0) + totalBytes
+            kids.push(
+              h('div', { 'data-bl-note': '', 'data-bl-total-when-checked': '' },
+                `勾选后将共删除 ${allCount} 项 / ${fmtBytes(allBytes)}（含 ${foreign.length} 个可能不是本插件的文件）`))
+          }
         }
         kids.push(
           h('div', { 'data-bl-row': '' },
@@ -970,6 +984,8 @@ MODULE_LOADER.load({
         try {
           const p = await jpost('/cache/preview', {})
           setAllPreview({ count: Number(p?.data?.count || 0), bytes: Number(p?.data?.bytes || 0) })
+          // N-F2：记下确认时的稳定标识清单，clear 时原样带回做核对。
+          setConfirmedTokens(Array.isArray(p?.data?.tokens) ? p.data.tokens : [])
           if (p?.data?.breakdown) setCacheFacts(p.data.breakdown)
           // 第三件（0.4.11）：把第二类「明确可疑」清单收进 state（用 Array.isArray 兜底）；
           //   每次开确认框都把勾选复位成不勾——上次勾过不代表这次还想删。
@@ -988,6 +1004,9 @@ MODULE_LOADER.load({
         try {
           const clearBody = { all: true, confirmed: true }
           if (includeUnknown) clearBody.includeUnknown = true
+          // N-F2（1516 返修）：只要有清单就挂，含空数组——空清单表示「确认时没有可删对象」，
+          //   必须让服务端知道并零删除；漏挂这个字段会被当成老调用方（没有 tokens）走老路全删。
+          if (Array.isArray(confirmedTokens)) clearBody.tokens = confirmedTokens
           const j = await jpost('/cache/clear', clearBody)
           const d = j?.data || {}
           // 回收站失效回落：这些条目已永久删除、不可恢复，不能用完成态措辞盖过去。
@@ -1003,13 +1022,23 @@ MODULE_LOADER.load({
           const fallbackNote = fallbackList.length
             ? `回收站不可用：${fallbackList.length} 项已永久删除（不可恢复）—— ${namesOf(fallbackList)}`
             : ''
+          // 1939 A 件：过期回执四态。按 skipped 条目的机器可读 kind 分组渲染，
+          //   不再靠中文 why 正则猜（原来把「内容已变化」混进「按设计保留」）。
+          //   没有 kind 的老回包条目一律当 design，保持旧调用方/旧夹具兼容。
+          const skippedAll = Array.isArray(d.skipped) ? d.skipped : []
+          const byKind = (k) => skippedAll.filter((s) => (s?.kind || 'design') === k)
+          const changedList = byKind('changed')
+          const designList = byKind('design')
+          const clearState = d.clearState
           let msg
           if (j?.ok === false) {
             msg = j.why || '彻底清空失败'
           } else if (fallbackList.length) {
             msg = `已清理 ${items} 项，但${fallbackNote}`
-          } else if (items === 0) {
+          } else if (clearState === 'empty' || items === 0) {
             msg = `没有可清理的条目${overflowCount ? `；因回收站空间不足跳过 ${overflowCount} 项` : ''}`
+          } else if (clearState === 'partial-stale' || (changedList.length && items > 0)) {
+            msg = `已清理 ${items} 项；另有 ${changedList.length} 项在你确认之后新增或内容变了，已保留，可重新预览确认`
           } else {
             msg = `已彻底清空（${items} 项）` + (overflowCount ? `；因回收站空间不足跳过 ${overflowCount} 项` : '')
           }
@@ -1017,12 +1046,13 @@ MODULE_LOADER.load({
           //   哪些条目没删成、哪些已经被永久删除。
           if (failedList.length) msg += `；删除失败 ${failedList.length} 项（${namesOf(failedList)}）`
           if (j?.ok === false && fallbackNote) msg += `；${fallbackNote}`
-          // 按设计保留的条目也要点名，否则「已彻底清空」和目录里还有文件互相打脸。
-          //   容量溢出那条已在上面单独计数，这里不重复列。
-          const kept = (Array.isArray(d.skipped) ? d.skipped : [])
-            .filter((s) => !/回收站空间不足/.test(String(s?.why || '')))
-          if (kept.length) {
-            msg += `；另有 ${kept.length} 项按设计保留（${namesOf(kept)}）`
+          // 变化/新增导致保留的条目单独点名（与「按设计保留」分开），并给重预览去处。
+          if (changedList.length && j?.ok !== false && clearState !== 'partial-stale') {
+            msg += `；${changedList.length} 项因内容变化或新增已保留（${namesOf(changedList)}），可重新预览确认`
+          }
+          // 按设计保留只装 design 这一类，不再把「内容已变化」混进来。
+          if (designList.length) {
+            msg += `；另有 ${designList.length} 项按设计保留（${namesOf(designList)}）`
           }
           setMsg(msg)
           dirtyRef.current = false
@@ -1380,11 +1410,14 @@ MODULE_LOADER.load({
               h('span', { 'data-bl-detail': '' },
                 ({ disabled: '自动清理已关闭', throttled: '10 分钟内已检查过', 'missing-root': '缓存目录不存在',
                   noMark: '缓存根不是本插件建的，未清理', locked: '有任务正在运行，已跳过',
-                  unknown: '有目录读不出来，已跳过' }[cache.lastAutoClean.skipReason.state]
+                  unknown: '有目录读不出来，已跳过',
+                  'bad-delete-mode': '配置里 deleteMode 无法识别，已停止自动清理，请改成 permanent / recycle / smart 之一' }[cache.lastAutoClean.skipReason.state]
                   || cache.lastAutoClean.skipReason.state) +
                 (cache.lastAutoClean.skipReason.at ? `（${new Date(cache.lastAutoClean.skipReason.at).toLocaleString()}）` : '') +
                 (cache.lastAutoClean.skipReason.state === 'unknown' && cache.lastAutoClean.skipReason.reason
-                  ? `：${cache.lastAutoClean.skipReason.reason}` : '')))
+                  ? `：${cache.lastAutoClean.skipReason.reason}` : '') +
+                (cache.lastAutoClean.skipReason.state === 'bad-delete-mode' && cache.lastAutoClean.skipReason.value !== undefined
+                  ? `（当前值：${JSON.stringify(cache.lastAutoClean.skipReason.value)}）` : '')))
             : null,
           cache.lastAutoClean?.truncated
             ? h('div', { 'data-bl-row': '' },

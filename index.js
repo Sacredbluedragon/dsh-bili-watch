@@ -31,9 +31,9 @@ import { fileURLToPath } from 'node:url'
 import { lockState } from './lib/locks.mjs'
 // 2026-10-31：删除面判据（归属 / 根标记 / 统计 / 清除）搬进 lib/cache-own.mjs。
 //   此后 isOwnBvDir 也不再直接调用（isOwnedEntry 在 lib 里用它），这里只留还读得到的四个。
-import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, previewAll, cacheBreakdown } from './lib/cache-own.mjs'
+import { dirStat, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, cachePreview } from './lib/cache-own.mjs'
 // C236b：三档 deleteMode 的唯一实现；手动 / 自动 / --all 三条路径都从这里取策略。
-import { normalizeDeleteMode, deletePaths, DELETE_MODES } from './lib/recycle.mjs'
+import { normalizeDeleteMode, deletePaths, DELETE_MODES, invalidDeleteModeOf } from './lib/recycle.mjs'
 import { modelRow, MODEL_EXPECTED_MB } from './lib/model-integrity.mjs'
 import { cleanKey, bvOf, cutCp, looksLikeOwnUrlDir } from './lib/keys.mjs'
 // 2026-11-01（0.4.1 第 1 条）：UA 搬进 lib/consts.mjs —— 原来本文件与 tools/look.mjs 各写一份、
@@ -607,9 +607,11 @@ function readJsonOrBackup(p, fallback) {
 function cfgProblemText(p, problem) {
   const name = basename(p)
   const err = problem.error
-  if (problem.kind === 'read') return `${name} 读取失败：${err}`
-  if (problem.backup) return `${name} 解析失败（${err}），原文件已备份为 ${basename(problem.backup)}，本次按默认值继续`
-  return `${name} 解析失败（${err}）且备份失败（${String(problem.backupFailed || '')}），本次按默认值继续`
+  if (problem.kind === 'read') return `${name} 读取失败：${err}，本次按默认值继续，不会删除任何文件`
+  // 方案 a（N-F1）：解析失败不再把坏文件改名移走，原文件留在原地、每次读都报 problem。
+  //   文案给可操作提示（改 deleteMode），且不再说「已备份」——因为压根没备份。
+  if (problem.kind === 'parse') return `${name} 解析失败（${err}），原文件保留未动，本次按默认值继续、不会删除任何文件；请修改其中的 deleteMode`
+  return `${name} 读取失败（${String(err || '')}），本次按默认值继续，不会删除任何文件`
 }
 
 function readDepsCfgFile(p) {
@@ -1277,6 +1279,19 @@ function autoCleanCache(opts = {}) {
   //   每次启动仍清一次，开关就成了假开关——所以这里不给 force 开口子。
   const cfg = cacheCfg()
   if (!cfg.autoClean) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'disabled', at: Date.now() } }
+  // 返修 X13-F2（自动清理）：cacheCfg() 已把非法 deleteMode 归一成 permanent，永远看不到非法值。
+  //   这里像 /cache/clear 一样单独读原始配置再喂 invalidDeleteModeOf：只有「键存在但值非法」
+  //   才拦，缺省与三合法值走原契约。放在节流判断之前，启动强制（force）与 /status 常规两条路径
+  //   共用同一保护；提前返回让删除（deletePaths）与清空目录（pruneEmptyDirs）两步都不发生。
+  //   经 skipReason 新状态告诉用户改哪项配置，不静默回落成永久删除。
+  // N-F1（2026-11-25）：薄壳 readJsonOrBackup 只回 value，坏 JSON / 读失败的 problem 会丢，
+  //   于是这里放行、随后按 normalizeDeleteMode 的 permanent 直删。改成直接读原始 {value,problem}，
+  //   problem 一并喂 invalidDeleteModeOf；同时自己 pushWarn 保住 /status 告警链路。
+  const cacheCfgRaw = readJsonOrBackupRaw(CACHE_CFG, {})
+  if (cacheCfgRaw.problem) pushWarn(cfgProblemText(CACHE_CFG, cacheCfgRaw.problem))
+  const badMode = invalidDeleteModeOf(cacheCfgRaw.value, cacheCfgRaw.problem)
+  if (badMode) return { removed: 0, bytes: 0, skipped: true, failed: [],
+    skipReason: { state: 'bad-delete-mode', at: Date.now(), value: badMode.value } }
   // T31-P2-6：面板每 8 秒轮询 /status，不许每次都全量 walk 缓存目录
   if (!opts.force && Date.now() - lastCleanAt < 10 * 60 * 1000) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'throttled', at: Date.now() } }
   if (!existsSync(cacheDir())) return { removed: 0, bytes: 0, skipped: true, failed: [], skipReason: { state: 'missing-root', at: Date.now() } }
@@ -3018,18 +3033,33 @@ function registerPanelRoute(ctx) {
                 }
               }
               // C236b：确认框要算「将删除 N 项 / X MB」，只在点按钮那一下扫，绝不进 /status。
-              // issue #15：同一个入口顺带给「占用 X / 本次可删 Y / 认不出 Z」三个数，
-              //   由 cacheBreakdown 一次算出，X − Y = Z 恒成立，不许前端另拿两个数相减。
+              // issue #15：同一个入口顺带给「占用 X / 本次可删 Y / 认不出 Z」三个数。
+              // 2128 续派：面板挂载会显式请求一次；/status 的 8 秒轮询不走这里。
+              //   一次请求只做一次带内容摘要的枚举，清单/foreign/三数同源；占用仍独立 dirStat。
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/preview') {
-                return sendJson(res, 200, {
-                  ok: true,
-                  data: { ...previewAll(cacheDir()), breakdown: cacheBreakdown(cacheDir()) },
-                })
+                return sendJson(res, 200, { ok: true, data: cachePreview(cacheDir()) })
               }
               if (req.method === 'POST' && url.pathname === '/api/bili-watch/cache/clear') {
                 const body = await readJsonBody(req)
                 const all = body?.all === true || Number(body?.all) === 1
                 const confirmed = body?.confirmed === true || Number(body?.confirmed) === 1
+                // X13-F2：cache-config.json 里显式写了但认不出的 deleteMode，删除前先停下。
+                //   cacheCfg() 会把非法值归一成 permanent，拿不到原值，所以这里单独读原始配置判断。
+                //   缺省（键不存在 / 文件不存在）与三合法值不拦，只在显式非法时返回 400。
+                // N-F1：坏 JSON / 读失败时薄壳只回 value({}) 会丢 problem 放行。这里直接读原始
+                //   {value,problem}，problem 一并喂 invalidDeleteModeOf，并自行 pushWarn 保住告警。
+                const cfgRaw = readJsonOrBackupRaw(CACHE_CFG, {})
+                if (cfgRaw.problem) pushWarn(cfgProblemText(CACHE_CFG, cfgRaw.problem))
+                const badCfgMode = invalidDeleteModeOf(cfgRaw.value, cfgRaw.problem)
+                if (badCfgMode !== null) {
+                  const hint = badCfgMode.problem
+                    ? `配置文件读取/解析失败（${badCfgMode.problem}${badCfgMode.detail ? '：' + badCfgMode.detail : ''}），原文件保留未动，请修改其中的 deleteMode`
+                    : (badCfgMode.shape ? `配置顶层必须是对象` : `缓存配置里的删除方式 ${JSON.stringify(badCfgMode.value)} 无法识别`)
+                  return sendJson(res, 400, {
+                    ok: false,
+                    why: `${hint}，已停止清理（没有删除任何文件）。合法值只有 permanent / recycle / smart，请修改 cache-config.json 中的 deleteMode 后重试`,
+                  })
+                }
                 const mode = normalizeDeleteMode(body?.mode || cacheCfg().deleteMode)
                 // 第三件（0.4.11）：includeUnknown = 用户在确认框勾选后一次性显式授权删第二类文件。
                 //   只在 removeAllOwned 的 all 分支透传；removeOwned（立即清理）永远只删第一类。
@@ -3045,9 +3075,22 @@ function registerPanelRoute(ctx) {
                 // 两步确认：--all 第一次只回预览，一个字节都不删；必须带 confirmed=1 才真执行。
                 //   后端也守这道，面板之外直接打 API 同样绕不过去。
                 if (all && !confirmed) {
+                  // 与 /cache/preview 共用单次快照实现；confirmed 真删分支仍从磁盘重新枚举。
                   return sendJson(res, 200, {
                     ok: true,
-                    data: { needConfirm: true, ...previewAll(cacheDir()), breakdown: cacheBreakdown(cacheDir()), mode },
+                    data: { needConfirm: true, ...cachePreview(cacheDir()), mode },
+                  })
+                }
+                // B-4（1805）：面板的确认请求（all && confirmed，即两步确认的第二步）必须携带
+                //   合法清单——数组，含空数组（空清单=确认时没有可删对象）。缺 tokens 字段或
+                //   tokens 不是数组，一律拒绝执行并提示重新预览，绝不默认为「对当下全部对象的授权」。
+                //   CLI 走 tools/look.mjs 直接调 removeAllOwned（不经本路由、不传 tokens），契约不变。
+                //   区分口径靠 confirmed=1（面板确认第二步才有），不靠猜 tokens 的内容。
+                if (all && confirmed && !Array.isArray(body?.tokens)) {
+                  return sendJson(res, 200, {
+                    ok: false,
+                    why: '确认清单缺失或格式不对，已停止清理（没有删除任何文件）。请重新打开面板预览确认后再清理',
+                    data: { removed: 0, bytes: 0, skipped: [], failed: [], needRepreview: true },
                   })
                 }
                 // A7（2026-10-27）：先查锁再清理——frames 下若有正在跑的抽帧锁，直接拒绝，
@@ -3090,8 +3133,11 @@ function registerPanelRoute(ctx) {
                   try { ctx.logger?.warn?.(`[dsh-bili-watch] 强制清理：我将忽略 ${ls.reason}（forceUnknown=1）`) } catch {}
                 }
                 // T35/T40-A1：只清插件自己的数据（BV_*、_logs、frames 等白名单），共享目录里别人的文件不碰
+                // N-F2：把确认时的稳定标识清单带进 removeAllOwned，执行前逐个核对；
+                //   没带 tokens 的老调用方（CLI / 直接打 API）走老路，保持兼容。
+                const confirmedTokens = Array.isArray(body?.tokens) ? body.tokens : null
                 const cleared = all
-                  ? removeAllOwned(cacheDir(), { mode, includeUnknown })
+                  ? removeAllOwned(cacheDir(), { mode, includeUnknown, ...(confirmedTokens ? { tokens: confirmedTokens } : {}) })
                   : removeOwned(cacheDir(), { mode })
                 // 两个入口的 files 语义不同：removeOwned 是真删文件数，removeAllOwned 是计划数。
                 //   --all 一律改读 removedFiles，让 removed 在这条接口上恒为「真删文件数」。
@@ -3106,12 +3152,28 @@ function registerPanelRoute(ctx) {
                 //   removed 只数真删掉的文件，plannedFiles 另列计划数，不再共用一个字段。
                 //   容量溢出导致一项都没删时同样不算成功：否则调用方拿到 ok:true + removed:0
                 //   会以为已经清干净。失败项与容量跳过分开报数，各说各的后果。
+                // 1939 A 件：过期回执四态。skipped 每条带机器可读 kind（design/changed/empty/overflow），
+                //   不靠中文 why 正则。按 kind 统计出「真正空 / 全过期 / 部分过期 / 正常」，
+                //   全过期必须 ok:false（否则前端报「已彻底清空」、用户以为清完了）。
+                const skippedList = Array.isArray(cleared.skipped) ? cleared.skipped : []
+                const changedCount = skippedList.filter((s) => s?.kind === 'changed').length
+                const emptyList = skippedList.some((s) => s?.kind === 'empty')
                 const failedCount = cleared.failed.length
                 const overflowCount = cleared.overflow?.count || 0
-                const partial = failedCount > 0 || overflowCount > 0
+                let clearState = 'ok'
+                if (all && confirmed && Array.isArray(confirmedTokens)) {
+                  // 2033 C-1（Astra 2028 第3条）：真正空必须「没有 changed 新增项」也成立。
+                  //   空预览之后有新增时，emptyList=true 但 changedCount>0，不能被抢先判成 empty，
+                  //   否则「实际清理 0 项 + 新增项保留 + 提示重新预览」这条回执拿不到。
+                  if (emptyList && removedFiles === 0 && changedCount === 0) clearState = 'empty'
+                  else if (changedCount > 0 && removedFiles === 0) clearState = 'all-stale'    // 全过期：一个没删、全因变化跳过
+                  else if (changedCount > 0 && removedFiles > 0) clearState = 'partial-stale'  // 部分过期：删了 N、跳过 M
+                }
                 const reasons = []
+                if (clearState === 'all-stale') reasons.push(`0 个已清理；${changedCount} 个在你确认之后新增或内容变了，已保留，请重新预览确认后再清理`)
                 if (failedCount) reasons.push(`部分失败：${failedCount} 项`)
                 if (overflowCount) reasons.push(`回收站空间不足跳过 ${overflowCount} 项`)
+                const partial = failedCount > 0 || overflowCount > 0 || clearState === 'all-stale'
                 const why = partial ? reasons.join('；') : undefined
                 return sendJson(res, 200, {
                   ok: !partial,
@@ -3120,6 +3182,9 @@ function registerPanelRoute(ctx) {
                   data: { removed: removedFiles, ...(all ? { plannedFiles: cleared.plannedFiles ?? 0 } : {}),
                     bytes: cleared.bytes, skipped: cleared.skipped, failed: cleared.failed,
                     mode, items: cleared.items ?? cleared.plan?.length ?? 0,
+                    // needRepreview 从这里起真被前端消费（缺/无效清单守卫那处也用它），不再是死字段。
+                    ...(all && confirmed ? { clearState, changedCount,
+                      needRepreview: clearState === 'all-stale' || clearState === 'empty' || clearState === 'partial-stale' } : {}),
                     skippedOverflow: cleared.overflow || { count: 0, bytes: 0 }, fallback: cleared.fallback || [] },
                 })
               }

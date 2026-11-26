@@ -12,7 +12,9 @@ const ROOT = join(HERE, '..', '..')
 const mod = await import(pathToFileURL(join(ROOT, 'lib', 'cache-own.mjs')).href)
 const { previewAll, removeAllOwned, removeOwned, cacheBreakdown, isOwnedEntry } = mod
 const clientSrc = readFileSync(join(ROOT, 'client.js'), 'utf8')
-const ownSrc = readFileSync(join(ROOT, 'lib', 'cache-own.mjs'), 'utf8')
+// 1913（常量跨模块搬移）：PRINT_TEXT_KINDS / PROVEN_NAME_RE 已从 cache-own.mjs 搬到 keys.mjs，
+//   kinds 同源断言要读常量当前所在的文件，否则常量搬走后这里假红。
+const ownSrc = readFileSync(join(ROOT, 'lib', 'keys.mjs'), 'utf8')
 
 const root = mkdtempSync(join(tmpdir(), 'bw-c348-'))
 const put = (rel, body = 'x') => {

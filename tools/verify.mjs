@@ -27,10 +27,10 @@ import vm from 'node:vm'
 //   不必再「读整份源码 → 正则抠函数体 → new Function 重编译」三件套。
 //   这不是「放松」：原来的 C7/C25 是「比两处函数体是否相等」，只证明两边写得一样，不证明写得对；
 //   现在是喂对抗输入看输出。函数被改坏时，旧断言只会在「两处不同步」时红，新断言会在「行为错了」时红。
-import { cleanKey, bvOf } from '../lib/keys.mjs'
+import { cleanKey, bvOf, looksLikeOwnUrlDir } from '../lib/keys.mjs'
 // 2026-10-31：锁判据与「目录能不能认领」搬进 lib/ 之后，C6/C23 也改成 import 真跑。
 import { hasAnyLock, isAdoptableDir, lockExpired, pidAlive, readLock } from '../lib/locks.mjs'
-import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, enumerateForAll, provableNamesIn } from '../lib/cache-own.mjs'
+import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, enumerateForAll, provableNamesIn, previewAll, entryToken } from '../lib/cache-own.mjs'
 // 2026-10-31：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
 import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
@@ -72,13 +72,16 @@ import { PROVEN_TOOL_TXT_RE, NEXT_STEP_PREFIX } from '../lib/consts.mjs'
 // 2026-11-24 B-1/B-2：失败出口指令行从「查子串」升级为「真解析」——直接引 CLI 的同源 flagFromArgv，
 //   判据里不重写一份，否则验的就不是产品实收的 argv。
 import { flagFromArgv, optFromArgv } from './cli-io.mjs'
+// 2026-11-24 1913 X13-F2：非法 deleteMode 的判定函数从 lib 引入真跑（入口拦截的判据要验同一个函数）。
+import { invalidDeleteModeOf } from '../lib/recycle.mjs'
+import { CACHE_MARK } from '../lib/consts.mjs'
 // 2026-11-01（P0-3）：must 也跟着 makeChecker 搬进 check-run.mjs。
 //   它是 700 多处断言的失败信号，却原来只是本文件的局部常量——外面碰不到，也就没有一条断言验过它。
 //   C77 现在 import 同一个绑定，直接喂 false 验「必须抛」。**别在这里再写一份**（那就又成了「验的不是用的」）。
 import {
   makeChecker, must, parseOnlySpecs, matchOnly, onlyNoticeLine, renderResults,
   checkId, SLOW_CHECKS, SLOW_BY_TIMING, TIMING_PRODUCERS, makeSlowChecker, fastNoticeLine,
-  selfNoticeLine, hasTimingProducerSpec, timingSummaryLines,
+  selfNoticeLine, hasTimingProducerSpec, timingSummaryLines, makeSlowSet,
 } from './check-run.mjs'
 // C245/C246：删除类命令的干跑契约，判据直接调真参数表（不采信夹具自述）。
 // 用命名空间导入是刻意的：实现还没落地时，具名 import 会让整个主闸当场崩掉，
@@ -481,6 +484,331 @@ const releaseProbe = () => {
   }
   return releaseProbeRun
 }
+// C454–C456：续推（任务 A）取证夹具真跑包装。与 C298–C300 同口径，定义在任何 check 之前。
+//   夹具自起本地假 Release API（自 spawn 一份本文件 --server）+ 本地 bare remote + pwsh7 真跑
+//   release.ps1 -ResumeGit。一次跑完三态，三条判据共用一份 JSON，不各起一遍。
+let resumeProbeRun = null
+const resumeProbe = () => {
+  if (!resumeProbeRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c454-resume-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = (r.stdout || '').trim()
+    const err = (r.stderr || '').trim()
+    let json = null
+    try { json = JSON.parse(out) } catch {}
+    resumeProbeRun = { status: r.status, raw: `${out}\n${err}`.trim(), json }
+  }
+  return resumeProbeRun
+}
+
+// B 块（N-F2 确认边界）：三现场共用一次子进程取证（真起 index.js 路由，走两次真实请求 + 中间插文件）。
+//   夹具 c477-confirm-boundary-probe.mjs 自己 import index.js、起 route handler、造临时缓存根。
+let confirmProbeCache = null
+const confirmProbe = () => {
+  if (confirmProbeCache) return confirmProbeCache
+  const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c477-'))
+  const home = join(tmp, 'home')
+  const cache = join(tmp, 'cache')
+  mkdirSync(home, { recursive: true })
+  mkdirSync(cache, { recursive: true })
+  const probeFile = join(ROOT, 'tools', 'fixtures', 'c477-confirm-boundary-probe.mjs')
+  try {
+    const r = spawnSync(process.execPath, [probeFile, idxUrl], {
+      env: baseEnv({ DSH_HOME: home, BILI_WATCH_CACHE: cache }),
+      encoding: 'utf8', timeout: 120000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/CONFIRM_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C477 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(0, 300)} stderr=${err.slice(0, 400)}`)
+    const c = JSON.parse(line)
+    must(!c.error, `C477 夹具内部抛错：${c.error}`)
+    confirmProbeCache = c
+    return c
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 1516 A-1+A-3：空清单完整往返 + 前端真实组包参与验收（抠 doClearAll 原样函数体，preview→前端组包→真打 clear）。
+let frontRoundCache = null
+const frontRoundProbe = () => {
+  if (frontRoundCache) return frontRoundCache
+  const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c482-'))
+  const home = join(tmp, 'home')
+  const cache = join(tmp, 'cache')
+  mkdirSync(home, { recursive: true })
+  mkdirSync(cache, { recursive: true })
+  const probeFile = join(ROOT, 'tools', 'fixtures', 'c482-frontend-roundtrip-probe.mjs')
+  try {
+    const r = spawnSync(process.execPath, [probeFile, idxUrl, ROOT], {
+      env: baseEnv({ DSH_HOME: home, BILI_WATCH_CACHE: cache }),
+      encoding: 'utf8', timeout: 120000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/FRONT_ROUND_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C482 前端往返夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    const c = JSON.parse(line)
+    must(!c.fatal, `C482 前端往返夹具内部抛错：${c.fatal}`)
+    frontRoundCache = c
+    return c
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 1516 B 件：PS5.1 / pwsh7 双跑真入口取证。
+let psDualCache = null
+const psDualProbe = () => {
+  if (psDualCache) return psDualCache
+  const probeFile = join(ROOT, 'tools', 'fixtures', 'c483-psdual-probe.mjs')
+  const r = spawnSync(process.execPath, [probeFile], {
+    cwd: ROOT, encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024,
+  })
+  const out = String(r.stdout || '')
+  const err = String(r.stderr || '')
+  const line = (/PS_DUAL_JSON=(.*)/.exec(out) || [])[1]
+  must(line, `C484 PS 双跑夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+  const c = JSON.parse(line)
+  must(!c.fatal, `C484 PS 双跑夹具内部抛错：${c.fatal}`)
+  psDualCache = c
+  return c
+}
+
+// 1516 C-1/C-2/C-3：发版闸行为回归——隔离副本+假 npm 真跑五场景。
+//   放所有 check 之前（C276 按块扫描会把夹在判据间的 spawnSync 算到相邻判据头上）。
+let gateCacheRun = null
+const gateProbe = () => {
+  if (gateCacheRun) return gateCacheRun
+  const probeFile = join(ROOT, 'tools', 'fixtures', 'c486-gate-probe.mjs')
+  const r = spawnSync(process.execPath, [probeFile], {
+    cwd: ROOT, encoding: 'utf8', timeout: 600000, maxBuffer: 16 * 1024 * 1024,
+  })
+  const out = String(r.stdout || '')
+  const err = String(r.stderr || '')
+  const line = (/GATE_JSON=(.*)/.exec(out) || [])[1]
+  must(line, `C486 发版闸夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+  const c = JSON.parse(line)
+  must(c.c486 && c.c487 && c.gate1 && c.gate2 && c.gate3, `C486 夹具结果缺场景：${line.slice(0, 300)}`)
+  gateCacheRun = c
+  return c
+}
+
+// 1516 C-4：autoCleanCache 宿主验证——复用 c1a1a2-child 真起独立进程打 /status，读 payload.data.cache。
+//   放所有 check 之前（C276 按块扫描会把夹在判据间的 spawnSync 算到相邻判据头上）。
+let autoCleanCacheRun = null
+const autoCleanProbe = () => {
+  if (!autoCleanCacheRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c489-autoclean-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/AUTOCLEAN_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C489 宿主夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    const c = JSON.parse(line)
+    must(!c.fatal, `C489 宿主夹具内部抛错：${c.fatal}`)
+    autoCleanCacheRun = c
+  }
+  return autoCleanCacheRun
+}
+
+// 1516 F-1 回归：Invoke-GhApi 中文 body 在 PS5.1 必须按 UTF-8 字节发出。
+//   独立复核带出的推翻项：PS5.1 把中文按 ISO-8859-1 编成问号静默入库。
+//   放所有 check 之前（C276 按块扫描会把夹在判据间的 spawnSync 算到相邻判据头上）。
+let ghApiUtf8Cache = null
+const ghApiUtf8Probe = () => {
+  if (!ghApiUtf8Cache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c491-ghapi-utf8-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/C491_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C491 夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    ghApiUtf8Cache = JSON.parse(line)
+  }
+  return ghApiUtf8Cache
+}
+
+// 1805 A 件 F-2：认证边界四格矩阵 + 判定 + 取凭据 + 重定向。
+//   放所有 check 之前（C276 按块扫描会把夹在判据间的 spawnSync 算到相邻判据头上）。
+let authBoundaryCache = null
+const authBoundaryProbe = () => {
+  if (!authBoundaryCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c492-auth-boundary-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    const line = (/AUTH_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C492 认证边界夹具没打出结果（rc=${r.status}）：stdout=${out.trim().slice(-300)} stderr=${err.slice(-300)}`)
+    authBoundaryCache = JSON.parse(line)
+  }
+  return authBoundaryCache
+}
+
+// 1805 B 件：N-F2 元数据四元组指纹 + 面板缺清单四态。放所有 check 之前（C276 按块扫描）。
+let nf2FpCache = null
+const nf2FpProbe = () => {
+  if (!nf2FpCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c495-nf2-fingerprint-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const line = (/NF2_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C495 指纹夹具没打出结果（rc=${r.status}）：${out.trim().slice(-300)}`)
+    nf2FpCache = JSON.parse(line)
+  }
+  return nf2FpCache
+}
+let panelManifestCache = null
+const panelManifestProbe = () => {
+  if (!panelManifestCache) {
+    const tmp = mkdtempSync(join(tmpdir(), 'bw-c495-'))
+    const home = join(tmp, 'home'), cache = join(tmp, 'cache')
+    mkdirSync(home, { recursive: true }); mkdirSync(cache, { recursive: true })
+    const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
+    const probeFile = join(HERE, 'fixtures', 'c495-panel-manifest-probe.mjs')
+    try {
+      const r = spawnSync(process.execPath, [probeFile, idxUrl, ROOT], {
+        env: baseEnv({ DSH_HOME: home, BILI_WATCH_CACHE: cache }),
+        encoding: 'utf8', timeout: 120000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024,
+      })
+      const out = String(r.stdout || '')
+      const line = (/PANEL_JSON=(.*)/.exec(out) || [])[1]
+      must(line, `C498 面板清单夹具没打出结果（rc=${r.status}）：${out.trim().slice(-300)}`)
+      panelManifestCache = JSON.parse(line)
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  }
+  return panelManifestCache
+}
+
+// 1939 A 件：过期回执四态（真起 index.js 路由 + 抠 client.js 组包）。放所有 check 之前（C276 按块扫描）。
+let staleCache = null
+const staleProbe = () => {
+  if (!staleCache) {
+    const tmp = mkdtempSync(join(tmpdir(), 'bw-c500-'))
+    const home = join(tmp, 'home'), cache = join(tmp, 'cache')
+    mkdirSync(home, { recursive: true }); mkdirSync(cache, { recursive: true })
+    const idxUrl = pathToFileURL(join(ROOT, 'index.js')).href
+    const probeFile = join(HERE, 'fixtures', 'c500-stale-receipt-probe.mjs')
+    try {
+      const r = spawnSync(process.execPath, [probeFile, idxUrl, ROOT], {
+        env: baseEnv({ DSH_HOME: home, BILI_WATCH_CACHE: cache }),
+        encoding: 'utf8', timeout: 180000, cwd: ROOT, maxBuffer: 8 * 1024 * 1024,
+      })
+      const out = String(r.stdout || '')
+      const line = (/STALE_JSON=(.*)/.exec(out) || [])[1]
+      must(line, `C500 四态夹具没打出结果（rc=${r.status}）：${out.trim().slice(-300)}`)
+      staleCache = JSON.parse(line)
+    } finally { rmSync(tmp, { recursive: true, force: true }) }
+  }
+  return staleCache
+}
+
+// 1939 C 件：同字节 tmp+rename 重写仍判「内容已变化」跳过。放所有 check 之前（C276 按块扫描）。
+let sameByteCache = null
+const sameByteProbe = () => {
+  if (!sameByteCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c499-same-byte-rewrite-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = String(r.stdout || '')
+    const line = (/REWRITE_JSON=(.*)/.exec(out) || [])[1]
+    must(line, `C501 同字节重写夹具没打出结果（rc=${r.status}）：${out.trim().slice(-300)}`)
+    sameByteCache = JSON.parse(line)
+  }
+  return sameByteCache
+}
+
+// 2033 A 件（Astra 2028 第1条）：内容摘要核对。三个 runner 放在所有 check 之前（C276 按块扫描）。
+let contentFpCache = null
+const contentFpProbe = () => {
+  if (!contentFpCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c502-content-fp-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const line = (/C502_JSON=(.*)/.exec(String(r.stdout || '')) || [])[1]
+    must(line, `C502 内容指纹夹具没打出结果（rc=${r.status}）：${String(r.stdout || '').trim().slice(-300)}`)
+    contentFpCache = JSON.parse(line)
+  }
+  return contentFpCache
+}
+let readErrCache = null
+const readErrProbe = () => {
+  if (!readErrCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c502-readerr-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const line = (/C503_JSON=(.*)/.exec(String(r.stdout || '')) || [])[1]
+    must(line, `C503 读不全夹具没打出结果（rc=${r.status}）：${String(r.stdout || '').trim().slice(-300)}`)
+    readErrCache = JSON.parse(line)
+  }
+  return readErrCache
+}
+let fixedMetaDualCache = null
+const fixedMetaDual = () => {
+  if (!fixedMetaDualCache) {
+    // 从本仓库 git 导出 37ffaa4 的 lib 到临时目录（旧版只有元数据四元组），跑同一固定元数据现场。
+    const base = mkdtempSync(join(tmpdir(), 'bw-c502-base-'))
+    try {
+      // 用 git ls-tree 列出 37ffaa4 的 lib/ 下全部 .mjs，逐个导出（写死列表会漏 platform.mjs 等传递依赖）。
+      const tree = spawnSync('git', ['ls-tree', '--name-only', '37ffaa4', 'lib/'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
+      const files = String(tree.stdout || '').split('\n').map(s => s.trim()).filter(s => /^lib\/.*\.mjs$/.test(s))
+      must(files.length > 0, `C504 无法从 37ffaa4 列出 lib 文件：${tree.stderr || tree.status}`)
+      for (const pathspec of files) {
+        const r = spawnSync('git', ['show', `37ffaa4:${pathspec}`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
+        if (r.status === 0 && r.stdout) {
+          const dst = join(base, pathspec)
+          mkdirSync(join(base, 'lib'), { recursive: true })
+          writeFileSync(dst, r.stdout)
+        }
+      }
+      const run = (root) => {
+        const p = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c502-fixedmeta-probe.mjs'), root], {
+          cwd: ROOT, encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+        })
+        const line = (/C502_FIXED_JSON=(.*)/.exec(String(p.stdout || '')) || [])[1]
+        must(line, `C502 固定元数据夹具没打出结果（root=${root} rc=${p.status}）：${String(p.stdout || '').trim().slice(-300)}`)
+        return JSON.parse(line)
+      }
+      fixedMetaDualCache = { now: run(ROOT), base: run(base) }
+    } finally { rmSync(base, { recursive: true, force: true }) }
+  }
+  return fixedMetaDualCache
+}
+
+// 2128 续派：单请求单次枚举与新旧契约对照。两个 runner 都放在所有 check 之前（C276 按块扫描）。
+let snapshotCache = null
+const snapshotProbe = () => {
+  if (!snapshotCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c507-snapshot-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const line = (/SNAPSHOT_JSON=(.*)/.exec(String(r.stdout || '')) || [])[1]
+    must(line, `C507 单快照夹具没打出结果（rc=${r.status}）：${String(r.stdout || '').trim().slice(-300)}`)
+    snapshotCache = JSON.parse(line)
+  }
+  return snapshotCache
+}
+let contractCache = null
+const contractProbe = () => {
+  if (!contractCache) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c509-snapshot-contract-probe.mjs'), ROOT], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const line = (/CONTRACT_JSON=(.*)/.exec(String(r.stdout || '')) || [])[1]
+    must(line, `C509 契约夹具没打出结果（rc=${r.status}）：${String(r.stdout || '').trim().slice(-300)}`)
+    contractCache = JSON.parse(line)
+  }
+  return contractCache
+}
+
 // C302–C307：0.4.10 面板五件 + 布局的共用取证夹具真跑包装。与 C298–C300 同口径，
 //   必须放在所有 check() 之前 —— 判据块里出现子进程调用的字面串会被 C276 的
 //   双向差集算到相邻判据头上（20:45 轮 releaseProbe 放错过一次）。
@@ -594,12 +922,15 @@ const c423Probe = () => {
   }
   return c423Run
 }
-// --fast 分档：跳过集合 = 过渡清单（93 条老判据，按编号） ∪ 本轮用 slowCheck() 显式声明的新判据。
-//   两边都不猜「名字像不像慢」：清单是 C276 双向差集守着的，声明是写的人自己标的。
-const declaredSlow = new Set()
+// --fast 分档 + C313 分档上界：共用**同一个**慢集合，杜绝检查面/被检查面各算一份（1120 发版阻断）。
+//   SLOW_SET = 三份常量清单 ∪ 源码 slowCheck() 声明，从源码文本构造：C313 定义在 :12787，
+//   绝大多数慢判据在它之后才注册，运行时 declaredSlow 那时还是空的（时序陷阱），故只认文本。
+//   清单是 C276 双向差集守着的，声明是写的人自己标的；两边都不猜「名字像不像慢」。
+const SLOW_SET = makeSlowSet(read('tools/verify.mjs'), [SLOW_CHECKS, SLOW_BY_TIMING, TIMING_PRODUCERS])
+const declaredSlow = new Set()   // makeSlowChecker 的 register 接收器；慢判定统一走 SLOW_SET，不再读这里
 const isSlow = (name) => {
   const id = checkId(name)
-  return declaredSlow.has(name) || (id !== null && SLOW_CHECKS.includes(id))
+  return id !== null && SLOW_SET.has(id)
 }
 let skippedSlow = 0        // 被 --fast 真正跳过的条数 → 提示行的分子（运行时计数，不写常量）
 let skippedSelf = 0        // 默认路径跳过的元判据数 → 元判据提示行的分子（独立于 skippedSlow，不复用）
@@ -2545,16 +2876,19 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
     const r = readJsonOrBackup(p, {})
     must(r.value && typeof r.value === 'object' && !Array.isArray(r.value), '坏文件应退回默认对象，实际 ' + JSON.stringify(r.value))
     must(r.problem?.kind === 'parse', '坏文件没有报 parse problem（调用方拿不到告警）')
-    must(!existsSync(p), '坏文件还在原地——下次写回会把它覆盖掉')
+    // N-F1 方案 a（2026-11-25）：解析失败不再把坏文件改名移走，原文件留在原地、每次读都报 problem。
+    //   移走会让第二读 problem=null → 放行 → normalizeDeleteMode 回落 permanent 直删（用户文件没了）。
+    must(existsSync(p), '坏文件没留在原地（方案 a 要求原文件保留、每读必报，绝不静默放行）')
     const baks = readdirSync(dir).filter((n) => n.includes('.broken-'))
-    must(baks.length === 1, `没留下备份（目录里：${readdirSync(dir).join(', ') || '空'}）`)
-    must(r.problem.backup && basename(r.problem.backup) === baks[0], 'problem.backup 与实际留档文件名不一致')
+    must(baks.length === 0, `方案 a 不该产生 .broken 备份副本（目录里：${readdirSync(dir).join(', ') || '空'}）`)
+    must(!r.problem.backup, 'problem.backup 不该存在（原文件没移走，没有留档文件）')
     // ENOENT / 空文件都不算异常（「没配过」是正常状态，不能每 8 秒刷一条面板告警）
     must(readJsonOrBackup(join(dir, 'nope.json'), {}).problem === null, '文件不存在被当成异常（ENOENT 是正常情况）')
     writeFileSync(join(dir, 'empty.json'), '  \n')
     must(readJsonOrBackup(join(dir, 'empty.json'), {}).problem === null, '空文件被当成异常')
-    // 留档之后第二次读必须是干净的（否则面板每轮都报同一条）
-    must(readJsonOrBackup(p, {}).problem === null, '留档后第二次读还报异常（面板会每 8 秒刷一条）')
+    // 方案 a：第二次读仍必须报 parse（原文件还在、问题没修），否则就是静默放行。
+    must(readJsonOrBackup(p, {}).problem?.kind === 'parse', '第二次读不再报 parse（坏文件被静默放行，会回落 permanent 直删）')
+    must(readJsonOrBackup(p, {}).problem?.kind === 'parse', '第三次读仍要报 parse（连续读都必须报，不能只读一次就放行）')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -2572,7 +2906,9 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
     writeFileSync(bad, '{ 还是坏的')
     shell.readJsonOrBackup(bad, {})
     must(warns.length === 1, `index 薄壳没产出告警（warns=${JSON.stringify(warns)}）`)
-    must(/解析失败/.test(warns[0]) && /已备份为/.test(warns[0]), `告警文案不对：${warns[0]}`)
+    // N-F1 方案 a：文案是「解析失败…原文件保留未动…请修改其中 deleteMode」，不再说「已备份为」。
+    must(/解析失败/.test(warns[0]) && /原文件保留/.test(warns[0]) && !/已备份/.test(warns[0]),
+      `告警文案不对（方案 a 不该提已备份）：${warns[0]}`)
     must(/ui\.json/.test(warns[0]), '告警里没有文件名（用户不知道该改哪个文件）')
     // ENOENT 不能产告警（否则面板每 8 秒刷一条）
     shell.readJsonOrBackup(join(dir3, 'nope.json'), {})
@@ -2589,7 +2925,7 @@ check('C38 deps-config.json 坏了要先留档再回默认值（#17，P1：否�
   must(/readJsonOrBackup\(/.test(rd), 'tools/look.mjs 没走 lib/config.mjs（两边行为又会分叉）')
   must(/process\.stderr\.write/.test(rd), 'tools/look.mjs 的 readDepsCfg 不再打 stderr')
   must(/read failed/.test(rd) && /parse failed/.test(rd), 'CLI 侧的英文文案被改掉了（PS 管道会乱码）')
-  return '坏文件改名留档 + 回默认值；problem 结构 / ENOENT / 空文件 / 二次读 / 两侧文案都核过'
+  return '方案 a：坏文件留原地、每读必报 parse + 回默认值；problem 结构 / ENOENT / 空文件 / 连续读 / 两侧文案都核过'
 })
 
 // #11（2026-10-30，P1）：/status 是 8 秒一轮，同一路由里 autoCleanCache() 早就节流了，
@@ -10752,6 +11088,12 @@ check('C251 手动 / 自动 / --all 三条路径同策略：自动清理真函�
       prelude: `
         const cacheDir = () => '/tmp/cache';
         const cacheCfg = () => ({ days: 1, maxMb: 100, autoClean: true, deleteMode: MODE });
+        // 返修 X13-F2：autoCleanCache 现在读原始配置查非法 deleteMode。这里 MODE 是合法值，
+        //   桩成 null（无非法）让三档策略测试照常跑；非法值场景由专门的判据覆盖。
+        const CACHE_CFG = '/tmp/cache-config.json';
+        // N-F1：autoCleanCache 改为直读原始 {value,problem}，桩名跟着换；problem=null 走原契约。
+        const readJsonOrBackupRaw = () => ({ value: {}, problem: null });
+        const invalidDeleteModeOf = () => null;
         let lastCleanAt = 0;
         let lastSkippedOverflow = null;
         const existsSync = () => true;
@@ -10953,9 +11295,11 @@ check('C257 放开只对 --all 生效：常规 clean 保守口径一字不动，
     'last-error.json 的 BV 目录常规 clean 仍清不掉（凭证没生效）')
   must(N.after.count > 0, '常规 clean 把整棵缓存根清空了（--all 之外不许这么干）')
   const own = read('lib/cache-own.mjs')
+  // 1913：last-error 凭证表已搬到 keys.mjs，另读一份供下面那条断言用；另两条仍读 cache-own。
+  const ownKeys = read('lib/keys.mjs')
   // 行为断言（上面 BV0000000000 被清掉）已经在守效果；这条只钉「凭证写在同一张表里」，
   //   不重复造第二条行为判据。查数组原文，别用会被源码转义绕开的正则。
-  must(own.includes("last-error\\\\.json"), 'last-error.json 没进 PROVEN_NAME_RE（同一张凭证表）')
+  must(ownKeys.includes("last-error\\\\.json"), 'last-error.json 没进 PROVEN_NAME_RE（同一张凭证表）')
   must(/if \(!opts\.all\) return false/.test(own), 'UNPROVABLE_DIRS 没用 --all 开关收口（常规路径会跟着放开）')
   must(/allProofDir\(/.test(own), '缺「目录由本插件创建」的正面凭证判据')
   return '常规 clean 六类照旧保留；last-error.json 有凭证；放开显式挂在 --all 上'
@@ -12450,11 +12794,13 @@ slowCheck('C313【主判据】3c 分档上界：主闸未跳过判据逐条 =Cxx
   const ids = [...new Set(lines
     .map((l) => /^\s*(?:check|slowCheck)\(\s*'([^']+)'/.exec(l))
     .filter(Boolean).map((m) => checkId(m[1])).filter(Boolean))]
-  const slow = new Set([...SLOW_CHECKS, ...SLOW_BY_TIMING, ...TIMING_PRODUCERS])
-  const targets = ids.filter((id) => !slow.has(id))
-  // 扫描面不许被掏空：12:52 实测这个集合是 202 条，低于 150 说明编号提取或清单被改坏。
+  // 1120：慢集合不再就地另造，直接用 --fast 共用的顶层 SLOW_SET。
+  //   SLOW_SET 已从源码 slowCheck() 声明 + 三份清单构造，含那 63 条后注册的慢判据。
+  //   两边共用同一实例，杜绝「检查面（--fast 跳过）与被检查面（C313 扫描）各算一份」。
+  const targets = ids.filter((id) => !SLOW_SET.has(id))
+  // 扫描面不许被掏空：1120 同源修复后实测 311 条，低于 150 说明编号提取或清单被改坏。
   must(targets.length >= 150,
-    `C313：未跳过判据只剩 ${targets.length} 条，扫描面被掏空（实测基线 202 条）`)
+    `C313：未跳过判据只剩 ${targets.length} 条，扫描面被掏空（同源修复后实测 311 条）`)
   const violations = []
   const noHit = []
   const nonZero = []
@@ -15721,6 +16067,1315 @@ check('C437【主判据】默认纯文本长样本：真走 lookup 拼装+截断
   must(g.effHead > 0 && g.effHead < 1950, `夹紧未生效：effHead=${g.effHead} 不小于请求 head=1950`)
   must(g.t2WithinCap, '夹紧后仍超 cap')
   return `拼合 ${g.combinedCp} 码点截断到 ${g.trimmedCp}；指令/失败标记进 head800；夹紧 effHead=${g.effHead}<1950`
+})
+
+// ── C438-C448 · 0.4.17 第一批：手动清理误删 / 非法删除方式（X11-F1 / X13-F1 / X13-F2）──
+// X11/X13 同一归属判断：URL 形目录里混入外来文件，旧版按名字整棵收走 → 永久删除。
+// C438/C439 验两原现场「判据收窄 + 外来文件原字节保留」；C440 验真缓存仍可清（防一律不删假绿）；
+// C442 验空 URL 目录按拿不出凭证处理；C443 验 X13-F2 非法 deleteMode 的判定函数（入口拦截另由 C305 与主闸夹具覆盖）。
+// C441 编号留空：早前裁定作废「:628 屏蔽单独判据」——那份基线上 UNPROVABLE_DIRS 五个名字都不以 http
+// 开头，加不加屏蔽都不改判定；真正要验的是 drillForAll 的嵌套样例，见 C444。
+// C445-C447 补保守口径：混合目录整棵跳过、只含用户文本残留、last-error.json 在 URL 目录层不当凭证。
+// C448 补自动清理 X13-F2：两个入口遇显式非法 deleteMode 都停在不删的状态，文件与目录都不动。
+const _md5 = (p) => createHash('md5').update(readFileSync(p)).digest('hex')
+const _mkCacheRoot = (tag) => {
+  const d = mkdtempSync(join(tmpdir(), tag))
+  writeFileSync(join(d, CACHE_MARK), '{}')
+  return d
+}
+
+check('C438【主判据】X11-F1 两原现场：URL 形目录 + 外来文件，判据收窄且外来文件原字节保留', () => {
+  const cases = [
+    { name: 'notes.lock', rel: 'httpsb23.tvabc123/notes.lock', tip: 'httpsb23.tvabc123', data: 'notes-data-15B-payload!!' },
+    { name: 'frames/photo.jpg', rel: 'https-album/frames/photo.jpg', tip: 'https-album', data: 'photo-jpg-34B-payloadxxxxxxxxxxxxxxxx' },
+  ]
+  const report = []
+  for (const c of cases) {
+    for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+      const root = _mkCacheRoot('c438-')
+      const f = join(root, c.rel)
+      mkdirSync(dirname(f), { recursive: true })
+      writeFileSync(f, c.data)
+      const before = _md5(f)
+      const verdict = looksLikeOwnUrlDir(join(root, c.tip), c.tip)
+      must(verdict === false, `C438 ${c.name}/${path} 仍把 URL 形目录认作自家缓存（误删源没堵）`)
+      const preview = fn(root, { dryRun: true, mode: 'permanent' })
+      must((preview.skipped || []).length > 0, `C438 ${c.name}/${path} 预览 skipped 为空，看不出为何不动`)
+      fn(root, { mode: 'permanent' })
+      must(existsSync(f), `C438 ${c.name}/${path} 外来文件被真删了`)
+      must(_md5(f) === before, `C438 ${c.name}/${path} 外来文件还在但字节变了（md5 不符）`)
+      report.push(`${c.name}/${path}:false/保留md5`)
+    }
+  }
+  return report.join('；')
+})
+
+check('C439【主判据】对照现场：非 URL 名字 notes.lock 不误认，外来文件保留', () => {
+  const root = _mkCacheRoot('c439-')
+  const f = join(root, 'my-notes/notes.lock')
+  mkdirSync(dirname(f), { recursive: true })
+  writeFileSync(f, 'my-notes-data-15B!!')
+  const before = _md5(f)
+  must(looksLikeOwnUrlDir(join(root, 'my-notes'), 'my-notes') === false, 'C439 非 URL 名字被误认')
+  removeOwned(root, { mode: 'permanent' })
+  must(existsSync(f) && _md5(f) === before, 'C439 外来文件被删或字节改变')
+  return 'my-notes 判 false、文件原字节保留'
+})
+
+check('C440【主判据】真插件缓存仍可清：frames 自有 jpg 两路径都被清掉（防一律不删假绿）', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c440-')
+    const f = join(root, 'frames/BV1xx411c7mD-01.jpg')
+    mkdirSync(dirname(f), { recursive: true })
+    writeFileSync(f, 'our-own-frame')
+    writeFileSync(join(root, 'meta.json'), '{}')
+    const preview = fn(root, { dryRun: true, mode: 'permanent' })
+    must((preview.plan || []).some((x) => x.name === 'frames'), `C440 ${path} 预览没把 frames 列入 plan`)
+    fn(root, { mode: 'permanent' })
+    must(!existsSync(f), `C440 ${path} 真缓存自有 jpg 没被清掉（一律不删假绿）`)
+  }
+  return 'removeOwned / removeAllOwned 都清掉了 frames 自有 jpg'
+})
+
+check('C442【主判据】空 URL 目录按拿不出凭证处理，判 false', () => {
+  const root = _mkCacheRoot('c442-')
+  mkdirSync(join(root, 'https-empty'))
+  must(looksLikeOwnUrlDir(join(root, 'https-empty'), 'https-empty') === false, 'C442 空 URL 目录被认作自家缓存（无凭证却被收走）')
+  return '空 URL 目录判 false'
+})
+
+check('C443【主判据】X13-F2 判定：合法值/缺省放行，键存在但非法值（含 null/undefined）精确识别', () => {
+  for (const v of ['permanent', 'recycle', 'smart']) must(invalidDeleteModeOf({ deleteMode: v }) === null, `C443 合法值 ${v} 被误判非法`)
+  must(invalidDeleteModeOf({}) === null, 'C443 缺 deleteMode 键被误判非法')
+  must(invalidDeleteModeOf(undefined) === null, 'C443 整份配置缺省被误判非法')
+  // 六非法值都以「键存在」形式喂入；返回值是 {value} 包装，对 null/undefined 也成立
+  for (const v of ['recycleX', '', null, 42, 'RECYCLE', undefined]) {
+    const r = invalidDeleteModeOf({ deleteMode: v })
+    must(r && Object.prototype.hasOwnProperty.call(r, 'value') && r.value === v,
+      `C443 非法值 ${JSON.stringify(v)} 没被识别（回落 permanent 无提示的漏洞）`)
+  }
+  return '合法值/缺省放行；六非法值（含 null/undefined）识别为需拦截'
+})
+
+check('C444【主判据】drillForAll 嵌套样例：URL 形子目录混入外来文件，默认下钻只 skip 自己、显式勾选才删', () => {
+  // 1948 第二条：真走到 drillForAll（顶层 named 容器 frames/ 判不出 → 下钻到 URL 形子目录）。
+  // 默认选项外来文件保留原字节、skipped 写明原因；用户显式勾 includeUnknown 才删（原契约）。
+  const build = (root) => {
+    const d = join(root, 'frames/https-album')
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, 'photo.jpg'), 'foreign-photo-payload-34B-xxxxxxxxxxxxxxxxxx')
+    writeFileSync(join(d, 'BV1xx411c7mD-01.jpg'), 'our-own-frame')
+  }
+  // 默认选项：外来文件保留、下钻 skip 原因可见
+  const r1root = _mkCacheRoot('c444-')
+  build(r1root)
+  const foreign = join(r1root, 'frames/https-album/photo.jpg')
+  const before = _md5(foreign)
+  const dry = removeAllOwned(r1root, { dryRun: true, mode: 'permanent' })
+  must((dry.skipped || []).some((x) => /frames\/https-album\/photo\.jpg/.test(x.name || '') && /勾选/.test(x.why || '')),
+    'C444 下钻没把外来文件列进 skipped（或没写勾选原因）')
+  removeAllOwned(r1root, { mode: 'permanent' })
+  must(existsSync(foreign) && _md5(foreign) === before, 'C444 默认选项下外来文件被收走或字节变了（下钻误删）')
+  // 显式勾选：才删（用户自己点的，原契约保持）
+  const r2root = _mkCacheRoot('c444-')
+  build(r2root)
+  const foreign2 = join(r2root, 'frames/https-album/photo.jpg')
+  removeAllOwned(r2root, { mode: 'permanent', includeUnknown: true })
+  must(!existsSync(foreign2), 'C444 显式勾选 includeUnknown 后外来文件没被删（原契约破了）')
+  return '默认下钻保留外来文件原字节并写明勾选原因；显式勾选才删'
+})
+
+check('C445【主判据】保守口径：URL 目录含强产物但混入用户文本，整棵跳过、字节不变、不做部分删除', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c445-')
+    const dir = join(root, 'httpsb23.tvreal')
+    mkdirSync(dir, { recursive: true })
+    const tool = join(dir, 'sub_text.a1b2c3.tool.txt')
+    const userText = join(dir, 'text.txt')
+    writeFileSync(tool, 'tool-output')          // 强凭证（精确 .tool.txt 产物）
+    writeFileSync(userText, 'user-text-data')   // 用户文本，应阻断整棵
+    const before = _md5(userText)
+    must(looksLikeOwnUrlDir(dir, 'httpsb23.tvreal') === false,
+      `C445 ${path} 混入用户文本的 URL 目录仍被认作自家缓存`)
+    const dry = fn(root, { dryRun: true, mode: 'permanent' })
+    must((dry.skipped || []).some((x) => /归属证明不足/.test(x.why || '')),
+      `C445 ${path} skipped 没写「整棵归属证明不足」`)
+    fn(root, { mode: 'permanent' })
+    must(existsSync(userText) && _md5(userText) === before,
+      `C445 ${path} 混入的用户 text.txt 被删或字节变了`)
+    must(existsSync(tool), `C445 ${path} 强产物被部分删除（保守口径应整棵跳过）`)
+  }
+  return '两路径：混入用户文本的 URL 目录整棵跳过，用户文件与强产物都原字节保留'
+})
+
+check('C446【主判据】保守口径：URL 目录只含用户 text.txt 允许残留（判 false 且文件保留）', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c446-')
+    const dir = join(root, 'https-我的备份')
+    mkdirSync(dir, { recursive: true })
+    const f = join(dir, 'text.txt')
+    writeFileSync(f, 'user-text-only')
+    const before = _md5(f)
+    must(looksLikeOwnUrlDir(dir, 'https-我的备份') === false, `C446 ${path} 只含 text.txt 的 URL 目录被认领`)
+    fn(root, { mode: 'permanent' })
+    must(existsSync(f) && _md5(f) === before, `C446 ${path} 只含 text.txt 的目录被收走`)
+  }
+  return '两路径：只含用户 text.txt 的 URL 目录判 false 且原字节残留'
+})
+
+check('C447【主判据】last-error.json 在 URL 目录层不当凭证（固定名清单 / PROVEN_NAME_RE 都不放行）', () => {
+  const root = _mkCacheRoot('c447-')
+  const dir = join(root, 'https-我的备份')
+  mkdirSync(dir, { recursive: true })
+  const f = join(dir, 'last-error.json')
+  writeFileSync(f, '{"err":"x"}')
+  const before = _md5(f)
+  must(looksLikeOwnUrlDir(dir, 'https-我的备份') === false,
+    'C447 URL 目录只含 last-error.json 仍被认领（固定名清单 / PROVEN_NAME_RE 误放行）')
+  removeOwned(root, { mode: 'permanent' })
+  must(existsSync(f) && _md5(f) === before, 'C447 last-error.json 被当作凭证删掉')
+  return 'URL 目录层 last-error.json 不作凭证，文件原字节保留'
+})
+
+check('C448【主判据】自动清理 X13-F2：启动强制 / status 常规两入口遇显式非法 deleteMode 都停在不删状态，文件与目录都不动', () => {
+  const idx = read('index.js')
+  const client = read('client.js')
+  // 面板键位：新状态要有中文文案，不能漏出英文原值
+  must(/'bad-delete-mode'/.test(client) && /deleteMode 无法识别/.test(client),
+    'C448 面板没给 bad-delete-mode 加中文键位（面板会漏英文原值）')
+  // 抠 autoCleanCache 真函数体跑：注入桩，只问「这次删没删、返回什么状态」。
+  // invalidDeleteModeOf 用真函数（从 params 传入），不在判据里重写一份。
+  const runAuto = (rawCfg, force) => {
+    const calls = { del: 0, prune: 0 }
+    const f = compile(idx, ['autoCleanCache'], {
+      prelude: `
+        const cacheDir = () => '/tmp/cache';
+        const cacheCfg = () => ({ days: 1, maxMb: 100, autoClean: true, deleteMode: 'permanent' });
+        const CACHE_CFG = '/tmp/cache-config.json';
+        // N-F1：autoCleanCache 直读原始 {value,problem}；RAW_CFG 是配置对象，problem=null。
+        const readJsonOrBackupRaw = () => ({ value: RAW_CFG, problem: null });
+        const invalidDeleteModeOf = INVALID_FN;
+        let lastCleanAt = 0;
+        let lastSkippedOverflow = null;
+        const existsSync = () => true;
+        const isOurCacheRoot = () => true;
+        const lockState = () => ({ state: 'idle', staleLocks: [], truncated: false, truncatedDirs: 0 });
+        const lockTtlMs = () => 1;
+        const walkEntries = () => [{ path: '/tmp/cache/a.txt', size: 10, mtime: 0 }];
+        const deletePaths = (entries, opts) => { CALLS.del++; return { removed: entries.length, bytes: 10, failed: [], overflow: { count: 0, bytes: 0 } }; };
+        const pruneEmptyDirs = () => { CALLS.prune++; };
+        const invalidateCacheStat = () => {};
+        const relative = (a, b) => b;
+      `,
+      params: ['RAW_CFG', 'INVALID_FN', 'CALLS'],
+      args: [rawCfg, invalidDeleteModeOf, calls],
+    })
+    const r = force ? f.autoCleanCache({ force: true }) : f.autoCleanCache()
+    return { r, calls }
+  }
+  for (const [label, force] of [['启动强制', true], ['status常规', false]]) {
+    for (const v of ['recycleX', '', 42, null, 'RECYCLE']) {
+      const { r, calls } = runAuto({ deleteMode: v }, force)
+      must(r.skipReason?.state === 'bad-delete-mode',
+        `C448 ${label} 非法值 ${JSON.stringify(v)} 没返回 bad-delete-mode 状态（r=${JSON.stringify(r)}）`)
+      must(calls.del === 0 && calls.prune === 0,
+        `C448 ${label} 非法值 ${JSON.stringify(v)} 仍删了文件或清了目录（del=${calls.del} prune=${calls.prune}）`)
+    }
+  }
+  // 缺省（键不在）与合法值不拦：照常清（旧契约）
+  for (const raw of [{}, { deleteMode: 'permanent' }, { deleteMode: 'recycle' }, { deleteMode: 'smart' }]) {
+    const { r, calls } = runAuto(raw, true)
+    must(calls.del === 1, `C448 缺省/合法值 ${JSON.stringify(raw)} 被误拦（旧契约破了）`)
+    must(r.skipReason?.state !== 'bad-delete-mode', `C448 缺省/合法值 ${JSON.stringify(raw)} 误报 bad-delete-mode`)
+  }
+  return '启动强制 / status 常规两入口遇非法值都停在不删状态、文件目录都不动；缺省与三合法值照常清；面板有中文键位'
+})
+
+// ── C449-C453 · 0.4.17 再返修（2156 / Astra 2151）：URL 目录认领扩大从规则上消除 ──
+// 21811fb 的 urlDirEntryKind weak 档 + urlDirAllProven 末尾 return strong，让一个精确 .tool.txt
+// 替同目录里没有任何归属依据的文件（manifest.json / runs.jsonl 等）取得整棵删除权。上界是 9bc913d：
+// 接受集必须是它的子集（扩大 0，允许收窄）。以下判据都真造现场、真跑函数、真比 md5，不断源码字符串。
+check('C449【主判据】再返修反例一：URL 目录 .tool.txt + manifest.json 整棵跳过，两路径预览写明、实删字节不变', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c449-')
+    const dir = join(root, 'httpsb23.tvmanifest')
+    mkdirSync(dir, { recursive: true })
+    const tool = join(dir, 'sub_text.a1b2c3.tool.txt')
+    const alien = join(dir, 'manifest.json')
+    writeFileSync(tool, 'tool-output-payload')
+    writeFileSync(alien, JSON.stringify({ files: ['user'] }))
+    const beforeAlien = _md5(alien), beforeTool = _md5(tool)
+    must(looksLikeOwnUrlDir(dir, 'httpsb23.tvmanifest') === false,
+      `C449 ${path} .tool.txt+manifest.json 仍被认领（扩大没堵）`)
+    const dry = fn(root, { dryRun: true, mode: 'permanent' })
+    must((dry.skipped || []).some((x) => /整棵归属证明不足/.test(x.why || '')),
+      `C449 ${path} 预览 skipped 没写「整棵归属证明不足」`)
+    fn(root, { mode: 'permanent' })
+    must(existsSync(alien) && _md5(alien) === beforeAlien, `C449 ${path} manifest.json 被删或字节变了`)
+    must(existsSync(tool) && _md5(tool) === beforeTool, `C449 ${path} .tool.txt 被部分删除（整棵跳过不该动它）`)
+  }
+  return '两路径：.tool.txt+manifest.json 整棵跳过，预览写明原因，实删两文件原字节保留'
+})
+
+check('C450【主判据】再返修反例二：URL 目录 .tool.txt + runs.jsonl 整棵跳过，两路径预览写明、实删字节不变', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c450-')
+    const dir = join(root, 'httpsb23.tvruns')
+    mkdirSync(dir, { recursive: true })
+    const tool = join(dir, 'sub_text.a1b2c3.tool.txt')
+    const alien = join(dir, 'runs.jsonl')
+    writeFileSync(tool, 'tool-output-payload')
+    writeFileSync(alien, '{"at":1}\n')
+    const beforeAlien = _md5(alien), beforeTool = _md5(tool)
+    must(looksLikeOwnUrlDir(dir, 'httpsb23.tvruns') === false,
+      `C450 ${path} .tool.txt+runs.jsonl 仍被认领（扩大没堵）`)
+    const dry = fn(root, { dryRun: true, mode: 'permanent' })
+    must((dry.skipped || []).some((x) => /整棵归属证明不足/.test(x.why || '')),
+      `C450 ${path} 预览 skipped 没写「整棵归属证明不足」`)
+    fn(root, { mode: 'permanent' })
+    must(existsSync(alien) && _md5(alien) === beforeAlien, `C450 ${path} runs.jsonl 被删或字节变了`)
+    must(existsSync(tool) && _md5(tool) === beforeTool, `C450 ${path} .tool.txt 被部分删除（整棵跳过不该动它）`)
+  }
+  return '两路径：.tool.txt+runs.jsonl 整棵跳过，预览写明原因，实删两文件原字节保留'
+})
+
+check('C451【主判据】再返修扩大项关闭：.tool.txt+.bili-watch-root 共存、.write-test-1 单独均判 false', () => {
+  const root = _mkCacheRoot('c451-')
+  const d1 = join(root, 'https-mark-together')
+  mkdirSync(d1, { recursive: true })
+  writeFileSync(join(d1, 'sub_text.a1b2c3.tool.txt'), 'tool')
+  writeFileSync(join(d1, CACHE_MARK), 'mark')
+  must(looksLikeOwnUrlDir(d1, 'https-mark-together') === false,
+    'C451 .tool.txt+.bili-watch-root 共存仍被认领（21811fb 特有扩大项）')
+  const d2 = join(root, 'https-write-test')
+  mkdirSync(d2, { recursive: true })
+  writeFileSync(join(d2, '.write-test-1'), 'test')
+  must(looksLikeOwnUrlDir(d2, 'https-write-test') === false,
+    'C451 只含 .write-test-1 的 URL 目录被当凭证认领')
+  return '.tool.txt+.bili-watch-root 共存、.write-test-1 单独均判 false'
+})
+
+check('C452【主判据】接受集是基线上界的回归：五个基线 false 形态新规则仍 false', () => {
+  const root = _mkCacheRoot('c452-')
+  const E = {
+    T: 'sub_text.a1b2c3.tool.txt', F: 'manifest.json', R: 'runs.jsonl',
+    J: 'BV1xx411c7mD-01.jpg', D: '.write-test-1', M: 'meta.json',
+  }
+  const cases = [['F', 'T'], ['R', 'T'], ['J', 'T'], ['D', 'M'], ['M', 'R', 'T']]
+  let i = 0
+  for (const c of cases) {
+    const dn = 'https-regress' + (i++)
+    const d = join(root, dn)
+    mkdirSync(d, { recursive: true })
+    for (const k of c) writeFileSync(join(d, E[k]), 'p-' + k)
+    must(looksLikeOwnUrlDir(d, dn) === false, `C452 基线 false 形态 ${c.join('+')} 新规则被认领（扩大）`)
+  }
+  return 'F+T / R+T / J+T / D+M / M+R+T 五形态均判 false，接受集未扩大'
+})
+
+check('C453【主判据】真实缓存正对照：URL 目录只含 *.tool.txt 时两路径都删得掉（防一律不删假绿）', () => {
+  for (const [path, fn] of [['removeOwned', removeOwned], ['removeAllOwned', removeAllOwned]]) {
+    const root = _mkCacheRoot('c453-')
+    const dir = join(root, 'httpsb23.tvtoolonly')
+    mkdirSync(dir, { recursive: true })
+    const tool = join(dir, 'sub_text.a1b2c3.tool.txt')
+    writeFileSync(tool, 'real-tool-output')
+    const dry = fn(root, { dryRun: true, mode: 'permanent' })
+    must((dry.plan || []).some((x) => /httpsb23\.tvtoolonly/.test(x.name || '')),
+      `C453 ${path} 预览没把纯 .tool.txt 的 URL 目录列入 plan`)
+    fn(root, { mode: 'permanent' })
+    must(!existsSync(tool), `C453 ${path} 纯 .tool.txt 的 URL 目录没被清掉（一律不删假绿）`)
+  }
+  return '两路径：只含 *.tool.txt 的 URL 目录预览进 plan、实删清得掉'
+})
+
+// ── C454-C460 · 2235 发布工具批次（A–F）──────────────────────────────────
+// 判据全部真跑/真读源码，不断文案。C454-C456 共用 resumeProbe() 的一次取证。
+slowCheck('C454【主判据】续推写成功丢回包：第一次 rc=3（不确定）、第二次 rc=0 且 POST 不重复', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C454 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const j = r.json
+  must(!j.serverErr, `C454 假 API 起不来：${j.serverErr}`)
+  const c = j.c454
+  must(c.r1.rc === 3, `C454 第一次（POST 写成功丢回包）应 rc=3 不确定，实得 ${c.r1.rc}：${c.r1.out.slice(-200)}`)
+  must(c.post1 === 1, `C454 第一次应正好 POST 一次，实得 ${c.post1}`)
+  must(c.r2.rc === 0, `C454 第二次重查远端应 rc=0 完成，实得 ${c.r2.rc}：${c.r2.out.slice(-200)}`)
+  must(c.post2 === 1, `C454 第二次不该再 POST（零重复写），实得 postCount=${c.post2}（第一笔 ${c.post1}）`)
+  must(/三级全匹配|零写入/.test(c.r2.out), 'C454 第二次没报「已匹配、零写入」，可能在冒充补写')
+  return '写成功丢回包→rc3；重跑→rc0 且 POST 仍 1（零重复写）'
+})
+
+slowCheck('C455【主判据】续推冲突保留现场：同名标签剥离目标不同 / Release 正文不同都不写', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C455 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c455
+  must(c.peel.rc === 2, `C455 标签剥离目标冲突应 rc=2，实得 ${c.peel.rc}：${c.peel.out.slice(-200)}`)
+  must(c.peel.refsUnchanged === true,
+    `C455 标签冲突后远端引用被改了（现场没保留）：\n前=${c.peel.refsBBefore}\n后=${c.peel.refsBAfter}`)
+  must(c.body.rc === 2, `C455 Release 正文不同应 rc=2，实得 ${c.body.rc}：${c.body.out.slice(-200)}`)
+  must(c.body.post === 0, `C455 正文冲突还去 POST 建 Release（覆盖现场），postCount=${c.body.post}`)
+  return '标签剥离目标冲突 / 正文冲突均 rc2，远端引用与 Release 原样未动'
+})
+
+slowCheck('C456【主判据】续推三级全匹配零写入，且续推分支在 registry 闸之前（已发布版本不被 §0b 卡）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C456 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c456
+  must(c.r3.rc === 0, `C456 三级全匹配应 rc=0，实得 ${c.r3.rc}`)
+  must(c.post3 === 1, `C456 全匹配再跑不该 POST，postCount=${c.post3}（应仍为第一笔 1）`)
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  // 锚点必须是真代码，不能是注释：原来锚 §0-pre 命中的是 :499 注释，改注释字样仍 PASS（假绿）。
+  // 下面三处都在 release.ps1 里全文件唯一，且是会被真执行的语句。
+  const resumeAt = rel.indexOf('if ($ResumeGit)')                    // :432 续推分支
+  const registryAt = rel.indexOf('npm view $pkgName versions')       // :507 registry 查询真代码
+  const zeroBAt = rel.indexOf('已经在 npm 上发布过了')               // :523 §0b Fail 真代码
+  must(resumeAt > 0, 'C456 release.ps1 找不到 -ResumeGit 续推分支')
+  must(registryAt > 0, 'C456 release.ps1 找不到 registry 查询真代码（npm view 锚点漂移）')
+  must(zeroBAt > 0, 'C456 release.ps1 找不到 §0b 版本未递增 Fail 真代码（锚点漂移）')
+  // 两条顺序断言都真进 must：续推分支必须同时早于 registry 查询与 §0b Fail，
+  // 否则已发布版本重跑会先 exit2，永远到不了续推。不许用 `registryAt < 0 ||` 短路。
+  must(resumeAt < registryAt,
+    `C456 续推分支（L${rel.slice(0, resumeAt).split('\n').length}）在 registry 查询（L${rel.slice(0, registryAt).split('\n').length}）之后，会被 §0b 卡住`)
+  must(resumeAt < zeroBAt,
+    `C456 续推分支（L${rel.slice(0, resumeAt).split('\n').length}）在 §0b Fail（L${rel.slice(0, zeroBAt).split('\n').length}）之后，已发布版本永远走不到续推`)
+  return '三级全匹配零写入；-ResumeGit 分支在真代码 npm view 与 §0b Fail 之前（锚点非注释）'
+})
+
+check('C457【主判据】pack 退出码两处真查：--dry-run 与 --silent 失败都 Fail，空 SHA 不 Substring 炸', () => {
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  // 第一处：npm pack --dry-run 之后紧跟 $LASTEXITCODE 检查
+  const dryAt = rel.indexOf('npm pack --dry-run 2>&1')
+  must(dryAt > 0, 'C457 找不到第一处 npm pack --dry-run')
+  const dryTail = rel.slice(dryAt, dryAt + 500)
+  must(/\$LASTEXITCODE\s*-ne\s*0/.test(dryTail), 'C457 --dry-run 失败没有查 $LASTEXITCODE（仍可能带着 rc≠0 往下走）')
+  // 空 SHA 防护（原 $shas.Substring(0,12) 空串会炸）
+  must(/\$shas\.Length\s*-ge\s*12/.test(rel), 'C457 空 SHA 防护没了（$shas 为空时 Substring(0,12) 会抛）')
+  // 第二处：npm pack --silent 之后紧跟 $LASTEXITCODE 检查
+  const silentAt = rel.indexOf('npm pack --silent 2>&1')
+  must(silentAt > 0, 'C457 找不到第二处 npm pack --silent')
+  const silentTail = rel.slice(silentAt, silentAt + 500)
+  must(/\$LASTEXITCODE\s*-ne\s*0/.test(silentTail), 'C457 --silent 失败没有查 $LASTEXITCODE（靠 Test-Path 兜会漏过真失败）')
+  // 第三处原本就有，不能动坏
+  must(/npm pack --dry-run --json/.test(rel), 'C457 第三处 --json 检查被误删')
+  return '两处 pack 都查 $LASTEXITCODE，空 SHA 有 Length 防护，第三处 --json 未动'
+})
+
+check('C458【主判据】registry 查询前移：npm view 在写版本之前，续推分支更早', () => {
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  const lines = rel.split('\n')
+  // 2-F1（2026-11-25）：原来锚点 `indexOf('npm view')` 会先命中 :627 注释「npm view 的输出解析不了」，
+  //   把真查询行整段删掉、只留注释也照样 PASS。改用真代码整行（含 $viewOut 赋值）作窄锚。
+  const viewLine = lines.findIndex((l) => /\$viewOut\s*=\s*\(cmd \/c "npm view \$pkgName versions --json/.test(l))
+  must(viewLine >= 0, 'C458 找不到真 registry 查询行（$viewOut = cmd /c npm view …）——不能拿注释当锚')
+  const viewAt = lines.slice(0, viewLine).join('\n').length
+  const writeVerAt = rel.indexOf('"version"\\s*:\\s*"[^"]*"', viewAt > 0 ? viewAt : 0) // 写版本那行的 regex::Replace
+  const readBackAt = rel.indexOf('$srcPkg.version -ne $Version')
+  // 前后快照：查询行之前不许出现写版本（证明「先查再写」，不是写完被注释糊弄过去）。
+  const beforeView = lines.slice(0, viewLine).join('\n')
+  must(!/"version"\\s*:\\s*"[^"]*"/.test(beforeView), 'C458 查询行之前已经写了版本号（前后快照证明先写后查）')
+  must(viewAt > 0 && writeVerAt > 0, 'C458 找不到写版本语句')
+  must(viewAt < writeVerAt,
+    `C458 registry 查询（L${viewLine + 1}）没有前移到写版本（L${rel.slice(0, writeVerAt).split('\n').length}）之前`)
+  must(readBackAt > writeVerAt, 'C458 写版本后缺少读回复核（防写入静默失败）')
+  return '真查询行窄锚 + 前后快照：npm view 在写版本之前，写后读回复核版本一致'
+})
+
+check('C459【主判据】受保护文件检查前移：excludeCopy 缺件 Fail 在复制循环之前', () => {
+  const sync = readFileSync(join(ROOT, 'scripts', 'sync-release.ps1'), 'utf8')
+  const lines = sync.split('\n')
+  const checkLine = lines.findIndex((l) => l.includes('发布树缺 $rel'))
+  must(checkLine >= 0, 'C459 找不到受保护文件缺件检查')
+  // 2-F1（2026-11-25）：原来只比两段字符串先后，把 Fail 改成 Write-Host 仍绿。
+  //   现在要求这条检查行本身是 Fail 调用（真结构），并确认它在 Copy-Item 复制循环之前。
+  const checkStmt = lines[checkLine]
+  must(/\bFail\s/.test(checkStmt) && !/Write-Host/.test(checkStmt),
+    `C459 缺件检查不是 Fail 调用（第 ${checkLine + 1} 行="${checkStmt.trim()}"）——改成 Write-Host 会让缺件静默放行`)
+  const copyLine = lines.findIndex((l, i) => i > 0 && /Copy-Item/.test(l))
+  must(copyLine >= 0, 'C459 找不到 Copy-Item 复制循环')
+  must(checkLine < copyLine,
+    `C459 受保护文件检查（L${checkLine + 1}）没有前移到复制循环（L${copyLine + 1}）之前——缺件时整棵临时树已被写一半`)
+  const window = lines.slice(Math.max(0, checkLine - 12), checkLine + 4).join('\n')
+  must(/auto-trigger\.js/.test(window) && /README\.md/.test(window),
+    'C459 前移后的检查没有覆盖 auto-trigger.js 与 README.md')
+  return '缺件 Fail 真调用在 Copy-Item 之前，覆盖 auto-trigger.js/README.md'
+})
+
+check('C460【主判据】台账登记 b7ca08b：三来源号处置档已修、登记节三行编号精确、引用复核报告', () => {
+  // 路径口径与 C301 一致（相对 ROOT 解析，不写死机器绝对路径）；可读失败也要点名。
+  const ledgerDir = join(ROOT, '..', '..', '项目', 'bili-watch', '台账')
+  must(existsSync(ledgerDir), `C460 台账目录不存在或不可读：${ledgerDir}`)
+  const ledger = join(ledgerDir, '待修-P2P3.md')
+  must(existsSync(ledger), `C460 台账文件不存在或不可读：${ledger}`)
+  const text = readFileSync(ledger, 'utf8')
+  const lines = text.split('\n')
+  must(/已修（b7ca08b/.test(text), 'C460 台账没有 b7ca08b 的已修登记')
+  must(/复核-手动清理误删-再返修\.md/.test(text), 'C460 台账没有指向独立复核报告')
+  // 长期断言：三来源号各恰好一行处置档「已修（b7ca08b…」（不验主表行数——每版追加行会假红，
+  //   且 C460 无从知道本次是哪次追加；只验处置档这一格的状态）。
+  for (const key of ['X-11 P1-F1', 'X-13 P1-F1', 'X-13 P1-F2']) {
+    const rows = lines.filter((l) => /^\|/.test(l) && l.includes(key) && /已修（b7ca08b/.test(l))
+    must(rows.length === 1, `C460 ${key} 处置档「已修（b7ca08b」行数为 ${rows.length}（应恰好 1 行）`)
+  }
+  // 末尾 0.4.17 登记节：恰好 3 行数据行，编号精确是这三个，不多不少。
+  const secAt = lines.findIndex((l) => /^## .*0\.4\.17 数据保护登记/.test(l))
+  must(secAt >= 0, 'C460 找不到 0.4.17 数据保护登记节')
+  const dataRows = lines.slice(secAt).filter((l) => /^\| X-1[13] P1-F[12] \|/.test(l))
+  must(dataRows.length === 3, `C460 登记节数据行数=${dataRows.length}（应恰好 3）`)
+  for (const key of ['X-11 P1-F1', 'X-13 P1-F1', 'X-13 P1-F2']) {
+    must(dataRows.some((l) => l.includes(key)), `C460 登记节缺编号 ${key}`)
+  }
+  return '三来源号处置档各恰好一行已修、登记节三行编号精确、引用复核报告'
+})
+
+check('C461【主判据】smart 语义统一：README 命令行与面板都讲清「重要进回收站、其余永久删除」', () => {
+  const rd = readFileSync(join(ROOT, 'README.md'), 'utf8')
+  const hits = rd.split('\n').filter((l) => /smart/.test(l) && /回收站|永久删/.test(l))
+  must(hits.length >= 2, `C461 README 里讲 smart 语义（回收站/永久删除）的行只有 ${hits.length} 处（应命令行+面板各一处）`)
+  // 确认框与分流逻辑原本就对，不许被这次改动带坏
+  const client = readFileSync(join(ROOT, 'client.js'), 'utf8')
+  must(/重要文件.*回收站|回收站.*重要文件/.test(client) || /clearAllConfirmWording/.test(client),
+    'C461 client.js 确认框 smart 分支被改动坏了')
+  return 'README 命令行与面板都写明 smart 语义；client.js 确认框未坏'
+})
+
+slowCheck('C462【主判据】-ResumeGit 按 -Release 定位仓库：cwd 在 git 仓库外也能 rc=0（不依赖调用者 cwd）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C462 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c462
+  // 先证现场真实：cwd 确实不在任何 git 仓库，否则这条判据空转。
+  must(c.cwdIsGit === false, `C462 取证现场无效：cwd 竟在 git 仓库内（${c.cwdOut}），不能证明 cwd 无关`)
+  // 修复前 Invoke-Resume 用 cwd 读 HEAD 会 rc=2；修复后按 -Release 定位，三级全匹配 rc=0。
+  must(c.rc === 0, `C462 cwd 在 git 仓库外时 -ResumeGit 应 rc=0，实得 rc=${c.rc}：${c.out}`)
+  // 唯一变量对照：同一现场、cwd 换成仓库内，也须 rc=0（证明 cwd 内外行为一致，不是只在仓外碰巧）。
+  must(c.inside && c.inside.rc === 0,
+    `C462 cwd 在仓库内应同样 rc=0，实得 rc=${c.inside ? c.inside.rc : '缺失'}：${c.inside ? c.inside.out : ''}`)
+  return 'cwd 非 git 目录/仓库内 -ResumeGit 都 rc=0（-Release 定位，不依赖调用者 cwd）'
+})
+
+// ── C463-C468 · 23:59 续推完成判定返修（假成功/轻量标签/非法语法/正文文件/正对照）──
+slowCheck('C463【主判据】续推假成功：本地与远端 main 分叉 + 无标签 + API 有正式 Release → rc=2 零写', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C463 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c463
+  must(c.rc === 2, `C463 假成功现场应 rc=2（冲突），实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 0, `C463 假成功现场不应 POST，实得 ${c.post}`)
+  must(c.refsUnchanged === true, `C463 假成功现场远端引用被改（现场没保留）：前 ${c.refsBefore} → 后 ${c.refsAfter}`)
+  must(/分叉|停下/.test(c.out), 'C463 没有「分叉停下」提示，疑似仍在提前报完成')
+  must(c.err === '', `C463 出现非法语法/未捕获异常 stderr：${c.err}`)
+  return '分叉+无标签+有Release → rc2、POST0、远端引用未变（不再误报三级全匹配）'
+})
+
+slowCheck('C464【主判据】续推轻量标签：远端 tag 非附注对象 → rc=2 零写', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C464 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c464
+  must(c.rc === 2, `C464 轻量标签应 rc=2（冲突），实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 0, `C464 轻量标签不应 POST，实得 ${c.post}`)
+  must(c.refsUnchanged === true, `C464 轻量标签现场远端引用被改：前 ${c.refsBefore} → 后 ${c.refsAfter}`)
+  must(/非附注标签|非 tag/.test(c.out), 'C464 没有「非附注标签」提示，疑似把轻量标签当已到位放过')
+  return '远端轻量标签（commit 对象）→ rc2、零写、提示非附注标签'
+})
+
+slowCheck('C465【主判据】return if 非法语法清零 + 远端查询失败分支 rc∈{2,3} 不是 1', () => {
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  must(!/return\s+if\s*\(/.test(rel), 'C465 release.ps1 仍有非法的 return if (...) 语法')
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C465 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c465
+  // 鉴权 401/403 → rc=2 不写
+  must(c.auth.rc === 2, `C465 鉴权失败应 rc=2，实得 ${c.auth.rc}：${c.auth.out.slice(-200)}`)
+  must(c.auth.post === 0, `C465 鉴权失败不应 POST，实得 ${c.auth.post}`)
+  // API 超时 → rc=3 不写
+  must(c.timeout.rc === 3, `C465 API 超时应 rc=3，实得 ${c.timeout.rc}：${c.timeout.out.slice(-200)}`)
+  must(c.timeout.post === 0, `C465 API 超时不应 POST，实得 ${c.timeout.post}`)
+  // 远端 git 查询失败 → rc∈{2,3} 且不是 1（不是语法错）
+  must([2, 3].includes(c.remoteFail.rc), `C465 远端查询失败 rc 应为 2 或 3（不是 1 语法错），实得 ${c.remoteFail.rc}：${c.remoteFail.out.slice(-300)}`)
+  return 'return if 零命中；鉴权rc2/超时rc3/远端失败rc∈{2,3}，均零写'
+})
+
+slowCheck('C466【主判据】续推定稿正文文件读不到 → rc=2 零写（不静默按空正文建空 Release）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C466 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c466
+  must(c.rc === 2, `C466 正文文件不存在应 rc=2，实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 0, `C466 正文文件读不到不应 POST 建空正文 Release，实得 ${c.post}`)
+  must(/读不到|未做任何写入/.test(c.out), 'C466 没有「正文文件读不到」提示，疑似静默降级为空正文')
+  return '-ResumeBodyFile 指向不存在路径 → rc2、POST0、提示读不到'
+})
+
+check('C467【主判据】完成判定必须在三级全查完后：提前 return 0 已删、仅 Release 匹配不报完成', () => {
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  // ①b 预检里只能置标记，不能再有提前 return 0。
+  const preGetAt = rel.indexOf('$releaseMatch = $false')
+  const mainAt = rel.indexOf('② main 级')
+  must(preGetAt > 0, 'C467 找不到 ①b 的 $releaseMatch 标记')
+  must(mainAt > preGetAt, 'C467 ② main 级判定不在 ①b 预检之后，结构异常')
+  // 0114 改版：完成回执拆成「本次零写入」与「本轮补写」两句，都在 ④ 的 $releaseMatch 判断体内。
+  // 旧文案「三级全匹配——已完成」必须彻底消失（提前报完成的口子已删）。
+  must(!/三级全匹配（main\/tag\/Release 正文）——已完成/.test(rel), 'C467 旧「三级全匹配——已完成」回执仍在（提前报完成）')
+  const doneRe = /已确认完成（main \/ 标签 \/ Release 三级均到位，本次零写入）/g
+  const doneHits = [...rel.matchAll(doneRe)]
+  must(doneHits.length === 1, `C467 「本次零写入」回执应只出现 1 处，实得 ${doneHits.length} 处`)
+  const sec4At = rel.indexOf('④ Release 级')
+  must(doneHits[0].index > sec4At, 'C467 完成回执出现在 ④ Release 级之前（提前报完成的口子仍在）')
+  const ifMatchAt = rel.indexOf('if ($releaseMatch)', sec4At)
+  must(ifMatchAt > 0 && ifMatchAt < doneHits[0].index, 'C467 ④ 里完成回执不在 $releaseMatch 判断之后')
+  // 补写文案必须在 releaseMatch 分支之外也有一处（POST 成功分支）
+  must(/本轮补写：/.test(rel), 'C467 缺「本轮补写」文案（完成/补写未拆句）')
+  return '①b 仅置标记、②③照判；完成回执拆零写入/补写两句，唯一且在 ④ 判断体内'
+})
+
+slowCheck('C468【主判据】续推正对照：远端 main 落后一提交 → rc=0 正常补推（main push + Release POST 各 1）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C468 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c468
+  must(c.rc === 0, `C468 远端落后该补推应 rc=0，实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 1, `C468 正对照应正好 POST 一次建 Release，实得 ${c.post}`)
+  must(c.refsAfter > c.refsBefore, `C468 正对照远端引用应增加（main push + tag + Release 不在 git refs，但至少 main/tag 上去），前 ${c.refsBefore} 后 ${c.refsAfter}`)
+  must(/main 已到位|标签.*已推到位|Release.*已建/.test(c.out), 'C468 没有补推/建 Release 提示，疑似「一概不动」的假绿')
+  return '远端 main 落后 → rc0、push+POST 各 1（证明不是一律不写）'
+})
+
+// ── C469-C473 · 0114 续推七边界返修（draft/prerelease/轻量标签/定稿三态/完成文案）──
+slowCheck('C469【主判据】续推完成三条件：draft=true 或 prerelease=true 都不算完成 → rc=2 零写', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C469 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c469
+  must(c.draft.rc !== 0, `C469 draft=true 不得判完成，实得 rc=${c.draft.rc}：${c.draft.out.slice(-300)}`)
+  must(c.draft.post === 0, `C469 draft=true 不应 POST，实得 ${c.draft.post}`)
+  must(c.draft.mainUnchanged === true, `C469 draft=true 现场远端 main 被改：${c.draft.mainBefore} → ${c.draft.mainAfter}`)
+  must(c.prerelease.rc !== 0, `C469 prerelease=true 不得判完成，实得 rc=${c.prerelease.rc}：${c.prerelease.out.slice(-300)}`)
+  must(c.prerelease.post === 0, `C469 prerelease=true 不应 POST，实得 ${c.prerelease.post}`)
+  must(c.prerelease.mainUnchanged === true, 'C469 prerelease=true 现场远端 main 被改')
+  must(/draft|prerelease/.test(c.draft.out + c.prerelease.out), 'C469 没有 draft/prerelease 提示，疑似仍按正文单条件判完成')
+  return 'draft=true / prerelease=true 各 rc≠0、POST0、main 未变'
+})
+
+slowCheck('C470【主判据】远端轻量标签 + main 落后可快进 → rc=2 零写（预检前移，main SHA 前后不变）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C470 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c470
+  must(c.rc === 2, `C470 远端轻量标签应 rc=2，实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 0, `C470 不应 POST，实得 ${c.post}`)
+  must(c.mainUnchanged === true, `C470 main 落后现场被先推上去（冲突前写）：${c.mainBefore} → ${c.mainAfter}`)
+  must(/轻量|非附注|tag/.test(c.out), 'C470 没有轻量标签提示，疑似放到 ③ 才发现')
+  return '远端轻量标签+main 落后 → rc2、POST0、main SHA 前后不变'
+})
+
+slowCheck('C471【主判据】本地轻量标签、远端无标签 → rc=2 零写（不推轻量标签上去）', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C471 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c471
+  must(c.rc === 2, `C471 本地轻量标签应 rc=2，实得 ${c.rc}：${c.out.slice(-300)}`)
+  must(c.post === 0, `C471 不应 POST，实得 ${c.post}`)
+  must(c.tagAbsent === true, `C471 远端不该出现轻量标签，实得 tags=${c.remoteTagsAfter}`)
+  must(/轻量|重建为附注标签/.test(c.out), 'C471 没有「轻量标签/重建附注」提示，疑似直接推了')
+  return '本地轻量标签远端无 → rc2、POST0、远端不出现该标签'
+})
+
+slowCheck('C472【主判据】定稿三态：缺定稿 / Release 缺 tag_name / 返回非 JSON 都不判完成 → rc≠0 零写', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C472 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c472
+  must(c.nobody.rc !== 0, `C472 缺定稿不得判完成，实得 rc=${c.nobody.rc}：${c.nobody.out.slice(-300)}`)
+  must(c.nobody.post === 0, `C472 缺定稿不应 POST，实得 ${c.nobody.post}`)
+  must(/未提供定稿正文/.test(c.nobody.out), 'C472 缺定稿没有专门文案')
+  must(c.notag.rc !== 0, `C472 Release 缺 tag_name 不得判完成，实得 rc=${c.notag.rc}：${c.notag.out.slice(-300)}`)
+  must(c.notag.post === 0, `C472 缺 tag_name 不应 POST，实得 ${c.notag.post}`)
+  must(/tag_name 缺失/.test(c.notag.out), 'C472 缺 tag_name 没有专门文案')
+  must(c.badjson.rc !== 0, `C472 非 JSON 不得判完成，实得 rc=${c.badjson.rc}：${c.badjson.out.slice(-300)}`)
+  must(c.badjson.post === 0, `C472 非 JSON 不应 POST，实得 ${c.badjson.post}`)
+  must(/不是合法 JSON/.test(c.badjson.out), 'C472 非 JSON 没有专门文案，疑似静默吞')
+  return '缺定稿/缺 tag_name/非 JSON 各 rc≠0、POST0、都有专门文案'
+})
+
+slowCheck('C473【主判据】完成文案拆句：「零写入」只在本来就全匹配时出现，补写现场列实际写入项', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C473 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c473
+  must(c.zero.rc === 0, `C473 正对照全匹配应 rc=0，实得 ${c.zero.rc}`)
+  must(/本次零写入/.test(c.zero.out), `C473 全匹配现场应出「本次零写入」，实得：${c.zero.out.slice(-300)}`)
+  must(!/本轮补写/.test(c.zero.out), 'C473 全匹配现场不该出现「本轮补写」')
+  must(c.write.rc === 0, `C473 补写正对照应 rc=0，实得 ${c.write.rc}`)
+  must(/本轮补写：/.test(c.write.out), `C473 补写现场应出「本轮补写：」，实得：${c.write.out.slice(-300)}`)
+  must(/main push/.test(c.write.out) && /标签推送/.test(c.write.out) && /Release 新建/.test(c.write.out),
+    `C473 补写现场应逐项列出 main push / 标签推送 / Release 新建，实得：${c.write.out.slice(-300)}`)
+  must(!/本次零写入/.test(c.write.out), 'C473 补写现场不该出现「本次零写入」')
+  return '全匹配→本次零写入；补写现场→本轮补写逐项列出（两路文案互斥）'
+})
+
+// ── 1252 A 块：N-F1（坏配置静默放行 → permanent 直删）──────────────────────────────
+check('C474【主判据】N-F1 方案 a：坏 JSON 连续三读 problem 都非空、原文件留在原地、不产生 .broken 副本', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c474-'))
+  const p = join(dir, 'cache-config.json')
+  try {
+    writeFileSync(p, '{ "deleteMode": "permanent", BROKEN')
+    for (let i = 1; i <= 3; i++) {
+      const r = readJsonOrBackup(p, {})
+      must(r.problem && r.problem.kind === 'parse',
+        `C474 第 ${i} 读没报 parse（会被当「没配过」放行 → permanent 直删）`)
+      must(existsSync(p), `C474 第 ${i} 读后原文件不在了（方案 a 要求留在原地、每读必报）`)
+      must(r.value && typeof r.value === 'object' && !Array.isArray(r.value), `C474 第 ${i} 读没回退默认对象`)
+    }
+    must(readdirSync(dir).filter((n) => n.includes('.broken-')).length === 0, 'C474 方案 a 不该产生 .broken 备份副本')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  return '坏 JSON 连续三读都报 parse、原文件三读后仍在、无 .broken 副本'
+})
+
+check('C475【主判据】N-F1 形状：invalidDeleteModeOf 对 []/\"hello\"/42/null 全拦并标 shape，对缺省放行', () => {
+  for (const bad of [[], 'hello', 42, null]) {
+    const got = invalidDeleteModeOf(bad)
+    must(got !== null, `C475 顶层形状 ${JSON.stringify(bad)} 被放行（会回落 permanent 直删）`)
+    must(got.shape === true, `C475 顶层形状 ${JSON.stringify(bad)} 没标 shape（入口提示会说成「值非法」）`)
+  }
+  for (const v of ['recycleX', '', 42, 'RECYCLE']) {
+    must(invalidDeleteModeOf({ deleteMode: v }) !== null, `C475 deleteMode=${JSON.stringify(v)} 没拦`)
+  }
+  must(invalidDeleteModeOf(undefined) === null, 'C475 undefined（整份缺省）被误拦')
+  must(invalidDeleteModeOf({}) === null, 'C475 对象无 deleteMode 键被误拦（原契约破了）')
+  for (const v of ['permanent', 'recycle', 'smart']) {
+    must(invalidDeleteModeOf({ deleteMode: v }) === null, `C475 合法值 ${v} 被误拦`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'bw-c475-'))
+  try {
+    const g1 = readJsonOrBackup(join(dir, 'nope.json'), {})
+    must(g1.problem === null && invalidDeleteModeOf(g1.value, g1.problem) === null, 'C475 无文件被当成非法')
+    const empty = join(dir, 'empty.json'); writeFileSync(empty, '  ')
+    const g2 = readJsonOrBackup(empty, {})
+    must(g2.problem === null && invalidDeleteModeOf(g2.value, g2.problem) === null, 'C475 空文件被当成非法')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+  return '顶层[]/\"hello\"/42/null 全拦标 shape，缺省/合法值放行，无文件/空文件端到端放行'
+})
+
+check('C476【主判据】N-F1 1-B：BILI_WATCH_DEPS 指文件时报可操作 problem、拦截不绕过、三入口都不静默放行', () => {
+  const box = mkdtempSync(join(tmpdir(), 'bw-c476-'))
+  try {
+    // Windows 下对文件拼子路径读返回 ENOENT；config 必须识别「父路径是文件」并报可操作 problem。
+    const depsFile = join(box, 'deps-is-a-file')
+    writeFileSync(depsFile, 'not a dir')
+    const got = readJsonOrBackup(join(depsFile, 'cache-config.json'), {})
+    must(got.problem && got.problem.kind === 'read',
+      `C476 指文件没报 read problem（problem=${JSON.stringify(got.problem)}）`)
+    must(/BILI_WATCH_DEPS/.test(got.problem.error) && /指向一个文件/.test(got.problem.error),
+      `C476 没有可操作的 BILI_WATCH_DEPS 提示：${got.problem.error}`)
+    // 拦截不绕过：该 problem 喂真 invalidDeleteModeOf 必须拦。
+    must(invalidDeleteModeOf(got.value, got.problem) !== null, 'C476 指文件的 problem 被放行（会回落 permanent 直删）')
+    // 宿主自动清理真跑：注入这条 problem，必须停在 bad-delete-mode 且不删。
+    const idx = read('index.js')
+    const calls = { del: 0, prune: 0 }
+    const f = compile(idx, ['autoCleanCache'], {
+      prelude: `
+        const cacheDir = () => '/tmp/cache';
+        const cacheCfg = () => ({ days: 1, maxMb: 100, autoClean: true, deleteMode: 'permanent' });
+        const CACHE_CFG = '/tmp/cache-config.json';
+        const readJsonOrBackupRaw = () => ({ value: {}, problem: ${JSON.stringify(got.problem)} });
+        const invalidDeleteModeOf = INVALID_FN;
+        const pushWarn = () => {};
+        const cfgProblemText = () => 'cfg problem';
+        let lastCleanAt = 0;
+        let lastSkippedOverflow = null;
+        const existsSync = () => true;
+        const isOurCacheRoot = () => true;
+        const lockState = () => ({ state: 'idle', staleLocks: [], truncated: false, truncatedDirs: 0 });
+        const lockTtlMs = () => 1;
+        const walkEntries = () => [{ path: '/tmp/cache/a.txt', size: 10, mtime: 0 }];
+        const deletePaths = (entries, opts) => { CALLS.del++; return { removed: entries.length, bytes: 10, failed: [], overflow: { count: 0, bytes: 0 } }; };
+        const pruneEmptyDirs = () => { CALLS.prune++; };
+        const invalidateCacheStat = () => {};
+        const relative = (a, b) => b;
+      `,
+      params: ['INVALID_FN', 'CALLS'],
+      args: [invalidDeleteModeOf, calls],
+    })
+    const r = f.autoCleanCache({ force: true })
+    must(r.skipReason?.state === 'bad-delete-mode', `C476 自动清理没停在 bad-delete-mode（r=${JSON.stringify(r)}）`)
+    must(calls.del === 0 && calls.prune === 0, 'C476 自动清理仍删了文件/清了目录')
+    // API /cache/clear 入口：直读原始配置、把 problem 传进去、why 带出 detail。
+    const clearAt = idx.indexOf("url.pathname === '/api/bili-watch/cache/clear'")
+    must(clearAt > 0, 'C476 找不到 /cache/clear 路由')
+    const clearSeg = idx.slice(clearAt, clearAt + 1800)
+    must(/readJsonOrBackupRaw\(CACHE_CFG/.test(clearSeg), 'C476 /cache/clear 没直读原始配置（problem 会丢）')
+    must(/invalidDeleteModeOf\(cfgRaw\.value, cfgRaw\.problem\)/.test(clearSeg), 'C476 /cache/clear 没把 problem 传给 invalidDeleteModeOf')
+    must(/badCfgMode\.detail/.test(clearSeg), 'C476 /cache/clear 的 why 没带出底层 detail（提示不可操作）')
+    // CLI look.mjs 入口：把 problem 传进去、hint 带出 detail。
+    const look = read('tools/look.mjs')
+    must(/invalidDeleteModeOf\(cfgObj, cfgProblem\)/.test(look), 'C476 CLI 没把 cfgProblem 传给 invalidDeleteModeOf')
+    must(/badCfgMode\.detail/.test(look), 'C476 CLI 的 hint 没带出底层 detail（提示不可操作）')
+  } finally {
+    rmSync(box, { recursive: true, force: true })
+  }
+  return '指文件→config 报可操作 problem、拦截非空、自动清理真跑停手、API/CLI 两入口传 problem 带 detail'
+})
+
+check('C477【主判据】N-F2 现场①：预览后新增可删插件产物，clear 只删确认过的、新增的保留并点名', () => {
+  const s = confirmProbe().s1
+  must(s && s.code === 200, `C477 clear 没回 200：${JSON.stringify(s)}`)
+  must(s.tokensIncludedA === true, 'C477 预览没返回 tokens 清单（确认边界无从核对）')
+  must(s.aGone === true, 'C477 确认过的 BV 没被删（正常清理失效）')
+  must(s.bKept === true, 'C477 确认后新增的 BV 被删了（TOCTOU：删了用户没确认的对象）')
+  must(Array.isArray(s.skipped) && s.skipped.includes('BV1bbbbbbbbb'), 'C477 skipped 没点名新增的 BV')
+  return '预览→新增可删 BV→带旧 tokens clear：确认过的删、新增的保留且 skipped 点名'
+})
+
+check('C478【主判据】N-F2 现场②：勾 includeUnknown 预览后新增外来文件，clear 不删这个未确认的外来文件', () => {
+  const s = confirmProbe().s2
+  must(s && s.code === 200, `C478 clear 没回 200：${JSON.stringify(s)}`)
+  must(s.tokensCount > 0, 'C478 预览没返回 tokens（含外来文件的确认清单为空）')
+  must(s.newForeignKept === true, 'C478 确认后新增的外来文件被删了（用户只勾了旧的那批）')
+  must(Array.isArray(s.skipped) && s.skipped.some((n) => String(n).includes('中途新增')),
+    'C478 skipped 没点名新增的外来文件')
+  return '勾 includeUnknown 预览→新增外来文件→带 tokens clear：新外来文件保留且 skipped 点名'
+})
+
+check('C479【主判据】N-F2 现场③：同数量同字节替换（内容变、mtime 变）必须识别，不删被换过的对象', () => {
+  const s = confirmProbe().s3
+  must(s && s.code === 200, `C479 clear 没回 200：${JSON.stringify(s)}`)
+  must(s.replacedDirKept === true, 'C479 同字节替换的对象被删了（只比数量/大小，没认出内容变化）')
+  must(s.metaContent === '[]', `C479 被换过的文件不在原位（meta=${s.metaContent}）`)
+  must(Array.isArray(s.skipped) && s.skipped.includes('BV1ddddddddd'), 'C479 skipped 没点名被替换的对象')
+  return '同数量同字节替换→带 tokens clear：被换过的对象保留、skipped 点名（mtime 变化被识别）'
+})
+
+slowCheck('C480【主判据】3-F1：POST 401 前 main/tag 已写入时，回执必须逐项说清，不许谎称「未写入远端」', () => {
+  const r = resumeProbe()
+  must(r.status === 0 && r.json, `C480 夹具自身失效（rc=${r.status}）：${r.raw.slice(-400)}`)
+  const c = r.json.c480
+  must(c, 'C480 夹具没产出 c480 现场')
+  must(c.err === '', `C480 release.ps1 语法/运行错误：${String(c.err).slice(0, 300)}`)
+  must(c.rc === 2, `C480 POST 401 应 rc=2，实得 ${c.rc}`)
+  must(c.post === 1, `C480 应发出 1 次 POST，实得 ${c.post}`)
+  must(c.mainPushed === true && c.tagPushed === true, `C480 应 main/tag 都已推：main=${c.mainPushed} tag=${c.tagPushed}`)
+  must(c.out.includes('已完成：main push / 标签推送'), 'C480 回执没逐项列出已写入项（main push / 标签推送）')
+  must(c.out.includes('未完成/仍待核实：Release 新建'), 'C480 回执没点名未完成项（Release 新建）')
+  must(c.out.includes('已写入项保留，未回滚'), 'C480 回执没说明已写入项保留、未回滚')
+  must(!/现场保留，未写入远端/.test(c.out), 'C480 回执仍谎称「未写入远端」（部分已写入时这句是假话）')
+  return 'POST401 前 main/tag 已推：rc2、POST1、回执逐项说清已完成/未完成、不谎称未写入'
+})
+
+check('C481【主判据】3-F2：sync-release.ps1 pack 必须查 $LASTEXITCODE，count/size 空也必须 Fail', () => {
+  const src = readFileSync(join(ROOT, 'scripts', 'sync-release.ps1'), 'utf8')
+  const packAt = src.indexOf('$pack = (cmd /c "npm pack --dry-run 2>&1")')
+  must(packAt > 0, 'C481 找不到 pack 调用行')
+  const tail = src.slice(packAt, packAt + 900)
+  must(/\$packRc\s*=\s*\$LASTEXITCODE/.test(tail), 'C481 pack 后没把 $LASTEXITCODE 存进 $packRc')
+  must(/if \(\$packRc\s*-ne\s*0\)\s*\{[^}]*Fail/.test(tail), 'C481 pack rc≠0 没有 Fail 停下')
+  must(/if \(\$count\.Count\s*-eq\s*0\s*-or\s*\$size\.Count\s*-eq\s*0\)\s*\{[^}]*Fail/.test(tail), 'C481 count/size 为空没有 Fail（会打「[ok] pack  / 」空壳）')
+  const hasSayDef = /function\s+Say\b/.test(src)
+  const usesSay = /\bSay\s+\$/.test(src)
+  must(!usesSay || hasSayDef, 'C481 pack 失败分支调用了未定义的 Say（sync-release.ps1 无 function Say），诊断信息会全灭')
+  return 'pack 段查 rc≠0 Fail + count/size 空 Fail，消除空壳成功'
+})
+
+// ── 1516 续派（空清单往返/子树指纹/PS5.1/面板）──────────────────────────────
+slowCheck('C482【主判据】A-1+A-3 空清单完整往返：前端真实组包把 preview 的空 tokens 挂上，服务端零删且点名', () => {
+  const c = frontRoundProbe()
+  must(c.bodyLength > 1000, `C482 doClearAll 原样函数体没抠出来（len=${c.bodyLength}）——前端组包没参与验收`)
+  const e = c.empty
+  must(e && e.tokensFromPreview === 0, `C482 现场无效：preview 应返回空 tokens，实得 ${e && e.tokensFromPreview}`)
+  must(e.frontHasTokens === true, 'C482 前端真实组包没挂 tokens 字段（空清单漏挂会被当老调用方走老路全删）')
+  must(Array.isArray(e.frontTokensLen === 0 ? [] : null) || e.frontTokensLen === 0,
+    `C482 前端 tokens 不是空数组，实得 ${e.frontTokensLen}`)
+  must(e.removed === 0 && e.items === 0, `C482 空清单往返没有零删：removed=${e.removed} items=${e.items}`)
+  must(e.artKept === true, 'C482 空清单往返把确认后新增的产物删了（应零删）')
+  must(Array.isArray(e.skipped) && e.skipped.some((s) => String(s).includes('确认清单为空')),
+    `C482 skipped 没点名「确认清单为空」：${JSON.stringify(e.skipped)}`)
+  return 'preview 空 tokens→前端真实组包挂 tokens:[]→真打 clear：零删、产物保住、skipped 点名'
+})
+
+check('C483【主判据】A-2 递归子树指纹：URL 目录内层等长改写被识别跳过、未变化的整棵照删', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'bw-c483-'))
+  const root = join(tmp, 'cache')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(join(root, '.bili-watch-root'), '')
+  const mkUrl = (name) => {
+    const d = join(root, name)
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, 'a.mwxyz123.tool.txt'), 'AAAA')
+    return d
+  }
+  try {
+    const d1 = mkUrl('httpsb23.tv111111')
+    const p1 = previewAll(root)
+    const tok1 = String(p1.tokens || '')
+    must(/httpsb23\.tv111111/.test(tok1), `C483 preview tokens 没含 URL 目录条目：${tok1}`)
+    // 等长改写：同名字节数不变，只改内容 → 子树指纹必须变。
+    writeFileSync(join(d1, 'a.mwxyz123.tool.txt'), 'CCCC')
+    const p2 = previewAll(root)
+    const tok2 = String(p2.tokens || '')
+    must(tok1 !== tok2, `C483 等长改写没被指纹识别（token 未变）——只比数量/大小会漏`)
+    // 带旧 tokens 真删：被换过的目录必须跳过、内容还在。
+    const r = removeAllOwned(root, { mode: 'permanent', tokens: p1.tokens })
+    must(existsSync(d1), 'C483 被换过的 URL 目录被删了（TOCTOU：删了内容已变的对象）')
+    const kept = readFileSync(join(d1, 'a.mwxyz123.tool.txt'), 'utf8')
+    must(kept === 'CCCC', `C483 被换过的文件内容被改动/删掉：${kept}`)
+    must(Array.isArray(r.skipped) && r.skipped.some((s) => String(s.name || '').includes('httpsb23.tv111111')),
+      `C483 skipped 没点名被换过的目录：${JSON.stringify(r.skipped)}`)
+    // 正对照：完全未变化的 URL 目录仍整棵删。
+    const d2 = mkUrl('httpsb23.tv222222')
+    const p3 = previewAll(root)
+    const r2 = removeAllOwned(root, { mode: 'permanent', tokens: p3.tokens })
+    must(!existsSync(d2), 'C483 未变化的 URL 目录没被整棵删（把删除能力弄死了）')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+  return '内层等长改写→指纹变→带旧 tokens 跳过且内容保住；未变化 URL 目录整棵删'
+})
+
+slowCheck('C484【主判据】B 件 PS5.1/pwsh7 双跑：本地无标签场景两端都 rc=0、不崩、标签到位', () => {
+  const c = psDualProbe()
+  for (const key of ['ps51', 'ps7']) {
+    const p = c[key]
+    must(p && p.rc === 0, `C484 ${key} 应 rc=0，实得 ${p && p.rc}：${p && p.outTail}`)
+    must(p.crashed === false, `C484 ${key} 出现 NativeCommandError/CommandNotFound（PS5.1 崩了）：${p.outTail}`)
+    must(p.reachedRemote === true && p.reachedTagStage === true, `C484 ${key} 没走到远端/标签阶段：${p.outTail}`)
+    must(p.tagOnRemote === true, `C484 ${key} 标签没推到远端：${p.outTail}`)
+    must(p.done === true, `C484 ${key} 回执没到「已确认完成」：${p.outTail}`)
+  }
+  return 'PS5.1 与 pwsh7 本地无标签场景均 rc=0、零崩溃、标签到位、回执到「已确认完成」'
+})
+
+check('C485【主判据】B 件 PS5.1 静态守卫：git 输出捕获用脚本块局部降 EAP，全局 $ErrorActionPreference 未放松', () => {
+  const rel = readFileSync(join(ROOT, 'scripts', 'release.ps1'), 'utf8')
+  must(/^\$ErrorActionPreference = "Stop"/m.test(rel), 'C485 全局 $ErrorActionPreference 不再是 Stop（被放宽了）')
+  const gh = rel.indexOf('$gitOut = {')
+  must(gh > 0, 'C485 找不到 $gitOut 脚本块（PS5.1 git 输出捕获的局部降 EAP 方案）')
+  const block = rel.slice(gh, gh + 500)
+  must(/\$ErrorActionPreference\s*=\s*'Continue'/.test(block), 'C485 $gitOut 没在调用期间局部降 EAP')
+  must(/finally\s*\{\s*\$ErrorActionPreference\s*=\s*\$oldEap/.test(block), 'C485 $gitOut 的 finally 没恢复 Stop（会污染后续调用）')
+  // -ResumeGit 路径的 git 调用都走 $gitOut，不再有裸的 2>&1 捕获。
+  //   函数体到下一个 function 声明为止（Say 在 Invoke-Resume 之后）；§6 正式发布段不在此列。
+  const resumeAt = rel.indexOf('function Invoke-Resume')
+  const nextFnAt = rel.indexOf('\nfunction ', resumeAt + 10)
+  let resume = rel.slice(resumeAt, nextFnAt > 0 ? nextFnAt : rel.length)
+  // 剔除 $gitOut 脚本块定义体本身：内部的 (& git @GitArgs 2>&1) 已被局部降 EAP 包裹，属正确实现。
+  const gb = resume.indexOf('$gitOut = {')
+  if (gb >= 0) {
+    const ge = resume.indexOf('}', gb)
+    if (ge > gb) resume = resume.slice(0, gb) + resume.slice(ge + 1)
+  }
+  const bare = [...resume.matchAll(/\(&\s*git[^\n]*2>&1/g)]
+  must(bare.length === 0, `C485 Invoke-Resume 里还有 ${bare.length} 处裸 (& git … 2>&1) 捕获（PS5.1 Stop 下会崩）`)
+  return '$gitOut 脚本块局部降 EAP + finally 恢复 Stop；Invoke-Resume 无裸 2>&1 git 捕获'
+})
+
+check('C490【主判据】D 件 4-F1：勾 includeUnknown 后确认框显示合计项数+大小，外来文件只算一次', () => {
+  const p = panelProbe()
+  must(p.status === 0 && p.json && !p.json.fatal, `C490 夹具失效（rc=${p.status}）：${(p.raw || '').slice(0, 300)}`)
+  const cli = read('client.js')
+  // 静态：勾选分支里有合计显示，且数据源是 preview 的 count/bytes + unknownFiles，不前端重扫。
+  must(/if \(o\.includeUnknown\)/.test(cli), 'C490 确认框没有「勾选后」分支')
+  const totalAt = cli.indexOf('勾选后将共删除')
+  must(totalAt > 0, 'C490 勾选后没显示合计项数+大小')
+  const seg = cli.slice(totalAt - 300, totalAt + 200)
+  must(/allPreview\?\.count/.test(seg) && /foreign\.length/.test(seg), 'C490 合计没用 preview count + foreign，前端自算或漏算')
+  must(/totalBytes/.test(seg), 'C490 合计大小没用外来文件字节（只加了项数）')
+  // 行为：C302 夹具的清空数据 foreign 空时不新增合计行（兼容既有确认框）。
+  const u = p.json.ui.clearAll
+  must(!u.error && u.texts.some((t) => /将删除 12 项/.test(t)), `C490 既有确认框被带坏：${u.error || JSON.stringify(u.texts)}`)
+  return '勾选后确认框显示合计（preview count+foreign 一次、bytes+foreign bytes），foreign 空时兼容'
+})
+
+slowCheck('C489【主判据】C-4 autoCleanCache 宿主验证：坏JSON两连零删、顶层非法停手、修好恢复清理、缺省照清', () => {
+  const c = autoCleanProbe()
+  const chk = (c0, tag) => {
+    must(c0 && c0.rc === 0 && c0.code === 200, `C489 ${tag} /status 没回 200：${JSON.stringify(c0)}`)
+  }
+  // ① 坏 JSON 两连（两个独立进程）——第二次不再「被移走」。
+  chk(c.bad1, '坏JSON第1次'); chk(c.bad2, '坏JSON第2次')
+  must(c.bad1.state === 'bad-delete-mode' && c.bad2.state === 'bad-delete-mode',
+    `C489 坏 JSON 两连没都停手：1=${c.bad1.state} 2=${c.bad2.state}`)
+  must(c.bad1.fileExists === true && c.bad2.fileExists === true, 'C489 坏 JSON 把 8 天前的文件清掉了（应零删）')
+  must(c.badCfgKept === true && c.badBytes === '{bad json', `C489 坏配置字节被改写/覆盖：${c.badBytes}`)
+  // ①b 修好后恢复清理。
+  chk(c.recoverBad, '修好前'); chk(c.recoverGood, '修好后')
+  must(c.recoverBad.fileExists === true && c.recoverGood.fileExists === false,
+    'C489 修好配置后没恢复清理（老文件还在）')
+  // ② 顶层非法形状一律停手零删。
+  for (const tag of ['arr', 'str', 'num', 'null']) {
+    const s = c['shape_' + tag]
+    chk(s, '顶层' + tag)
+    must(s.state === 'bad-delete-mode', `C489 顶层 ${tag} 没停手：state=${s.state}`)
+    must(s.fileExists === true, `C489 顶层 ${tag} 把老文件清掉了（应零删）`)
+  }
+  // ③ 缺省对照照清（防「一律不删」假绿）。
+  chk(c.default, '缺省')
+  must(c.default.fileExists === false, 'C489 缺省配置没清理（把清理能力弄死了）')
+  return '坏JSON两连 bad-delete-mode 零删且配置字节不变；顶层[]/"hello"/42/null 全停手；修好恢复清理；缺省照清'
+})
+
+slowCheck('C486【主判据】C-1 registry 正对照：未发布目标版本真走到写版本并读回复核', () => {
+  const c = gateProbe()
+  const e = c.c486
+  must(e.rc === 2 && e.rc !== 0, `C486 探针失效：期望后续 §2 缺件 rc=2，实得 ${e.rc}（rc=0 说明根本没到 §2）`)
+  must(e.before === '0.4.16' && e.after === '0.4.17' && e.wroteVersion === true,
+    `C486 未发布目标版本没真写到 package.json：before=${e.before} after=${e.after}`)
+  must(e.sawNotPublished === true, `C486 没打出「版本未发布过」（registry 查询前移没走通）：${e.outTail}`)
+  must(e.sawMeta === true, `C486 没打出「源版本 -> …（已读回复核）」（写版本成功铁证）：${e.outTail}`)
+  return '未发布版本 0.4.17：registry 查询放行→真写到 package.json（0.4.16→0.4.17）→读回复核，前移没堵死正常路径'
+})
+
+slowCheck('C487【主判据】C-2 缺件零写入：发布树缺手工维护件时在复制前 Fail，目标树零文件', () => {
+  const c = gateProbe()
+  const e = c.c487
+  must(e.rc === 1, `C487 缺件应 rc=1，实得 ${e.rc}`)
+  must(e.sawFail === true, `C487 缺件没打出 Fail 文案：${e.outTail}`)
+  must(e.beforeCount === 0 && e.afterCount === 0 && e.zeroWrite === true,
+    `C487 缺件仍写了文件（零写入没兑现）：before=${e.beforeCount} after=${e.afterCount}`)
+  return '源缺 auto-trigger.js + 空发布树：sync Fail rc=1，发布树文件数 0→0，缺件检查在复制之前'
+})
+
+slowCheck('C488【主判据】C-3 四道闸逐一注入失败：版本未递增/md5硬闸/元判据闸/缺件闸都真红', () => {
+  const c = gateProbe()
+  const g1 = c.gate1, g2 = c.gate2, g3 = c.gate3
+  must(g1.rc === 2 && g1.saw === true, `C488 闸1版本未递增没红：rc=${g1.rc} saw=${g1.saw} ${g1.outTail}`)
+  must(g2.rc === 2 && g2.preRc === 0, `C488 闸2 md5 硬闸没红或预同步没过：rc=${g2.rc} preRc=${g2.preRc}`)
+  must(g2.sawDrift === true && g2.sawFail === true, `C488 闸2 没报 drift/DryRun不放行：${g2.outTail}`)
+  must(g3.rc === 2 && g3.saw === true, `C488 闸3元判据闸没红：rc=${g3.rc} saw=${g3.saw} ${g3.outTail}`)
+  // 闸4 即 C487 的缺件闸，这里交叉引用确认同一现场也被 C487 覆盖。
+  must(c.c487.rc === 1 && c.c487.zeroWrite === true, 'C488 闸4缺件闸与 C487 现场不一致')
+  return '四闸注入失败各真红：闸1 rc2版本未递增、闸2 rc2 md5 drift（预同步rc0对照）、闸3 rc2元判据截断、闸4 rc1缺件零写入'
+})
+
+slowCheck('C491【主判据】F-1 回归：Invoke-GhApi 中文 body 在 PS5.1 与 pwsh7 都按 UTF-8 字节发出', () => {
+  const c = ghApiUtf8Probe()
+  must(!c.fatal, `C491 夹具内部抛错：${c.fatal}`)
+  must(c.ps51 && c.ps51.rc === 0 && c.ps51.ok === true,
+    `C491 PS5.1 中文 body 没发成 UTF-8：rc=${c.ps51 && c.ps51.rc} hex=${c.ps51 && c.ps51.hex} ${c.ps51 && c.ps51.err}`)
+  must(c.ps7 && c.ps7.rc === 0 && c.ps7.ok === true,
+    `C491 pwsh7 中文 body 没发成 UTF-8：rc=${c.ps7 && c.ps7.rc} hex=${c.ps7 && c.ps7.hex} ${c.ps7 && c.ps7.err}`)
+  must(c.ps51.hex === c.expect && c.ps7.hex === c.expect,
+    `C491 两端 body 与定稿 UTF-8 不一致：expect=${c.expect} ps51=${c.ps51.hex} ps7=${c.ps7.hex}`)
+  return '中文定稿正文经真抠 Invoke-GhApi 函数体：PS5.1 与 pwsh7 发出的 body 都是定稿 UTF-8 字节（不再问号乱码）'
+})
+
+slowCheck('C492【主判据】F-2 官方源挂认证头且取一次凭据，PS5.1/pwsh7 一致', () => {
+  const c = authBoundaryProbe()
+  must(!c.fatal, `C492 夹具内部抛错：${c.fatal}`)
+  for (const k of ['ps51', 'ps7']) {
+    const v = c[k]
+    must(v && v.official && v.official.rc === 0 && v.official.header === 'PRESENT',
+      `C492 ${k} 官方源没挂认证头：${JSON.stringify(v && v.official)}`)
+    must(v.official.credCalls === 1,
+      `C492 ${k} 官方源取凭据次数应 1，实得 ${v.official.credCalls}`)
+    must(v.judge && v.judge.some(x => x === 'https://api.github.com/x=>True') && v.judge.some(x => x === 'https://API.GitHub.com/x=>True'),
+      `C492 ${k} 判定函数没认出官方源（含大写归一）：${JSON.stringify(v.judge)}`)
+    must(v.redir && v.redir.A === 'PRESENT' && v.redir.B === 'none',
+      `C492 ${k} 跨源重定向没剥离认证头：${JSON.stringify(v.redir)}`)
+  }
+  return '官方 HTTPS 源：挂头+取凭据1次；大写域名归一认出；跨端口重定向 A 收头 B 收 none（PowerShell 自带剥离），两端一致'
+})
+
+slowCheck('C493【主判据】F-2 自定义源不挂头也不取凭据（非官方地址拿不到真 token）', () => {
+  const c = authBoundaryProbe()
+  for (const k of ['ps51', 'ps7']) {
+    const v = c[k]
+    must(v && v.custom && v.custom.rc === 0 && v.custom.header === 'none',
+      `C493 ${k} 自定义源挂了认证头：${JSON.stringify(v && v.custom)}`)
+    must(v.custom.credCalls === 0,
+      `C493 ${k} 自定义源仍取了凭据（应 0 次）：${v.custom.credCalls}`)
+    // 防御格：即使调用方硬塞一个非空 token 进来，Invoke-GhApi 也不许往非官方源挂头
+    must(v.customForced && v.customForced.rc === 0 && v.customForced.header === 'none',
+      `C493 ${k} 自定义源强塞 token 后竟挂了头：${JSON.stringify(v && v.customForced)}`)
+  }
+  return '自定义 loopback 目标：两端均无认证头、凭据调用 0 次；强塞 token 也不挂头'
+})
+
+slowCheck('C494【主判据】F-2 非默认端口/非 https/仿冒域名均不挂头', () => {
+  const c = authBoundaryProbe()
+  for (const k of ['ps51', 'ps7']) {
+    const v = c[k]
+    must(v && v.nonDefaultPort && v.nonDefaultPort.rc === 0 && v.nonDefaultPort.header === 'none',
+      `C494 ${k} 非默认端口强塞 token 后仍挂了认证头：${JSON.stringify(v && v.nonDefaultPort)}`)
+    const j = v.judge || []
+    must(j.includes('https://api.github.com:8443/x=>False') && j.includes('http://api.github.com/x=>False') && j.includes('https://api.github.com.evil.com/x=>False'),
+      `C494 ${k} 判定函数误放行非默认端口/http/仿冒域名：${JSON.stringify(j)}`)
+  }
+  return 'https 非默认端口、http、api.github.com.evil.com 仿冒域名：两端判定 False 且不挂头'
+})
+
+slowCheck('C495【主判据】B-1 目录内等长改写保留 mtime：旧指纹相同、四元组指纹变化、零删', () => {
+  const c = nf2FpProbe()
+  must(!c.fatal, `C495 夹具内部抛错：${c.fatal}`)
+  const v = c.inner
+  must(v && v.oldFpSame === true,
+    `C495 旧算法（size+mtimeMs）应认不出等长改写，实得 oldFpSame=${v && v.oldFpSame}`)
+  must(v.newFpChanged === true,
+    `C495 新四元组指纹应变化，实得 newFpChanged=${v.newFpChanged}`)
+  must(v.content === '2222' && v.dirKept === true && v.items === 0 && v.removedFiles === 0,
+    `C495 目录内改写后必须零删且新内容保住：${JSON.stringify(v)}`)
+  must((v.skipped || []).some(s => s.includes('内容已变化')),
+    `C495 skipped 应说明内容已变化需重预览：${JSON.stringify(v.skipped)}`)
+  return '目录内 sub_text.a1b2c3.tool.txt 等长改写并保留 mtime：旧指纹相同（挡不住）、四元组变化、零删、新内容保住'
+})
+
+slowCheck('C496【主判据】B-2 散文件同现场零删（meta.json 等长改写保留 mtime）', () => {
+  const c = nf2FpProbe()
+  const v = c.loose
+  must(v && v.oldFpSame === true,
+    `C496 散文件旧算法应认不出等长改写，实得 oldFpSame=${v && v.oldFpSame}`)
+  must(v.newFpChanged === true,
+    `C496 散文件四元组指纹应变化，实得 newFpChanged=${v.newFpChanged}`)
+  must(v.content === '2222' && v.items === 0,
+    `C496 散文件改写后必须零删且新内容保住：${JSON.stringify(v)}`)
+  return '散文件 meta.json 等长改写保留 mtime：旧指纹相同、四元组变化、零删、新内容保住'
+})
+
+slowCheck('C497【主判据】B-3 正对照仍真删 + 预览代价实测可报', () => {
+  const c = nf2FpProbe()
+  const v = c.positive
+  must(v && v.dirGone === true && v.removedFiles >= 1,
+    `C497 未变化的 URL 目录应整棵真删，实得 ${JSON.stringify(v)}`)
+  const bench = c.bench
+  // 2033 B-1/B-2/B-3（Astra 2028 第2条）：bench 样本必须 previewAll 真能认领。
+  //   count>0 必须断言（否则 count=0 空转也能绿），且产品实际返回的 count/files/bytes 与样本预期逐项相符。
+  //   样本规模（30 目录 × 5 文件）写进判据与输出；耗时只报数不设绝对阈值。
+  must(bench && bench.root === '<自建临时样本>' && bench.dirs === 30 && bench.filesPerDir === 5,
+    `C497 bench 样本规模须写出（30 目录 × 5 文件）：${JSON.stringify(bench)}`)
+  must(bench && bench.count > 0 && bench.count === bench.dirs,
+    `C497 previewAll 必须真能认领样本，count=${bench && bench.count}（应为 ${bench && bench.dirs}>0，不能空转）：${JSON.stringify(bench)}`)
+  must(bench.pvFiles === bench.dirs * bench.filesPerDir && bench.pvBytes === bench.bytes && bench.tokens === bench.count,
+    `C497 产品返回的 count/files/bytes 须与样本预期逐项相符：${JSON.stringify(bench)}`)
+  must(typeof bench.metaMs === 'number' && typeof bench.contentMs === 'number',
+    `C497 须报预览耗时与内容哈希耗时实测数字：${JSON.stringify(bench)}`)
+  return `正对照整棵真删；自建样本 30 目录×5 文件（count=${bench?.count}/files=${bench?.pvFiles}/bytes=${bench?.pvBytes} 逐项相符），预览 ${bench?.metaMs}ms、内容哈希 ${bench?.contentMs}ms（比值 ${bench?.ratio}，仅信息）`
+})
+
+slowCheck('C498【主判据】B-4 面板缺清单/无效清单零删提示重预览，空清单有效，CLI 老路独立', () => {
+  const c = panelManifestProbe()
+  must(!c.fatal, `C498 夹具内部抛错：${c.fatal}`)
+  for (const k of ['missing', 'invalid']) {
+    const v = c[k]
+    must(v && v.ok === false && v.needRepreview === true && v.removed === 0 && v.artKept === true,
+      `C498 面板${k}应拒绝执行、零删、产物保住：${JSON.stringify(v)}`)
+  }
+  must(c.empty && c.empty.ok === true && c.empty.removed === 0 && c.empty.artKept === true &&
+    (c.empty.skipped || []).some(s => s.includes('确认清单为空') || s.includes('确认时没有可删对象')),
+    `C498 tokens:[] 应是有效清单、零删、skipped 说明空清单：${JSON.stringify(c.empty)}`)
+  must(c.valid && c.valid.removed >= 1 && c.valid.artGone === true,
+    `C498 真实 preview tokens 应真删（不是一律不删）：${JSON.stringify(c.valid)}`)
+  must(c.fnBodyLen > 500, `C498 前端 doClearAll 原样组包未参与（bodyLen=${c.fnBodyLen}）`)
+  return '面板缺清单/非数组清单→拒绝+提示重预览+零删；空清单有效零删；真实清单真删；前端 doClearAll 原样组包参与，CLI 老路独立'
+})
+
+slowCheck('C500【主判据】1939 A 件过期回执四态：空/全过期/部分过期/缺清单各自可区分且文案正确', () => {
+  const c = staleProbe()
+  must(!c.fatal, `C500 四态夹具内部抛错：${c.fatal}`)
+  const e = c.empty
+  must(e && e.ok === true && e.clearState === 'empty' && e.removed === 0 && e.artKept === true &&
+    (e.skippedKinds || []).includes('empty') && (e.msgs || []).some(m => m.includes('没有可清理')),
+    `C500 真正空应 ok=true/clearState=empty/零删/不伪报按设计保留：${JSON.stringify(e)}`)
+  const a = c.allStale
+  must(a && a.ok === false && a.clearState === 'all-stale' && a.changedCount === 1 && a.removed === 0 &&
+    a.artKept === true && (a.why || '').includes('0 个已清理') && (a.why || '').includes('重新预览') &&
+    (a.msgs || []).some(m => m.includes('0 个已清理')),
+    `C500 全过期应 ok=false/清0/报重新预览、前端不得报已彻底清空：${JSON.stringify(a)}`)
+  const p = c.partialStale
+  must(p && p.ok === true && p.clearState === 'partial-stale' && p.changedCount === 1 && p.removed === 1 &&
+    p.staleKept === true && p.freshGone === true &&
+    (p.msgs || []).some(m => m.includes('已清理 1 项') && m.includes('另有 1 项')),
+    `C500 部分过期应同时报 N 与 M、过期项保住、新鲜项真删：${JSON.stringify(p)}`)
+  const m = c.missing
+  must(m && m.ok === false && m.needRepreview === true && m.removed === 0 && m.artKept === true &&
+    (m.msgs || []).some(x => x.includes('重新打开面板')),
+    `C500 缺清单应拒绝+零删+提示重预览（C498 保绿）：${JSON.stringify(m)}`)
+  return '四态可区分：空=ok零删、全过期=ok=false报重预览、部分过期=报N与M且过期保住、缺清单=拒绝零删；服务端与前端文案一致'
+})
+
+slowCheck('C501【主判据】1939 C 件同字节 tmp+rename 重写仍判内容已变化、零删、提示重预览', () => {
+  const c = sameByteProbe()
+  const v = c.rewrite
+  must(!c.fatal, `C501 同字节重写夹具内部抛错：${c.fatal}`)
+  must(v && v.contentSame === true && v.inoChanged === true && v.fpChanged === true,
+    `C501 同字节重写应字节相同但 inode 变、指纹变：${JSON.stringify(v)}`)
+  must(v.removedFiles === 0 && v.dirKept === true && v.changedSkipped.length >= 1,
+    `C501 同字节重写应零删、目录保住、skipped 有 kind=changed：${JSON.stringify(v)}`)
+  return '同字节 tmp+rename 重写：内容字节相同但 inode/指纹变化→带旧清单清理零删、目录保住、skipped 含 kind=changed，提示重预览（故意保留的保守行为）'
+})
+
+// ===== 2033（Astra 2028）续派判据 =====
+slowCheck('C502【主判据】2033 A-1 内容摘要核对：散文件/目录内等长改写保留 mtime 后 token 变、零删、内容保住、正对照真删', () => {
+  const c = contentFpProbe()
+  must(!c.fatal, `C502 夹具内部抛错：${c.fatal}`)
+  const loose = c.loose
+  must(loose && loose.tokenChanged === true,
+    `C502 散文件等长改写(保留mtime)后 token 必须变（内容纳入摘要），实得 ${JSON.stringify(loose)}`)
+  must(loose.content === '2222' && loose.removedFiles === 0 && (loose.skippedKinds || []).includes('changed'),
+    `C502 散文件改写后应零删、新内容保住、skipped 含 kind=changed：${JSON.stringify(loose)}`)
+  const inner = c.inner
+  must(inner && inner.tokenChanged === true,
+    `C502 目录内等长改写(保留mtime)后 token 必须变，实得 ${JSON.stringify(inner)}`)
+  must(inner.content === '2222' && inner.dirKept === true && inner.removedFiles === 0 && (inner.skippedKinds || []).includes('changed'),
+    `C502 目录内改写后应零删、目录保住、新内容保住、skipped 含 changed：${JSON.stringify(inner)}`)
+  must(c.positive && c.positive.removedFiles >= 1 && c.positive.dirGone === true,
+    `C502 正对照未变化对象须整棵真删：${JSON.stringify(c.positive)}`)
+  return '散文件+目录内等长改写保留 mtime：内容摘要纳入 fp→token 变、零删、内容保住、kind=changed；未变化对象仍真删'
+})
+
+slowCheck('C503【主判据】2033 A-2 读不全保留：打不开的对象不进删除清单、进 skipped 说明无法核实', () => {
+  const c = readErrProbe()
+  must(!c.fatal, `C503 夹具内部抛错：${c.fatal}`)
+  must(c.normalInEntries === true, `C503 正常可读对象应照常进 entries：${JSON.stringify(c)}`)
+  must(c.unreadableInEntries === false, `C503 读不全对象绝不能进删除清单：${JSON.stringify(c)}`)
+  must(c.unreadableSkipped === true, `C503 读不全对象须进 skipped 且说明无法核实/保留：${JSON.stringify(c)}`)
+  return '读不全(打不开)对象不进删除清单、进 skipped 标「无法核实，保留不删」；正常对象照常认领'
+})
+
+slowCheck('C504【主判据】2033 A-4 新旧对照：固定元数据现场在 37ffaa4 误删(红)、新候选跳过保住(绿)', () => {
+  const d = fixedMetaDual()
+  must(d.now && !d.now.fatal && d.base && !d.base.fatal, `C504 双跑夹具异常：${JSON.stringify(d)}`)
+  const n = d.now.loose, b = d.base.loose
+  must(b && b.tokenChanged === false && b.removedFiles === 1 && b.content === null,
+    `C504 37ffaa4 在该现场应 token 不变且误删(内容丢失)——否则对照无效：${JSON.stringify(b)}`)
+  must(n && n.tokenChanged === true && n.removedFiles === 0 && n.content === '2222' && (n.skippedKinds || []).includes('changed'),
+    `C504 新候选应 token 变、零删、内容保住、kind=changed：${JSON.stringify(n)}`)
+  return '固定元数据四元组现场：37ffaa4 token 不变误删(证明旧代码转红)、新候选 token 变零删保住(转绿)，非重试凑绿'
+})
+
+slowCheck('C505【主判据】2033 A-6 首览变慢如实报数：可认领候选集规模 + 首次/二次预览耗时三组实测，首次付内容哈希成本', () => {
+  const c = contentFpProbe()
+  const v = c.cost
+  must(v && v.count > 0 && v.count === v.dirs && v.tokens === v.count,
+    `C505 成本样本须可认领(count=${v && v.count}>0)：${JSON.stringify(v)}`)
+  must(v.files === v.dirs * v.filesPerDir + 1 && v.bytes > 0,
+    `C505 成本样本规模须写出(30目录×5文件+根标记)：${JSON.stringify(v)}`)
+  must(typeof v.firstMs === 'number' && typeof v.secondMs === 'number' && v.firstMs > 0,
+    `C505 须报首次/二次预览耗时实测数：${JSON.stringify(v)}`)
+  return `候选集 ${v.count} 对象 / ${v.files} 文件 / ${v.bytes}B；首次预览 ${v.firstMs}ms、二次 ${v.secondMs}ms（首次须付内容哈希成本，如实报数）`
+})
+
+slowCheck('C506【主判据】2033 C 件空预览两态区分：真空=empty 零删；空后新增=all-stale 报 0 项+新增保留+重预览（面板代码生成）', () => {
+  const c = staleProbe()
+  must(!c.fatal, `C506 夹具内部抛错：${c.fatal}`)
+  const e = c.empty
+  must(e && e.ok === true && e.clearState === 'empty' && e.removed === 0 && e.tokensBefore === 0 &&
+    (e.msgs || []).some(m => m.includes('没有可清理')),
+    `C506 真正始终为空须 clearState=empty/零删/「没有可清理的条目」：${JSON.stringify(e)}`)
+  const n = c.emptyThenNew
+  must(n && n.ok === false && n.clearState === 'all-stale' && n.removed === 0 && n.changedCount === 1 &&
+    n.newArtKept === true && (n.why || '').includes('0 个已清理') && (n.why || '').includes('重新预览') &&
+    (n.msgs || []).some(m => m.includes('0 个已清理')),
+    `C506 空预览后新增须 all-stale/ok=false/清0/新增保住/提示重预览（不能被 empty 抢先）：${JSON.stringify(n)}`)
+  return '真空(预览与确认都空)=empty/零删/「没有可清理条目」；空后新增(合格BV名)=all-stale/0项/新增保留/提示重预览；两条均由面板 doClearAll 生成'
+})
+
+slowCheck('C507【主判据】2128 单请求只枚举一次：/cache/preview 目标大文件只读打开恰好 1 次', () => {
+  const c = snapshotProbe()
+  must(!c.fatal, `C507 夹具内部抛错：${c.fatal}`)
+  const m = c.marked
+  must(m && m.rc === 0 && m.preview?.code === 200, `C507 预览入口必须真跑成功：${JSON.stringify(m)}`)
+  must(m.counts?.preview === 1, `C507 目标文件只读打开必须恰好 1 次，实得 ${m.counts?.preview}`)
+  must(m.preview.data.count === 1 && m.preview.data.bytes === 2097169,
+    `C507 预览仍须认出目标对象：${JSON.stringify(m.preview.data)}`)
+  return '2,097,169B 目标文件在 /cache/preview 一次请求中只读打开 1 次，预览数量/字节正确'
+})
+
+slowCheck('C508【主判据】2128 两个预览入口各只枚举一次：preview 与 clear 未确认分支打开次数均为 1', () => {
+  const c = snapshotProbe()
+  must(!c.fatal, `C508 夹具内部抛错：${c.fatal}`)
+  const m = c.marked
+  must(m && m.rc === 0 && m.preview?.code === 200 && m.clear?.code === 200,
+    `C508 两个入口必须真跑成功：${JSON.stringify(m)}`)
+  must(m.counts?.preview === 1 && m.counts?.clear === 1,
+    `C508 两入口各打开 1 次，实得 ${JSON.stringify(m.counts)}`)
+  must(m.clear.data.needConfirm === true && m.clear.data.count === 1 && m.clear.data.breakdown,
+    `C508 clear 未确认分支仍须回预览与三数：${JSON.stringify(m.clear.data)}`)
+  return 'preview 与 clear(all=1,confirmed=0) 各枚举一次；目标文件打开次数分别为 1/1'
+})
+
+slowCheck('C509【主判据】2128 新旧逐字段契约一致：清单/foreign/removable/occupied/unrecognized 同源对照', () => {
+  const c = contractProbe()
+  must(!c.fatal, `C509 夹具内部抛错：${c.fatal}`)
+  must(c.samePreview === true && c.sameBreakdown === true && c.sameTokensOrder === true && c.sameUnknownFiles === true,
+    `C509 50792ac 旧实现与新 cachePreview 必须逐字段一致：${JSON.stringify(c)}`)
+  must(c.now.preview.count === 1 && c.now.breakdown.removable.count === 1 &&
+    c.now.breakdown.unrecognizedCount === 2 && c.now.preview.unknownFiles.length === 1,
+    `C509 对照现场须同时含可删/foreign/日志：${JSON.stringify(c.now)}`)
+  return '50792ac previewAll+cacheBreakdown 与 cachePreview 同盘逐字段一致；tokens 顺序与 unknownFiles 也一致'
+})
+
+slowCheck('C510【主判据】2128 未标记根零结构：两个预览入口不枚举、不报可删项、三数全零', () => {
+  const c = snapshotProbe()
+  must(!c.fatal, `C510 夹具内部抛错：${c.fatal}`)
+  const u = c.unmarked
+  must(u && u.rc === 0 && u.counts?.preview === 0 && u.counts?.clear === 0,
+    `C510 未标记根两入口都不得打开目标文件：${JSON.stringify(u)}`)
+  const zeroBreakdown = { occupied: { bytes: 0, files: 0 }, removable: { count: 0, files: 0, bytes: 0 },
+    unrecognized: { bytes: 0, files: 0 }, unrecognizedCount: 0, unknownFiles: [] }
+  for (const [name, data] of [['preview', u.preview?.data], ['clear', u.clear?.data]]) {
+    must(data && data.count === 0 && data.files === 0 && data.bytes === 0 && Array.isArray(data.tokens) && data.tokens.length === 0,
+      `C510 ${name} 清单须零结构：${JSON.stringify(data)}`)
+    must(JSON.stringify(data.breakdown) === JSON.stringify(zeroBreakdown),
+      `C510 ${name} 三数须零结构：${JSON.stringify(data.breakdown)}`)
+  }
+  return '未标记根两入口打开次数 0/0；清单空、tokens 空、occupied/removable/unrecognized 全零'
+})
+
+slowCheck('C511【主判据】2128 读失败保守保留：null 摘要进 skipped(kind=design)、不进 entries、不抛错', () => {
+  const c = readErrProbe()
+  must(!c.fatal, `C511 夹具内部抛错：${c.fatal}`)
+  must(c.normalInEntries === true && c.unreadableInEntries === false,
+    `C511 读不全对象绝不能进删除清单：${JSON.stringify(c)}`)
+  must(c.unreadableSkipped === true && c.unreadableSkippedKind === 'design' &&
+    String(c.unreadableSkippedWhy).includes('读不全') && String(c.unreadableSkippedWhy).includes('保留不删'),
+    `C511 读不全对象须进 skipped 且 kind=design/说明保留：${JSON.stringify(c)}`)
+  return 'openSync 失败→摘要 null→skipped(kind=design,「读不全…保留不删」)；正常对象仍进 entries，过程不抛错'
+})
+
+slowCheck('C512【主判据】2128 预览后同 tick 等长改写并恢复 mtime：旧 tokens 确认零删、文件保住、kind=changed', () => {
+  const c = contentFpProbe()
+  must(!c.fatal, `C512 夹具内部抛错：${c.fatal}`)
+  const v = c.inner
+  must(v && v.tokenChanged === true, `C512 同 tick 等长改写后 token 必须变：${JSON.stringify(v)}`)
+  must(v.content === '2222' && v.dirKept === true && v.removedFiles === 0 && (v.skippedKinds || []).includes('changed'),
+    `C512 旧 tokens 确认须零删、新内容保住、skipped 含 changed：${JSON.stringify(v)}`)
+  return '单次等长改写+固定 mtime：内容摘要使 token 变；旧 tokens 确认 removed=0、目录/内容保住、skipped kind=changed'
+})
+
+slowCheck('C513【主判据】1120 慢档口径同源：slowCheck 声明与 --fast 跳过同一集合，双向扰动都红', () => {
+  // 纯函数真求值 + 源码文本扫描，块内不出现 spawnSync/onlyProbe 字面（避开 C276 按块扫描）。
+  const src = read('tools/verify.mjs')
+  const lines = src.split('\n')
+  const re = /^\s*(?:check|slowCheck)\(\s*'([^']+)'/
+  const all = new Set()
+  const declared = new Set()
+  for (const l of lines) {
+    const m = re.exec(l)
+    if (!m) continue
+    const id = checkId(m[1])
+    if (!id) continue
+    all.add(id)
+    if (/^\s*slowCheck\(/.test(l)) declared.add(id)
+  }
+  // ① 正向：本版已知的重夹具（单条分钟级）必须仍是 slowCheck 声明的慢判据。
+  //    这 16 条若被改回 check(，--fast 与 C313 会把它当快判据真跑/扫描 → 发版闸重新超时。
+  //    口径从源码声明取，不写死运行时集合；抽其中若干条做代表锚点。
+  const KNOWN_HEAVY = ['C454', 'C455', 'C456', 'C462', 'C463', 'C469', 'C480', 'C486']
+  const heavyNotDeclared = KNOWN_HEAVY.filter((id) => !declared.has(id))
+  must(heavyNotDeclared.length === 0,
+    `C513：已知重夹具被改回 check(，--fast 会误跑：${heavyNotDeclared.join(',')}`)
+  // 正向通用性质：源码每条 slowCheck 声明都被单一慢集合认到（声明 ⊆ 慢集合）。
+  const slowSet = makeSlowSet(src, [SLOW_CHECKS, SLOW_BY_TIMING, TIMING_PRODUCERS])
+  const missed = [...declared].filter((id) => !slowSet.has(id))
+  must(missed.length === 0,
+    `C513：${missed.length} 条 slowCheck 声明没被慢集合认到（--fast 会误跑）：${missed.slice(0, 6).join(',')}`)
+  // ② 反向：--fast 的 isSlow 与 C313 扫描必须引用同一个顶层 SLOW_SET，
+  //    不许任何一处再就地 new Set([...SLOW_CHECKS,...]) 另造一份（1120 根因）。
+  must(/\bconst SLOW_SET\s*=\s*makeSlowSet\(/.test(src),
+    'C513：找不到顶层单一慢集合 SLOW_SET 的构造')
+  must(/const isSlow = \(name\) => \{[\s\S]{0,200}?SLOW_SET\.has\(id\)/.test(src),
+    'C513：--fast 的 isSlow 没用 SLOW_SET（口径又分叉了）')
+  must(/ids\.filter\(\(id\) => !SLOW_SET\.has\(id\)\)/.test(src),
+    'C513：C313 的 targets 没用 SLOW_SET 过滤（口径又分叉了）')
+  const adHoc = /const slow = new Set\(\[\.\.\.SLOW_CHECKS/.test(src)
+  must(!adHoc, 'C313 扫描面又出现就地另造的 slow 集合')
+  // ③ 数字护栏：慢集合 = 三清单 ∪ 源码声明，targets 数量应对上 311（不写死等，防新增判据后误红，只守 >=150）。
+  const targets = [...all].filter((id) => !slowSet.has(id))
+  must(targets.length >= 150, `C513：同源慢集合把扫描面掏空，targets=${targets.length}`)
+  return `慢集合单一来源=SLOW_SET(${slowSet.size})；slowCheck 声明 ${declared.size} 条全被认；targets=${targets.length}；两入口共用同一实例`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）
