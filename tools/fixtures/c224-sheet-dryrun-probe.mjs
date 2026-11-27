@@ -8,7 +8,7 @@ import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import vm from 'node:vm'
-import { sheetPlan } from '../../lib/sheet-plan.mjs'
+import { sheetPlan, parseGrid } from '../../lib/sheet-plan.mjs'
 import { manifestPathOf } from '../../lib/sheet-manifest.mjs'
 // C231：cmdSheet 干跑段里的落点 helper 是模块级自由变量，vm 切片跑不到定义；
 //   补真 lib 实现（无配置时返回值与旧的 <TMP>/sheets/<name> 逐字节相同）。
@@ -92,7 +92,7 @@ const sandbox = {
   tokenEstimateLine: (t) => tokenEstimateLine(t),
   warn: () => {},
   atTagOf: (s) => String(s),
-  sheetPlan, manifestPathOf,
+  sheetPlan, parseGrid, manifestPathOf,
   grabFrames: async () => { grabCalls++; throw new Error('短路失效：真的去抽帧了') },
 }
 let chainError = ''

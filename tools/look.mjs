@@ -103,7 +103,7 @@ import { videoMeta } from '../lib/video-meta.mjs'
 // C223：ASR 覆盖不足要说「为什么弃用」，带 ⚠ 才能被工具层回灌给模型。
 import { asrCoverageNotice } from '../lib/asr-coverage.mjs'
 // C224：sheet --dry-run 只出计划，纯函数不碰 IO。
-import { sheetPlan } from '../lib/sheet-plan.mjs'
+import { sheetPlan, parseGrid, gridScaleOverflow } from '../lib/sheet-plan.mjs'
 // C231 / A3 默认输出目录（最小版）：纯函数算落点，未配置时与改动前逐字节相同。
 import { pictureOutPath, textOutPath } from '../lib/default-out.mjs'
 // C232：成本回报一行（只加字段 / 加一行，不改既有字段含义）。
@@ -1454,6 +1454,18 @@ function fmtSec(s) {
   return m ? `${m}m${String(s % 60).padStart(2, '0')}s` : `${s}s`
 }
 
+// 1003 任务 C：search 的 duration 是「总分钟:秒」字符串（上游秒位不补零）。
+// 展示要明确单位、秒位补零可辨、超长分钟可辨；空值给 ?；未识别的非空形态原样保留、不猜单位。
+function fmtSearchDuration(raw) {
+  if (raw === null || raw === undefined || raw === '') return '?'
+  const s = String(raw).trim()
+  if (!s) return '?'
+  // 1121 任务 3：秒位只认 0–59（/[0-5]?\d/），1:99 这类秒位超范围的保留原文、不误标成「1分99秒」。
+  const m = /^(\d+):([0-5]?\d)$/.exec(s)
+  if (!m) return s  // 未识别的非空原值（含秒位超范围），原样保留不猜单位
+  return `${m[1]}分${m[2].padStart(2, '0')}秒`
+}
+
 async function cmdView(bv, p = 1) {
   const v = await viewOf(bv, p)
   const pTag = v.pages > 1 ? `  共 ${v.pages} 个分P（看的是 P${v.p}）` : ''
@@ -2099,7 +2111,7 @@ async function cmdSearch(keyword, { limit = 10, order = '', days = 0 } = {}) {
     if (!it.bvid) continue
     const title = String(it.title ?? '').replace(/<[^>]+>/g, '')
     const day = dayUtc(it.pubdate)
-    console.log(`  ${it.bvid}  ${fmtPlay(it.play)}播放  ${it.duration ?? '?'}  ${day}  ${title}`)
+    console.log(`  ${it.bvid}  ${fmtPlay(it.play)}播放  ${fmtSearchDuration(it.duration)}  ${day}  ${title}`)
     console.log(`           UP ${it.author ?? '?'}`)
   }
   console.log('\n挑中哪个就 view / text / comments 它。')
@@ -2363,17 +2375,32 @@ const textArtifactOut = (filename, explicitOut) => textOutPath({
 
 async function cmdSheet(bv, opts = {}) {
   const grid = String(opts.grid ?? '3x3').toLowerCase()
-  const [cols, rows] = grid.split('x').map(Number)
-  if (!cols || !rows) { process.exitCode = 1; console.error('✗ 格子格式应是 3x3 / 4x4'); return }
-  const n = cols * rows
+  const parsed = parseGrid(grid)
+  if (!parsed) {
+    // 1003 任务 B：格式合法但乘积溢出 → 规模错误可读；因子非法（0x3/-1x3）仍是格式错（C529 守）。
+    process.exitCode = 1
+    console.error(gridScaleOverflow(grid)
+      ? '✗ 网格规模过大：格子数超出安全整数上限，请减小网格'
+      : '✗ 格子格式应是 NxM（例如 3x3 / 4x4，两段都要正整数）')
+    return
+  }
+  const { cols, rows, n } = parsed
   // --at 与 frames 走同一套 parseAtTimes（在 grabFrames 里），
   //   这里只负责把 at 传下去 + 后续按「时刻命名的帧」读文件。
   const at = String(opts.at ?? '').trim()
   // C233：预算由分派链按 tuning 注入（本函数不引入第二个常量）；估算与 dry-run 第四行同一口径。
   //   sheetPlan 是纯函数，多算一次没有副作用；超预算只走 warn() 到 stderr，不改 stdout 四行、不阻断。
   const budget = Number(opts.tokenBudget) > 0 ? Number(opts.tokenBudget) : 0
-  const planToken = Number(sheetPlan({ bv, grid, dur: Number(opts.dur) || null, out: '', manifestPath: null }).token) || 0
+  const plan = sheetPlan({ bv, grid, dur: Number(opts.dur) || null, out: '', manifestPath: null })
+  const planToken = Number(plan.token) || 0
   const budgetWarn = budgetWarnLine(planToken, budget)
+  // 1003 任务 B：成图尺寸软预判。Astra 本机实测（16:9 源 scale=640:-1，103 帧）：29×29=193M 过、
+  //   33×33=250M 过、34×34=266M 失败、40×40=368M 失败；50×2 过而 30×30(4:3) 失败，
+  //   说明约束是成图总像素约 2.5 亿量级、与源比例和编码器有关。这是有依据的取舍不是物理定律，
+  //   故只 warn 不拒绝（29×29/maxFrames/n>files.length 都不当通用拒绝条件）。源比例在抽帧前未知，
+  //   area 按 16:9 基准估，预判不出的编码失败在下方 catch 里保留 ffmpeg 真实诊断并追加减小网格提示。
+  const planArea = Number(plan.area) || 0
+  if (planArea > 250_000_000) warn(`按 16:9 源估算，${grid} 成图约 ${(planArea / 1e6).toFixed(0)}M 像素，可能超过可编码上限；请减小网格（实际受源比例与编码器影响）`)
   // C224：出计划不出图。短路必须留在 grabFrames 之前 —— 一旦走到它就真抽帧/下载/写盘了。
   if (opts.dryRun) {
     const planOut = artifactOut(`${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`, opts.out)
@@ -2386,7 +2413,9 @@ async function cmdSheet(bv, opts = {}) {
   // C233：非干跑也要在拼图前先报这次大概会用多少 token；超预算同一行提示，绝不阻断。
   console.log(tokenEstimateLine(planToken))
   if (budgetWarn) warn(budgetWarn)
-  console.log(`九宫格 ${bv}（${grid}，从抽帧里均匀挑 ${n} 张拼一张图）${at ? ` · 指定时刻 ${at}` : ''}`)
+  // 1121 任务 2：少帧时抽出的帧可能少于 n（pickEven(files,n) 在 files.length<=n 时返回全部），
+  //   这句在 picked 声明(:2421)之前，不能写 picked.length（TDZ）；改成「最多选 n 帧」，实数由拼完那句(:2443)报。
+  console.log(`九宫格 ${bv}（${grid}，从抽帧里最多选 ${n} 帧拼一张图）${at ? ` · 指定时刻 ${at}` : ''}`)
   const r = await grabFrames(bv, { step: opts.step ?? 0, p: opts.p ?? 1, ffmpeg: opts.ffmpeg, fresh: opts.fresh, at })
   // --at 模式下抽出来的是 f_12m30s.jpg（按时刻命名），`${bv}-NN.jpg` 那套文件根本不存在——
   //   原来固定用 frameList，于是 sheet --at 会走到「没抽到帧」。选择逻辑见 sheetFrameFiles。
@@ -2407,7 +2436,13 @@ async function cmdSheet(bv, opts = {}) {
     if (!bin) { process.exitCode = 1; console.error('✗ 找不到 ffmpeg：' + FFMPEG_HINT); return }
     const out = artifactOut(`${bv}-p${opts.p ?? 1}-${grid}${at ? '-' + atTagOf(at) : ''}.jpg`, opts.out)
     mkdirSync(dirname(out), { recursive: true })
-    ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], ffTimeoutMs())
+    try {
+      ffExec(bin, ['-y', '-threads', '2', '-i', join(tmp, '%02d.jpg'), '-vf', `scale=640:-1,tile=${cols}x${rows}`, '-frames:v', '1', out], ffTimeoutMs())
+    } catch (e) {
+      // 1003 任务 B：预判不出的编码失败保留 ffmpeg 原始诊断（ffExec 抛的 tail），只追加减小网格提示，不覆盖真因。
+      warn(`成图失败可能与该网格的像素规模有关，可尝试减小网格（--grid）；原始错误见上`)
+      throw e
+    }
     console.log(`拼图: ${out}（${(statSync(out).size / 1024).toFixed(0)} KiB，共 ${picked.length} 帧）`)
     // T42：九宫格没有时间轴，模型看图不知道「第几格是第几秒」；写一份 manifest 并打一行
     const stepUsed = Number((/-([0-9]+)s$/.exec(r.dir) || [])[1] || opts.step || 0)

@@ -19,6 +19,8 @@ import { pictureOutPath, textOutPath } from '../../lib/default-out.mjs'
 import { costOf, costProse } from '../../lib/cost-line.mjs'
 // C233：cmdSheet 新增的 token 预算 helper，同样补真 lib 实现。
 import { budgetWarnLine, tokenEstimateLine } from '../../lib/sheet-token.mjs'
+// 0844：cmdSheet 函数体新增 parseGrid(grid) 依赖，vm 切片跑不到定义，补真 lib 实现（与 sheetPlan 同源）。
+import { parseGrid } from '../../lib/sheet-plan.mjs'
 const norm = (p) => String(p).replace(/\\/g, '/')
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -114,7 +116,7 @@ const makeSandbox = (opts, logs) => ({
   writeSheetManifest: () => '<TMP>/out.manifest.json',
   manifestLine: (p) => `格位索引: ${p}`,
   manifestPathOf: (p) => String(p).replace(/\.jpg$/, '.manifest.json'),
-  sheetPlan: () => ({ lines: [] }),
+  sheetPlan: () => ({ lines: [] }), parseGrid,
   atTagOf: (s) => String(s),
   warn: () => {},
   fetchSheetCues: async () => ({ ok: false, why: '' }),

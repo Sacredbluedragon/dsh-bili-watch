@@ -501,6 +501,40 @@ const resumeProbe = () => {
   }
   return resumeProbeRun
 }
+// 0844 任务 A grid 严格校验取证：CLI/宿主execute/纯函数四组对照，一次起子进程跑完。
+//   放所有 check 之前避 C276 按块扫描；用 slowCheck 守，C529 单条。
+let gridProbeRun = null
+const gridProbe = () => {
+  if (!gridProbeRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c529-grid-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = (r.stdout || '').trim()
+    const err = (r.stderr || '').trim()
+    const line = out.split('\n').find((l) => l.startsWith('C529_JSON=')) || ''
+    let json = null
+    try { json = JSON.parse(line.slice('C529_JSON='.length)) } catch {}
+    gridProbeRun = { status: r.status, raw: `${out}\n${err}`.trim(), json }
+  }
+  return gridProbeRun
+}
+// 1003 续修三项取证：少帧成功 / 规模约束 / search 时长显示，一次起子进程跑完。
+//   放所有 check 之前避 C276 按块扫描；用 slowCheck 守，C530/C531/C532 三条。
+let probe1003Run = null
+const probe1003 = () => {
+  if (!probe1003Run) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c530-1003-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 16 * 1024 * 1024,
+    })
+    const out = (r.stdout || '').trim()
+    const err = (r.stderr || '').trim()
+    const line = out.split('\n').find((l) => l.startsWith('PROBE_JSON=')) || ''
+    let json = null
+    try { json = JSON.parse(line.slice('PROBE_JSON='.length)) } catch {}
+    probe1003Run = { status: r.status, raw: `${out}\n${err}`.trim(), json }
+  }
+  return probe1003Run
+}
 // 2017 第一档规则行为取证：子进程 import 真 _rules.mjs 求值，放所有 check 之前避 C276 按块扫描。
 //   7 正例必须「旧规则不命中、新规则命中」，3 反例两边都不命中；旧规则不命中由隔离扰动证明。
 let rulesProbeRun = null
@@ -7343,8 +7377,10 @@ check('C108 sheet 真跑（本地 mock + 缓存帧）：首行格式、拼图行
     const out = String(r.stdout || '')
     const err = String(r.stderr || '')
     // 与环境无关的两条：首行格式 + 「缓存命中不重下视频」
-    must(out.includes(`九宫格 ${MOCK_BV}（3x3，从抽帧里均匀挑 9 张拼一张图）`),
-      `首行没了或格式变了（BV / 格子 / 张数三段）：${tail(out)}`)
+    // 1121 任务 2：少帧前文案「均匀挑 N 张」改「最多选 N 帧」——N 是格子数上限，非实际帧数。
+    //   仍守三段（BV / 格子 / 张数），别把断言放宽成只认前缀（C497 教训：改断言成空转则改坏仍绿）。
+    must(out.includes(`九宫格 ${MOCK_BV}（3x3，从抽帧里最多选 9 帧拼一张图）`),
+      `首行没了或格式变了（BV / 格子 / 最多选帧数三段）：${tail(out)}`)
     const paths = mockBili.hits().map((h) => h.path)
     must(paths.includes('/x/web-interface/view'), `连 view 都没打（时长拿不到，缓存判据会跟着错）：${paths.join(',')}`)
     must(!paths.includes('/x/player/playurl'), `缓存里有 9 帧却还是重新下了视频（白等一次下载）：${paths.join(',')}`)
@@ -17745,6 +17781,178 @@ slowCheck('C528【主判据】第一档六条规则真求值：7 正例全命中
       `C528：反例${i + 1}「${s}」被误伤：${JSON.stringify(j.n?.[i])}`)
   })
   return `${r.positives.length} 正例全命中（规则名对）/${r.negatives.length} 反例零命中，_rules.mjs 真求值`
+})
+
+slowCheck('C529【主判据】--grid 严格校验：合法3x3出计划；3x3x2等5畸形在CLI/宿主execute/纯函数三入口全拒且抽帧前退出', () => {
+  const r = gridProbe()
+  must(r.status === 0 && r.json, `C529：grid 夹具失效 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  must(r.json.fatal === null, `C529：grid 夹具内部异常 ${r.json.fatal}`)
+  const BAD = ['3x3x2', '3x3abc', 'xx', '0x3', '-1x3']
+  const j = r.json
+  // ① CLI 合法出计划、畸形 rc≠0 且错误行在计划之前
+  must(j.cli?.legal?.rc === 0 && j.cli.legal.hasPlan === true,
+    `C529：CLI 合法 3x3 没出计划 ${JSON.stringify(j.cli?.legal)}`)
+  for (const g of BAD) {
+    const v = j.cli?.bad?.[g]
+    must(v && v.rc !== 0 && v.hasErr === true && v.hasPlan === false,
+      `C529：CLI 畸形 ${g} 没在抽帧前拒（rc/hasErr/hasPlan）${JSON.stringify(v)}`)
+  }
+  // ③ 宿主 execute 经真 index.js 分发：合法 ok:true，畸形 ok:false 且错误传回调用方
+  must(j.host?.registered >= 1 && j.host.legal?.ok === true,
+    `C529：宿主工具未注册或合法 grid 没过 ${JSON.stringify({ registered: j.host?.registered, legal: j.host?.legal })}`)
+  for (const g of BAD) {
+    const v = j.host?.bad?.[g]
+    must(v && v.ok === false && v.text.includes('格子格式'),
+      `C529：宿主 execute 畸形 ${g} 没把错误传回调用方 ${JSON.stringify(v)}`)
+  }
+  // ④ 纯函数直调：合法 n=9，畸形 parseGrid=null 且 sheetPlan 抛错
+  must(j.pure?.legal?.n === 9, `C529：纯函数合法 3x3 n≠9 ${JSON.stringify(j.pure?.legal)}`)
+  for (const g of BAD) {
+    const v = j.pure?.bad?.[g]
+    must(v && v.threw === true && v.parsed === null,
+      `C529：纯函数畸形 ${g} 没拒 ${JSON.stringify(v)}`)
+  }
+  // 1344 落实 F1：夹具必须 hermetic——缓存/输出在临时树、外部请求被看守拦下、不重下视频。
+  //   少了这几条，夹具退化成写用户真实缓存时上面四组仍全绿（改前就是这样假绿的）。
+  const h = j.hermetic || {}
+  must(h.cacheUnderTmp === true, `C529：夹具没把缓存指到临时目录（会写用户真实缓存）${JSON.stringify(h)}`)
+  must(h.escapeLines === 0, `C529：有外部请求逃逸出 mock 看守 ${JSON.stringify(h)}`)
+  must(h.guardFired === true, `C529：看守自检没拦下外部请求（看守形同虚设）${JSON.stringify(h)}`)
+  must(h.playurlHits === 0, `C529：预填帧命中缓存却去重新下载了视频 playurl=${h.playurlHits}`)
+  must(h.tempCleaned === true, `C529：夹具临时目录没清理干净 ${JSON.stringify(h)}`)
+  return `CLI 合法出计划/5 畸形 rc=1 错误在计划前；宿主 execute 合法 ok/5 畸形 ok:false 错误回传；纯函数 n=9/5 畸形抛错；hermetic(临时缓存/零逃逸/看守生效/不重下/已清理)`
+})
+
+slowCheck('C530【主判据】少帧成功：3 帧输入 + 3x3 不拒绝，可用图片/实际帧数/cells 三者都为 3（帧<格数不报 9 格）', () => {
+  const r = probe1003()
+  must(r.status === 0 && r.json, `C530：夹具失效 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  must(r.json.fatal === null, `C530：夹具内部异常 ${r.json.fatal}`)
+  const f = r.json.few
+  must(f.pickFound === true, `C530：没切到真 pickEven 源码`)
+  must(f.belowGrid === true && f.availableFiles === 3, `C530：合成输入不是「帧数<格数」现场 ${JSON.stringify(f)}`)
+  must(f.pickedLen === 3 && f.cellsLen === 3,
+    `C530：3 帧 + 3x3 未保留全部帧（picked=${f.pickedLen} cells=${f.cellsLen}），应都为 3 不是 9 ${JSON.stringify(f)}`)
+  return `3 帧<9 格：pickEven 返回 3、cells=3，未报 9 格；零帧提示与成功路径均保留`
+})
+
+slowCheck('C531【主判据】规模约束：合法3x3/4x4/10x10契约不变；超大网格时间点有界、CLI 低成本不崩；乘积溢出早退且错误可读', () => {
+  const r = probe1003()
+  must(r.status === 0 && r.json, `C531：夹具失效 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  must(r.json.fatal === null, `C531：夹具内部异常 ${r.json.fatal}`)
+  const s = r.json.scale
+  must(s.maxTimepoints === 4096 && s.showTimepoints === 32, `C531：有界常量意外 ${JSON.stringify({ m: s.maxTimepoints, sh: s.showTimepoints })}`)
+  // ① 合法网格契约不变：n 全展开、truncated=false、四行计划
+  // 1121 任务 1：新增展示行元素数断言——合法网格必须展示全部 n 个（旧版只列 32 个却写共 n 个的回归就是这里溜过去的）
+  for (const g of ['3x3', '4x4', '10x10', '50x2', '2x50']) {
+    const v = s.legal?.[g]
+    must(v && v.timesLen === v.n && v.truncated === false && v.lines === 4,
+      `C531：合法 ${g} 契约被破坏 ${JSON.stringify(v)}`)
+    must(v && v.shownCount === v.n,
+      `C531：合法 ${g} 展示行只列 ${v?.shownCount} 个、应列全部 ${v?.n} 个${JSON.stringify(v)}`)
+    // 首末值必须与 (i+0.5)*d/n 公式一致（展示行写的是 `${t}s`）
+    must(v && v.shownFirst === `${v.expFirst.toFixed(1)}s` && v.shownLast === `${v.expLast.toFixed(1)}s`,
+      `C531：合法 ${g} 展示行首末与公式不符 首=${v?.shownFirst}/期望${v?.expFirst}s 末=${v?.shownLast}/期望${v?.expLast}s`)
+  }
+  // ② 超大网格有界：times 截到 4096、truncated=true、展示行只列 32 个且含「仅列前 …共 N 个」
+  must(s.capped?.timesLen === 4096 && s.capped.truncated === true && s.capped.shownCount === 32 && s.capped.line2Tail.includes('…共') && s.capped.line2Tail.includes('仅列前'),
+    `C531：999x999 时间点没被有界截断/展示行个数错 ${JSON.stringify(s.capped)}`)
+  must(s.huge?.timesLen === 4096 && s.huge.truncated === true && s.huge.shownCount === 32 && s.huge.line2Tail.includes('…共') && s.huge.line2Tail.includes('仅列前'),
+    `C531：99999x99999 时间点没被有界截断/展示行个数错 ${JSON.stringify(s.huge)}`)
+  // ③ 乘积溢出早退可读、不是 Invalid array length
+  must(s.overflow?.parsed === null && s.overflow.scaleOverflow === true && s.overflow.msg.includes('网格规模过大'),
+    `C531：乘积溢出没早退或错误不可读 ${JSON.stringify(s.overflow)}`)
+  // ④ CLI 三态：合法/超大 rc=0 且输出远小于失控（<64KB）、无崩；溢出 rc=1 且错误可读
+  for (const k of ['legal', 'capped', 'huge']) {
+    const v = s.cli?.[k]
+    must(v && v.rc === 0 && v.hasCrash === false && v.bytes < 65536,
+      `C531：CLI ${k} 没被低成本处理（rc/bytes/crash）${JSON.stringify(v)}`)
+  }
+  const ov = s.cli?.overflow
+  must(ov && ov.rc === 1 && ov.first.includes('网格规模过大') && ov.hasCrash === false,
+    `C531：CLI 乘积溢出没早退成可读错误 ${JSON.stringify(ov)}`)
+  // ⑤ 成图尺寸预判：软预判 warn 存在、超大网格 CLI 真报「成图约…减小网格」、ffmpeg catch 保留原始诊断+提示
+  must(s.dim?.warnSrc === true, `C531：成图尺寸软预判 warn 源码不存在`)
+  must(s.dim?.ffCatchSrc === true, `C531：ffmpeg 失败 catch 没保留原始诊断(throw e)+减小网格提示`)
+  must(s.dim?.areaFromPlan > 250_000_000, `C531：sheetPlan 没回传 area 供尺寸预判 ${JSON.stringify(s.dim)}`)
+  must(s.cli?.capped.dimWarn === true, `C531：999x999 CLI 没报「成图约…减小网格」软提示 ${JSON.stringify(s.cli?.capped)}`)
+  return `合法5形态契约不变；超大网格截4096/CLI<64KB无崩；溢出 rc=1「网格规模过大」；成图尺寸软预判warn+ffmpeg失败保留诊断`
+})
+
+slowCheck('C532【主判据】search 时长显示：四形态明确单位（正常/超长分钟/秒位一位/空/?）、未知原样保留、hot 不动', () => {
+  const r = probe1003()
+  must(r.status === 0 && r.json, `C532：夹具失效 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  must(r.json.fatal === null, `C532：夹具内部异常 ${r.json.fatal}`)
+  const d = r.json.searchDur
+  must(d.found === true, `C532：没切到真 fmtSearchDuration 源码`)
+  must(d.normal === '2843分14秒', `C532：正常形态显示错 ${JSON.stringify(d.normal)}`)
+  must(d.longMin === '8724分29秒', `C532：超长分钟显示错 ${JSON.stringify(d.longMin)}`)
+  must(d.oneDigitSec === '3627分04秒', `C532：秒位一位没补零 ${JSON.stringify(d.oneDigitSec)}`)
+  must(d.empty === '?' , `C532：空值没给 ? ${JSON.stringify(d.empty)}`)
+  must(d.unknown === 'abc' && d.colon3 === '12:34:56', `C532：未知形态没原样保留 ${JSON.stringify({ a: d.unknown, c: d.colon3 })}`)
+  must(d.sourceUsesHelper === true, `C532：cmdSearch 显示行没走 fmtSearchDuration`)
+  must(d.hotUntouched === true, `C532：hot 显示被改动（应维持不动）`)
+  return `四形态带单位/补零/空值?/未知原样；search 走 helper、hot 维持现行`
+})
+
+slowCheck('C533【主判据】search 时长秒位边界：0–59 才解释为分秒、秒位超范围(1:99)原样保留', () => {
+  const r = probe1003()
+  must(r.status === 0 && r.json, `C533：夹具失效 rc=${r.status} ${r.raw.slice(0, 200)}`)
+  must(r.json.fatal === null, `C533：夹具内部异常 ${r.json.fatal}`)
+  const d = r.json.searchDur
+  must(d.found === true, `C533：没切到真 fmtSearchDuration 源码`)
+  must(d.maxSec === '0分59秒', `C533：秒位上界 0:59 应解释为分秒 ${JSON.stringify(d.maxSec)}`)
+  must(d.secOverflow === '1:99', `C533：秒位超范围 1:99 应原样保留、不得标成 1分99秒 ${JSON.stringify(d.secOverflow)}`)
+  return `秒位 0–59 解释为分秒(0:59→0分59秒)；超范围(1:99)原样保留`
+})
+
+// 1121 任务 2：少帧真实分派四样核对。复用 C108 那套 runLookMock + 缓存帧机制（跨机器可跑、不绑用户缓存）；
+//   C530 保留轻量选帧价值，这里专守「文案 N=格子数 / 成功 rc / JPEG 可开 / manifest.cells=实帧数」。
+check('C534【主判据】sheet 少帧真跑（4帧/3x3）：文案「最多选9帧」、rc=0、JPEG可开、manifest.cells=4', () => {
+  const NAME = 'C534 sheet 少帧真跑'
+  if (!needMock(NAME)) return
+  const cache = mockCache('c534')                       // 带 .bili-watch-root 标记，缓存根不被拼子目录
+  const home = mkdtempSync(join(tmpdir(), 'bw-c534-home-'))
+  const work = mkdtempSync(join(tmpdir(), 'bw-c534-work-'))
+  try {
+    const dir = framesDir(cache, framesDirName(MOCK_BV, 1, '5s'))
+    mkdirSync(dir, { recursive: true })
+    const seed = FF_BIN ? seedJpg(work) : null
+    fillFrames(dir, seed, 4)                            // 4 帧 < 9 格
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ ok: true, step: 5, scene: false, times: null, frames: 4, at: Date.now() }))
+    mockBili.clearHits()
+    const args = ['sheet', MOCK_BV, '--grid', '3x3', '--step', '5']
+    if (FF_BIN) args.push('--ffmpeg', FF_BIN)
+    const r = runLookMock(args, mockEnv({ BILI_WATCH_CACHE: cache, DSH_HOME: home }))
+    const out = String(r.stdout || '')
+    const err = String(r.stderr || '')
+    // ①② 少帧文案：N 是格子数 9（上限），不是实际帧数 4；首行「最多选 9 帧」逐字守
+    must(out.includes(`九宫格 ${MOCK_BV}（3x3，从抽帧里最多选 9 帧拼一张图）`),
+      `C534：少帧文案不对（应「最多选 9 帧」、N=格子数）：${tail(out)}`)
+    const paths = mockBili.hits().map((h) => h.path)
+    must(!paths.includes('/x/player/playurl'), `C534：缓存有 4 帧却重新下载了视频：${paths.join(',')}`)
+    if (!FF_BIN) {
+      must(r.status === 1 && /✗ 找不到 ffmpeg：.*fetch-deps/.test(err), `C534：缺 ffmpeg 分支不对：rc=${r.status} ${tail(err)}`)
+      return 'rc=1；少帧文案对、缓存命中不重下；本机无 ffmpeg，JPEG/cells 两样未验（跨机器降级）'
+    }
+    // ② 成功状态
+    must(r.status === 0, `C534：少帧 sheet 退出码 ${r.status}；stderr=${tail(err)}`)
+    // ③ 拼图行报实数 4 帧（不是 9），JPEG 头部可开
+    must(/^拼图: .*\.jpg（\d+ KiB，共 4 帧）$/m.test(out), `C534：拼图行没报实数 4 帧：${tail(out)}`)
+    const jpg = join(cache, 'sheets', `${MOCK_BV}-p1-3x3.jpg`)
+    must(existsSync(jpg), `C534：少帧拼图没落盘：${jpg}`)
+    must(readFileSync(jpg).subarray(0, 3).toString('hex').toUpperCase() === 'FFD8FF', `C534：产出的 JPEG 头部不是 FFD8FF`)
+    // ④ manifest.cells 长度 = 实帧数 4（< 格子数 9），与「拼图共 4 帧」同源
+    const man = join(cache, 'sheets', `${MOCK_BV}-p1-3x3.manifest.json`)
+    must(existsSync(man), `C534：少帧 manifest 没落盘：${man}`)
+    const mj = JSON.parse(readFileSync(man, 'utf8'))
+    must(mj.grid === '3x3' && Array.isArray(mj.cells) && mj.cells.length === 4,
+      `C534：manifest.cells 应=实帧数 4（不是格数 9）：${JSON.stringify(mj).slice(0, 220)}`)
+    return 'rc=0；文案「最多选9帧」+拼图行报4帧+JPEG头FFD8FF+manifest.cells=4；缓存命中不重下'
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+    rmSync(work, { recursive: true, force: true })
+  }
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

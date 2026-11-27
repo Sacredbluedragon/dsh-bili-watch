@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import { TUNING_DEFS, normalizeTuning } from '../../lib/tuning.mjs'
 import { tokenBudgetOf, budgetWarnLine, tokenEstimateLine } from '../../lib/sheet-token.mjs'
-import { sheetPlan } from '../../lib/sheet-plan.mjs'
+import { sheetPlan, parseGrid } from '../../lib/sheet-plan.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..', '..')
@@ -102,7 +102,7 @@ try {
     bv: BV,
     join: (...a) => a.join('/'), dirname: (p) => String(p).split('/').slice(0, -1).join('/'),
     cacheDir: () => '<TMP>', atTagOf: (s) => String(s),
-    sheetPlan, manifestPathOf: (p) => String(p).replace(/\.jpg$/, '.manifest.json'),
+    sheetPlan, parseGrid, manifestPathOf: (p) => String(p).replace(/\.jpg$/, '.manifest.json'),
     artifactOut: (f, e) => e || `<TMP>/sheets/${f}`,
     budgetWarnLine, tokenEstimateLine, warn: () => {},
     grabFrames: async () => { throw new Error('走到抽帧（切片按预期到此为止）') },

@@ -12,7 +12,7 @@ _bili-asr.py —— 把本地音频/视频文件转成文字（faster-whisper，
     GPU 要真跑起来还得有 CUDA 12 的 cuBLAS + cuDNN：要么系统装了 CUDA 12 运行时，
     要么在虚拟环境里 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12（本脚本会自动把它们的 bin 加进 DLL 搜索路径）。
   · 模型默认 small（约 250 MB，一个 3 分钟视频约 30–45 秒）；可 --model 换 base/tiny。
-  · 模型与缓存落 D 盘项目目录（HF_HOME），不碰用户主目录。
+  · 未设置 HF_HOME 时，默认使用脚本旁的 .hf-home；已设置时沿用环境变量指定的位置。
   · 音频由调用方先转成 16 kHz 单声道 wav 再传进来——这里不碰网络、不碰 B 站接口。
 
 用法：
