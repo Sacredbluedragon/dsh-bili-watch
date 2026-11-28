@@ -188,15 +188,15 @@ r1c1 00:00-00:05 @00:02    r1c2 00:05-00:10 @00:07
 | `asrMemMB` | number (MB) | 1536 | 本地 ASR 内存门槛。低于此值跳过转写 |
 | `lockTtlMin` | number (min) | 30 | 残留锁过期时长 |
 | `unitLimit` | number (chars) | 5000 | 单条评论/弹幕截断阈值 |
-| `textLimit` | number (chars) | 800 | 文本层单次返回正文上限 |
-| `toolTextCap` | number (chars) | 2000 | 工具层单次返回正文总上限 |
-| `toolHead` | number (chars) | 800 | 工具层默认返回头部字数 |
+| `textLimit` | number (chars) | 6000 | 文本层渲染后正文字数（不含宿主外层来源标记与尾行）。6000 是本层默认阈值，非首轮必得 6000 字正文（实际可见量受渲染与包装影响）；超出给摘要、截断时尾行给全文落盘路径可按路径读回 |
+| `toolTextCap` | number (chars) | 6000 | 工具层返回的总字数（正文＋外层来源标记＋尾行）。6000 是本层默认阈值；与文本层同值时上限附近第二层先截断属正常、非配置错；截断时尾行给全文落盘路径可按路径读回 |
+| `toolHead` | number (chars) | 2000 | 工具层默认返回头部字数 |
 | `dmBucketSec` | number (sec) | 30 | 弹幕分桶宽度 |
 | `dmTop` | number (buckets) | 5 | 弹幕热区输出条数 |
 | `downloadMaxMB` | number (MB) | 512 | 单文件下载体积上限 |
 | `subRateMin10` | number (×10 chars/s) | 20 | 字幕语速下限（2.0 字/秒） |
 | `subRateMax10` | number (×10 chars/s) | 85 | 字幕语速上限（8.5 字/秒） |
-| `textBrief` | number (chars) | 400 | 超长文本摘要长度 |
+| `textBrief` | number (chars) | 2000 | 超长文本摘要长度 |
 | `asrMaxSec` | number (sec) | 1800 | 转写时长闸门 |
 | `maxFrames` | number | 500 | 抽帧张数上限 |
 | `asrTimeoutSec` | number (sec) | 900 | ASR 进程超时 |

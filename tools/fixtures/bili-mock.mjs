@@ -22,10 +22,12 @@ import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
 /**
- * @param {{ commentText?: string, subtitleText?: string, subtitleOff?: boolean }} [opts]
+ * @param {{ commentText?: string, subtitleText?: string, subtitleOff?: boolean, subtitleRawCues?: Array<{from:number,to:number,content:string}> }} [opts]
  *   commentText：把夹具热评第一条的正文换成它（2026-11-02 护栏判据要喂一段带注入的评论）
  *   subtitleText：把夹具字幕正文换成它（同上，要真跑 sub 落盘 wrapped 那条）
  *   subtitleOff：返回空字幕轨（0.4.16 判据接缝，让 text 降级链走到 OCR / 兜底分支）
+ *   subtitleRawCues：原样返回给定 cue 数组，不拼任何后缀（1814-DSH C536：造纯空白 cue 走
+ *     真实 fetchSubtitle → cmdSub 的 empty:true 现行行为；subtitleText 会拼「第 N 段」造不出）。
  *   不传时与原来完全一致——老判据看到的响应一个字节都没变。
  * @returns {Promise<{
  *   port: number,
@@ -44,6 +46,7 @@ export async function startMockBili(opts = {}) {
       commentText: typeof opts.commentText === 'string' ? opts.commentText : '',
       subtitleText: typeof opts.subtitleText === 'string' ? opts.subtitleText : '',
       subtitleOff: opts.subtitleOff === true,
+      subtitleRawCues: Array.isArray(opts.subtitleRawCues) ? opts.subtitleRawCues : null,
     },
     // worker 默认继承 process.execArgv；verify 若用 --input-type 之类的参数起，会带蹦 worker
     execArgv: process.execArgv.filter((a) => !a.startsWith('--input-type')),

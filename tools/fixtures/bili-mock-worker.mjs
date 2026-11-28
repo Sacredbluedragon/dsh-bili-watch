@@ -127,7 +127,9 @@ const server = createServer((req, res) => {
         data: { subtitle: { subtitles: [{ lan: 'zh', subtitle_url: `http://127.0.0.1:${PORT}/subtitle.json` }] } },
       })
     case 'subtitle.json/':
-      return send(SUB_BODY)
+      // 1814-DSH C536：subtitleRawCues 给了就原样返回 cue 数组（不拼后缀），
+      //   用来造纯空白 cue 走 fetchSubtitle → cmdSub 的 empty:true 现行行为。不传时逐字节不变。
+      return send(workerData.subtitleRawCues ? { body: workerData.subtitleRawCues } : SUB_BODY)
     // 直链指回本机自己：真要下也留在夹具里，不会摸到外网
     case 'api.bilibili.com/x/player/playurl':
       return send({ code: 0, data: { durl: [{ url: `http://127.0.0.1:${server.address().port}/media/fixture.mp4`, size: 2048 }] } })

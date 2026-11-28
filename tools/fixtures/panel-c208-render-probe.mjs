@@ -52,7 +52,7 @@ function baseStatus() {
       tuningRanges: {
         asrMaxSec: [300, 3600], maxFrames: [100, 1000], asrTimeoutSec: [300, 3600],
         ffmpegTimeoutSec: [60, 1800], cmdTimeoutSec: [60, 900], asrMemMB: [512, 16384],
-        lockTtlMin: [5, 240], unitLimit: [1000, 20000], textLimit: [200, 5000],
+        lockTtlMin: [5, 240], unitLimit: [1000, 20000], textLimit: [200, 10000],
         toolTextCap: [500, 12000], toolHead: [200, 5000], dmBucketSec: [5, 120],
         dmTop: [1, 20], downloadMaxMB: [64, 4096], subRateMin10: [5, 60],
         subRateMax10: [30, 200], textBrief: [100, 3000], asrDevice: ['auto', 'cpu'],

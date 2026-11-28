@@ -1006,7 +1006,7 @@ function asrReady() {
 //   短片（≤180s）不受内存判据约束——whisper 崩的是长片（issue #2 P2-1）。
 function canRunAsr(dur) {
   if (!asrReady()) {
-    return { ok: false, why: '本地转写环境不可用（缺 ' + ASR_PY + ' 或 ' + ASR_SCRIPT + '；跑 node scripts/fetch-deps.mjs asr）' }
+    return { ok: false, why: '本地转写环境不可用（缺 .venv-asr 里的 python 解释器或 _bili-asr.py 脚本）；跑 node scripts/fetch-deps.mjs asr' }
   }
   const t = tuning()
   if (dur > t.asrMaxSec) {
@@ -1190,7 +1190,7 @@ async function runVisible(bin, args, opts = {}) {
 
 async function transcribe(bv, { model = 'small', timeoutMs = tuning().asrTimeoutSec * 1000, p: page = 1, ffmpeg = '' } = {}) {
   // B40：不再依赖调用方自觉——本函数内部先预查 ASR 环境，缺失就返回结构化错误（不抛异常）
-  if (!asrReady()) return { ok: false, why: '本地转写环境不可用（缺 ' + ASR_PY + ' 或 ' + ASR_SCRIPT + '；跑 node scripts/fetch-deps.mjs asr）' }
+  if (!asrReady()) return { ok: false, why: '本地转写环境不可用（缺 .venv-asr 里的 python 解释器或 _bili-asr.py 脚本）；跑 node scripts/fetch-deps.mjs asr' }
   // 3-6：首次跑要下 faster-whisper-small（约 460 MB），提前打中文提示，别让用户面对英文栈
   try {
     if (!existsSync(join(HF_HOME_DIR, 'hub', 'models--Systran--faster-whisper-small'))) {
@@ -2157,7 +2157,7 @@ function fmtPlay(n) {
 
 async function cmdAsr(bv, p = 1, ffmpeg = '') {
   if (!asrReady()) {
-    process.exitCode = 1; console.error(`✗ 本地转写环境不可用（缺 ${ASR_PY} 或 ${ASR_SCRIPT}）`)
+    process.exitCode = 1; console.error(`✗ 本地转写环境不可用（缺 .venv-asr 里的 python 解释器或 _bili-asr.py 脚本）；跑 node scripts/fetch-deps.mjs asr`)
     console.log('  跑 node scripts/fetch-deps.mjs asr 装环境，或用 text 走字幕/OCR 降级')
     return
   }
@@ -2685,7 +2685,7 @@ function markSeen(bv, title) {
 }
 
 /** 四级链：字幕 → ASR → 抽帧 OCR。输出最可信的一份文本。 */
-// 2026-10-28 高级设置放开：文本层上限改从 tuning().textLimit 取（默认 800）
+// 2026-10-28 高级设置放开：文本层上限从 tuning().textLimit 取（缺省值见 lib/tuning.mjs 的 TUNING_DEFS，不在这里写死）；超出上限时先给开头摘要 + 全文落盘路径。
 
 // cleanKey / bvOf 已搬到 lib/keys.mjs（2026-10-31）——两处逐字相同的实现只留一份。
 /** 按视频分目录：CACHE/<BV>/<kind>.txt —— 同一个视频识别到的各层都收在同一个文件夹里 */
@@ -3016,7 +3016,7 @@ function printText(text, opts, bv, kind = 'text') {
     return
   }
   if (full.length <= tuning().textLimit) { console.log(`\n${disp(full)}`); if (opts && opts._noFrameCheck) console.log('本次未做画面核对（默认不抽帧）'); return }
-  const brief = tuning().textBrief // 高级设置：textBrief 默认 400
+  const brief = tuning().textBrief // 超长时只给开头多少字（缺省值见 lib/tuning.mjs 的 TUNING_DEFS，不在这里写死）
   console.log(`\n${disp(cutCp(full, brief))}`)
   console.log(`\n…（全文 ${full.length} 字，这里只给开头 ${brief} 字）`)
   if (file) console.log(`全文已存：${file}`)
@@ -3846,7 +3846,7 @@ async function downloadGenericAudio(url, outDir, ffmpeg = '') { // W-27：同上
 
 // 本地转写通用音轨：复用 ASR_PY / ASR_SCRIPT / asrReady() 与转写缓存
 async function transcribeLocal(wav, tag, { model = 'small', timeoutMs = tuning().asrTimeoutSec * 1000 } = {}) {
-  if (!asrReady()) return { ok: false, why: `本地转写环境不可用（缺 ${ASR_PY} 或 ${ASR_SCRIPT}）；跑 node scripts/fetch-deps.mjs asr` }
+  if (!asrReady()) return { ok: false, why: `本地转写环境不可用（缺 .venv-asr 里的 python 解释器或 _bili-asr.py 脚本）；跑 node scripts/fetch-deps.mjs asr` }
   const dir = join(cacheDir(), 'asr')
   mkdirSync(dir, { recursive: true })
   // T35-E/B：同一本地文件同一模型的转写互斥（别的进程正在转它就不重跑），wav 由调用方管理不在此锁范围

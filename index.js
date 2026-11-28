@@ -68,8 +68,11 @@ import { extractWrittenPath } from './lib/written-path.mjs'
 // @deepseek-ai/dsh-tools 是可选 peer：桌面版 autoInstallPeers:false，市场安装时不会自动装上。
 // 缺了只少一个 bili_watch 工具，/bili 命令、插件面板与路由照常工作，不能因此整块加载失败。
 // 工具输出上限：超了就把全文落文件、只回摘要。
-// 由来：2026-10-26 一段 14 分钟视频的字幕 4,449 字整段塞进上下文，把会话挤爆两次。
-// 2026-10-28 高级设置放开：两个上限改从 readTuning() 每次取（toolTextCap 默认 2000、toolHead 默认 800）。
+// 现行机制（见 trimForModel）：宿主对长返回保留首段（toolHead，与尾行一起计入 cap），尾行给全文落盘路径；
+//   JSON 类输出整体落盘、不回半截。缺省值不写在这里，见 lib/tuning.mjs 的 TUNING_DEFS。
+// 历史：本组上限最初按「2026-10-26 一段 14 分钟视频字幕 4,449 字挤爆会话」设定，
+//   该因果现已无法独立判定（同期记录指向每轮注入面，而非单次工具输出），保留为无法判断。
+// 2026-10-28 高级设置放开：两个上限改从 readTuning() 每次取，缺省值随 TUNING_DEFS 走。
 // 不能写成模块级 const——index.js 是常驻进程，那样面板改了要重启才生效，和 cacheCfg 踩过的坑一样。
 const toolTextCap = () => readTuning().toolTextCap
 const toolTextHead = () => readTuning().toolHead
@@ -88,8 +91,8 @@ let TOOL_FILE_SEQ = 0
  *  也会被模型误读成坏 JSON。直接告诉模型「全文已整体落盘，去 read 那个文件」。 */
 function trimForModel(text, tag = 'out', bv = '', jsonMode = false, opts = {}) {
   const s = String(text ?? '')
-  // A8（2026-10-27）：--full 时工具层不要再把已放大的文本切回 800——
-  //   full 走 20000 上限；用户给的 --head N 优先于默认 800；不传 full 仍 ≤2000。
+  // A8（2026-10-27）：--full 时工具层不要再截回默认头长——
+  //   full 走 20000 固定上限；用户给的 --head N 优先于默认头长；默认头长与默认总字数都从 readTuning() 取（缺省值见 lib/tuning.mjs 的 TUNING_DEFS，不在这里写死）。
   const full = !!opts.full
   const cap = full ? 20000 : toolTextCap()
   const head = (Number.isFinite(opts.head) && opts.head > 0)
@@ -2666,7 +2669,7 @@ function registerSlashCommand(ctx) {
     handler: async (invocation) => {
       const { command, bv, positionals, extra, badOut } = parseCommandLine(invocation?.rawInput)
       const r = await lookup({ command, bv, positionals, extra, badOut })
-      // A8：斜杠命令带了 --full / --head 也透给 trimForModel，别再切回 800
+      // A8：斜杠命令带了 --full / --head 也透给 trimForModel（由它按 tuning 里的头长/总字数夹紧），这里不截断
       const fullOn = (extra || []).includes('--full')
       const hi = (extra || []).indexOf('--head')
       const headOn = hi >= 0 && Number(extra[hi + 1]) ? Number(extra[hi + 1]) : null
@@ -2856,15 +2859,14 @@ function registerTool(ctx) {
         const s = String(value?.text ?? '')
         // 失败要把 ok 说出来，否则模型会把错误提示当成视频内容（2026-10-26 T31-1）
         const head = value?.ok === false ? '⚠ 本次调用失败（ok=false），下面是错误信息，不是视频内容。' + String.fromCharCode(10) : ''
-        // N05-A4（2026-10-27 改）：full=true 是「用户明确要全文」，渲染层不许再截。
-        //   原来一律砍成 2000+400，还会补一句「全文见上面提示里的路径」，可 full 分支（trimForModel 的 cap=20000）
-        //   压根不写路径——等于承诺了一条不存在的路，8000 字只回 2421 字。
-        if (args?.full) return [{ type: 'text', text: head + s }]
-        if (s.length <= 2500) return [{ type: 'text', text: head + s }]
-        // 超长时保头也保尾：尾部通常是「全文已存 → read 这个文件」，切掉就等于没给路（T31-2）
-        // N05-B4：头尾都按码点切，别把 emoji 代理对切成 `�`
-        const arr = Array.from(s)
-        return [{ type: 'text', text: head + arr.slice(0, 2000).join('') + String.fromCharCode(10) + '…（已截断，全文见上面提示里的路径）…' + String.fromCharCode(10) + arr.slice(-400).join('') }]
+        // 渲染层只负责「呈现」，不负责「预算」——这是 0.4.20（2026-11-28）最小修复后的分工：
+        //   ① 呈现：原样呈现 execute 返回的 text（head + s），单块 type=text，不改一字、不截断、
+        //      不补任何句子；传入正文自己写了「已截断…路径」或提到文件路径也照原样给（C539 返修）。
+        //   ② 失败前缀：value.ok===false 时加一行 ⚠ 前缀，防止模型把错误提示当成视频内容（T31-1）。
+        //   ③ 预算在宿主层 trimForModel：按 toolTextCap/toolHead 夹紧回执字数、超限落盘
+        //      <tag>.<ts>.tool.txt，并把「全文已存：<路径>」的续读路径写进 text 本身——所以这里
+        //      看到的 text 可能已含路径，照原样呈现即可，绝不自己编路径或截断（旧二次截断已删）。
+        return [{ type: 'text', text: head + s }]
       },
     },
     execute: async (args, execCtx) => {

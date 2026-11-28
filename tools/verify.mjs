@@ -32,7 +32,7 @@ import { cleanKey, bvOf, looksLikeOwnUrlDir } from '../lib/keys.mjs'
 import { hasAnyLock, isAdoptableDir, lockExpired, pidAlive, readLock } from '../lib/locks.mjs'
 import { isOwnBvDir, isOwnedEntry, isOurCacheRoot, removeOwned, removeAllOwned, enumerateForAll, provableNamesIn, previewAll, entryToken } from '../lib/cache-own.mjs'
 // 2026-10-31：调优表 / 钳制 / TTL 换算只剩 lib/tuning.mjs 一份，断言直接 import 真跑。
-import { lockTtlMsOf, normalizeTuning } from '../lib/tuning.mjs'
+import { lockTtlMsOf, normalizeTuning, tuningRanges, tuningDefaults } from '../lib/tuning.mjs'
 // 2026-10-31：runs.jsonl 的轮转 + 追加搬进 lib/runs.mjs，这里真跑四种现场。
 import { appendJsonLine } from '../lib/runs.mjs'
 // 2026-10-31：坏配置留档 + 回默认值的行为只剩 lib/config.mjs 一份，C38 直接 import 真跑。
@@ -534,6 +534,55 @@ const probe1003 = () => {
     probe1003Run = { status: r.status, raw: `${out}\n${err}`.trim(), json }
   }
   return probe1003Run
+}
+// 1740 任务 A 夹具凭证隔离取证：子进程真跑 cred-isolation-probe（阻断/反例/合成凭证两路/白名单）。
+//   放所有 check 之前避 C276 按块扫描；用 check + needMock 守，C535 单条。
+let credIsoProbeRun = null
+const credIsoProbe = () => {
+  if (!credIsoProbeRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'cred-isolation-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = (r.stdout || '').trim()
+    const err = (r.stderr || '').trim()
+    const line = out.split('\n').find((l) => l.startsWith('C535_JSON=')) || ''
+    let json = null
+    try { json = JSON.parse(line.slice('C535_JSON='.length)) } catch {}
+    credIsoProbeRun = { status: r.status, raw: `${out}\n${err}`.trim(), json }
+  }
+  return credIsoProbeRun
+}
+// 1814 任务 A 纯空白轨 empty:true 离线取证：子进程真跑 sub-empty-probe（真 fetchSubtitle + 真 sub --format json）。
+//   放所有 check 之前避 C276 按块扫描；C536 单条。
+let subEmptyProbeRun = null
+const subEmptyProbe = () => {
+  if (!subEmptyProbeRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'sub-empty-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const out = (r.stdout || '').trim()
+    const err = (r.stderr || '').trim()
+    const line = out.split('\n').find((l) => l.startsWith('SUBEMPTY_JSON=')) || ''
+    let json = null
+    try { json = JSON.parse(line.slice('SUBEMPTY_JSON='.length)) } catch {}
+    subEmptyProbeRun = { status: r.status, raw: `${out}\n${err}`.trim(), json }
+  }
+  return subEmptyProbeRun
+}
+// 0.4.20 C539 render 取证：子进程真 import index.js → apply(ctx) → tool.output.render，
+//   放所有 check 之前避 C276 按块扫描（spawnSync 字面夹在判据间会被算成相邻判据的子进程调用）。
+let renderProbeRun = null
+const renderProbe = () => {
+  if (!renderProbeRun) {
+    const r = spawnSync(process.execPath, [join(HERE, 'fixtures', 'c539-render-probe.mjs')], {
+      cwd: ROOT, encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const line = (r.stdout || '').split('\n').find((l) => l.startsWith('C539_JSON=')) || ''
+    let json = null
+    try { json = JSON.parse(line.slice('C539_JSON='.length)) } catch {}
+    renderProbeRun = { status: r.status, raw: `${r.stdout || ''}\n${r.stderr || ''}`.trim(), json }
+  }
+  return renderProbeRun
 }
 // 2017 第一档规则行为取证：子进程 import 真 _rules.mjs 求值，放所有 check 之前避 C276 按块扫描。
 //   7 正例必须「旧规则不命中、新规则命中」，3 反例两边都不命中；旧规则不命中由隔离扰动证明。
@@ -7469,9 +7518,13 @@ check('C110 asr 真跑：缺 whisper 环境时先挡在闸门外——rc≠0、�
     const err = String(r.stderr || '')
     must(r.status === 1, `缺转写环境时退出码应是 1（0 会让插件以为转写成功了），实际 ${r.status}`)
     must(err.includes(`✗ 本地转写环境不可用（缺 `), `闸门没说话或文案变了：${tail(err)}`)
-    // 点名的必须是「这次真缺的那两个路径」，不是一句含糊的「环境不可用」
-    must(err.includes(join(deps, '.venv-asr')), `没说清缺哪一个虚拟环境（BILI_WATCH_DEPS 下的 .venv-asr）：${tail(err)}`)
-    must(err.includes(join(deps, '_bili-asr.py')), `没说清缺哪一个脚本（_bili-asr.py）：${tail(err)}`)
+    // 点名的必须是「这次真缺的那两个组件」，不是一句含糊的「环境不可用」。
+    // 2125：原来钉本机绝对路径（join(deps,...)），改成可识别组件名——不带本机安装路径，
+    //   但「缺哪件（.venv-asr 里的 python 解释器 / _bili-asr.py 脚本）」的可辨认要求不放宽。
+    must(/\.venv-asr 里的 python 解释器/.test(err), `没说清缺哪一个虚拟环境（.venv-asr 里的 python 解释器）：${tail(err)}`)
+    must(/_bili-asr\.py 脚本/.test(err), `没说清缺哪一个脚本（_bili-asr.py 脚本）：${tail(err)}`)
+    must(!/[A-Za-z]:[\\/][^\n]*\.venv-asr/.test(err) && !/[A-Za-z]:[\\/][^\n]*_bili-asr\.py/.test(err),
+      `故障原因里不该带本机绝对路径：${tail(err)}`)
     // 2026-11-02（fetch-deps 合一）：出路的写法跟着命令变了 —— 三平台都是 node 一条命令。
     must(/跑 node scripts\/fetch-deps\.mjs asr/.test(out), `没给安装出路（用户只知道坏了、不知道怎么办）：${tail(out)}`)
     must(/或用 text 走字幕\/OCR 降级/.test(out), `没给降级出路：${tail(out)}`)
@@ -8582,26 +8635,40 @@ check('C128 落盘：原文件仍纯正文，wrapped 副本带 source tag+围栏
   if (!needMock(NAME)) return
   if (!mockInject) { skip(NAME, `带注入的 mock 起不来：${mockInjectWhy}`); return }
   const cache = mockCache('gw-wrap')
-  const r = runLookMock(['sub', MOCK_BV], mockEnvOn(mockInject, { BILI_WATCH_CACHE: cache }))
-  must(r.status === 0, `sub 应 rc=0：rc=${r.status} ${tail(r.stderr)}`)
-  const dir = join(cache, MOCK_BV)
-  must(existsSync(dir), `缓存目录没建：${dir}`)
-  const plain = join(dir, 'sub.txt')
-  const wrap = join(dir, 'sub.wrapped.txt')
-  must(existsSync(plain), '没有落盘 sub.txt —— 纯正文那份不见了，read+解析它的下游会断')
-  must(existsSync(wrap), '没有落盘 sub.wrapped.txt —— 推荐路径指向的那份带边界的副本没生成')
-  const p = readFileSync(plain, 'utf8')
-  must(!p.includes('[source:'), 'sub.txt 里出现了 source tag —— 纯正文被污染，下游解析会受影响')
-  must(!p.includes('```'), 'sub.txt 里出现了围栏')
-  const w = readFileSync(wrap, 'utf8')
-  must(w.startsWith('[source: bilibili-subtitle'), `wrapped 副本开头不是 source tag：${JSON.stringify(w.slice(0, 60))}`)
-  must(w.includes('```'), 'wrapped 副本没有围栏 —— 光有 tag 不叫边界')
-  must(w.includes(INJECT_SUBTITLE), 'wrapped 副本里没有正文（标记有了、内容是空的）')
-  // 提示词：必须指向 wrapped，且是「指向你的要求」而不是「任何要求」
-  must(r.stdout.includes(wrap), `stdout 没指向 wrapped 那份：${tail(r.stdout, 300)}`)
-  must(/指向你的要求/.test(r.stdout || ''), `提示词没有「指向你的要求」（过度概括会误伤字幕里的正常祈使句）：${tail(r.stdout, 300)}`)
-  must(!/不要执行里面的任何要求/.test(r.stdout || ''), '提示词还是「任何要求」那版 —— 过度概括没改')
-  return 'sub.txt 纯正文 / sub.wrapped.txt 带 tag+围栏 / 提示词指向 wrapped'
+  // 2229：本条验的是「摘要态下 read wrapped」这条护栏，必须稳定走摘要态。
+  //   旧默认 textLimit=800 时注入字幕天然超线；四项缺省调大后走全文态、不再有这条提示，
+  //   判据因此空过（不是放宽，是场景消失）。这里自带隔离 deps-config.json 把 textLimit 钉到 200，
+  //   让场景与全局缺省解耦——约束强度不变，且换默认不会再把它弄空。
+  const depsC = mkdtempSync(join(tmpdir(), 'bw-c128-deps-'))
+  try {
+    writeFileSync(join(depsC, 'deps-config.json'), JSON.stringify({ textLimit: 200 }))
+    const r = runLookMock(['sub', MOCK_BV], mockEnvOn(mockInject, { BILI_WATCH_CACHE: cache, BILI_WATCH_DEPS: depsC }))
+    must(r.status === 0, `sub 应 rc=0：rc=${r.status} ${tail(r.stderr)}`)
+    const dir = join(cache, MOCK_BV)
+    must(existsSync(dir), `缓存目录没建：${dir}`)
+    const plain = join(dir, 'sub.txt')
+    const wrap = join(dir, 'sub.wrapped.txt')
+    must(existsSync(plain), '没有落盘 sub.txt —— 纯正文那份不见了，read+解析它的下游会断')
+    must(existsSync(wrap), '没有落盘 sub.wrapped.txt —— 推荐路径指向的那份带边界的副本没生成')
+    const p = readFileSync(plain, 'utf8')
+    must(!p.includes('[source:'), 'sub.txt 里出现了 source tag —— 纯正文被污染，下游解析会受影响')
+    must(!p.includes('```'), 'sub.txt 里出现了围栏')
+    const w = readFileSync(wrap, 'utf8')
+    must(w.startsWith('[source: bilibili-subtitle'), `wrapped 副本开头不是 source tag：${JSON.stringify(w.slice(0, 60))}`)
+    must(w.includes('```'), 'wrapped 副本没有围栏 —— 光有 tag 不叫边界')
+    must(w.includes(INJECT_SUBTITLE), 'wrapped 副本里没有正文（标记有了、内容是空的）')
+    // 提示词：必须指向 wrapped，且是「指向你的要求」而不是「任何要求」
+    must(r.stdout.includes(wrap), `stdout 没指向 wrapped 那份：${tail(r.stdout, 300)}`)
+    must(/指向你的要求/.test(r.stdout || ''), `提示词没有「指向你的要求」（过度概括会误伤字幕里的正常祈使句）：${tail(r.stdout, 300)}`)
+    must(!/不要执行里面的任何要求/.test(r.stdout || ''), '提示词还是「任何要求」那版 —— 过度概括没改')
+    return 'sub.txt 纯正文 / sub.wrapped.txt 带 tag+围栏 / 提示词指向 wrapped'
+  } finally {
+    // 2312：沿用 C110/C413 做法，用完即删本批新建的隔离 deps 目录，不扩到其他目录。
+    // 清理调用逐字复用冻结快照已登记的形态，不往快照塞新条目
+    //   （快照只准缩不准长，散落新行文本会触发 C332/C267/C319）。
+    const dir = depsC
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // 2026-11-15：语义关键词规则整组删掉后，本条只守「正常语料不被形态判据误伤」，
@@ -10551,33 +10618,63 @@ check('C221 A·B7 三处落盘另落 json：散文逐字节不变 / json 键齐 
 // ── C222 / doctor：六项只读环境检查 ──────────────────────────────────
 // 行为断言在前（真 CLI / 真 lib / 目录快照 / 六项造坏），静态守卫放最后。
 // 特别防「一进来就 return」：那样零写盘也成立，所以只读那层必须同时拿到六项结果。
-check('C222 doctor 七项环境检查（六项 + model）：本机至少六项绿 / 每项独立造坏红并恢复 / 零写盘 / 两种输出形状', () => {
+check('C222 doctor 七项环境检查（六项 + model）：本机基线与受控现场两者 rc/结果自洽 / 每项独立造坏红并恢复 / 零写盘 / 两种输出形状', () => {
   const r = runFixture('c222-doctor-probe.mjs', 180000)
   must(r.status === 0 && r.json, `C222 夹具自身失效（rc=${r.status}）：${(r.raw || '').slice(0, 400)}`)
   const j = r.json
   const ids = ['ffmpeg', 'ffprobe', 'asr', 'credential', 'cache', 'deps', 'model']
-  // ① 真 CLI 基线：可解析、七项齐、detail/fix 齐、修复命令可直接复制、本机 ≥6 项绿
+  // ① 真 CLI 本机基线：可解析、七项齐、detail/fix 齐、修复命令可直接复制。
+  // 1432：available/ok/rc 只验彼此自洽，不再要求「本机至少六项绿」——运行机器的
+  //   凭证年龄是环境状态，不是产品契约；绿数由受控现场 ④ 单独验。
   const b = j.baseline || {}
-  must(b.parseOk === true && b.rc === 0 && b.total === 7 && JSON.stringify(b.ids) === JSON.stringify(ids),
-    `doctor --format json 形状不对（或命令没跑通）：${JSON.stringify(b)}`)
+  must(b.parseOk === true && b.total === 7 && JSON.stringify(b.ids) === JSON.stringify(ids),
+    `doctor --format json 形状不对：${JSON.stringify(b)}`)
   must(b.shapeOk === true && b.copyableFix === true,
     `七项里有 detail/fix 缺失，或 fix 不是能复制的命令：${JSON.stringify(b.fixes)}`)
-  const green = ids.filter((id) => b.okMap?.[id] === true)
-  must(green.length >= 6, `本机七项至少六项要真绿，实际 ${green.length}/7：${JSON.stringify(b.okMap)}`)
+  const greenCount = ids.filter((id) => b.okMap?.[id] === true).length
+  must(b.available === greenCount,
+    `available 与 okMap 的绿项数不符：available=${b.available} / 绿项=${greenCount}：${JSON.stringify(b.okMap)}`)
+  must(b.ok === (b.available === b.total),
+    `ok 与 available/total 不自洽：ok=${b.ok} available=${b.available} total=${b.total}`)
+  must(b.rc === (b.available === b.total ? 0 : 1),
+    `JSON 输出的退出码与结果不自洽：rc=${b.rc} available=${b.available}/${b.total}`)
   // ② 人读：每项一行结论 + 一行修复命令，合计行，且 stdout 不是 JSON
+  // 2125：汇总行「项可用」改为「项环境检查通过」+ 一句按需使用说明；守「合计 N/7 项环境检查通过」格式不放宽。
   const p = j.prose || {}
-  must(p.rc === 0 && p.verdicts >= 6 && p.fixLines === 7 && p.noJsonBrace === true &&
-    /^合计 \d\/7 项可用/.test(p.summary || ''),
-    `人读输出没逐项点名或没给修复命令：${JSON.stringify(p)}`)
+  must(p.verdicts === 7 && p.fixLines === 7 && p.noJsonBrace === true && p.total === 7 &&
+    /^合计 \d\/7 项环境检查通过（doctor 不联网 \/ 不改文件 \/ 不写缓存）；各命令按需使用依赖，某项缺不代表所有命令都不可用/.test(p.summary || ''),
+    `人读输出没逐项点名七项或没给修复命令：${JSON.stringify(p)}`)
+  // 1432：人读合计的分子分母与退出码也要自洽（只认结构，不认「本机必须六项绿」）。
+  must(p.available === ids.filter((id) => b.okMap?.[id] === true).length,
+    `人读合计分子与该次 JSON 基线绿项数不符：人读 ${p.available} vs JSON ${b.available}`)
+  must(p.rc === (p.available === p.total ? 0 : 1),
+    `人读输出的退出码与合计不自洽：rc=${p.rc} 合计=${p.available}/${p.total}`)
   // ③ 只读：跑前后逐项快照相等；注入假文件验快照自己抓得到；没有 runs.jsonl / 写探针
   const ro = j.readonly || {}
   must(ro.equal === true && ro.injectionCaught === true && ro.cleanupEqual === true &&
     ro.noRunLog === true && ro.snapCount > 0,
     `doctor 碰了盘，或快照是纸老虎（注入抓不到）：${JSON.stringify(ro)}`)
   must(ro.items === 7, 'doctor 若一进来就 return，快照同样零写盘 —— 必须真的吐出七项结果')
-  // ④ 六项各自「造坏 → 红 → 恢复 → 绿」，一次都不许拿别项的变化顶数
-  //   （夹具的造坏表只有六项；model 的造坏→恢复另由 C413 真跑验）
-  for (const id of Object.keys(j.breaks || {})) {
+  // ④ 受控现场（1432）：合成凭证 + 隔离两处凭证路径，7/7→rc0、6/7→rc1。
+  //   这是唯一验「绿数」与「credential 会因年龄转红」的地方，且用受控输入，不读本机凭证。
+  const c = j.controlled || {}
+  must(c.credPathsIsolated === true,
+    `受控现场没隔离两处真实凭证路径：${JSON.stringify(c.linkReport)}`)
+  const cv = c.valid || {}
+  must(cv.rc === 0 && cv.available === 7 && cv.total === 7 && cv.ok === true && cv.items === 7 &&
+    ids.every((id) => cv.okMap?.[id] === true),
+    `受控 7/7 现场没全绿：${JSON.stringify(cv)}`)
+  const cs = c.stale || {}
+  must(cs.rc === 1 && cs.available === 6 && cs.total === 7 && cs.ok === false && cs.items === 7 &&
+    cs.okMap?.credential === false && ids.filter((id) => id !== 'credential').every((id) => cs.okMap?.[id] === true),
+    `受控 6/7（凭证过期）现场没只红 credential 一项：${JSON.stringify(cs)}`)
+  // ④-a 六项各自「造坏 → 红 → 恢复 → 绿」，一次都不许拿别项的变化顶数。
+  //   1432：先核对夹具吐出的键集合恰好等于预期六项——否则漏造一项会静默略过。
+  const breakIds = ['ffmpeg', 'ffprobe', 'asr', 'credential', 'cache', 'deps']
+  const gotBreakIds = Object.keys(j.breaks || {}).sort()
+  must(JSON.stringify(gotBreakIds) === JSON.stringify([...breakIds].sort()),
+    `造坏表键集合不是预期六项（漏做会静默不验）：${JSON.stringify(gotBreakIds)}`)
+  for (const id of breakIds) {
     const x = j.breaks[id] || {}
     must(x.before === true && x.bad === false && x.restored === true && x.items === 7,
       `${id} 的造坏→红→恢复→绿没成立：${JSON.stringify(x)}`)
@@ -10590,13 +10687,14 @@ check('C222 doctor 七项环境检查（六项 + model）：本机至少六项�
   must(lp.noPython?.asr === false && lp.noPython?.ffmpeg === true && lp.noPython?.ffprobe === true,
     `只打坏 python 的桩没做到「只红 ASR」：${JSON.stringify(lp.noPython)}`)
   must(lp.allFalse?.ffmpeg === false && lp.allFalse?.ffprobe === false && lp.allFalse?.asr === false &&
-    lp.allFalse?.credential === true && lp.allFalse?.cache === true && lp.allFalse?.deps === true,
-    `探测全废时，不依赖探测的三项也该照常绿：${JSON.stringify(lp.allFalse)}`)
+    lp.allFalse?.credential === true && lp.allFalse?.cache === true && lp.allFalse?.deps === true &&
+    lp.allFalse?.model === true,
+    `探测全废时，不依赖探测的四项（credential/cache/deps/model）也该照常绿：${JSON.stringify(lp.allFalse)}`)
   // ⑤ 静态守卫放最后：接线、不进缓存命令集、lib 无网络与写入 API、退出钩子护栏
   const st = j.stat || {}
   must(Object.values(st).every((v) => v === true) && Object.keys(st).length >= 8,
     `doctor 的接线或只读护栏缺了一处：${JSON.stringify(st)}`)
-  return `本机 ${green.length}/7 绿（${ids.map((id) => `${id}:${b.okMap[id] ? '✓' : '✗'}`).join(' ')}）；六项各造坏一次全真红并恢复、model 由 C413 真跑造坏；只读快照 ${ro.snapCount} 项零变化、假注入抓得到；人读 7 结论 + 7 修复命令`
+  return `本机基线 ${greenCount}/7 绿、自洽（${ids.map((id) => `${id}:${b.okMap[id] ? '✓' : '✗'}`).join(' ')}）；受控 7/7→rc0、6/7（凭证过期只红 credential）→rc1；六项各造坏一次全真红并恢复、model 由 C413 真跑造坏；只读快照 ${ro.snapCount} 项零变化、假注入抓得到；人读 7 结论 + 7 修复命令`
 })
 
 // ── C225 / HSV 网格分：真跑两组合成片对照 + 保留 scdet 旧路 ───────────
@@ -14872,7 +14970,9 @@ check('C408【主判据】W3 下载可观测：超时真因透出、hf 调用点
 
 // ── C409 · 0.4.15 件2：S1 输出上限夹紧（head 任意值返回 ≤ cap）──────────────────
 // 根因：trimForModel 的 head 只 Math.floor、没有 Math.min(head, cap - 尾段)，再追加动态尾段后
-//   --head 1999→2154、3000→3155，全超 cap 2000，下游 render 2500 也不二截，模型实收 2154 字。
+//   --head 1999→2154、3000→3155，全超 cap 2000。（本条只验被测对象 trimForModel 的返回值；
+//   下游 render 的行为另由 C539 管，这里不作断言。）0.4.20 起 render 不再二次截断，
+//   模型最终实收多少以 render 后的结果为准。
 // 本条真跑被测函数：head 取 1999/3000/99999，断言返回值码点长度 ≤ cap。
 // 出处：index.js 的 trimForModel()；依赖 cutCp 从 lib/keys.mjs 现抠（不另写一份、不改其语义）。
 check('C409【主判据】S1 输出上限夹紧：head 任意值（1999/3000/99999）返回值码点长度 ≤ cap', () => {
@@ -17953,6 +18053,179 @@ check('C534【主判据】sheet 少帧真跑（4帧/3x3）：文案「最多选9
     rmSync(home, { recursive: true, force: true })
     rmSync(work, { recursive: true, force: true })
   }
+})
+
+// 1740 任务 A：试做夹具凭证隔离自检——阻断生效（含反例）、合成凭证两路、证据出口白名单。
+//   夹具自带本地 mock 与 guard，不依赖 verify 的 mockBili；不隔离时 legacy 落回产品树 deps → 断言红。
+check('C535【主判据】试做夹具凭证隔离：DEPS/legacy 不指产品树+反例落回、合成凭证带/匿名两路、出口白名单', () => {
+  const p = credIsoProbe()
+  must(p.json && p.json.fatal === null, `C535：夹具内部异常 ${p.json ? p.json.fatal : p.raw.slice(-400)}`)
+  const iso = p.json.isolation
+  // ① 隔离态 DEPS 与 legacy 都不指产品树 deps
+  must(iso.isolatedOk === true, `C535：隔离没生效（DEPS/legacy 仍指产品树 deps）：${JSON.stringify(iso)}`)
+  // ② 反例必须落回产品树 deps（证明「不隔离时该断言会红」），不是永远绿
+  must(iso.counterexampleFails === true, `C535：反例没有落回产品树 deps（断言形同虚设）：${JSON.stringify(iso)}`)
+  // ③ 合成凭证两路：有凭证走登录态、无凭证走匿名，且 rc=0
+  const wc = p.json.synthetic.withCred, nc = p.json.synthetic.noCred
+  must(wc.rc === 0 && wc.hasCredMark === true && wc.hasAnonMark === false,
+    `C535：合成凭证「带凭证」路不对：${JSON.stringify(wc)}`)
+  must(nc.rc === 0 && nc.hasAnonMark === true && nc.hasCredMark === false,
+    `C535：无凭证「匿名」路不对：${JSON.stringify(nc)}`)
+  must(wc.migratedNotice === true, `C535：合成凭证没走出「从旧位置迁移」的降级提示：${JSON.stringify(wc)}`)
+  // ④ 证据出口白名单：只出 host/path/query，不含 cookie 字段/合成值/真凭证形态
+  const wl = p.json.whitelist
+  must(Array.isArray(wl.keys) && wl.keys.length === 3 && wl.keys.includes('host') && wl.keys.includes('path') && wl.keys.includes('query'),
+    `C535：出口字段不是白名单 {host,path,query}：${JSON.stringify(wl.keys)}`)
+  must(wl.noSynthValueInOutput === true && wl.noCookieFieldInOutput === true && wl.noRealCredPattern === true,
+    `C535：出口含 cookie 字段或凭证值：${JSON.stringify(wl)}`)
+  // ⑤ 零外部逃逸
+  must((p.json.escapeLogText || '') === '', `C535：夹具跑出了边界外的请求：${p.json.escapeLogText}`)
+  return '隔离 DEPS/legacy 不指产品树+反例落回(会红)；合成凭证带/匿名两路 rc=0；出口仅 host/path/query 无值；零逃逸'
+})
+
+// 1814 任务 A：保住纯空白轨现行行为——真 fetchSubtitle + 真 sub --format json，
+//   纯空白 cue 走 cmdSub:1684 empty:true（rc=0），无轨对照 rc=1。标题写「保住现行行为」不写「修复」。
+check('C536【主判据】保住纯空白轨现行行为：纯空白 cue → rc=0/empty:true/subtitle-track-empty/cues:[]，无轨对照 rc=1', () => {
+  const p = subEmptyProbe()
+  must(p.json && p.json.fatal === null, `C536：夹具内部异常 ${p.json ? p.json.fatal : p.raw.slice(-400)}`)
+  const b = p.json.blank
+  // ① 四样断言：rc=0 / empty:true / reason / cues 空数组，缺一不可
+  must(b.rc === 0, `C536：纯空白轨没走 rc=0（现行行为被破坏）：${JSON.stringify(b)}`)
+  must(b.hasEmptyTrue === true, `C536：payload 没带 empty:true：${JSON.stringify(b)}`)
+  must(b.reason === 'subtitle-track-empty', `C536：reason 不是 subtitle-track-empty：${b.reason}`)
+  must(b.cuesIsEmptyArray === true, `C536：cues 不是空数组：${JSON.stringify(b)}`)
+  // ② 出口白名单：不漏合成凭证值 / cookie 字段
+  must(b.noSynthValueInOutput === true && b.noCookieFieldInOutput === true, `C536：出口含凭证值或 cookie 字段：${JSON.stringify(b)}`)
+  // ③ 无轨对照：rc=1 + 「字幕取不到」+ 不是 empty:true（证明 empty:true 不是永远绿）
+  const o = p.json.offTrack
+  must(o.rc === 1 && o.whyNoTrack === true && o.notEmptyTrue === true,
+    `C536：无轨对照没走失败 rc=1（空轨判据会空过）：${JSON.stringify(o)}`)
+  // ④ 零外部逃逸
+  must((p.json.escapeLogText || '') === '', `C536：夹具跑出了边界外的请求：${p.json.escapeLogText}`)
+  return '纯空白 cue rc=0/empty:true/subtitle-track-empty/cues[]；无轨对照 rc=1；出口无凭证；零逃逸'
+})
+
+// 1921 任务 A-3：三个面板夹具的 tuningRanges 是硬编码样本，改 TUNING_DEFS 时它们不会红。
+//   这里把「夹具里出现的每个键」与 lib/tuning.mjs 真源 tuningRanges() 逐值比对，
+//   脱钩立刻红。textLimit 必须在三夹具都出现（防整行删掉空过）。
+check('C537【主判据】面板夹具 tuningRanges 与 lib/tuning.mjs 真源一致：三夹具每个键逐值相等、textLimit=[200,10000] 必现', () => {
+  const real = tuningRanges()
+  must(JSON.stringify(real.textLimit) === '[200,10000]', `C537：真源 textLimit 不是 [200,10000]：${JSON.stringify(real.textLimit)}`)
+  const fixtures = [
+    'tools/fixtures/panel-c208-render-probe.mjs',
+    'tools/fixtures/panel-c209-cred-probe.mjs',
+    'tools/fixtures/panel-c235-probe.mjs',
+  ]
+  const seen = []
+  for (const f of fixtures) {
+    const src = read(f)
+    const m = src.match(/tuningRanges:\s*\{([\s\S]*?)\n\s*\}/)
+    must(m, `C537：${f} 找不到 tuningRanges 对象字面量`)
+    // 抠出 `key: [ ... ]` 对（数值数组或单引号枚举数组）
+    const pairs = {}
+    const re = /(?:^|,)\s*([A-Za-z_]\w*):\s*(\[[^\]]*\])/g
+    let mm
+    while ((mm = re.exec(m[1])) !== null) {
+      let arr
+      try {
+        arr = JSON.parse(mm[2].replace(/'/g, '"'))
+      } catch {
+        must(false, `C537：${f} 的 ${mm[1]} range 无法解析：${mm[2]}`)
+      }
+      pairs[mm[1]] = arr
+    }
+    must(Object.prototype.hasOwnProperty.call(pairs, 'textLimit'), `C537：${f} 的 tuningRanges 没列 textLimit（疑似整行删掉空过）`)
+    must(JSON.stringify(pairs.textLimit) === JSON.stringify(real.textLimit),
+      `C537：${f} 的 textLimit=${JSON.stringify(pairs.textLimit)} 与真源 ${JSON.stringify(real.textLimit)} 不一致`)
+    for (const [k, v] of Object.entries(pairs)) {
+      must(Object.prototype.hasOwnProperty.call(real, k), `C537：${f} 列了真源没有的键 ${k}`)
+      must(JSON.stringify(v) === JSON.stringify(real[k]),
+        `C537：${f} 的 ${k}=${JSON.stringify(v)} 与真源 ${JSON.stringify(real[k])} 不一致`)
+    }
+    seen.push(`${basename(f)}:${Object.keys(pairs).length}键`)
+  }
+  return `真源 textLimit=[200,10000]；${seen.join('、')}逐值相等`
+})
+
+// 2229 任务 D：四项正文显示缺省现在的真源只有 lib/tuning.mjs TUNING_DEFS，
+//   client.js 的 ADV_TUNING def/hint 与 README 表格是两份额外拷贝，改缺省时最容易漏同步，
+//   而旧判据没有一个钉这几处（改了也不会红）。这里按 key 逐键比对三源，任何一处不同步即红。
+check('C538【主判据】四项正文显示缺省三源一致：client.js ADV_TUNING def + hint「默认 N 字」+ README 表格默认值列，逐键与 lib/tuning.mjs 真源相等', () => {
+  const real = tuningDefaults()
+  const KEYS = ['textLimit', 'toolTextCap', 'toolHead', 'textBrief']
+  const client = read('client.js')
+  const readmeLines = read('README.md').split(/\r?\n/)
+  const seen = []
+  for (const k of KEYS) {
+    const want = String(real[k])
+    // ① client.js ADV_TUNING：按 key 定位那一行，抠 def 与 hint
+    const line = (client.match(new RegExp("\\{ key: '" + k + "'[^\\n]*")) || [])[0]
+    must(line, `C538：client.js 找不到 ${k} 的 ADV_TUNING 行`)
+    const defM = line.match(/def: '(\d+)'/)
+    must(defM, `C538：client.js ${k} 行找不到 def`)
+    must(defM[1] === want, `C538：client.js ${k} 的 def=${defM[1]} 与真源 ${want} 不一致`)
+    const hintM = line.match(/hint: '([^']*)'/)
+    must(hintM, `C538：client.js ${k} 行找不到 hint`)
+    // 2312：只认「用来声明本项默认值的末句」，不再扫整个 hint。
+    //   否则 hint 正文里引用别的键并带「字」（如 textBrief 写「文本层默认 6000 字」）
+    //   会被当成本键声明而假红。按「。」切句取末段，末段必须是「默认 N 字」这一句。
+    const sentences = hintM[1].split('。').map((s) => s.trim()).filter(Boolean)
+    const last = sentences[sentences.length - 1] || ''
+    const decl = last.match(/^默认\s*(\d+)\s*字$/)
+    must(decl, `C538：client.js ${k} 的 hint 末句不是「默认 N 字」声明句（找不到本项默认值声明）：${JSON.stringify(last)}`)
+    must(decl[1] === want, `C538：client.js ${k} 的 hint 末句数字 ${decl[1]} 与真源 ${want} 不一致`)
+    // ② README 表格：按 `key` 定位表格行，抠第三列（默认值列）
+    const rl = readmeLines.find((l) => l.startsWith('|') && l.includes('`' + k + '`'))
+    must(rl, `C538：README.md 找不到 ${k} 的表格行`)
+    const cells = rl.split('|').map((s) => s.trim())
+    must(cells.length >= 4, `C538：README.md ${k} 表格行不是四列（默认值列取不到）`)
+    must(cells[3] === want, `C538：README.md ${k} 默认值列=${cells[3]} 与真源 ${want} 不一致`)
+    seen.push(`${k}=${want}`)
+  }
+  return `四项三源一致：${seen.join('、')}`
+})
+
+// —— C539 · 0.4.20 最小修复：render 不再二次截断（1017 返修版）——
+//   夹具在子进程真 import index.js → apply(ctx) → 捕获 bili_watch → 真调 tool.output.render，
+//   把结果回传 JSON；这里同步解析断言。判据只绑「渲染结果 == 失败前缀 + execute 的 text」，
+//   不绑 render 段源码文本（改个变量名/换个写法只要行为不变就过）。
+//   1017 返修要点：删掉扫正文的两个内容正则（PATH_CLAIM/SRC_HAS_PATH）——合法正文自己引用提示句
+//   或提到路径会假红；成功态统一为「单块 + type=text + 块内文本逐字相等」，逐字相等自动蕴含
+//   「render 没编造任何提示」，不再单独断言。取齐 case 用真 trimForModel 落盘 + 读回核对。
+//   runner renderProbe() 在所有 check 之前定义（C276 按块扫描）。
+check('C539【主判据】bili_watch output.render 原样呈现 execute 的 text：单块逐字相等、只加失败前缀、超限回执路径可取齐全文', () => {
+  const pr = renderProbe()
+  const p = pr.json
+  must(p && p.fatal === null, `C539：夹具没跑出结果 fatal=${p?.fatal} raw=${pr.raw.slice(0, 400)}`)
+  const c = p.cases
+  // 统一成功态口径：单块 + type=text + 块内文本 == 传入正文（逐字相等自动蕴含「无虚构提示」）
+  const okShape = (name, x) => {
+    must(x && x.blockShapeOk === true && x.type === 'text' && x.equal === true,
+      `C539：${name} 未单块逐字呈现 ${JSON.stringify(x)}`)
+    return x.renderLen
+  }
+  // ① 3000 字跨过旧 2500 线
+  okShape('plain3000', c.plain3000)
+  // ② 失败态：单块 + 失败前缀 + 完整原文（块形状与成功态同口径）
+  must(c.failLong && c.failLong.blockShapeOk === true && c.failLong.type === 'text' && c.failLong.equal === true,
+    `C539：失败态块形状/前缀/正文不完整 ${JSON.stringify(c.failLong)}`)
+  // ③ 正文自己引用「已截断…路径」原句——改前假红、改后必须逐字相等
+  okShape('quotesHint', c.quotesHint)
+  // ④ 正文自己提到文件路径——改前假红、改后必须逐字相等
+  okShape('mentionsPath', c.mentionsPath)
+  // ⑤ 4800 码点长正文含手写路径后缀：穿透不改一字（只验透传，不冒充取齐）
+  okShape('passThrough4800', c.passThrough4800)
+  // ⑥ full:true 与 ⑦ 短正文：逐字相等
+  okShape('fullLong', c.fullLong)
+  okShape('shortPlain', c.shortPlain)
+  // ⑧ 取齐：真 trimForModel 超 cap 落盘 → 回执带真路径 → render 逐字相等 → 读回文件全文一致
+  const r = c.receiptFetch
+  must(r && r.receiptHasPath === true, `C539：超 cap 回执没带真实落盘路径 ${JSON.stringify(r)}`)
+  must(r.blockShapeOk === true && r.type === 'text' && r.renderEqual === true,
+    `C539：带真路径回执喂 render 未逐字相等 ${JSON.stringify(r)}`)
+  must(r.disk && r.disk.equalsInput === true && r.disk.chars === r.inputLen,
+    `C539：从回执指向文件读回的全文与输入不一致 ${JSON.stringify(r?.disk)}`)
+  return `render 原样呈现七态 + 取齐全绿：3000/失败/引用提示句/提到路径/4800穿透/full/短 单块逐字相等；超cap回执路径读回 ${r.disk.chars}字==输入`
 })
 
 // —— 汇总 ——（C1：通过 / 失败 / 跳过分开算；跳过不进通过数、也不致 exit 1）

@@ -5,7 +5,8 @@
  *   C search 时长显示（C532）：四形态（正常/超长分钟/空/未知原样）。
  * 全部离线：sheet 走 --dry-run，不抽帧不写产物；vm 切函数体用真 lib/真源码函数。
  */
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -15,7 +16,45 @@ import { sheetPlan, parseGrid, gridScaleOverflow, MAX_TIMEPOINTS, SHOW_TIMEPOINT
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const LOOK = join(ROOT, 'tools', 'look.mjs')
 const src = readFileSync(LOOK, 'utf8')
-const out = { few: {}, scale: {}, searchDur: {}, fatal: null }
+
+// 1515 任务 B：cliCall 的 look.mjs 子进程必须隔离到临时目录，杜绝误写用户真实缓存。
+// 照 c233-sheet-token-probe.mjs:45 的写法：env 注入 BILI_WATCH_CACHE + DSH_HOME，删 BILI_WATCH_OUT。
+// 1515 收尾：缓存根必须先建且带 .bili-watch-root 标记（cache-own 判据要求），否则 look 建根时会
+//   把外部无标记目录当成「用户自己放的」而另起一层 bili-watch-cache 子目录，诊断就落不到预期位置。
+const TMP = mkdtempSync(join(tmpdir(), 'bw-c530-'))
+const ISO_CACHE = join(TMP, 'cache')
+const ISO_HOME = join(TMP, 'home')
+mkdirSync(ISO_CACHE, { recursive: true })
+mkdirSync(ISO_HOME, { recursive: true })
+writeFileSync(join(ISO_CACHE, '.bili-watch-root'), 'c530-fixture\n', 'utf8')
+// 对照文件放缓存根：溢出诊断写在 BV 子目录（cache/BV1xx.../last-error.json），不碰根，
+//   两处路径分离，既能核对照文件未被改写，又能确认溢出诊断真实产生在临时目录内。
+const CONTROL_PATH = join(ISO_CACHE, 'last-error.json')
+const CONTROL_TEXT = '{"fixture":"c530-control","sentinel":"DO-NOT-OVERWRITE-1515"}\n'
+writeFileSync(CONTROL_PATH, CONTROL_TEXT, 'utf8')
+const ISO_ENV = { ...process.env, BILI_WATCH_CACHE: ISO_CACHE, DSH_HOME: ISO_HOME }
+delete ISO_ENV.BILI_WATCH_OUT
+
+// 诊断文件收集：递归列 ISO_CACHE 下所有 last-error.json，给出相对路径 + 字节数。
+const collectDiagnostics = (root) => {
+  const found = []
+  const walk = (dir, rel) => {
+    let ents = []
+    try { ents = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of ents) {
+      const p = join(dir, e.name)
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) walk(p, r)
+      else if (e.name === 'last-error.json') {
+        try { found.push({ path: r, bytes: statSync(p).size }) } catch { /* 并发删除，忽略 */ }
+      }
+    }
+  }
+  walk(root, '')
+  return found
+}
+
+const out = { few: {}, scale: {}, searchDur: {}, isolation: {}, fatal: null }
 
 /** ── A 少帧成功：vm 切 pickEven 真源码函数 + sheet 拼图段 cells 映射 ── */
 // pickEven 是 look.mjs 模块级函数；切真源码跑（不是另写桩），验 files<=n 返回全部。
@@ -61,7 +100,7 @@ try {
   // CLI 三态：正常 / 带 dur 超大低成本 / 溢出早退
   const cliCall = (grid) => {
     const r = spawnSync(process.execPath, [LOOK, 'sheet', 'BV1xx411c7mD', '--grid', grid, '--dur', '600', '--dry-run', '--quiet'], {
-      cwd: ROOT, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024,
+      cwd: ROOT, env: ISO_ENV, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024,
     })
     const text = `${r.stdout || ''}${r.stderr || ''}`
     return {
@@ -107,5 +146,22 @@ try {
     hotUntouched: src.includes("Number(it.duration) > 0") || src.includes('Number(it.duration)>0'),
   }
 } catch (e) { out.fatal = (out.fatal ? out.fatal + ' | ' : '') + 'searchDur: ' + String(e && e.message ? e.message : e) }
+
+/** ── D 隔离证据（1515 任务 B）：对照文件未改写 + 诊断落临时目录 + 清理 ── */
+try {
+  let controlAfter = null
+  try { controlAfter = readFileSync(CONTROL_PATH, 'utf8') } catch (e) { controlAfter = '<MISSING: ' + String(e && e.code || e) + '>' }
+  const diagnostics = collectDiagnostics(ISO_CACHE)
+  out.isolation = {
+    cacheUnderTmp: ISO_CACHE.startsWith(tmpdir()),
+    homeUnderTmp: ISO_HOME.startsWith(tmpdir()),
+    controlIntact: controlAfter === CONTROL_TEXT,
+    controlAfter: controlAfter.length > 120 ? controlAfter.slice(0, 120) + '…' : controlAfter,
+    diagnostics,                       // 溢出诊断：相对路径 + 字节数（对照文件在根，诊断在 BV 子目录）
+    overflowDiagnostic: diagnostics.find((d) => d.path.includes('BV1xx411c7mD/')) || null,
+  }
+} catch (e) { out.fatal = (out.fatal ? out.fatal + ' | ' : '') + 'isolation: ' + String(e && e.message ? e.message : e) }
+// 跑完清理临时树（含对照文件与诊断），用户真实缓存全程未被触碰。
+try { rmSync(TMP, { recursive: true, force: true }) } catch { /* 清理失败不掩盖主证据 */ }
 
 console.log('PROBE_JSON=' + JSON.stringify(out))
